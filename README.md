@@ -1,0 +1,117 @@
+# llama-wackMall
+
+> Expert-granular MoE tiering for llama.cpp: hot experts in VRAM, cold experts in RAM, adaptive online cache, zero-config auto-fit.
+
+`llama-wackMall` is a private research fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)
+that runs large sparse Mixture-of-Experts (MoE) models - Qwen3.5-122B-A10B,
+Qwen3.6-35B-A3B, gemma-4-26B-A4B - at high token-generation throughput on
+consumer GPUs with as little as 8 GB VRAM.
+
+First public disclosure: 2026-07-26. See [ARCHITECTURE.md](ARCHITECTURE.md)
+for the full technical specification. Released under the MIT License (see
+[LICENSE](LICENSE)).
+
+---
+
+## The bottleneck
+
+Stock llama.cpp offloads at layer granularity (`-ngl N`): an MoE layer with
+128-256 expert tensors is an all-or-nothing block. On small GPUs, fitting a
+28 GB MoE model means most layers fall back to CPU, and every generated token
+streams its active experts through system RAM - the memory-bandwidth wall.
+
+## What this engine does
+
+Replaces layer-granular offload with **expert-granular offload**:
+
+1. **Hot/cold expert split.** Per MoE layer, the S currently-hottest experts
+   are pinned in VRAM; the rest stay in RAM and are computed on CPU only when
+   actually routed. Per-token traffic drops from "all active experts" to
+   "only the cold-selected ones".
+2. **Hardware-aware auto-fit.** At startup the engine places dense weights,
+   KV cache and compute buffers first, measures the remaining free VRAM, and
+   computes the exact number of hot expert slots S that fits. No manual
+   `-ngl` tuning.
+3. **Adaptive online cache.** Router decisions are counted per token; an
+   exponential-decay score with hysteresis (1.5x score ratio, 32-token
+   minimum dwell) swaps hot/cold assignments online. No offline profiling
+   required; optional warm-start seeds are supported.
+4. **Zero-config entry point.** One flag, `-cmoe`, enables the whole stack.
+
+The design is model-agnostic: all hooks live at the shared MoE graph-builder
+level (no per-model branches), covering any llama.cpp MoE architecture whose
+expert tensors use the standard `ffn_{gate,up,down}_exps` layout.
+
+## Verified results
+
+Hardware: RTX 3070 8 GB VRAM, 31 GB RAM, `--temp 0`, `-n 256 --ignore-eos`,
+single run per config, same binary/session per A/B pair.
+
+| Model | Quant (size) | Stock | wackMall | Speedup |
+|---|---|---|---|---|
+| Qwen3.6-35B-A3B | IQ2_M (11 GB) | 27.74 tok/s | **63.54 tok/s** (S=112) | +129% |
+| Qwen3.6-35B-A3B | Q4_K_M (20 GB) | 26.89 tok/s | **49.93 tok/s** (S=64) | +86% |
+| gemma-4-26B-A4B | Q5_K_S (17 GB) | 19.50 tok/s | **25.62 tok/s** (S=42) | +31% |
+| Qwen3.5-122B-A10B | IQ2_M (28 GB) | ~8.0 tok/s (best layer-split config) | **10.60 tok/s** (S=28) | +33% |
+| Long context (67k prompt) | - | CUDA OOM | **410.38 tok/s** (prompt eval) | runs cleanly |
+| Qwen3.5-122B, 16 GB RAM cap | IQ2_M (28 GB) | stock OOM | **5.08 tok/s** | runs cleanly |
+
+All numbers measured manually by the authors; single run per config,
+same-flags stock baselines on the identical upstream base. Correctness:
+tiered vs stock echo output byte-identical; perplexity deltas attributed to
+GPU activation-quantization numerics (machinery proven exact by control
+runs). Details in ARCHITECTURE.md section 5.
+
+## Quick start
+
+Requirements: CMake 3.18+, GCC/Clang with OpenMP, CUDA toolkit for NVIDIA
+builds.
+
+```bash
+mkdir build && cd build
+cmake -DGGML_CUDA=ON ..
+cmake --build . -j
+```
+
+Run (zero-config):
+
+```bash
+./bin/llama-completion -m /path/to/moe-model.gguf \
+  -cmoe --no-mmap -c 8000 \
+  -p "Write a technical guide to setting up a home Linux server" \
+  -n 256 --temp 0
+```
+
+`-cmoe` auto-configures: auto-fit offloading, batch/ubatch 256,
+flash attention, KV offload, threads = hardware_concurrency - 2, hot-slot
+count S from free VRAM, online adaptation on. `--no-mmap` is required (the
+cold tier must be RAM-resident). Interactive use: `llama-cli` with the same
+flags (add `--jinja` for architectures with custom chat templates, e.g.
+gemma4).
+
+### Optional environment knobs
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LLAMA_EXPERT_S` | auto | Hot slots per layer (>0 forces, <0 disables tiering) |
+| `LLAMA_EXPERT_OFF` | - | Set to 1 to disable tiering (stock behavior) |
+| `LLAMA_EXPERT_HOT` | - | CSV heat seed for warm start |
+| `LLAMA_EXPERT_ADAPT` | 1 | Online adaptation on/off |
+| `LLAMA_EXPERT_DECAY` | 1.0 | Score decay per update (1.0 = cumulative) |
+| `LLAMA_EXPERT_TMAX` | 16 | Max tokens/graph that takes the tiered path |
+| `LLAMA_EXPERT_STATS` | - | 1 or path: dump cache statistics at exit |
+| `LLAMA_EXPERT_USAGE` | - | Path: dump counts (reusable as next seed) |
+
+## Status
+
+Research preview. Verified on `qwen35moe` and `gemma4` architectures. On the
+roadmap: disk as third tier for models exceeding RAM (mmap-based, see
+ARCHITECTURE.md section 6), multi-GPU tier priority, per-layer slot skew.
+
+## Prior art notice
+
+This repository and ARCHITECTURE.md are published to disclose the described
+methods and systems as of the first publication date, with the intent that
+this disclosure serve as prior art. The code is MIT licensed; the authors
+grant no patent rights and intend none to be asserted over the disclosed
+concepts.
