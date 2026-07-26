@@ -40,6 +40,7 @@ concurrency:
 jobs:
   check-release:
     runs-on: ubuntu-slim
+    timeout-minutes: 20
 
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
@@ -61,6 +62,7 @@ jobs:
 
   get-version:
     runs-on: ubuntu-slim
+    timeout-minutes: 20
     outputs:
       ui_version: ${{ steps.version.outputs.ui_version }}
     steps:
@@ -86,6 +88,7 @@ jobs:
     needs: [check-release, get-version]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: 'arm64'
@@ -106,6 +109,7 @@ jobs:
             defines: "-DGGML_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
 
     permissions:
       actions: write
@@ -168,6 +172,7 @@ jobs:
     needs: [check-release, get-version]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: 'x64'
@@ -178,6 +183,7 @@ jobs:
             os: ubuntu-24.04-s390x
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
 
     permissions:
       actions: write
@@ -256,6 +262,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: 'x64'
@@ -264,6 +271,7 @@ jobs:
             os: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
 
     permissions:
       actions: write
@@ -342,6 +350,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     #permissions:
     #  actions: write
@@ -435,6 +444,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     permissions:
       actions: write
@@ -533,11 +543,13 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2025-vs2026
+    timeout-minutes: 20
 
     permissions:
       actions: write
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: 'x64'
@@ -601,6 +613,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2025
+    timeout-minutes: 20
 
     permissions:
       actions: write
@@ -610,6 +623,7 @@ jobs:
       VULKAN_VERSION: 1.4.313.2
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - backend: 'vulkan'
@@ -695,50 +709,7 @@ jobs:
           path: llama-bin-win-${{ matrix.backend }}-${{ matrix.arch }}.zip
           name: llama-bin-win-${{ matrix.backend }}-${{ matrix.arch }}.zip
 
-  windows-cuda:
-    needs: [check-release]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
-
-    runs-on: windows-2022
-
-    permissions:
-      actions: write
-
-    strategy:
-      matrix:
-        cuda: ['12.4', '13.3']
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: "npm"
-          cache-dependency-path: "tools/ui/package-lock.json"
-
-      - name: Install Cuda Toolkit
-        uses: ./.github/actions/windows-setup-cuda
-        with:
-          cuda_version: ${{ matrix.cuda }}
-
-      - name: Install Ninja
-        id: install_ninja
-        run: |
-          choco install ninja
-
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: release-windows-2022-x64-cuda-${{ matrix.cuda }}
-
-      - name: Build
-        id: cmake_build
-        shell: cmd
-        # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
+# TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
@@ -787,6 +758,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
+    timeout-minutes: 20
 
     defaults:
       run:
@@ -897,6 +869,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     strategy:
+      fail-fast: false
       matrix:
         build: [fp32, fp16]
         include:
@@ -906,6 +879,7 @@ jobs:
             fp16: ON
 
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     env:
       ONEAPI_ROOT: /opt/intel/oneapi/
@@ -983,201 +957,7 @@ jobs:
           path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz
           name: llama-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz
 
-  ubuntu-22-rocm:
-    needs: [check-release, get-version]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
-
-    runs-on: ubuntu-22.04
-
-    permissions:
-      actions: write
-
-    strategy:
-      matrix:
-        include:
-          - ROCM_VERSION: "7.2.1"
-            gpu_targets: "gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1150;gfx1200;gfx1201"
-            build: 'x64'
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: "npm"
-          cache-dependency-path: "tools/ui/package-lock.json"
-
-      - name: Free up disk space
-        uses: ggml-org/free-disk-space@v1.3.1
-        with:
-          tool-cache: true
-
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: release-ubuntu-22.04-rocm-${{ matrix.ROCM_VERSION }}
-
-      - name: Dependencies
-        id: depends
-        run: |
-          sudo apt install -y build-essential git cmake wget
-
-      - name: Setup Legacy ROCm
-        if: matrix.ROCM_VERSION == '7.2.1'
-        id: legacy_env
-        run: |
-          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
-          wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
-            gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
-
-          sudo tee /etc/apt/sources.list.d/rocm.list << EOF
-          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${{ matrix.ROCM_VERSION }} jammy main
-          EOF
-
-          sudo tee /etc/apt/preferences.d/rocm-pin-600 << EOF
-          Package: *
-          Pin: release o=repo.radeon.com
-          Pin-Priority: 600
-          EOF
-
-          sudo apt update
-          sudo apt-get install -y libssl-dev rocm-hip-sdk
-
-      - name: Setup TheRock
-        if: matrix.ROCM_VERSION != '7.2.1'
-        id: therock_env
-        run: |
-          wget https://repo.amd.com/rocm/tarball/therock-dist-linux-gfx1151-${{ matrix.ROCM_VERSION }}.tar.gz
-          mkdir install
-          tar -xf *.tar.gz -C install
-          export ROCM_PATH=$(pwd)/install
-          echo ROCM_PATH=$ROCM_PATH >> $GITHUB_ENV
-          echo PATH=$PATH:$ROCM_PATH/bin >> $GITHUB_ENV
-          echo LD_LIBRARY_PATH=$ROCM_PATH/lib:$ROCM_PATH/llvm/lib:$ROCM_PATH/lib/rocprofiler-systems >> $GITHUB_ENV
-
-      - name: Build with native CMake HIP support
-        id: cmake_build
-        run: |
-          cmake -B build -S . \
-            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_BACKEND_DL=ON \
-            -DGGML_NATIVE=OFF \
-            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DGGML_CPU_ALL_VARIANTS=ON \
-            -DGPU_TARGETS="${{ matrix.gpu_targets }}" \
-            -DGGML_HIP=ON \
-            -DHIP_PLATFORM=amd \
-            -DGGML_HIP_ROCWMMA_FATTN=ON \
-            -DHF_UI_VERSION=${{ needs.get-version.outputs.ui_version }} \
-            ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
-
-      - name: ccache-clear
-        uses: ./.github/actions/ccache-clear
-        with:
-          key: release-ubuntu-22.04-rocm-${{ matrix.ROCM_VERSION }}
-
-      - name: Determine tag name
-        id: tag
-        uses: ./.github/actions/get-tag-name
-
-      - name: Get ROCm short version
-        run: echo "ROCM_VERSION_SHORT=$(echo '${{ matrix.ROCM_VERSION }}' | cut -d '.' -f 1,2)" >> $GITHUB_ENV
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          cp LICENSE ./build/bin/
-          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz --transform "s,^\.,llama-${{ steps.tag.outputs.name }}," -C ./build/bin .
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz
-          name: llama-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz
-
-  windows-hip:
-    needs: [check-release, get-version]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
-
-    runs-on: windows-2022
-
-    permissions:
-      actions: write
-
-    env:
-      HIPSDK_INSTALLER_VERSION: "26.Q1"
-
-    strategy:
-      matrix:
-        include:
-          - name: "radeon"
-            gpu_targets: "gfx1150;gfx1151;gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1030;gfx1031;gfx1032"
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: "npm"
-          cache-dependency-path: "tools/ui/package-lock.json"
-
-      - name: Grab rocWMMA package
-        id: grab_rocwmma
-        run: |
-          curl -o rocwmma.deb "https://repo.radeon.com/rocm/apt/7.2.1/pool/main/r/rocwmma-dev/rocwmma-dev_2.2.0.70201-81~24.04_amd64.deb"
-          7z x rocwmma.deb
-          7z x data.tar
-
-      - name: Cache ROCm Installation
-        id: cache-rocm
-        uses: actions/cache@v5
-        with:
-          path: C:\Program Files\AMD\ROCm
-          key: cache-gha-rocm-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
-
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: release-windows-2022-x64-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ matrix.name }}
-
-      - name: Install ROCm
-        if: steps.cache-rocm.outputs.cache-hit != 'true'
-        id: depends
-        run: |
-          $ErrorActionPreference = "Stop"
-          write-host "Downloading AMD HIP SDK Installer"
-          Invoke-WebRequest -Uri "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-${{ env.HIPSDK_INSTALLER_VERSION }}-Win11-For-HIP.exe" -OutFile "${env:RUNNER_TEMP}\rocm-install.exe"
-          write-host "Installing AMD HIP SDK"
-          $proc = Start-Process "${env:RUNNER_TEMP}\rocm-install.exe" -ArgumentList '-install' -NoNewWindow -PassThru
-          $completed = $proc.WaitForExit(600000)
-          if (-not $completed) {
-              Write-Error "ROCm installation timed out after 10 minutes. Killing the process"
-              $proc.Kill()
-              exit 1
-          }
-          if ($proc.ExitCode -ne 0) {
-              Write-Error "ROCm installation failed with exit code $($proc.ExitCode)"
-              exit 1
-          }
-          write-host "Completed AMD HIP SDK installation"
-
-      - name: Verify ROCm
-        id: verify
-        run: |
-          # Find and test ROCm installation
+# Find and test ROCm installation
           $clangPath = Get-ChildItem 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Select-Object -First 1
           if (-not $clangPath) {
             Write-Error "ROCm installation not found"
@@ -1228,56 +1008,7 @@ jobs:
           path: llama-bin-win-hip-${{ matrix.name }}-x64.zip
           name: llama-bin-win-hip-${{ matrix.name }}-x64.zip
 
-  ios-xcode:
-    needs: [check-release, get-version]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
-    runs-on: macos-26
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Setup Xcode
-        run: |
-          sudo xcode-select -s /Applications/Xcode_26.4.app
-
-      - name: Build
-        id: cmake_build
-        run: |
-          sysctl -a
-          cmake -B build -G Xcode \
-            -DGGML_METAL_USE_BF16=ON \
-            -DGGML_METAL_EMBED_LIBRARY=ON \
-            -DLLAMA_OPENSSL=OFF \
-            -DLLAMA_BUILD_APP=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DLLAMA_BUILD_TOOLS=OFF \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_SERVER=OFF \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
-            -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml \
-            -DHF_UI_VERSION=${{ needs.get-version.outputs.ui_version }}
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
-
-      - name: xcodebuild for swift package
-        id: xcodebuild
-        run: |
-          ./build-xcframework.sh
-
-      - name: Build Xcode project
-        run: xcodebuild -project examples/llama.swiftui/llama.swiftui.xcodeproj -scheme llama.swiftui -sdk iphoneos CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= -destination 'generic/platform=iOS' FRAMEWORK_FOLDER_PATH=./build-ios build
-
-      - name: Determine tag name
-        id: tag
-        uses: ./.github/actions/get-tag-name
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          # Zip file is required for Swift Package Manager, which does not support tar.gz for binary targets.
+# Zip file is required for Swift Package Manager, which does not support tar.gz for binary targets.
           # For more details, see https://developer.apple.com/documentation/xcode/distributing-binary-frameworks-as-swift-packages
           zip -r -y llama-${{ steps.tag.outputs.name }}-xcframework.zip build-apple/llama.xcframework
 
@@ -1312,6 +1043,7 @@ jobs:
 #            build: 'Release'
 #            use_acl_graph: 'off'
 #    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 20
 #    steps:
 #      - name: Checkout
 #        uses: actions/checkout@v6
@@ -1395,22 +1127,19 @@ jobs:
         contents: write # for creating release
 
     runs-on: ubuntu-slim
+    timeout-minutes: 20
 
     needs:
       - get-version
       - windows
       - windows-cpu
-      - windows-cuda
       #- windows-sycl
-      - windows-hip
-      - ubuntu-22-rocm
       - ubuntu-cpu
       - ubuntu-vulkan
       - ubuntu-24-openvino
       #- ubuntu-24-sycl
       - android-arm64
       - macos-cpu
-      - ios-xcode
       #- openEuler-cann
       - ui-build
 
