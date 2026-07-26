@@ -265,12 +265,7 @@ void init(const llama_model & model) {
     if (!g_layers.empty()) {
         return; // already initialized
     }
-    const char * env_off = getenv("LLAMA_EXPERT_OFF");
-    const char * env_s   = getenv("LLAMA_EXPERT_S");
-    if ((env_off && atoi(env_off) != 0) || (env_s && atoi(env_s) < 0)) {
-        TIER_LOG("%s: expert tiering disabled (LLAMA_EXPERT_OFF=1 or LLAMA_EXPERT_S<0)\n", __func__);
-        return;
-    }
+    const char * env_s = getenv("LLAMA_EXPERT_S");
     const char * env_hot = getenv("LLAMA_EXPERT_HOT");
     if (const char * e = getenv("LLAMA_EXPERT_ADAPT")) {
         g_adapt = atoi(e) != 0;
@@ -278,10 +273,14 @@ void init(const llama_model & model) {
         g_adapt = true; // Auto-fit and online adaptation ON by default
     }
 
+    // ngl-style: unset/negative = auto, 0 = off, N = force N slots
     bool manual_S = false;
     if (env_s) {
-        g_S = std::max(0, atoi(env_s));
-        manual_S = (g_S > 0);
+        const int s = atoi(env_s);
+        if (s >= 0) {
+            g_S = s;
+            manual_S = true;
+        }
     }
 
     if (const char * e = getenv("LLAMA_EXPERT_TMAX")) {

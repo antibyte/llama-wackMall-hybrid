@@ -100,8 +100,7 @@ gemma4). KV cache defaults to f16; on K-quant models at long context,
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LLAMA_EXPERT_S` | auto | Hot slots per layer (>0 forces, <0 disables tiering) |
-| `LLAMA_EXPERT_OFF` | - | Set to 1 to disable tiering (stock behavior) |
+| `LLAMA_EXPERT_S` | auto | Hot slots per layer (-1 = auto, 0 = off, N = force N) |
 | `LLAMA_EXPERT_HOT` | - | CSV heat seed for warm start |
 | `LLAMA_EXPERT_ADAPT` | 1 | Online adaptation on/off |
 | `LLAMA_EXPERT_DECAY` | 1.0 | Score decay per update (1.0 = cumulative) |

@@ -1209,6 +1209,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // with tiering active and no manual -c, fit spends free VRAM on context
+    // instead of the expert cache
+    if (params.fit_params && params.n_ctx == 0 && llama_expert_tier::expert_weight_bytes(*model) > 0) {
+        const char * env_s = getenv("LLAMA_EXPERT_S");
+        if (!env_s || atoi(env_s) != 0) {
+            LOG_WRN("%s: -c not set: auto-fit will spend free VRAM on context instead of the expert cache; set -c and/or use -ctk q8_0 -ctv q8_0 to free VRAM for caching experts (can massively increase performance)\n", __func__);
+        }
+    }
+
     // cmoe: arg.cpp keeps n_threads == -1 as an auto marker when -t is unset.
     // If the dense (non-expert) weights fit the GPU, the CPU only streams
     // cold experts, so use 80% of the hardware threads; else stock default.
@@ -1229,20 +1238,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.cpuparams_batch.n_threads = nt;
         }
     }
-    // warn when -cmoe is used on a model without expert tensors
-    {
-        bool cmoe = false;
-        for (const auto & o : params.tensor_buft_overrides) {
-            if (o.pattern && strstr(o.pattern, "exps")) {
-                cmoe = true;
-                break;
-            }
-        }
-        if (cmoe && llama_expert_tier::expert_weight_bytes(*model) == 0) {
-            LOG_WRN("%s: -cmoe given but the model has no expert tensors; MoE defaults have no effect\n", __func__);
-        }
-    }
-
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters

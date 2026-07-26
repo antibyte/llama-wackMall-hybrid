@@ -502,6 +502,21 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    // default to -cmoe when expert tiering is active (LLAMA_EXPERT_S unset,
+    // <0, or >0); applied before env/CLI handling so explicit options win
+    const char * env_s = getenv("LLAMA_EXPERT_S");
+    const bool tier_active = !env_s || atoi(env_s) != 0;
+    if (tier_active) {
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        if (params.n_parallel < 0) {
+            params.n_parallel = 1;
+        }
+        params.n_batch = 256;
+        params.n_ubatch = 256;
+        params.kv_unified = true;
+        params.no_kv_offload = false;
+    }
+
     // handle environment variables
     for (auto & opt : ctx_arg.options) {
         std::string value;
@@ -673,6 +688,21 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (!params.kv_overrides.empty()) {
         params.kv_overrides.emplace_back();
         params.kv_overrides.back().key[0] = 0;
+    }
+
+    // keep expert weights on the CPU when expert tiering is active, unless
+    // the user already set an expert override (-cmoe/-ncmoe/-ot)
+    if (tier_active) {
+        bool has_expert_override = false;
+        for (const auto & o : params.tensor_buft_overrides) {
+            if (o.pattern && strstr(o.pattern, "exps")) {
+                has_expert_override = true;
+                break;
+            }
+        }
+        if (!has_expert_override) {
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
     }
 
     // pad tensor_buft_overrides for llama_params_fit:
