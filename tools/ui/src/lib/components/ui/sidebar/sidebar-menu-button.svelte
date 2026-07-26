@@ -49,12 +49,12 @@
 		tooltipContentProps,
 		...restProps
 	}: WithElementRef<HTMLAttributes<HTMLButtonElement>, HTMLButtonElement> & {
-		isActive?: boolean;
-		variant?: SidebarMenuButtonVariant;
-		size?: SidebarMenuButtonSize;
-		tooltipContent?: Snippet | string;
-		tooltipContentProps?: WithoutChildrenOrChild<ComponentProps<typeof Tooltip.Content>>;
-		child?: Snippet<[{ props: Record<string, unknown> }]>;
+		isActive: boolean;
+		variant: SidebarMenuButtonVariant;
+		size: SidebarMenuButtonSize;
+		tooltipContent: Snippet | string;
+		tooltipContentProps: WithoutChildrenOrChild<ComponentProps<typeof Tooltip.Content>>;
+		child: Snippet<[{ props: Record<string, unknown> }]>;
 	} = $props();
 
 	const sidebar = useSidebar();
@@ -69,7 +69,7 @@
 	});
 </script>
 
-{#snippet Button({ props }: { props?: Record<string, unknown> })}
+{#snippet Button({ props }: { props: Record<string, unknown> })}
 	{@const mergedProps = mergeProps(buttonProps, props)}
 	{#if child}
 		{@render child({ props: mergedProps })}

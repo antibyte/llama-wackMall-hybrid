@@ -12,12 +12,12 @@
 	interface Props {
 		url: string;
 		headers: string;
-		useProxy?: boolean;
+		useProxy: boolean;
 		onUrlChange: (url: string) => void;
 		onHeadersChange: (headers: string) => void;
-		onUseProxyChange?: (useProxy: boolean) => void;
-		urlError?: string | null;
-		id?: string;
+		onUseProxyChange: (useProxy: boolean) => void;
+		urlError: string | null;
+		id: string;
 	}
 
 	let {

@@ -2,10 +2,10 @@
 	import { SearchInput } from '$lib/components/app';
 
 	interface Props {
-		value?: string;
-		placeholder?: string;
-		onInput?: (value: string) => void;
-		class?: string;
+		value: string;
+		placeholder: string;
+		onInput: (value: string) => void;
+		class: string;
 	}
 
 	let {

@@ -19,7 +19,7 @@
 
 	let processingVisible = $derived(processingDetails.length > 0);
 
-	let { onVisibilityChange }: { onVisibilityChange?: (visible: boolean) => void } = $props();
+	let { onVisibilityChange }: { onVisibilityChange: (visible: boolean) => void } = $props();
 
 	$effect(() => {
 		onVisibilityChange?.(processingVisible);

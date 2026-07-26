@@ -17,18 +17,18 @@
 	import { HealthCheckStatus } from '$lib/enums';
 
 	interface Props {
-		class?: string;
-		disabled?: boolean;
-		hasAudioModality?: boolean;
-		hasVideoModality?: boolean;
-		hasVisionModality?: boolean;
-		hasMcpPromptsSupport?: boolean;
-		hasMcpResourcesSupport?: boolean;
-		onFileUpload?: () => void;
-		onSystemPromptClick?: () => void;
-		onMcpPromptClick?: () => void;
-		onMcpResourcesClick?: () => void;
-		trigger: Snippet<[{ disabled: boolean; onclick?: () => void }]>;
+		class: string;
+		disabled: boolean;
+		hasAudioModality: boolean;
+		hasVideoModality: boolean;
+		hasVisionModality: boolean;
+		hasMcpPromptsSupport: boolean;
+		hasMcpResourcesSupport: boolean;
+		onFileUpload: () => void;
+		onSystemPromptClick: () => void;
+		onMcpPromptClick: () => void;
+		onMcpResourcesClick: () => void;
+		trigger: Snippet<[{ disabled: boolean; onclick: () => void }]>;
 	}
 
 	let {

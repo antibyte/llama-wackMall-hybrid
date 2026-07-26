@@ -9,10 +9,10 @@
 	import type { DatabaseMessageExtraMcpPrompt } from '$lib/types';
 
 	interface Props {
-		class?: string;
+		class: string;
 		message: DatabaseMessage;
 		mcpPrompt: DatabaseMessageExtraMcpPrompt;
-		siblingInfo?: ChatMessageSiblingInfo | null;
+		siblingInfo: ChatMessageSiblingInfo | null;
 		showDeleteDialog: boolean;
 		deletionInfo: {
 			totalCount: number;
@@ -24,7 +24,7 @@
 		onEdit: () => void;
 		onDelete: () => void;
 		onConfirmDelete: () => void;
-		onNavigateToSibling?: (siblingId: string) => void;
+		onNavigateToSibling: (siblingId: string) => void;
 		onShowDeleteDialogChange: (show: boolean) => void;
 	}
 

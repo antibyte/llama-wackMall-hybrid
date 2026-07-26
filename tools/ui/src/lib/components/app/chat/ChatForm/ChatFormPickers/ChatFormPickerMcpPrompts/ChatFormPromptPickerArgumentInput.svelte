@@ -9,10 +9,10 @@
 	interface Props {
 		argument: PromptArgument;
 		value: string;
-		suggestions?: string[];
-		isLoadingSuggestions?: boolean;
-		isAutocompleteActive?: boolean;
-		autocompleteIndex?: number;
+		suggestions: string[];
+		isLoadingSuggestions: boolean;
+		isAutocompleteActive: boolean;
+		autocompleteIndex: number;
 		onInput: (value: string) => void;
 		onKeydown: (event: KeyboardEvent) => void;
 		onBlur: () => void;

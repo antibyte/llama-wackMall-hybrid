@@ -20,13 +20,13 @@
 	import { onMount } from 'svelte';
 
 	interface Props {
-		isActive?: boolean;
-		depth?: number;
+		isActive: boolean;
+		depth: number;
 		conversation: DatabaseConversation;
-		onDelete?: (id: string) => void;
-		onEdit?: (id: string) => void;
-		onSelect?: (id: string) => void;
-		onStop?: (id: string) => void;
+		onDelete: (id: string) => void;
+		onEdit: (id: string) => void;
+		onSelect: (id: string) => void;
+		onStop: (id: string) => void;
 	}
 
 	let {

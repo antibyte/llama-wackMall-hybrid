@@ -16,8 +16,8 @@
 	interface Props {
 		resource: MCPResourceInfo | null;
 		/** Pre-loaded content (e.g., from template resolution). Skips store fetch when provided. */
-		preloadedContent?: MCPResourceContent[] | null;
-		class?: string;
+		preloadedContent: MCPResourceContent[] | null;
+		class: string;
 	}
 
 	let { resource, preloadedContent, class: className }: Props = $props();

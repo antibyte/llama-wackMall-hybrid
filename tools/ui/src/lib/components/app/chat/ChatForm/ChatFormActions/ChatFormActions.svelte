@@ -18,22 +18,22 @@
 	import { ROUTES } from '$lib/constants/routes';
 
 	interface Props {
-		canSend?: boolean;
-		canSubmit?: boolean;
-		class?: string;
-		disabled?: boolean;
-		isLoading?: boolean;
-		isReasoning?: boolean;
-		isRecording?: boolean;
-		showAddButton?: boolean;
-		showModelSelector?: boolean;
-		uploadedFiles?: ChatUploadedFile[];
-		onFileUpload?: () => void;
-		onMicClick?: () => void;
-		onStop?: () => void;
-		onSystemPromptClick?: () => void;
-		onMcpPromptClick?: () => void;
-		onMcpResourcesClick?: () => void;
+		canSend: boolean;
+		canSubmit: boolean;
+		class: string;
+		disabled: boolean;
+		isLoading: boolean;
+		isReasoning: boolean;
+		isRecording: boolean;
+		showAddButton: boolean;
+		showModelSelector: boolean;
+		uploadedFiles: ChatUploadedFile[];
+		onFileUpload: () => void;
+		onMicClick: () => void;
+		onStop: () => void;
+		onSystemPromptClick: () => void;
+		onMcpPromptClick: () => void;
+		onMcpResourcesClick: () => void;
 	}
 
 	let {

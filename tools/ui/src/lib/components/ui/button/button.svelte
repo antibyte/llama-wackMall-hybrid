@@ -37,8 +37,8 @@
 
 	export type ButtonProps = WithElementRef<HTMLButtonAttributes> &
 		WithElementRef<HTMLAnchorAttributes> & {
-			variant?: ButtonVariant;
-			size?: ButtonSize;
+			variant: ButtonVariant;
+			size: ButtonSize;
 		};
 </script>
 

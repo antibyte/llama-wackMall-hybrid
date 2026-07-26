@@ -178,8 +178,10 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
+        const size_t src0_name_len = strlen(src0->name);
+        const bool tiered_hot_ids = src0_name_len >= 4 && strcmp(src0->name + src0_name_len - 4, ".hot") == 0;
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, stream, tiered_hot_ids);
         CUDA_CHECK(cudaGetLastError());
     }
 

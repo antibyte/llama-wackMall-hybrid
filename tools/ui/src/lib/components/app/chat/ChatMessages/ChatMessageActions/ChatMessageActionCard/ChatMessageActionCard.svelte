@@ -2,7 +2,7 @@
 	import type { Snippet, Component } from 'svelte';
 
 	interface Props {
-		icon: Component<{ class?: string }>;
+		icon: Component<{ class: string }>;
 		message: Snippet;
 		actions: Snippet;
 	}

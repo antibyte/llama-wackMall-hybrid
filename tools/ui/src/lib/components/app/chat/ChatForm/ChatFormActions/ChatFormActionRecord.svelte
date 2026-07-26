@@ -4,12 +4,12 @@
 	import * as Tooltip from '$lib/components/ui/tooltip';
 
 	interface Props {
-		class?: string;
-		disabled?: boolean;
-		hasAudioModality?: boolean;
-		isLoading?: boolean;
-		isRecording?: boolean;
-		onMicClick?: () => void;
+		class: string;
+		disabled: boolean;
+		hasAudioModality: boolean;
+		isLoading: boolean;
+		isRecording: boolean;
+		onMicClick: () => void;
 	}
 
 	let {

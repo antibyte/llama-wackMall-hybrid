@@ -15,16 +15,16 @@
 	import { isMcpPrompt, isMcpResource, isPdfFile } from '$lib/utils';
 
 	interface Props {
-		class?: string;
-		imageClass?: string;
-		imageHeight?: string;
-		imageWidth?: string;
+		class: string;
+		imageClass: string;
+		imageHeight: string;
+		imageWidth: string;
 		item: ChatAttachmentDisplayItem;
-		limitToSingleRow?: boolean;
-		onFileRemove?: (fileId: string) => void;
-		onMcpResourcePreview?: (extra: DatabaseMessageExtraMcpResource) => void;
-		onPreview?: (item: ChatAttachmentDisplayItem) => void;
-		readonly?: boolean;
+		limitToSingleRow: boolean;
+		onFileRemove: (fileId: string) => void;
+		onMcpResourcePreview: (extra: DatabaseMessageExtraMcpResource) => void;
+		onPreview: (item: ChatAttachmentDisplayItem) => void;
+		readonly: boolean;
 	}
 
 	let {

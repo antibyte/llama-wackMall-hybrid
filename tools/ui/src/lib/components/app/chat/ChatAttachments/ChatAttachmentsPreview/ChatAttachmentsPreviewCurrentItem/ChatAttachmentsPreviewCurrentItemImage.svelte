@@ -1,6 +1,6 @@
 <script lang="ts">
 	interface Props {
-		currentItem: { name?: string } | null;
+		currentItem: { name: string } | null;
 		displayPreview: string | undefined;
 	}
 

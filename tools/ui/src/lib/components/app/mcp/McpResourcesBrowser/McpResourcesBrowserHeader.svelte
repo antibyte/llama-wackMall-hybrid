@@ -6,8 +6,8 @@
 	interface Props {
 		isLoading: boolean;
 		onRefresh: () => void;
-		onSearch?: (query: string) => void;
-		searchQuery?: string;
+		onSearch: (query: string) => void;
+		searchQuery: string;
 	}
 
 	let { isLoading, onRefresh, onSearch, searchQuery = '' }: Props = $props();

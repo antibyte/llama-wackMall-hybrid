@@ -38,10 +38,10 @@
 
 	interface Props {
 		message: DatabaseMessage;
-		toolMessages?: DatabaseMessage[];
-		isStreaming?: boolean;
-		isLastAssistantMessage?: boolean;
-		highlightTurns?: boolean;
+		toolMessages: DatabaseMessage[];
+		isStreaming: boolean;
+		isLastAssistantMessage: boolean;
+		highlightTurns: boolean;
 	}
 
 	let {

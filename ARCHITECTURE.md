@@ -88,16 +88,18 @@ Three-stage init at context creation:
 2. KV cache and compute buffers allocated.
 3. Tier init measures the physically free VRAM and sets
 
-   S = clamp( floor( (V_free - 300 MB) / bytes_per_slot ), 0, N_experts )
+   S = clamp( floor( (V_free - 512 MB) / bytes_per_slot ), 0, N_experts )
 
    with bytes_per_slot derived from the actual tensor quantization. S is
-   uniform across layers; manual override via LLAMA_EXPERT_S. The 300 MB
+   uniform across layers; manual override via LLAMA_EXPERT_S. The 512 MB
    flat reserve covers runtime allocations (CUDA graph capture buffers are
-   allocated after measurement; the reserve covers all observed cases).
+   allocated after measurement). A manually forced S is clamped to what
+   fits rather than failing at capture time.
 
 `-cmoe` additionally auto-configures batch/ubatch 256, flash attention, KV
-offload, np=1, and threads = hardware_concurrency - 2 (both token and batch
-pools). All manual flags take precedence.
+offload, np=1, and threads: when the dense (non-expert) weights fit the
+GPU, 80% of hardware threads (the CPU then only streams cold experts);
+otherwise the stock default. Manual -t always takes precedence.
 
 ## 5. Online adaptation (the cache policy)
 
@@ -117,11 +119,13 @@ it runs after each graph_compute at ubatch granularity.
   dumps counts at exit, reusable as the next session's seed
   (cross-session learning).
 
-Correctness gates used during development: echo tests (tiered output
-byte-identical to stock), perplexity pairs, and an S=0-style control that
-disables hot caching entirely; the machinery is bit-exact, with residual
-perplexity deltas traced to GPU activation-quantization (mmq q8_1)
-numerics on low-bit weight types.
+Correctness gates used during development: perplexity pairs (>= 9 chunks;
+tiered within rounding noise of stock), bit-exact controls through
+identical compute paths (tiering off / all-CPU), and a permanent invariant
+guard that verifies lut/mask/slot bookkeeping after each run's re-pins.
+The tiered path rounds differently than stock (different ops on different
+backends), so greedy outputs can tie-flip; quality is equivalent within
+measurement noise.
 
 ## 6. Integration invariants (the non-obvious parts)
 

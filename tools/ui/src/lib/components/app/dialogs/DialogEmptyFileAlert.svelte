@@ -5,7 +5,7 @@
 	interface Props {
 		open: boolean;
 		emptyFiles: string[];
-		onOpenChange?: (open: boolean) => void;
+		onOpenChange: (open: boolean) => void;
 	}
 
 	let { open = $bindable(), emptyFiles, onOpenChange }: Props = $props();

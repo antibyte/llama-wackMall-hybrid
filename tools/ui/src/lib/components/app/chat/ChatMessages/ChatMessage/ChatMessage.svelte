@@ -20,11 +20,11 @@
 	import { ROUTES } from '$lib/constants/routes';
 
 	interface Props {
-		class?: string;
+		class: string;
 		message: DatabaseMessage;
-		toolMessages?: DatabaseMessage[];
-		isLastAssistantMessage?: boolean;
-		siblingInfo?: ChatMessageSiblingInfo | null;
+		toolMessages: DatabaseMessage[];
+		isLastAssistantMessage: boolean;
+		siblingInfo: ChatMessageSiblingInfo | null;
 	}
 
 	let {
@@ -246,7 +246,7 @@
 		}, 0);
 	}
 
-	function handleRegenerate(modelOverride?: string) {
+	function handleRegenerate(modelOverride: string) {
 		chatActions.regenerateWithBranching(message, modelOverride);
 	}
 

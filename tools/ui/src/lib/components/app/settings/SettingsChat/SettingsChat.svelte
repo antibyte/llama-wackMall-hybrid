@@ -28,8 +28,8 @@
 	import { modelsStore } from '$lib/stores/models.svelte';
 	import { isRouterMode } from '$lib/stores/server.svelte';
 	interface Props {
-		initialSection?: string;
-		getSectionHref?: (section: SettingsSection) => string;
+		initialSection: string;
+		getSectionHref: (section: SettingsSection) => string;
 	}
 
 	let { initialSection, getSectionHref }: Props = $props();

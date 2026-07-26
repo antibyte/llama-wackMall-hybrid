@@ -54,13 +54,16 @@ single run per config, same binary/session per A/B pair.
 | gemma-4-26B-A4B | Q5_K_S (17 GB) | 19.50 tok/s | **25.62 tok/s** (S=42) | +31% |
 | Qwen3.5-122B-A10B | IQ2_M (28 GB) | ~8.0 tok/s (best layer-split config) | **10.60 tok/s** (S=28) | +33% |
 | Long context (67k prompt) | - | CUDA OOM | **410.38 tok/s** (prompt eval) | runs cleanly |
-| Qwen3.5-122B, 16 GB RAM cap | IQ2_M (28 GB) | stock OOM | **5.08 tok/s** | runs cleanly |
+| Qwen3.5-122B, 16 GB RAM cap | IQ3_XS (34 GB) | 2.40 tok/s | **2.84 tok/s** | +18% |
 
 All numbers measured manually by the authors; single run per config,
 same-flags stock baselines on the identical upstream base. Correctness:
-tiered vs stock echo output byte-identical; perplexity deltas attributed to
-GPU activation-quantization numerics (machinery proven exact by control
-runs). Details in ARCHITECTURE.md section 5.
+perplexity within rounding noise of stock (9-chunk protocol); bit-identical
+to stock when forced through identical compute paths; adaptive re-pin
+bookkeeping machine-checked by a permanent invariant guard. Greedy output
+can tie-flip vs stock (different-but-valid rounding, same class as changing
+batch size); output quality is equivalent. Details in ARCHITECTURE.md
+section 5.
 
 ## Quick start
 
@@ -83,11 +86,15 @@ Run (zero-config):
 ```
 
 `-cmoe` auto-configures: auto-fit offloading, batch/ubatch 256,
-flash attention, KV offload, threads = hardware_concurrency - 2, hot-slot
-count S from free VRAM, online adaptation on. `--no-mmap` is required (the
-cold tier must be RAM-resident). Interactive use: `llama-cli` with the same
+flash attention, KV offload, threads = 80% of hardware when the dense
+weights fit the GPU (stock default otherwise; manual -t always wins),
+hot-slot count S from free VRAM (with a reserve for graph capture),
+online adaptation on. `-cmoe` is for MoE models; on dense models it has
+no benefit (a warning is printed). `--no-mmap` is required (the cold tier
+must be RAM-resident). Interactive use: `llama-cli` with the same
 flags (add `--jinja` for architectures with custom chat templates, e.g.
-gemma4).
+gemma4). KV cache defaults to f16; on K-quant models at long context,
+`-ctk q8_0 -ctv q8_0` is measurably faster (tested +35% on gemma-4-26B).
 
 ### Optional environment knobs
 

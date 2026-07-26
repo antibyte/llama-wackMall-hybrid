@@ -12,8 +12,8 @@
 		noPortal = false,
 		...restProps
 	}: TooltipPrimitive.ContentProps & {
-		arrowClasses?: string;
-		noPortal?: boolean;
+		arrowClasses: string;
+		noPortal: boolean;
 	} = $props();
 
 	const contentClass = $derived(

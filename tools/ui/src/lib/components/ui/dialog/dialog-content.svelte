@@ -13,9 +13,9 @@
 		showCloseButton = true,
 		...restProps
 	}: WithoutChildrenOrChild<DialogPrimitive.ContentProps> & {
-		portalProps?: DialogPrimitive.PortalProps;
+		portalProps: DialogPrimitive.PortalProps;
 		children: Snippet;
-		showCloseButton?: boolean;
+		showCloseButton: boolean;
 	} = $props();
 </script>
 

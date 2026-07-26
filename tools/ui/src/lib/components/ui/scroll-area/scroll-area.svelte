@@ -12,9 +12,9 @@
 		children,
 		...restProps
 	}: WithoutChild<ScrollAreaPrimitive.RootProps> & {
-		orientation?: 'vertical' | 'horizontal' | 'both' | undefined;
-		scrollbarXClasses?: string | undefined;
-		scrollbarYClasses?: string | undefined;
+		orientation: 'vertical' | 'horizontal' | 'both' | undefined;
+		scrollbarXClasses: string | undefined;
+		scrollbarYClasses: string | undefined;
 	} = $props();
 </script>
 

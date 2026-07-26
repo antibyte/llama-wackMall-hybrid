@@ -5,8 +5,8 @@
 	interface Props {
 		sections: SettingsSection[];
 		isActive: (section: SettingsSection) => boolean;
-		getHref?: (section: SettingsSection) => string;
-		onSectionChange?: (section: SettingsSectionTitle) => void;
+		getHref: (section: SettingsSection) => string;
+		onSectionChange: (section: SettingsSectionTitle) => void;
 	}
 
 	let { sections, isActive, getHref, onSectionChange }: Props = $props();

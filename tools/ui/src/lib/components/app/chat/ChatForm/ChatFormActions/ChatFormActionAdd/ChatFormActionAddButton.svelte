@@ -5,8 +5,8 @@
 	import { ATTACHMENT_TOOLTIP_TEXT } from '$lib/constants';
 
 	interface Props {
-		disabled?: boolean;
-		onclick?: (e: MouseEvent) => void;
+		disabled: boolean;
+		onclick: (e: MouseEvent) => void;
 	}
 
 	let { disabled = false, onclick }: Props = $props();

@@ -43,28 +43,28 @@
 
 	interface Props {
 		// Data
-		attachments?: DatabaseMessageExtra[];
-		uploadedFiles?: ChatUploadedFile[];
-		value?: string;
+		attachments: DatabaseMessageExtra[];
+		uploadedFiles: ChatUploadedFile[];
+		value: string;
 
 		// UI State
-		class?: string;
-		disabled?: boolean;
-		isLoading?: boolean;
-		placeholder?: string;
-		showMcpPromptButton?: boolean;
-		showAddButton?: boolean;
-		showModelSelector?: boolean;
+		class: string;
+		disabled: boolean;
+		isLoading: boolean;
+		placeholder: string;
+		showMcpPromptButton: boolean;
+		showAddButton: boolean;
+		showModelSelector: boolean;
 
 		// Event Handlers
-		onAttachmentRemove?: (index: number) => void;
-		onFilesAdd?: (files: File[]) => void;
-		onStop?: () => void;
-		onSubmit?: () => void;
-		onSystemPromptClick?: (draft: { message: string; files: ChatUploadedFile[] }) => void;
-		onUploadedFileRemove?: (fileId: string) => void;
-		onUploadedFilesChange?: (files: ChatUploadedFile[]) => void;
-		onValueChange?: (value: string) => void;
+		onAttachmentRemove: (index: number) => void;
+		onFilesAdd: (files: File[]) => void;
+		onStop: () => void;
+		onSubmit: () => void;
+		onSystemPromptClick: (draft: { message: string; files: ChatUploadedFile[] }) => void;
+		onUploadedFileRemove: (fileId: string) => void;
+		onUploadedFilesChange: (files: ChatUploadedFile[]) => void;
+		onValueChange: (value: string) => void;
 	}
 
 	let {
@@ -334,7 +334,7 @@
 	function handlePromptLoadStart(
 		placeholderId: string,
 		promptInfo: MCPPromptInfo,
-		args?: Record<string, string>
+		args: Record<string, string>
 	) {
 		// Only clear the value if the prompt was triggered by typing '/'
 		if (value.startsWith(PROMPT_TRIGGER_PREFIX)) {

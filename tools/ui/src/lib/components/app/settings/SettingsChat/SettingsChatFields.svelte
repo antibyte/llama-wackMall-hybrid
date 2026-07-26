@@ -18,7 +18,7 @@
 		fields: SettingsFieldConfig[];
 		localConfig: SettingsConfigType;
 		onConfigChange: (key: string, value: string | boolean) => void;
-		onThemeChange?: (theme: string) => void;
+		onThemeChange: (theme: string) => void;
 	}
 
 	let { fields, localConfig, onConfigChange, onThemeChange }: Props = $props();
@@ -152,7 +152,7 @@
 			{/if}
 		{:else if field.type === SettingsFieldType.SELECT}
 			{@const selectedOption = field.options?.find(
-				(opt: { value: string; label: string; icon?: Component }) =>
+				(opt: { value: string; label: string; icon: Component }) =>
 					opt.value === localConfig[field.key]
 			)}
 			{@const currentValue = localConfig[field.key]}

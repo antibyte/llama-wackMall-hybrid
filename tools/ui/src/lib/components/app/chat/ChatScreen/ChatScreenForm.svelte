@@ -6,16 +6,16 @@
 	import { useDraftMessages } from '$lib/hooks/use-draft-messages.svelte';
 
 	interface Props {
-		class?: string;
-		disabled?: boolean;
-		initialMessage?: string;
-		isLoading?: boolean;
-		onFileRemove?: (fileId: string) => void;
-		onFileUpload?: (files: File[]) => void;
-		onSend?: (message: string, files?: ChatUploadedFile[]) => Promise<boolean>;
-		onStop?: () => void;
-		onSystemPromptAdd?: (draft: { message: string; files: ChatUploadedFile[] }) => void;
-		uploadedFiles?: ChatUploadedFile[];
+		class: string;
+		disabled: boolean;
+		initialMessage: string;
+		isLoading: boolean;
+		onFileRemove: (fileId: string) => void;
+		onFileUpload: (files: File[]) => void;
+		onSend: (message: string, files: ChatUploadedFile[]) => Promise<boolean>;
+		onStop: () => void;
+		onSystemPromptAdd: (draft: { message: string; files: ChatUploadedFile[] }) => void;
+		uploadedFiles: ChatUploadedFile[];
 	}
 
 	let {

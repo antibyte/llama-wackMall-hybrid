@@ -14,7 +14,7 @@
 	import { replaceState } from '$app/navigation';
 
 	interface Props {
-		class?: string;
+		class: string;
 	}
 
 	let { class: className }: Props = $props();

@@ -24,29 +24,29 @@
 	import { hasAgenticContent } from '$lib/utils';
 
 	interface Props {
-		class?: string;
+		class: string;
 		deletionInfo: {
 			totalCount: number;
 			userMessages: number;
 			assistantMessages: number;
 			messageTypes: string[];
 		} | null;
-		isLastAssistantMessage?: boolean;
+		isLastAssistantMessage: boolean;
 		message: DatabaseMessage;
-		toolMessages?: DatabaseMessage[];
+		toolMessages: DatabaseMessage[];
 		messageContent: string | undefined;
 		onCopy: () => void;
 		onConfirmDelete: () => void;
-		onContinue?: () => void;
+		onContinue: () => void;
 		onDelete: () => void;
-		onEdit?: () => void;
-		onForkConversation?: (options: { name: string; includeAttachments: boolean }) => void;
-		onNavigateToSibling?: (siblingId: string) => void;
-		onRegenerate: (modelOverride?: string) => void;
+		onEdit: () => void;
+		onForkConversation: (options: { name: string; includeAttachments: boolean }) => void;
+		onNavigateToSibling: (siblingId: string) => void;
+		onRegenerate: (modelOverride: string) => void;
 		onShowDeleteDialogChange: (show: boolean) => void;
 		showDeleteDialog: boolean;
-		siblingInfo?: ChatMessageSiblingInfo | null;
-		textareaElement?: HTMLTextAreaElement;
+		siblingInfo: ChatMessageSiblingInfo | null;
+		textareaElement: HTMLTextAreaElement;
 	}
 
 	let {

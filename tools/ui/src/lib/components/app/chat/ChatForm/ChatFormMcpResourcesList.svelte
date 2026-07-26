@@ -10,8 +10,8 @@
 	} from '$lib/components/app';
 
 	interface Props {
-		class?: string;
-		onResourceClick?: (uri: string) => void;
+		class: string;
+		onResourceClick: (uri: string) => void;
 	}
 
 	let { class: className, onResourceClick }: Props = $props();

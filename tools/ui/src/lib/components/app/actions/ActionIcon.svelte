@@ -5,17 +5,17 @@
 	import { TooltipSide } from '$lib/enums';
 
 	interface Props {
-		ariaLabel?: string;
-		class?: string;
-		disabled?: boolean;
+		ariaLabel: string;
+		class: string;
+		disabled: boolean;
 		icon: Component;
-		iconSize?: string;
-		onclick: (e?: MouseEvent) => void;
-		size?: ButtonSize;
-		stopPropagationOnClick?: boolean;
+		iconSize: string;
+		onclick: (e: MouseEvent) => void;
+		size: ButtonSize;
+		stopPropagationOnClick: boolean;
 		tooltip: string;
-		variant?: ButtonVariant;
-		tooltipSide?: TooltipSide;
+		variant: ButtonVariant;
+		tooltipSide: TooltipSide;
 	}
 
 	let {

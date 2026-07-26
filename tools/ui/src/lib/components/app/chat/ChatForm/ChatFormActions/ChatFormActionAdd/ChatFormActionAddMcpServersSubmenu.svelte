@@ -11,7 +11,7 @@
 	import { ROUTES } from '$lib/constants/routes';
 
 	interface Props {
-		onMcpSettingsClick?: () => void;
+		onMcpSettingsClick: () => void;
 	}
 
 	let { onMcpSettingsClick }: Props = $props();

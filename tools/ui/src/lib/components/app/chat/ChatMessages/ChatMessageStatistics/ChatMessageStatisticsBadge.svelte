@@ -5,10 +5,10 @@
 	import type { Component } from 'svelte';
 
 	interface Props {
-		class?: string;
+		class: string;
 		icon: Component;
 		value: string | number;
-		tooltipLabel?: string;
+		tooltipLabel: string;
 	}
 
 	let { class: className = '', icon: IconComponent, value, tooltipLabel }: Props = $props();

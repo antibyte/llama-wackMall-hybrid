@@ -19,11 +19,11 @@
 		IconComponent: Component;
 		buttonText: string;
 		onclick: () => void;
-		titleClass?: string;
-		buttonVariant?: ButtonVariant;
-		buttonClass?: string;
-		wrapperClass?: string;
-		summary?: { show: boolean; verb: string; items: DatabaseConversation[] };
+		titleClass: string;
+		buttonVariant: ButtonVariant;
+		buttonClass: string;
+		wrapperClass: string;
+		summary: { show: boolean; verb: string; items: DatabaseConversation[] };
 	} = $props();
 
 	let sectionButtonClass = $derived(buttonClass ?? 'justify-start justify-self-start md:w-auto');

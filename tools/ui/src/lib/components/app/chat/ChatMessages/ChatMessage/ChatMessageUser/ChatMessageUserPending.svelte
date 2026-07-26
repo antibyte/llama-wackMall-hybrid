@@ -6,11 +6,11 @@
 	import { useMessageEditContext } from '$lib/hooks/use-message-edit-context.svelte';
 
 	interface Props {
-		class?: string;
+		class: string;
 		content: string;
-		extras?: DatabaseMessageExtra[];
+		extras: DatabaseMessageExtra[];
 		onSendImmediately: () => void;
-		onEdit: (newContent: string, extras?: DatabaseMessageExtra[]) => void;
+		onEdit: (newContent: string, extras: DatabaseMessageExtra[]) => void;
 		onDelete: () => void;
 	}
 

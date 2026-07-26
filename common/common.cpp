@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-expert-tier.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1208,6 +1209,40 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // cmoe: arg.cpp keeps n_threads == -1 as an auto marker when -t is unset.
+    // If the dense (non-expert) weights fit the GPU, the CPU only streams
+    // cold experts, so use 80% of the hardware threads; else stock default.
+    if (params.cpuparams.n_threads == -1) {
+        int nt = common_cpu_get_num_math();
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (dev) {
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            const size_t dense = llama_model_size(model) - llama_expert_tier::expert_weight_bytes(*model);
+            if (dense <= free) {
+                nt = std::max(1, (int) std::lround(0.8 * (double) std::thread::hardware_concurrency()));
+            }
+        }
+        LOG_INF("%s: auto threads = %d\n", __func__, nt);
+        params.cpuparams.n_threads = nt;
+        if (params.cpuparams_batch.n_threads == -1) {
+            params.cpuparams_batch.n_threads = nt;
+        }
+    }
+    // warn when -cmoe is used on a model without expert tensors
+    {
+        bool cmoe = false;
+        for (const auto & o : params.tensor_buft_overrides) {
+            if (o.pattern && strstr(o.pattern, "exps")) {
+                cmoe = true;
+                break;
+            }
+        }
+        if (cmoe && llama_expert_tier::expert_weight_bytes(*model) == 0) {
+            LOG_WRN("%s: -cmoe given but the model has no expert tensors; MoE defaults have no effect\n", __func__);
+        }
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
@@ -1275,30 +1310,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.sampling.backend_sampling) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
-    }
-
-    // auto-adjust thread count for -cmoe: GPU handles dense attention, CPU handles experts,
-    // so max-2 threads always benefits the CPU expert math regardless of how many layers fitted
-    {
-        bool has_cmoe = false;
-        for (const auto & ovr : params.tensor_buft_overrides) {
-            if (ovr.pattern && strcmp(ovr.pattern, LLM_FFN_EXPS_REGEX) == 0) {
-                has_cmoe = true;
-                break;
-            }
-        }
-        if (has_cmoe) {
-            const uint32_t max_threads = std::thread::hardware_concurrency();
-            const int32_t auto_threads = max_threads >= 4 ? (int32_t)(max_threads - 2) : (int32_t)max_threads;
-            if (params.cpuparams_n_threads_auto) {
-                cparams.n_threads = auto_threads;
-                params.cpuparams.n_threads = auto_threads;
-            }
-            if (params.cpuparams_batch_n_threads_auto) {
-                cparams.n_threads_batch = auto_threads;
-                params.cpuparams_batch.n_threads = auto_threads;
-            }
-        }
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);

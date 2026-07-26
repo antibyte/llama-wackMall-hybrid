@@ -9,16 +9,16 @@
 	import type { Component } from 'svelte';
 
 	interface Props {
-		predictedTokens?: number;
-		predictedMs?: number;
-		promptTokens?: number;
-		promptMs?: number;
-		isLive?: boolean;
-		isProcessingPrompt?: boolean;
-		initialView?: ChatMessageStatsView;
-		agenticTimings?: ChatMessageAgenticTimings;
-		onActiveViewChange?: (view: ChatMessageStatsView) => void;
-		hideSummary?: boolean;
+		predictedTokens: number;
+		predictedMs: number;
+		promptTokens: number;
+		promptMs: number;
+		isLive: boolean;
+		isProcessingPrompt: boolean;
+		initialView: ChatMessageStatsView;
+		agenticTimings: ChatMessageAgenticTimings;
+		onActiveViewChange: (view: ChatMessageStatsView) => void;
+		hideSummary: boolean;
 	}
 
 	let {
@@ -120,7 +120,7 @@
 	icon: Component;
 	label: string;
 	tooltipText: string;
-	disabled?: boolean;
+	disabled: boolean;
 })}
 	{@const IconComponent = opts.icon}
 	<Tooltip.Root>

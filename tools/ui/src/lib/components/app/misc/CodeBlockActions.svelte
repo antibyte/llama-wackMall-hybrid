@@ -6,8 +6,8 @@
 	interface Props {
 		code: string;
 		language: string;
-		disabled?: boolean;
-		onPreview?: (code: string, language: string) => void;
+		disabled: boolean;
+		onPreview: (code: string, language: string) => void;
 	}
 
 	let { code, language, disabled = false, onPreview }: Props = $props();

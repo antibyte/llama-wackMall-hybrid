@@ -8,9 +8,9 @@
 	import { MessageRole } from '$lib/enums';
 
 	interface Props {
-		class?: string;
+		class: string;
 		message: DatabaseMessage;
-		siblingInfo?: ChatMessageSiblingInfo | null;
+		siblingInfo: ChatMessageSiblingInfo | null;
 		deletionInfo: {
 			totalCount: number;
 			userMessages: number;
@@ -21,9 +21,9 @@
 		onEdit: () => void;
 		onDelete: () => void;
 		onConfirmDelete: () => void;
-		onForkConversation?: (options: { name: string; includeAttachments: boolean }) => void;
+		onForkConversation: (options: { name: string; includeAttachments: boolean }) => void;
 		onShowDeleteDialogChange: (show: boolean) => void;
-		onNavigateToSibling?: (siblingId: string) => void;
+		onNavigateToSibling: (siblingId: string) => void;
 		onCopy: () => void;
 	}
 

@@ -27,9 +27,9 @@
 	} from '$lib/utils';
 
 	interface Props {
-		messages?: DatabaseMessage[];
-		onUserAction?: () => void;
-		onMessagesReady?: (messageCount: number) => void;
+		messages: DatabaseMessage[];
+		onUserAction: () => void;
+		onMessagesReady: (messageCount: number) => void;
 	}
 
 	let { messages = [], onUserAction, onMessagesReady }: Props = $props();
@@ -63,7 +63,7 @@
 		editWithBranching: async (
 			message: DatabaseMessage,
 			newContent: string,
-			newExtras?: DatabaseMessageExtra[]
+			newExtras: DatabaseMessageExtra[]
 		) => {
 			onUserAction?.();
 			await chatStore.editMessageWithBranching(message.id, newContent, newExtras);
@@ -83,14 +83,14 @@
 		editUserMessagePreserveResponses: async (
 			message: DatabaseMessage,
 			newContent: string,
-			newExtras?: DatabaseMessageExtra[]
+			newExtras: DatabaseMessageExtra[]
 		) => {
 			onUserAction?.();
 			await chatStore.editUserMessagePreserveResponses(message.id, newContent, newExtras);
 			refreshAllMessages();
 		},
 
-		regenerateWithBranching: async (message: DatabaseMessage, modelOverride?: string) => {
+		regenerateWithBranching: async (message: DatabaseMessage, modelOverride: string) => {
 			onUserAction?.();
 			await chatStore.regenerateMessageWithBranching(message.id, modelOverride);
 			refreshAllMessages();

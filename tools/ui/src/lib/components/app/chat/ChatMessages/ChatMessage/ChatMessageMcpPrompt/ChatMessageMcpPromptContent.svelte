@@ -13,11 +13,11 @@
 	}
 
 	interface Props {
-		class?: string;
+		class: string;
 		prompt: DatabaseMessageExtraMcpPrompt;
-		variant?: McpPromptVariant;
-		isLoading?: boolean;
-		loadError?: string;
+		variant: McpPromptVariant;
+		isLoading: boolean;
+		loadError: string;
 	}
 
 	let {

@@ -3,16 +3,16 @@
 	import { X } from '@lucide/svelte';
 
 	interface Props {
-		class?: string;
-		height?: string;
+		class: string;
+		height: string;
 		id: string;
-		imageClass?: string;
-		onclick?: (event?: MouseEvent) => void;
-		onRemove?: (id: string) => void;
+		imageClass: string;
+		onclick: (event: MouseEvent) => void;
+		onRemove: (id: string) => void;
 		name: string;
 		preview: string;
-		readonly?: boolean;
-		width?: string;
+		readonly: boolean;
+		width: string;
 	}
 
 	let {

@@ -193,6 +193,31 @@ static void dump_stats() {
                         100.0*(double) L.cum_cold/(double) L.cum_total,
                         (unsigned long long) L.cum_graphs);
             }
+            // invariant: mask agrees with lut, slot<->expert bijection holds
+            for (const auto & L : g_layers) {
+                if (!L.sd) {
+                    continue;
+                }
+                const int32_t * m = (const int32_t *) L.sd->mask->data;
+                int bad = 0;
+                for (int e = 0; e < L.n_expert; e++) {
+                    const int want = (L.lut_host[e] == L.sentinel) ? 1 : 0;
+                    if (m[e] != want) {
+                        bad++;
+                    }
+                }
+                for (int s = 0; s < L.n_slots; s++) {
+                    if (s == L.sentinel || L.slot_expert[s] < 0) {
+                        continue;
+                    }
+                    if (L.lut_host[L.slot_expert[s]] != s) {
+                        bad++;
+                    }
+                }
+                if (bad) {
+                    fprintf(f, "layer %2d: INVARIANT VIOLATIONS %d\n", L.il, bad);
+                }
+            }
             if (f != stderr) {
                 fclose(f);
             }
@@ -221,6 +246,19 @@ void update() {
     for (auto & L : g_layers) {
         maybe_update(L);
     }
+}
+
+size_t expert_weight_bytes(const llama_model & model) {
+    size_t b = 0;
+    for (int il = 0; il < (int) model.hparams.n_layer(); il++) {
+        const llama_layer & l = model.layers[il];
+        for (ggml_tensor * w : {l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps}) {
+            if (w) {
+                b += ggml_nbytes(w);
+            }
+        }
+    }
+    return b;
 }
 
 void init(const llama_model & model) {
@@ -287,14 +325,14 @@ void init(const llama_model & model) {
         return;
     }
 
+    // Reserve 512 MB for the CUDA runtime, display, alignment and the graph
+    // capture buffers that allocate after this sizing (300 MB let capture OOM)
+    const size_t safety_buffer = 512ULL * 1024 * 1024;
+    size_t free_vram = 0, total_vram = 0;
+    ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+    const size_t usable_vram = (free_vram > safety_buffer) ? (free_vram - safety_buffer) : 0;
+
     if (!manual_S && bytes_per_slot_all_layers > 0) {
-        size_t free_vram = 0, total_vram = 0;
-        ggml_backend_dev_memory(dev, &free_vram, &total_vram);
-        // Reserve 300 MB safety buffer for CUDA runtime, display driver overhead & memory alignment
-        // (KV cache & graphs are already allocated). 300 MB prevents VRAM exhaustion on single-GPU
-        // systems where the GPU also drives a display.
-        const size_t safety_buffer = 300ULL * 1024 * 1024;
-        const size_t usable_vram = (free_vram > safety_buffer) ? (free_vram - safety_buffer) : 0;
         if (usable_vram >= bytes_per_slot_all_layers) {
             int autofit_s = (int) (usable_vram / bytes_per_slot_all_layers);
             g_S = std::clamp(autofit_s, 1, n_expert);
@@ -306,6 +344,15 @@ void init(const llama_model & model) {
             g_S = 0;
             TIER_LOG("%s: AUTO-FIT ENGINE -> Insufficient free VRAM (%.2f MB free vs %.2f MB required per slot), expert tiering on GPU disabled\n",
                            __func__, (double)free_vram / (1024.0*1024.0), (double)bytes_per_slot_all_layers / (1024.0*1024.0));
+        }
+    }
+
+    // clamp a forced S to what fits; the unclamped path OOMs at graph capture
+    if (manual_S && bytes_per_slot_all_layers > 0) {
+        const int afford = (int) (usable_vram / bytes_per_slot_all_layers);
+        if (g_S > afford) {
+            TIER_LOG("%s: manual S = %d exceeds free VRAM, clamping to %d\n", __func__, g_S, afford);
+            g_S = std::max(afford, 0);
         }
     }
 
@@ -502,20 +549,6 @@ void init(const llama_model & model) {
                 TIER_LOG("%s: expert tiering on: %d slots/layer, %zu tensors, %.2f GiB pinned, seed coverage %.1f%%\n",
             __func__, g_S, g_stores.size(), (double) total_bytes/(1 << 30),
             total > 0 ? 100.0*hits/total : 0.0);
-
-    if (getenv("LLAMA_EXPERT_DEBUG")) {
-        // verify lut content on the GPU for the first registered tensor
-        const store & s = g_stores.begin()->second;
-        std::vector<int32_t> lut_gpu(n_expert);
-        ggml_backend_tensor_get(s.lut, lut_gpu.data(), 0, n_expert*sizeof(int32_t));
-        std::string out;
-        for (int i = 0; i < 24; i++) {
-            char b[8];
-            snprintf(b, sizeof(b), "%d ", lut_gpu[i]);
-            out += b;
-        }
-        TIER_LOG("%s: lut[0..23] = %s\n", __func__, out.c_str());
-    }
 }
 
 ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids) {
@@ -526,21 +559,13 @@ ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
 
     const store & s = it->second;
 
-    // debug isolation flags
-    static const bool nocold = getenv("LLAMA_EXPERT_NOCOLD") != nullptr;
-    static const bool nohot  = getenv("LLAMA_EXPERT_NOHOT")  != nullptr;
-
-    if (nohot) {
-        return ggml_mul_mat_id_cold(ctx, w, x, ids, s.mask);
-    }
-
     // get_rows wants matching trailing dims, so flatten ids to 1d first
     ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, ids), ids->ne[0]*ids->ne[1]);
     ggml_tensor * hot_flat = ggml_get_rows(ctx, s.lut, ids_flat); // [1, n_used*n_tokens]
     ggml_tensor * ids_hot  = ggml_reshape_2d(ctx, hot_flat, ids->ne[0], ids->ne[1]);
     ggml_tensor * hot      = ggml_mul_mat_id(ctx, s.w_hot, x, ids_hot);    // GPU
 
-    if (nocold || g_hot_only) {
+    if (g_hot_only) {
         return hot;
     }
 
@@ -571,10 +596,6 @@ ggml_tensor * end_moe_cold(ggml_context * ctx,
         ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,
         ggml_tensor * x, ggml_tensor * ids) {
     if (!g_hot_only) {
-        return nullptr;
-    }
-    static const bool nocold = getenv("LLAMA_EXPERT_NOCOLD") != nullptr;
-    if (nocold) {
         return nullptr;
     }
     store & sd = g_stores[down_w];

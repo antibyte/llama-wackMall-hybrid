@@ -7,8 +7,8 @@
 		open: boolean;
 		type: ErrorDialogType;
 		message: string;
-		contextInfo?: { n_prompt_tokens: number; n_ctx: number };
-		onOpenChange?: (open: boolean) => void;
+		contextInfo: { n_prompt_tokens: number; n_ctx: number };
+		onOpenChange: (open: boolean) => void;
 	}
 
 	let { open = $bindable(), type, message, contextInfo, onOpenChange }: Props = $props();

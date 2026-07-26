@@ -19,11 +19,11 @@
 		isSelected: boolean;
 		isHighlighted: boolean;
 		isFav: boolean;
-		hideOrgName?: boolean;
+		hideOrgName: boolean;
 		onSelect: (modelId: string) => void;
 		onMouseEnter: () => void;
 		onKeyDown: (e: KeyboardEvent) => void;
-		onInfoClick?: (modelName: string) => void;
+		onInfoClick: (modelName: string) => void;
 	}
 
 	let {

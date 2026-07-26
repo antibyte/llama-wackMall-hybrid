@@ -9,10 +9,10 @@
 
 	interface Props {
 		code: string;
-		language?: string;
-		class?: string;
-		maxHeight?: string;
-		maxWidth?: string;
+		language: string;
+		class: string;
+		maxHeight: string;
+		maxWidth: string;
 	}
 
 	let {

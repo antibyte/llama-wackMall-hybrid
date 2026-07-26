@@ -5,7 +5,7 @@
 	interface Props {
 		serverId: string;
 		serverUrl: string;
-		serverUseProxy?: boolean;
+		serverUseProxy: boolean;
 		onSave: (url: string, headers: string, useProxy: boolean) => void;
 		onCancel: () => void;
 	}

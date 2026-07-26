@@ -35,7 +35,7 @@
 	import { conversations } from '$lib/stores/conversations.svelte';
 	import { isMobile } from '$lib/stores/viewport.svelte';
 	import { theme } from '$lib/stores/theme.svelte';
-	import { buildInfoStore } from '$lib/stores/build-info.svelte';
+	import { buildInfoStore } from '$lib/stores/build-info.svelte.ts';
 
 	import { SETTINGS_KEYS } from '$lib/constants';
 

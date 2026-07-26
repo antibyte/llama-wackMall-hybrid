@@ -19,8 +19,8 @@
 		children,
 		...restProps
 	}: WithElementRef<HTMLAttributes<HTMLDivElement>> & {
-		open?: boolean;
-		onOpenChange?: (open: boolean) => void;
+		open: boolean;
+		onOpenChange: (open: boolean) => void;
 	} = $props();
 
 	const sidebar = setSidebar({

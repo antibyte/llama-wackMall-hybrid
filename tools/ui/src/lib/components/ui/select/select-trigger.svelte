@@ -11,8 +11,8 @@
 		variant = 'default',
 		...restProps
 	}: WithoutChild<SelectPrimitive.TriggerProps> & {
-		size?: 'sm' | 'default';
-		variant?: 'default' | 'plain';
+		size: 'sm' | 'default';
+		variant: 'default' | 'plain';
 	} = $props();
 
 	const baseClasses = $derived(

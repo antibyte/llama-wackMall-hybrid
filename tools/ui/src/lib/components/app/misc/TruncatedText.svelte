@@ -3,8 +3,8 @@
 
 	interface Props {
 		text: string;
-		class?: string;
-		showTooltip?: boolean;
+		class: string;
+		showTooltip: boolean;
 	}
 
 	let { text, class: className = '', showTooltip = true }: Props = $props();

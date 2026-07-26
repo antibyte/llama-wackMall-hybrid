@@ -17,7 +17,7 @@
 
 	interface Props {
 		server: MCPServerSettingsEntry;
-		enabled?: boolean;
+		enabled: boolean;
 		onToggle: (enabled: boolean) => void;
 		onUpdate: (updates: Partial<MCPServerSettingsEntry>) => void;
 		onDelete: () => void;

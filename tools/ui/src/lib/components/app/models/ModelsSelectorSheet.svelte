@@ -10,14 +10,14 @@
 	} from '$lib/components/app';
 
 	interface Props {
-		class?: string;
-		currentModel?: string | null;
+		class: string;
+		currentModel: string | null;
 		/** Callback when model changes. Return false to keep menu open (e.g., for validation failures) */
-		onModelChange?: (modelId: string, modelName: string) => Promise<boolean> | boolean | void;
-		disabled?: boolean;
-		forceForegroundText?: boolean;
+		onModelChange: (modelId: string, modelName: string) => Promise<boolean> | boolean | void;
+		disabled: boolean;
+		forceForegroundText: boolean;
 		/** When true, user's global selection takes priority over currentModel (for form selector) */
-		useGlobalSelection?: boolean;
+		useGlobalSelection: boolean;
 	}
 
 	let {

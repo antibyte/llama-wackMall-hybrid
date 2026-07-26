@@ -5,7 +5,7 @@
 
 	interface Tool {
 		name: string;
-		description?: string;
+		description: string;
 	}
 
 	interface Props {

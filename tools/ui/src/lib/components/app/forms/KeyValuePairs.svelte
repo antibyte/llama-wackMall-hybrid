@@ -10,15 +10,15 @@
 	import type { KeyValuePair } from '$lib/types';
 
 	interface Props {
-		class?: string;
+		class: string;
 		pairs: KeyValuePair[];
 		onPairsChange: (pairs: KeyValuePair[]) => void;
-		keyPlaceholder?: string;
-		valuePlaceholder?: string;
-		addButtonLabel?: string;
-		emptyMessage?: string;
-		sectionLabel?: string;
-		sectionLabelOptional?: boolean;
+		keyPlaceholder: string;
+		valuePlaceholder: string;
+		addButtonLabel: string;
+		emptyMessage: string;
+		sectionLabel: string;
+		sectionLabelOptional: boolean;
 	}
 
 	let {

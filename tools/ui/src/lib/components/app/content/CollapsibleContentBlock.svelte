@@ -11,16 +11,16 @@
 	import type { Component } from 'svelte';
 
 	interface Props {
-		open?: boolean;
-		class?: string;
-		icon?: Component;
-		iconClass?: string;
+		open: boolean;
+		class: string;
+		icon: Component;
+		iconClass: string;
 		title: string;
-		subtitle?: string;
-		preview?: string;
-		rawContent?: string;
-		isStreaming?: boolean;
-		onToggle?: () => void;
+		subtitle: string;
+		preview: string;
+		rawContent: string;
+		isStreaming: boolean;
+		onToggle: () => void;
 		children: Snippet;
 	}
 

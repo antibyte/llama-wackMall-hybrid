@@ -9,9 +9,9 @@
 
 	interface Props {
 		attachment: MCPResourceAttachment;
-		class?: string;
-		onclick?: () => void;
-		onRemove?: (attachmentId: string) => void;
+		class: string;
+		onclick: () => void;
+		onRemove: (attachmentId: string) => void;
 	}
 
 	let { attachment, class: className, onclick, onRemove }: Props = $props();

@@ -4,10 +4,10 @@
 	import * as Tooltip from '$lib/components/ui/tooltip';
 
 	interface Props {
-		canSend?: boolean;
-		disabled?: boolean;
-		showErrorState?: boolean;
-		tooltipLabel?: string;
+		canSend: boolean;
+		disabled: boolean;
+		showErrorState: boolean;
+		tooltipLabel: string;
 	}
 
 	let { canSend = false, disabled = false, showErrorState = false, tooltipLabel }: Props = $props();

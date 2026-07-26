@@ -76,16 +76,16 @@
 	import { fadeInView } from '$lib/actions/fade-in-view.svelte';
 
 	interface Props {
-		attachments?: DatabaseMessageExtra[];
+		attachments: DatabaseMessageExtra[];
 		content: string;
-		class?: string;
-		disableMath?: boolean;
+		class: string;
+		disableMath: boolean;
 	}
 
 	interface MarkdownBlock {
 		id: string;
 		html: string;
-		contentHash?: string;
+		contentHash: string;
 	}
 
 	let { content, attachments, class: className = '', disableMath = false }: Props = $props();
@@ -352,7 +352,7 @@
 				const normalizedPrefix = preprocessLaTeX(prefixMarkdown);
 				const processorInstance = processor();
 				const ast = processorInstance.parse(normalizedPrefix) as MdastRoot;
-				const mdastChildren = (ast as { children?: unknown[] }).children ?? [];
+				const mdastChildren = (ast as { children: unknown[] }).children ?? [];
 				const nextBlocks: MarkdownBlock[] = [];
 
 				// Check if we're in append mode for cache reuse
@@ -378,7 +378,7 @@
 					// Transform this block (with caching)
 					const { html, hash } = await transformMdastNode(processorInstance, child, index);
 					const id = getHastNodeId(
-						{ position: (child as { position?: unknown }).position } as HastRootContent,
+						{ position: (child as { position: unknown }).position } as HastRootContent,
 						index
 					);
 
@@ -403,7 +403,7 @@
 		const normalized = preprocessLaTeX(markdown);
 		const processorInstance = processor();
 		const ast = processorInstance.parse(normalized) as MdastRoot;
-		const mdastChildren = (ast as { children?: unknown[] }).children ?? [];
+		const mdastChildren = (ast as { children: unknown[] }).children ?? [];
 		const stableCount = Math.max(mdastChildren.length - 1, 0);
 		const nextBlocks: MarkdownBlock[] = [];
 
@@ -428,7 +428,7 @@
 			// Transform this block (with caching)
 			const { html, hash } = await transformMdastNode(processorInstance, child, index);
 			const id = getHastNodeId(
-				{ position: (child as { position?: unknown }).position } as HastRootContent,
+				{ position: (child as { position: unknown }).position } as HastRootContent,
 				index
 			);
 

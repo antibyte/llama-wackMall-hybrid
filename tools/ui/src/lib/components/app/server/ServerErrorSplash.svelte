@@ -13,11 +13,11 @@
 	import { KeyboardKey } from '$lib/enums';
 
 	interface Props {
-		class?: string;
+		class: string;
 		error: string;
-		onRetry?: () => void;
-		showRetry?: boolean;
-		showTroubleshooting?: boolean;
+		onRetry: () => void;
+		showRetry: boolean;
+		showTroubleshooting: boolean;
 	}
 
 	let {

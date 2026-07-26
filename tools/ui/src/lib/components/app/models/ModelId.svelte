@@ -5,13 +5,13 @@
 
 	interface Props {
 		modelId: string;
-		hideOrgName?: boolean;
-		showRaw?: boolean;
-		hideQuantization?: boolean;
-		hideTags?: boolean;
-		aliases?: string[];
-		tags?: string[];
-		class?: string;
+		hideOrgName: boolean;
+		showRaw: boolean;
+		hideQuantization: boolean;
+		hideTags: boolean;
+		aliases: string[];
+		tags: string[];
+		class: string;
 	}
 
 	let {

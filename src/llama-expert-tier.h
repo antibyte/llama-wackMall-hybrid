@@ -31,6 +31,9 @@ ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
 // (LLAMA_EXPERT_ADAPT) repin hot slots; call after each ubatch compute
 void update();
 
+// total bytes of routed-expert weight tensors (for dense-fit estimates)
+size_t expert_weight_bytes(const llama_model & model);
+
 // fused cold-expert path for one MoE layer, two calls per layer:
 // begin (before the expert matmuls): validates the layer and makes
 //   build_mul_mat_id return hot-only results.

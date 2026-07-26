@@ -7,7 +7,7 @@
 
 	interface Props {
 		conversations: DatabaseConversation[];
-		messageCountMap?: Map<string, number>;
+		messageCountMap: Map<string, number>;
 		mode: 'export' | 'import';
 		onCancel: () => void;
 		onConfirm: (selectedConversations: DatabaseConversation[]) => void;

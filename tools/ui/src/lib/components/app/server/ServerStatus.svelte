@@ -6,8 +6,8 @@
 	import { singleModelName } from '$lib/stores/models.svelte';
 
 	interface Props {
-		class?: string;
-		showActions?: boolean;
+		class: string;
+		showActions: boolean;
 	}
 
 	let { class: className = '', showActions = false }: Props = $props();

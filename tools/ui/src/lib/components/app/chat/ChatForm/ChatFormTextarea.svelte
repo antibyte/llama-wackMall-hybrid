@@ -3,13 +3,13 @@
 	import { onMount } from 'svelte';
 
 	interface Props {
-		class?: string;
-		disabled?: boolean;
-		onInput?: () => void;
-		onKeydown?: (event: KeyboardEvent) => void;
-		onPaste?: (event: ClipboardEvent) => void;
-		placeholder?: string;
-		value?: string;
+		class: string;
+		disabled: boolean;
+		onInput: () => void;
+		onKeydown: (event: KeyboardEvent) => void;
+		onPaste: (event: ClipboardEvent) => void;
+		placeholder: string;
+		value: string;
 	}
 
 	let {

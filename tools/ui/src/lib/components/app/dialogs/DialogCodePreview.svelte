@@ -6,7 +6,7 @@
 		open: boolean;
 		code: string;
 		language: string;
-		onOpenChange?: (open: boolean) => void;
+		onOpenChange: (open: boolean) => void;
 	}
 
 	let { open = $bindable(), code, language, onOpenChange }: Props = $props();

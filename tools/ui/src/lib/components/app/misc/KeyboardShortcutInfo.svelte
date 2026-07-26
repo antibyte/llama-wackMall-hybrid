@@ -3,8 +3,8 @@
 
 	interface Props {
 		keys: string[];
-		variant?: 'default' | 'destructive';
-		class?: string;
+		variant: 'default' | 'destructive';
+		class: string;
 	}
 
 	let { keys, variant = 'default', class: className = '' }: Props = $props();

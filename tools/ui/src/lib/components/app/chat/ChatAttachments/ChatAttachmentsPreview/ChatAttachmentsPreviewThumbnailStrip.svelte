@@ -8,7 +8,7 @@
 		isImage: boolean;
 		isAudio: boolean;
 		isVideo: boolean;
-		preview?: string;
+		preview: string;
 	}
 
 	interface Props {

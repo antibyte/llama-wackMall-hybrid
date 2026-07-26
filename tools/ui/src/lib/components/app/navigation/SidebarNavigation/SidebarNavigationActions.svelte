@@ -10,8 +10,8 @@
 		handleMobileSidebarItemClick: () => void;
 		isSearchModeActive: boolean;
 		searchQuery: string;
-		isCancelAlwaysVisible?: boolean;
-		onSearchDeactivated?: () => void;
+		isCancelAlwaysVisible: boolean;
+		onSearchDeactivated: () => void;
 	}
 
 	let {

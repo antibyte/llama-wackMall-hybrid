@@ -7,8 +7,8 @@
 	import McpLogo from './McpLogo.svelte';
 
 	interface Props {
-		class?: string;
-		onclick?: () => void;
+		class: string;
+		onclick: () => void;
 	}
 
 	let { class: className = '', onclick }: Props = $props();

@@ -261,7 +261,7 @@
 		autoScroll.handleScroll();
 	}
 
-	async function handleSendMessage(message: string, files?: ChatUploadedFile[]): Promise<boolean> {
+	async function handleSendMessage(message: string, files: ChatUploadedFile[]): Promise<boolean> {
 		const plainFiles = files ? $state.snapshot(files) : undefined;
 		const result = plainFiles
 			? await parseFilesToMessageExtras(plainFiles, activeModelId ?? undefined)

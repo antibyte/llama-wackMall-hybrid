@@ -16,12 +16,12 @@
 	} from '$lib/components/app/chat';
 
 	interface Props {
-		class?: string;
-		isOpen?: boolean;
-		searchQuery?: string;
-		onClose?: () => void;
-		onResourceSelect?: (resource: MCPResourceInfo) => void;
-		onBrowse?: () => void;
+		class: string;
+		isOpen: boolean;
+		searchQuery: string;
+		onClose: () => void;
+		onResourceSelect: (resource: MCPResourceInfo) => void;
+		onBrowse: () => void;
 	}
 
 	let {

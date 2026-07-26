@@ -124,7 +124,7 @@
 		}
 	}
 
-	let chatSidebarActions: { activateSearch?: () => void } | undefined = $state();
+	let chatSidebarActions: { activateSearch: () => void } | undefined = $state();
 	let openedForSearch = $state(false);
 
 	export function activateSearchMode() {

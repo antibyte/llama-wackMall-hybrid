@@ -9,7 +9,7 @@
 		portalProps,
 		...restProps
 	}: WithoutChild<AlertDialogPrimitive.ContentProps> & {
-		portalProps?: WithoutChildrenOrChild<AlertDialogPrimitive.PortalProps>;
+		portalProps: WithoutChildrenOrChild<AlertDialogPrimitive.PortalProps>;
 	} = $props();
 </script>
 

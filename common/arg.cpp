@@ -625,8 +625,20 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    // cmoe: keep n_threads == -1 as an auto marker when -t is unset; it is
+    // resolved after model load when the dense size is known (common.cpp)
+    const bool cmoe_auto_threads = params.cpuparams.n_threads < 0;
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+    if (cmoe_auto_threads) {
+        for (const auto & o : params.tensor_buft_overrides) {
+            if (o.pattern && strstr(o.pattern, "exps")) {
+                params.cpuparams.n_threads       = -1;
+                params.cpuparams_batch.n_threads = -1;
+                break;
+            }
+        }
+    }
 
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
@@ -1155,7 +1167,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("number of CPU threads to use during generation (default: %d)", params.cpuparams.n_threads),
         [](common_params & params, int value) {
             params.cpuparams.n_threads = value;
-            params.cpuparams_n_threads_auto = false;
             if (params.cpuparams.n_threads <= 0) {
                 params.cpuparams.n_threads = std::thread::hardware_concurrency();
             }
@@ -1166,7 +1177,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of threads to use during batch and prompt processing (default: same as --threads)",
         [](common_params & params, int value) {
             params.cpuparams_batch.n_threads = value;
-            params.cpuparams_batch_n_threads_auto = false;
             if (params.cpuparams_batch.n_threads <= 0) {
                 params.cpuparams_batch.n_threads = std::thread::hardware_concurrency();
             }

@@ -187,6 +187,7 @@ int main(int argc, char ** argv) {
         struct required_check { const char * label; match_fn match; bool found; };
         required_check checks[] = {
             { "index.html",           exact("index.html"),           false },
+            { "loading.html",         exact("loading.html"),         false },
             { "manifest.webmanifest", exact("manifest.webmanifest"), false },
             { "sw.js",                exact("sw.js"),                false },
             { "build.json",           exact("build.json"),           false },

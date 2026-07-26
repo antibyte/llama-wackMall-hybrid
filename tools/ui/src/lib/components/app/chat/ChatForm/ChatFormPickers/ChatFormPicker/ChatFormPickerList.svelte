@@ -10,12 +10,12 @@
 		selectedIndex: number;
 		searchQuery: string;
 		showSearchInput: boolean;
-		searchPlaceholder?: string;
-		emptyMessage?: string;
+		searchPlaceholder: string;
+		emptyMessage: string;
 		itemKey: (item: T, index: number) => string;
 		item: Snippet<[T, number, boolean]>;
-		skeleton?: Snippet;
-		footer?: Snippet;
+		skeleton: Snippet;
+		footer: Snippet;
 	}
 
 	let {

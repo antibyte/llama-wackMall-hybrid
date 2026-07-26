@@ -9,8 +9,8 @@
 		variant = 'default',
 		...restProps
 	}: DropdownMenuPrimitive.ItemProps & {
-		inset?: boolean;
-		variant?: 'default' | 'destructive';
+		inset: boolean;
+		variant: 'default' | 'destructive';
 	} = $props();
 </script>
 

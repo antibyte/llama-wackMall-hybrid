@@ -14,9 +14,9 @@
 		children,
 		...restProps
 	}: WithElementRef<HTMLAttributes<HTMLDivElement>> & {
-		side?: 'left' | 'right';
-		variant?: 'sidebar' | 'floating' | 'inset';
-		collapsible?: 'offcanvas' | 'icon' | 'none';
+		side: 'left' | 'right';
+		variant: 'sidebar' | 'floating' | 'inset';
+		collapsible: 'offcanvas' | 'icon' | 'none';
 	} = $props();
 
 	const sidebar = useSidebar();

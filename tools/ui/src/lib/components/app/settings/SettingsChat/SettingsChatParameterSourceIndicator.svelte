@@ -3,7 +3,7 @@
 	import { Badge } from '$lib/components/ui/badge';
 
 	interface Props {
-		class?: string;
+		class: string;
 	}
 
 	let { class: className = '' }: Props = $props();

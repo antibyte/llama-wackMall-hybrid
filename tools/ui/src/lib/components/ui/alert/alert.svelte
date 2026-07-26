@@ -29,7 +29,7 @@
 		children,
 		...restProps
 	}: WithElementRef<HTMLAttributes<HTMLDivElement>> & {
-		variant?: AlertVariant;
+		variant: AlertVariant;
 	} = $props();
 </script>
 

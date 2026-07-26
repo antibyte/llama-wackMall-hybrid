@@ -9,7 +9,7 @@
 			modalityReasons: Record<string, string>;
 			supportedTypes: string[];
 		};
-		onOpenChange?: (open: boolean) => void;
+		onOpenChange: (open: boolean) => void;
 	}
 
 	let { open = $bindable(), fileErrorData, onOpenChange }: Props = $props();

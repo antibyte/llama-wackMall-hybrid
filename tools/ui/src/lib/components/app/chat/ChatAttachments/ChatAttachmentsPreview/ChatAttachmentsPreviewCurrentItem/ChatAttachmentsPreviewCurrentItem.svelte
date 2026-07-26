@@ -21,7 +21,7 @@
 		videoSrc: string | null;
 		language: string;
 		hasVisionModality: boolean;
-		activeModelId?: string;
+		activeModelId: string;
 	}
 
 	let {

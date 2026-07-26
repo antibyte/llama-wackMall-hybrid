@@ -20,10 +20,10 @@
 	import { SvelteSet } from 'svelte/reactivity';
 
 	interface Props {
-		open?: boolean;
-		onOpenChange?: (open: boolean) => void;
-		onAttach?: (resource: MCPResourceInfo) => void;
-		preSelectedUri?: string;
+		open: boolean;
+		onOpenChange: (open: boolean) => void;
+		onAttach: (resource: MCPResourceInfo) => void;
+		preSelectedUri: string;
 	}
 
 	let { open = $bindable(false), onOpenChange, onAttach, preSelectedUri }: Props = $props();

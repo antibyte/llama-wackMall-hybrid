@@ -19,14 +19,14 @@
 		serverRes: MCPServerResources;
 		isExpanded: boolean;
 		selectedUris: Set<string>;
-		selectedTemplateUri?: string | null;
+		selectedTemplateUri: string | null;
 		expandedFolders: SvelteSet<string>;
 		onToggleServer: () => void;
 		onToggleFolder: (folderId: string) => void;
-		onSelect?: (resource: MCPResourceInfo, shiftKey?: boolean) => void;
-		onToggle?: (resource: MCPResourceInfo, checked: boolean) => void;
-		onTemplateSelect?: (template: MCPResourceTemplateInfo) => void;
-		searchQuery?: string;
+		onSelect: (resource: MCPResourceInfo, shiftKey: boolean) => void;
+		onToggle: (resource: MCPResourceInfo, checked: boolean) => void;
+		onTemplateSelect: (template: MCPResourceTemplateInfo) => void;
+		searchQuery: string;
 	}
 
 	let {

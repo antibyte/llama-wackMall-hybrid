@@ -10,7 +10,7 @@
 		children,
 		...restProps
 	}: WithElementRef<HTMLAttributes<HTMLElement>> & {
-		showIcon?: boolean;
+		showIcon: boolean;
 	} = $props();
 
 	// Random width between 50% and 90%

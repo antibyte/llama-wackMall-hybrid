@@ -10,9 +10,9 @@
 	import { isIMEComposing } from '$lib/utils';
 
 	interface Props {
-		class?: string;
+		class: string;
 		message: DatabaseMessage;
-		siblingInfo?: ChatMessageSiblingInfo | null;
+		siblingInfo: ChatMessageSiblingInfo | null;
 		showDeleteDialog: boolean;
 		deletionInfo: {
 			totalCount: number;
@@ -24,9 +24,9 @@
 		onEdit: () => void;
 		onDelete: () => void;
 		onConfirmDelete: () => void;
-		onNavigateToSibling?: (siblingId: string) => void;
+		onNavigateToSibling: (siblingId: string) => void;
 		onShowDeleteDialogChange: (show: boolean) => void;
-		textareaElement?: HTMLTextAreaElement;
+		textareaElement: HTMLTextAreaElement;
 	}
 
 	let {

@@ -8,10 +8,10 @@
 	import type { ApiLlamaCppServerProps } from '$lib/types';
 
 	interface Props {
-		open?: boolean;
-		onOpenChange?: (open: boolean) => void;
+		open: boolean;
+		onOpenChange: (open: boolean) => void;
 		// when set, fetch props from the child process (router mode)
-		modelId?: string | null;
+		modelId: string | null;
 	}
 
 	let { open = $bindable(), onOpenChange, modelId = null }: Props = $props();

@@ -12,9 +12,9 @@
 		isActive = false,
 		...restProps
 	}: WithElementRef<HTMLAnchorAttributes> & {
-		child?: Snippet<[{ props: Record<string, unknown> }]>;
-		size?: 'sm' | 'md';
-		isActive?: boolean;
+		child: Snippet<[{ props: Record<string, unknown> }]>;
+		size: 'sm' | 'md';
+		isActive: boolean;
 	} = $props();
 
 	const mergedProps = $derived({

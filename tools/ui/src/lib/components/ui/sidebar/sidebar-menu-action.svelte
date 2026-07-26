@@ -11,8 +11,8 @@
 		child,
 		...restProps
 	}: WithElementRef<HTMLButtonAttributes> & {
-		child?: Snippet<[{ props: Record<string, unknown> }]>;
-		showOnHover?: boolean;
+		child: Snippet<[{ props: Record<string, unknown> }]>;
+		showOnHover: boolean;
 	} = $props();
 
 	const mergedProps = $derived({

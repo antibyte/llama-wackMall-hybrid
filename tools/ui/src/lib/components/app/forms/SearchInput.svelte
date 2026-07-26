@@ -3,15 +3,15 @@
 	import { Search, X } from '@lucide/svelte';
 
 	interface Props {
-		value?: string;
-		placeholder?: string;
-		onInput?: (value: string) => void;
-		onClose?: () => void;
-		onKeyDown?: (event: KeyboardEvent) => void;
-		class?: string;
-		id?: string;
-		ref?: HTMLInputElement | null;
-		isCancelAlwaysVisible?: boolean;
+		value: string;
+		placeholder: string;
+		onInput: (value: string) => void;
+		onClose: () => void;
+		onKeyDown: (event: KeyboardEvent) => void;
+		class: string;
+		id: string;
+		ref: HTMLInputElement | null;
+		isCancelAlwaysVisible: boolean;
 	}
 
 	let {

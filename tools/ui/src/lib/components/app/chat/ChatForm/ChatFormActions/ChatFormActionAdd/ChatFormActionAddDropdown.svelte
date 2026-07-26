@@ -16,18 +16,18 @@
 	import { useAttachmentMenu } from '$lib/hooks/use-attachment-menu.svelte';
 
 	interface Props {
-		class?: string;
-		disabled?: boolean;
-		hasAudioModality?: boolean;
-		hasVideoModality?: boolean;
-		hasVisionModality?: boolean;
-		hasMcpPromptsSupport?: boolean;
-		hasMcpResourcesSupport?: boolean;
-		onFileUpload?: () => void;
-		onSystemPromptClick?: () => void;
-		onMcpPromptClick?: () => void;
-		onMcpSettingsClick?: () => void;
-		onMcpResourcesClick?: () => void;
+		class: string;
+		disabled: boolean;
+		hasAudioModality: boolean;
+		hasVideoModality: boolean;
+		hasVisionModality: boolean;
+		hasMcpPromptsSupport: boolean;
+		hasMcpResourcesSupport: boolean;
+		onFileUpload: () => void;
+		onSystemPromptClick: () => void;
+		onMcpPromptClick: () => void;
+		onMcpSettingsClick: () => void;
+		onMcpResourcesClick: () => void;
 	}
 
 	let {

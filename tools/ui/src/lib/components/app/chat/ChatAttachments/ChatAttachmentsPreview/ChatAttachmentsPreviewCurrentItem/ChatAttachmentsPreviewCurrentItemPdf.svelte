@@ -13,7 +13,7 @@
 		displayName: string;
 		displayTextContent: string | undefined;
 		hasVisionModality: boolean;
-		activeModelId?: string;
+		activeModelId: string;
 	}
 
 	let { currentItem, displayName, displayTextContent, hasVisionModality, activeModelId }: Props =

@@ -7,8 +7,8 @@
 	interface Props {
 		open: boolean;
 		modelName: string;
-		availableModels?: string[];
-		onOpenChange?: (open: boolean) => void;
+		availableModels: string[];
+		onOpenChange: (open: boolean) => void;
 	}
 
 	let { open = $bindable(), modelName, availableModels = [], onOpenChange }: Props = $props();

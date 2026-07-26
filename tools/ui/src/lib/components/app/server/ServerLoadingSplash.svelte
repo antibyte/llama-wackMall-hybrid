@@ -4,8 +4,8 @@
 	import { fade } from 'svelte/transition';
 
 	interface Props {
-		class?: string;
-		message?: string;
+		class: string;
+		message: string;
 	}
 
 	let { class: className = '', message = 'Initializing connection to server...' }: Props = $props();

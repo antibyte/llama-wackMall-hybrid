@@ -15,7 +15,7 @@
 		portalProps,
 		...restProps
 	}: PopoverPrimitive.ContentProps & {
-		portalProps?: WithoutChildrenOrChild<ComponentProps<typeof PopoverPortal>>;
+		portalProps: WithoutChildrenOrChild<ComponentProps<typeof PopoverPortal>>;
 	} = $props();
 </script>
 

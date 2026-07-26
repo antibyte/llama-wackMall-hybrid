@@ -1,7 +1,7 @@
 <script lang="ts">
 	interface Props {
-		titleWidth?: string;
-		showBadge?: boolean;
+		titleWidth: string;
+		showBadge: boolean;
 	}
 
 	let { titleWidth = 'w-48', showBadge = false }: Props = $props();

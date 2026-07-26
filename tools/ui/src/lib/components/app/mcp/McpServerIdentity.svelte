@@ -6,14 +6,14 @@
 	import type { MCPServerInfo } from '$lib/types';
 
 	interface Props {
-		displayName?: string;
-		faviconUrl?: string | null;
-		serverInfo?: MCPServerInfo;
-		iconClass?: string;
-		iconRounded?: string;
-		showVersion?: boolean;
-		showWebsite?: boolean;
-		nameClass?: string;
+		displayName: string;
+		faviconUrl: string | null;
+		serverInfo: MCPServerInfo;
+		iconClass: string;
+		iconRounded: string;
+		showVersion: boolean;
+		showWebsite: boolean;
+		nameClass: string;
 	}
 
 	let {

@@ -13,17 +13,17 @@
 	import { AttachmentType } from '$lib/enums';
 
 	interface Props {
-		attachment?: DatabaseMessageExtra;
-		class?: string;
+		attachment: DatabaseMessageExtra;
+		class: string;
 		id: string;
-		onclick?: (event: MouseEvent) => void;
-		onRemove?: (id: string) => void;
+		onclick: (event: MouseEvent) => void;
+		onRemove: (id: string) => void;
 		name: string;
-		readonly?: boolean;
-		size?: number;
-		textContent?: string;
+		readonly: boolean;
+		size: number;
+		textContent: string;
 		// Either uploaded file or stored attachment
-		uploadedFile?: ChatUploadedFile;
+		uploadedFile: ChatUploadedFile;
 	}
 
 	let {

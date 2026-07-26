@@ -461,8 +461,6 @@ struct common_params {
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
-    bool              cpuparams_n_threads_auto       = true;
-    bool              cpuparams_batch_n_threads_auto = true;
 
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;

@@ -6,11 +6,11 @@
 
 	interface Props {
 		content: string;
-		attachments?: DatabaseMessageExtra[];
-		renderMarkdown?: boolean;
-		textColorClass?: string;
-		cardBgClass?: string;
-		maxHeightStyle?: string;
+		attachments: DatabaseMessageExtra[];
+		renderMarkdown: boolean;
+		textColorClass: string;
+		cardBgClass: string;
+		maxHeightStyle: string;
 	}
 
 	let {

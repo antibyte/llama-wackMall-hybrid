@@ -11,7 +11,7 @@
 		onclick,
 		...restProps
 	}: ComponentProps<typeof Button> & {
-		onclick?: (e: MouseEvent) => void;
+		onclick: (e: MouseEvent) => void;
 	} = $props();
 
 	const sidebar = useSidebar();

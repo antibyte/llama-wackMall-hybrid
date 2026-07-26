@@ -8,19 +8,19 @@
 		icon: Component;
 		label: string;
 		onclick: (event: Event) => void;
-		variant?: 'default' | 'destructive';
-		disabled?: boolean;
-		shortcut?: string[];
-		separator?: boolean;
+		variant: 'default' | 'destructive';
+		disabled: boolean;
+		shortcut: string[];
+		separator: boolean;
 	}
 
 	interface Props {
 		triggerIcon: Component;
-		triggerTooltip?: string;
-		triggerClass?: string;
+		triggerTooltip: string;
+		triggerClass: string;
 		actions: ActionItem[];
-		align?: 'start' | 'center' | 'end';
-		open?: boolean;
+		align: 'start' | 'center' | 'end';
+		open: boolean;
 	}
 
 	let {
