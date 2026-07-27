@@ -9,22 +9,22 @@
 	import { getAttachmentDisplayItems, isMcpPrompt, isMcpResource } from '$lib/utils';
 
 	interface Props {
-		class: string;
-		style: string;
+		class?: string;
+		style?: string;
 		// For ChatMessage - stored attachments
-		attachments: DatabaseMessageExtra[];
-		readonly: boolean;
+		attachments?: DatabaseMessageExtra[];
+		readonly?: boolean;
 		// For ChatForm - pending uploads
-		onFileRemove: (fileId: string) => void;
-		uploadedFiles: ChatUploadedFile[];
+		onFileRemove?: (fileId: string) => void;
+		uploadedFiles?: ChatUploadedFile[];
 		// Image size customization
-		imageClass: string;
-		imageHeight: string;
-		imageWidth: string;
+		imageClass?: string;
+		imageHeight?: string;
+		imageWidth?: string;
 		// Limit display to single row with "+ X more" button
-		limitToSingleRow: boolean;
+		limitToSingleRow?: boolean;
 		// For vision modality check
-		activeModelId: string;
+		activeModelId?: string;
 	}
 
 	let {
@@ -50,7 +50,7 @@
 
 	let displayItems = $derived(getAttachmentDisplayItems({ uploadedFiles, attachments }));
 
-	function openPreview(item: ChatAttachmentDisplayItem, event: MouseEvent) {
+	function openPreview(item: ChatAttachmentDisplayItem, event?: MouseEvent) {
 		event?.stopPropagation();
 		event?.preventDefault();
 
@@ -83,7 +83,7 @@
 		{limitToSingleRow}
 		{onFileRemove}
 		onMcpResourcePreview={openMcpResourcePreview}
-		onPreview={(i: ChatAttachmentDisplayItem, event: MouseEvent) => openPreview(i, event)}
+		onPreview={(i: ChatAttachmentDisplayItem, event?: MouseEvent) => openPreview(i, event)}
 		{readonly}
 	/>
 {/snippet}

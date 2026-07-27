@@ -7,9 +7,9 @@
 		server: MCPServerSettingsEntry | undefined;
 		serverLabel: string;
 		title: string;
-		description: string;
-		titleExtra: Snippet;
-		subtitle: Snippet;
+		description?: string;
+		titleExtra?: Snippet;
+		subtitle?: Snippet;
 	}
 
 	let { server, serverLabel, title, description, titleExtra, subtitle }: Props = $props();

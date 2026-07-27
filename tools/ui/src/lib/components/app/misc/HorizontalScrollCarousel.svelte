@@ -1,12 +1,13 @@
 <script lang="ts">
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { ChevronLeft, ChevronRight } from '@lucide/svelte';
 	import type { Snippet } from 'svelte';
 
 	interface Props {
-		class: string;
-		children: Snippet;
-		gapSize: string;
-		onScrollableChange: (isScrollable: boolean) => void;
+		class?: string;
+		children?: Snippet;
+		gapSize?: string;
+		onScrollableChange?: (isScrollable: boolean) => void;
 	}
 
 	let { class: className = '', children, gapSize = '3', onScrollableChange }: Props = $props();
@@ -15,18 +16,18 @@
 	let canScrollRight = $state(false);
 	let scrollContainer: HTMLDivElement | undefined = $state();
 
-	function scrollLeft(event: MouseEvent) {
-		event.stopPropagation();
-		event.preventDefault();
+	function scrollLeft(event?: MouseEvent) {
+		event?.stopPropagation();
+		event?.preventDefault();
 
 		if (!scrollContainer) return;
 
 		scrollContainer.scrollBy({ left: scrollContainer.clientWidth * -0.67, behavior: 'smooth' });
 	}
 
-	function scrollRight(event: MouseEvent) {
-		event.stopPropagation();
-		event.preventDefault();
+	function scrollRight(event?: MouseEvent) {
+		event?.stopPropagation();
+		event?.preventDefault();
 
 		if (!scrollContainer) return;
 
@@ -71,7 +72,7 @@
 		disabled={!canScrollLeft}
 		aria-label="Scroll left"
 	>
-		<ChevronLeft class="h-4 w-4" />
+		<ChevronLeft class={ICON_CLASS_DEFAULT} />
 	</button>
 
 	<div
@@ -88,6 +89,6 @@
 		disabled={!canScrollRight}
 		aria-label="Scroll right"
 	>
-		<ChevronRight class="h-4 w-4" />
+		<ChevronRight class={ICON_CLASS_DEFAULT} />
 	</button>
 </div>

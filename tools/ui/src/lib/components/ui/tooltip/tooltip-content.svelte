@@ -5,15 +5,15 @@
 	let {
 		ref = $bindable(null),
 		class: className,
-		sideOffset = 0,
+		sideOffset = 4,
 		side = 'top',
 		children,
 		arrowClasses,
 		noPortal = false,
 		...restProps
 	}: TooltipPrimitive.ContentProps & {
-		arrowClasses: string;
-		noPortal: boolean;
+		arrowClasses?: string;
+		noPortal?: boolean;
 	} = $props();
 
 	const contentClass = $derived(

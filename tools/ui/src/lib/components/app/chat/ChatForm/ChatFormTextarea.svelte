@@ -1,15 +1,16 @@
 <script lang="ts">
+	import { isMobile } from '$lib/stores/viewport.svelte';
 	import { autoResizeTextarea } from '$lib/utils';
 	import { onMount } from 'svelte';
 
 	interface Props {
-		class: string;
-		disabled: boolean;
-		onInput: () => void;
-		onKeydown: (event: KeyboardEvent) => void;
-		onPaste: (event: ClipboardEvent) => void;
-		placeholder: string;
-		value: string;
+		class?: string;
+		disabled?: boolean;
+		onInput?: () => void;
+		onKeydown?: (event: KeyboardEvent) => void;
+		onPaste?: (event: ClipboardEvent) => void;
+		placeholder?: string;
+		value?: string;
 	}
 
 	let {
@@ -37,7 +38,9 @@
 	}
 
 	export function focus() {
-		textareaElement?.focus();
+		if (isMobile.current) return;
+
+		textareaElement?.focus({ preventScroll: true });
 	}
 
 	export function resetHeight() {

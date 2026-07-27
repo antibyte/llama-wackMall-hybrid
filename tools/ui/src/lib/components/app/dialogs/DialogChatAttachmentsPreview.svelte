@@ -7,10 +7,10 @@
 
 	interface Props {
 		open: boolean;
-		uploadedFiles: ChatUploadedFile[];
-		attachments: DatabaseMessageExtra[];
-		activeModelId: string;
-		previewFocusIndex: number;
+		uploadedFiles?: ChatUploadedFile[];
+		attachments?: DatabaseMessageExtra[];
+		activeModelId?: string;
+		previewFocusIndex?: number;
 	}
 
 	let {

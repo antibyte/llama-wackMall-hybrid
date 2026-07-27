@@ -7,11 +7,11 @@
 	import * as Tooltip from '$lib/components/ui/tooltip';
 
 	interface Props {
-		class: string;
-		model: string;
-		onclick: () => void;
-		showCopyIcon: boolean;
-		showTooltip: boolean;
+		class?: string;
+		model?: string;
+		onclick?: () => void;
+		showCopyIcon?: boolean;
+		showTooltip?: boolean;
 	}
 
 	let {
@@ -27,7 +27,7 @@
 	let shouldShow = $derived(model && (modelProp !== undefined || isModelMode));
 </script>
 
-{#snippet badgeContent(triggerProps: Record<string, unknown>)}
+{#snippet badgeContent(triggerProps?: Record<string, unknown>)}
 	<BadgeInfo {...triggerProps ?? {}} class={className} {onclick}>
 		{#snippet icon()}
 			<Package class="h-3 w-3" />

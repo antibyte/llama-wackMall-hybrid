@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { X, Music, Video } from '@lucide/svelte';
 	import {
 		formatFileSize,
@@ -13,17 +14,17 @@
 	import { AttachmentType } from '$lib/enums';
 
 	interface Props {
-		attachment: DatabaseMessageExtra;
-		class: string;
+		attachment?: DatabaseMessageExtra;
+		class?: string;
 		id: string;
-		onclick: (event: MouseEvent) => void;
-		onRemove: (id: string) => void;
+		onclick?: (event: MouseEvent) => void;
+		onRemove?: (id: string) => void;
 		name: string;
-		readonly: boolean;
-		size: number;
-		textContent: string;
+		readonly?: boolean;
+		size?: number;
+		textContent?: string;
 		// Either uploaded file or stored attachment
-		uploadedFile: ChatUploadedFile;
+		uploadedFile?: ChatUploadedFile;
 	}
 
 	let {
@@ -109,9 +110,9 @@
 		class="flex h-8 w-8 items-center justify-center rounded bg-primary/10 text-xs font-medium text-primary"
 	>
 		{#if isAudio}
-			<Music class="h-4 w-4 text-white/70" />
+			<Music class="{ICON_CLASS_DEFAULT} text-white/70" />
 		{:else if isVideo}
-			<Video class="h-4 w-4 text-white/70" />
+			<Video class="{ICON_CLASS_DEFAULT} text-white/70" />
 		{:else}
 			{fileTypeLabel}
 		{/if}

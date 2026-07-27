@@ -7,11 +7,11 @@
 		groups: GroupedModelOptions;
 		currentModel: string | null;
 		activeId: string | null;
-		sectionHeaderClass: string;
-		orgHeaderClass: string;
+		sectionHeaderClass?: string;
+		orgHeaderClass?: string;
 		onSelect: (modelId: string) => void;
 		onInfoClick: (modelName: string) => void;
-		renderOption: import('svelte').Snippet<[ModelItem, boolean]>;
+		renderOption?: import('svelte').Snippet<[ModelItem, boolean]>;
 	}
 
 	let {

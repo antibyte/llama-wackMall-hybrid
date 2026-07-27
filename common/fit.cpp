@@ -54,8 +54,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
-    mparams_copy.use_mmap  = false;
-    mparams_copy.use_mlock = false;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
@@ -137,7 +136,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         devs.push_back(llama_model_get_device(model, i));
     }
 
-    hp_ngl         = llama_model_n_layer(model);
+    hp_ngl         = llama_model_n_layer(model) + llama_model_n_layer_nextn(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 
@@ -233,7 +232,7 @@ static void common_params_fit_impl(
         sum_projected_used = dmds_full.back().mb.total();
         sum_free           = dmds_full.back().total;
         sum_projected_free = sum_free - sum_projected_used;
-        LOG_INF("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
+        LOG_TRC("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (sum_projected_free >= margins[0]) {
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
@@ -393,15 +392,8 @@ static void common_params_fit_impl(
     if (!tensor_buft_overrides) {
         throw common_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
     }
-    bool has_cmoe_override = false;
     if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
-        if (mparams->tensor_buft_overrides[0].pattern &&
-            std::string(mparams->tensor_buft_overrides[0].pattern) == "\\.ffn_(up|down|gate|gate_up)_(ch|)exps" &&
-            !mparams->tensor_buft_overrides[1].pattern && !mparams->tensor_buft_overrides[1].buft) {
-            has_cmoe_override = true;
-        } else {
-            throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
-        }
+        throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
     }
 
     // step 3: iteratively fill the back to front with "dense" layers
@@ -481,10 +473,6 @@ static void common_params_fit_impl(
         mparams.tensor_split = tensor_split;
 
         size_t itbo = 0;
-        if (has_cmoe_override) {
-            tensor_buft_overrides[itbo] = { "\\.ffn_(up|down|gate|gate_up)_(ch|)exps", ggml_backend_cpu_buffer_type() };
-            itbo++;
-        }
         for (size_t id = 0; id < nd; id++) {
             il0 += ngl_per_device[id].n_full();
             for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part; il++) {
@@ -560,11 +548,9 @@ static void common_params_fit_impl(
                 __func__, -global_surplus_cpu_moe/MiB);
         }
 
-        // reset (preserve override for Step 3 if -cmoe is active)
-        if (!has_cmoe_override) {
-            tensor_buft_overrides[0] = {nullptr, nullptr};
-            mparams->tensor_buft_overrides = tensor_buft_overrides;
-        }
+        // reset
+        tensor_buft_overrides[0] = {nullptr, nullptr};
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
     }
 
     std::vector<int64_t> targets; // maximum acceptable memory use per device
@@ -590,8 +576,7 @@ static void common_params_fit_impl(
     //   - check memory use of our guess, replace either the low or high bound
     //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
     //   - the last device has the output layer, which cannot be a partial layer
-    const bool is_moe_partial_fit = (hp_nex > 0 && !has_cmoe_override);
-    if (!is_moe_partial_fit) {
+    if (hp_nex == 0) {
         LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
     } else {
         LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
@@ -605,7 +590,7 @@ static void common_params_fit_impl(
 
         std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
         ngl_per_device_high[id].n_layer = n_unassigned;
-        if (is_moe_partial_fit) {
+        if (hp_nex > 0) {
             ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
         }
         if (ngl_per_device_high[id].n_layer > 0) {
@@ -621,7 +606,7 @@ static void common_params_fit_impl(
 
                     std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
                     ngl_per_device_test[id].n_layer += step_size;
-                    if (is_moe_partial_fit) {
+                    if (hp_nex) {
                         ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
                             step_size - 1 : step_size; // the first layer is the output layer which must always be full
                     }
@@ -651,7 +636,7 @@ static void common_params_fit_impl(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
-    if (hp_nex == 0 || global_surplus_cpu_moe <= 0 || has_cmoe_override) {
+    if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }

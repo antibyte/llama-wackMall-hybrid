@@ -5,12 +5,12 @@
 	import { McpPromptVariant } from '$lib/enums';
 
 	interface Props {
-		class: string;
-		isLoading: boolean;
-		loadError: string;
-		onRemove: () => void;
+		class?: string;
+		isLoading?: boolean;
+		loadError?: string;
+		onRemove?: () => void;
 		prompt: DatabaseMessageExtraMcpPrompt;
-		readonly: boolean;
+		readonly?: boolean;
 	}
 
 	let {

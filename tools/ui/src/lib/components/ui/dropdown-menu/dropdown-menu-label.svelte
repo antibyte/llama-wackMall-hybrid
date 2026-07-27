@@ -9,7 +9,7 @@
 		children,
 		...restProps
 	}: WithElementRef<HTMLAttributes<HTMLDivElement>> & {
-		inset: boolean;
+		inset?: boolean;
 	} = $props();
 </script>
 

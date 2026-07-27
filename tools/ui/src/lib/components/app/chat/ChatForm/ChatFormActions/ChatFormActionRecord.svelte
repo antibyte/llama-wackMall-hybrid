@@ -1,15 +1,16 @@
 <script lang="ts">
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { Mic, Square } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 
 	interface Props {
-		class: string;
-		disabled: boolean;
-		hasAudioModality: boolean;
-		isLoading: boolean;
-		isRecording: boolean;
-		onMicClick: () => void;
+		class?: string;
+		disabled?: boolean;
+		hasAudioModality?: boolean;
+		isLoading?: boolean;
+		isRecording?: boolean;
+		onMicClick?: () => void;
 	}
 
 	let {
@@ -36,9 +37,9 @@
 				<span class="sr-only">{isRecording ? 'Stop recording' : 'Start recording'}</span>
 
 				{#if isRecording}
-					<Square class="h-4 w-4 animate-pulse fill-white" />
+					<Square class="{ICON_CLASS_DEFAULT} animate-pulse fill-white" />
 				{:else}
-					<Mic class="h-4 w-4" />
+					<Mic class={ICON_CLASS_DEFAULT} />
 				{/if}
 			</Button>
 		</Tooltip.Trigger>

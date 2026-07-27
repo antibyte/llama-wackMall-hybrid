@@ -2,9 +2,9 @@
 	import type { Snippet } from 'svelte';
 
 	interface Props {
-		isSelected: boolean;
+		isSelected?: boolean;
 		onclick: () => void;
-		dataIndex: number;
+		dataIndex?: number;
 		children: Snippet;
 	}
 

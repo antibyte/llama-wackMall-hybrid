@@ -12,15 +12,15 @@
 	import { activeMessages } from '$lib/stores/conversations.svelte';
 
 	interface Props {
-		disabled: boolean;
-		forceForegroundText: boolean;
-		hasAudioModality: boolean;
-		hasVideoModality: boolean;
-		hasVisionModality: boolean;
-		hasModelSelected: boolean;
-		isSelectedModelInCache: boolean;
-		submitTooltip: string;
-		useGlobalSelection: boolean;
+		disabled?: boolean;
+		forceForegroundText?: boolean;
+		hasAudioModality?: boolean;
+		hasVideoModality?: boolean;
+		hasVisionModality?: boolean;
+		hasModelSelected?: boolean;
+		isSelectedModelInCache?: boolean;
+		submitTooltip?: string;
+		useGlobalSelection?: boolean;
 	}
 
 	let {

@@ -25,6 +25,7 @@
 		SpecialFileType
 	} from '$lib/enums';
 	import { config } from '$lib/stores/settings.svelte';
+	import ContextGaugePopup from './ChatFormContextGauge/ContextGaugePopup.svelte';
 	import { modelOptions, selectedModelId } from '$lib/stores/models.svelte';
 	import { isRouterMode } from '$lib/stores/server.svelte';
 	import { chatStore } from '$lib/stores/chat.svelte';
@@ -43,28 +44,28 @@
 
 	interface Props {
 		// Data
-		attachments: DatabaseMessageExtra[];
-		uploadedFiles: ChatUploadedFile[];
-		value: string;
+		attachments?: DatabaseMessageExtra[];
+		uploadedFiles?: ChatUploadedFile[];
+		value?: string;
 
 		// UI State
-		class: string;
-		disabled: boolean;
-		isLoading: boolean;
-		placeholder: string;
-		showMcpPromptButton: boolean;
-		showAddButton: boolean;
-		showModelSelector: boolean;
+		class?: string;
+		disabled?: boolean;
+		isLoading?: boolean;
+		placeholder?: string;
+		showMcpPromptButton?: boolean;
+		showAddButton?: boolean;
+		showModelSelector?: boolean;
 
 		// Event Handlers
-		onAttachmentRemove: (index: number) => void;
-		onFilesAdd: (files: File[]) => void;
-		onStop: () => void;
-		onSubmit: () => void;
-		onSystemPromptClick: (draft: { message: string; files: ChatUploadedFile[] }) => void;
-		onUploadedFileRemove: (fileId: string) => void;
-		onUploadedFilesChange: (files: ChatUploadedFile[]) => void;
-		onValueChange: (value: string) => void;
+		onAttachmentRemove?: (index: number) => void;
+		onFilesAdd?: (files: File[]) => void;
+		onStop?: () => void;
+		onSubmit?: () => void;
+		onSystemPromptClick?: (draft: { message: string; files: ChatUploadedFile[] }) => void;
+		onUploadedFileRemove?: (fileId: string) => void;
+		onUploadedFilesChange?: (files: ChatUploadedFile[]) => void;
+		onValueChange?: (value: string) => void;
 	}
 
 	let {
@@ -334,7 +335,7 @@
 	function handlePromptLoadStart(
 		placeholderId: string,
 		promptInfo: MCPPromptInfo,
-		args: Record<string, string>
+		args?: Record<string, string>
 	) {
 		// Only clear the value if the prompt was triggered by typing '/'
 		if (value.startsWith(PROMPT_TRIGGER_PREFIX)) {
@@ -494,7 +495,7 @@
 	/>
 
 	<div
-		class="{INPUT_CLASSES} overflow-hidden rounded-3xl backdrop-blur-md {disabled
+		class="{INPUT_CLASSES} overflow-hidden rounded-4xl md:rounded-3xl backdrop-blur-md {disabled
 			? 'cursor-not-allowed opacity-60'
 			: ''}"
 		data-slot="input-area"
@@ -510,7 +511,7 @@
 		/>
 
 		<div
-			class="flex-column relative min-h-[48px] items-center rounded-3xl py-2 pb-2.25 shadow-sm transition-all focus-within:shadow-md md:!py-3"
+			class="flex-column relative min-h-12 items-center rounded-4xl md:rounded-3xl py-2 pb-2.25 shadow-sm transition-all focus-within:shadow-md md:py-3!"
 			onpaste={handlePaste}
 		>
 			<ChatFormTextarea
@@ -556,6 +557,8 @@
 			/>
 		</div>
 	</div>
+
+	<ContextGaugePopup />
 </form>
 
 <DialogMcpResourcesBrowser

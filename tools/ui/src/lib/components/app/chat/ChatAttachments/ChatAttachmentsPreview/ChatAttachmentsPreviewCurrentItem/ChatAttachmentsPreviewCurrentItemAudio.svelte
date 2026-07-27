@@ -2,7 +2,7 @@
 	import { Music } from '@lucide/svelte';
 
 	interface Props {
-		currentItem: { name: string } | null;
+		currentItem: { name?: string } | null;
 		audioSrc: string | null;
 	}
 

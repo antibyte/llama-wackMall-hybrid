@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { FileText, Loader2, AlertCircle, Download } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
@@ -16,8 +17,8 @@
 	interface Props {
 		resource: MCPResourceInfo | null;
 		/** Pre-loaded content (e.g., from template resolution). Skips store fetch when provided. */
-		preloadedContent: MCPResourceContent[] | null;
-		class: string;
+		preloadedContent?: MCPResourceContent[] | null;
+		class?: string;
 	}
 
 	let { resource, preloadedContent, class: className }: Props = $props();
@@ -140,7 +141,7 @@
 						/>
 					{:else}
 						<div class="flex items-center gap-2 rounded bg-muted p-2 text-sm text-muted-foreground">
-							<FileText class="h-4 w-4" />
+							<FileText class={ICON_CLASS_DEFAULT} />
 
 							<span>Binary content ({blob.mimeType || 'unknown type'})</span>
 						</div>

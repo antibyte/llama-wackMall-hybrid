@@ -4,7 +4,7 @@
 	import { Badge } from '$lib/components/ui/badge';
 
 	interface Props {
-		capabilities: MCPCapabilitiesInfo;
+		capabilities?: MCPCapabilitiesInfo;
 	}
 
 	let { capabilities }: Props = $props();

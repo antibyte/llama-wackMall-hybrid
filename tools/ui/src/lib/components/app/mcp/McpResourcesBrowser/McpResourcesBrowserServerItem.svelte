@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { FolderOpen, ChevronDown, ChevronRight, Loader2, Braces } from '@lucide/svelte';
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Collapsible from '$lib/components/ui/collapsible';
@@ -19,14 +20,14 @@
 		serverRes: MCPServerResources;
 		isExpanded: boolean;
 		selectedUris: Set<string>;
-		selectedTemplateUri: string | null;
+		selectedTemplateUri?: string | null;
 		expandedFolders: SvelteSet<string>;
 		onToggleServer: () => void;
 		onToggleFolder: (folderId: string) => void;
-		onSelect: (resource: MCPResourceInfo, shiftKey: boolean) => void;
-		onToggle: (resource: MCPResourceInfo, checked: boolean) => void;
-		onTemplateSelect: (template: MCPResourceTemplateInfo) => void;
-		searchQuery: string;
+		onSelect?: (resource: MCPResourceInfo, shiftKey?: boolean) => void;
+		onToggle?: (resource: MCPResourceInfo, checked: boolean) => void;
+		onTemplateSelect?: (template: MCPResourceTemplateInfo) => void;
+		searchQuery?: string;
 	}
 
 	let {
@@ -122,7 +123,7 @@
 					checked={isSelected}
 					onCheckedChange={(checked: boolean | 'indeterminate') =>
 						handleCheckboxChange(resource, checked === true)}
-					class="h-4 w-4"
+					class={ICON_CLASS_DEFAULT}
 				/>
 			{/if}
 
@@ -160,7 +161,7 @@
 				<McpServerIdentity
 					displayName={serverDisplayName}
 					faviconUrl={serverFaviconUrl}
-					iconClass="h-4 w-4"
+					iconClass={ICON_CLASS_DEFAULT}
 					showVersion={false}
 				/>
 			</div>

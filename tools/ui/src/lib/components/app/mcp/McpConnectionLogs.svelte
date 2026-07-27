@@ -6,9 +6,9 @@
 
 	interface Props {
 		logs: MCPConnectionLog[];
-		connectionTimeMs: number;
-		defaultExpanded: boolean;
-		class: string;
+		connectionTimeMs?: number;
+		defaultExpanded?: boolean;
+		class?: string;
 	}
 
 	let { logs, connectionTimeMs, defaultExpanded = false, class: className }: Props = $props();

@@ -2,10 +2,10 @@
 	import { SearchInput } from '$lib/components/app';
 
 	interface Props {
-		value: string;
-		placeholder: string;
-		onInput: (value: string) => void;
-		class: string;
+		value?: string;
+		placeholder?: string;
+		onInput?: (value: string) => void;
+		class?: string;
 	}
 
 	let {
@@ -16,4 +16,6 @@
 	}: Props = $props();
 </script>
 
-<SearchInput bind:value {placeholder} {onInput} class="mb-4 {className}" />
+<div class="mb-4 px-2 {className}">
+	<SearchInput bind:value {placeholder} {onInput} />
+</div>

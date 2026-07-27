@@ -3,11 +3,11 @@
 	import * as Popover from '$lib/components/ui/popover';
 
 	interface Props {
-		class: string;
-		isOpen: boolean;
-		srLabel: string;
-		onClose: () => void;
-		onKeydown: (event: KeyboardEvent) => void;
+		class?: string;
+		isOpen?: boolean;
+		srLabel?: string;
+		onClose?: () => void;
+		onKeydown?: (event: KeyboardEvent) => void;
 		children: Snippet;
 	}
 

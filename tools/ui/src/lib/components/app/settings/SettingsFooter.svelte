@@ -5,8 +5,8 @@
 	import { RotateCcw } from '@lucide/svelte';
 
 	interface Props {
-		onReset: () => void;
-		onSave: () => void;
+		onReset?: () => void;
+		onSave?: () => void;
 	}
 
 	let { onReset, onSave }: Props = $props();

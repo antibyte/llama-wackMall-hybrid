@@ -5,17 +5,17 @@
 	import ChatFormActionAddButton from './ChatFormActionAddButton.svelte';
 
 	interface Props {
-		disabled: boolean;
-		hasAudioModality: boolean;
-		hasVideoModality: boolean;
-		hasMcpPromptsSupport: boolean;
-		hasMcpResourcesSupport: boolean;
-		hasVisionModality: boolean;
-		onFileUpload: () => void;
-		onMcpPromptClick: () => void;
-		onMcpResourcesClick: () => void;
-		onMcpSettingsClick: () => void;
-		onSystemPromptClick: () => void;
+		disabled?: boolean;
+		hasAudioModality?: boolean;
+		hasVideoModality?: boolean;
+		hasMcpPromptsSupport?: boolean;
+		hasMcpResourcesSupport?: boolean;
+		hasVisionModality?: boolean;
+		onFileUpload?: () => void;
+		onMcpPromptClick?: () => void;
+		onMcpResourcesClick?: () => void;
+		onMcpSettingsClick?: () => void;
+		onSystemPromptClick?: () => void;
 	}
 
 	let {
@@ -42,6 +42,7 @@
 		{hasMcpPromptsSupport}
 		{hasMcpResourcesSupport}
 		{onFileUpload}
+		{onSystemPromptClick}
 		{onMcpPromptClick}
 		{onMcpResourcesClick}
 	>

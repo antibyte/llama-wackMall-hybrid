@@ -15,7 +15,6 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
-#include <cstdlib>
 
 #include "repack.h"
 
@@ -24,43 +23,6 @@
 #endif
 
 #define UNUSED GGML_UNUSED
-
-// colibri-tier: dump routed expert ids to $LLAMA_EXPERT_TRACE
-// record: magic "EXTR", il, k, n_tokens, ids[k*n_tokens] (int32)
-static void expert_trace_dump(const ggml_tensor * src0, const ggml_tensor * ids) {
-    if (getenv("LLAMA_EXPERT_TRACE_DEBUG")) {
-        fprintf(stderr, "HOOK repack: src0='%s' ids=[%d,%d]\n", src0->name, (int) ids->ne[0], (int) ids->ne[1]);
-    }
-
-    static FILE * f = getenv("LLAMA_EXPERT_TRACE") ? fopen(getenv("LLAMA_EXPERT_TRACE"), "wb") : nullptr;
-
-    if (f == nullptr || ids->type != GGML_TYPE_I32) {
-        static bool once = false;
-        if (!once && getenv("LLAMA_EXPERT_TRACE")) {
-            once = true;
-            fprintf(stderr, "expert_trace: repack path hit (f=%p ids_type=%d)\n", (void *) f, ids->type);
-        }
-        return;
-    }
-
-    int il = -1;
-    if (sscanf(src0->name, "blk.%d.", &il) != 1) {
-        return;
-    }
-
-    // up/gate/down share the ids tensor: record once per layer
-    static const ggml_tensor * prev_ids = nullptr;
-    if (ids == prev_ids) {
-        return;
-    }
-    prev_ids = ids;
-
-    const int32_t hdr[4] = { 0x52545845, il, (int32_t) ids->ne[0], (int32_t)(ggml_nelements(ids)/ids->ne[0]) };
-
-    fwrite(hdr, sizeof(hdr), 1, f);
-    fwrite(ids->data, sizeof(int32_t), ggml_nelements(ids), f);
-    fflush(f);
-}
 
 static inline int nearest_int(float fval) {
     assert(fabsf(fval) <= 4194303.f);
@@ -4431,10 +4393,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const int ith = params->ith;
         const int nth = params->nth;
-
-        if (ith == 0) {
-            expert_trace_dump(src0, ids);
-        }
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 

@@ -13,7 +13,7 @@
 		children: childrenProp,
 		...restProps
 	}: WithoutChildrenOrChild<DropdownMenuPrimitive.CheckboxItemProps> & {
-		children: Snippet;
+		children?: Snippet;
 	} = $props();
 </script>
 

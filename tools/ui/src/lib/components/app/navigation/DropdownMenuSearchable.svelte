@@ -4,14 +4,14 @@
 	import { SearchInput } from '$lib/components/app';
 
 	interface Props {
-		placeholder: string;
-		searchValue: string;
-		onSearchChange: (value: string) => void;
-		onSearchKeyDown: (event: KeyboardEvent) => void;
-		emptyMessage: string;
-		isEmpty: boolean;
+		placeholder?: string;
+		searchValue?: string;
+		onSearchChange?: (value: string) => void;
+		onSearchKeyDown?: (event: KeyboardEvent) => void;
+		emptyMessage?: string;
+		isEmpty?: boolean;
 		children: Snippet;
-		footer: Snippet;
+		footer?: Snippet;
 	}
 
 	let {

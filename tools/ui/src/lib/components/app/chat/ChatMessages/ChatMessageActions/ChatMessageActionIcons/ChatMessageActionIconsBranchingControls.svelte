@@ -3,9 +3,9 @@
 	import { ActionIcon } from '$lib/components/app';
 
 	interface Props {
-		class: string;
+		class?: string;
 		siblingInfo: ChatMessageSiblingInfo | null;
-		onNavigateToSibling: (siblingId: string) => void;
+		onNavigateToSibling?: (siblingId: string) => void;
 	}
 
 	let { class: className = '', siblingInfo, onNavigateToSibling }: Props = $props();

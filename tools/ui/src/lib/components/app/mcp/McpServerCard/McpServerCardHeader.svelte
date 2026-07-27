@@ -8,13 +8,13 @@
 
 	interface Props {
 		displayName: string;
-		faviconUrl: string | null;
+		faviconUrl?: string | null;
 		enabled: boolean;
-		disabled: boolean;
+		disabled?: boolean;
 		onToggle: (enabled: boolean) => void;
-		serverInfo: MCPServerInfo;
-		capabilities: MCPCapabilitiesInfo;
-		transportType: MCPTransportType;
+		serverInfo?: MCPServerInfo;
+		capabilities?: MCPCapabilitiesInfo;
+		transportType?: MCPTransportType;
 	}
 
 	let {

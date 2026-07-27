@@ -9,7 +9,7 @@
 		class: className,
 		...restProps
 	}: DropdownMenuPrimitive.ContentProps & {
-		portalProps: DropdownMenuPrimitive.PortalProps;
+		portalProps?: DropdownMenuPrimitive.PortalProps;
 	} = $props();
 </script>
 

@@ -35,7 +35,7 @@
 		children,
 		...restProps
 	}: WithElementRef<HTMLAnchorAttributes> & {
-		variant: BadgeVariant;
+		variant?: BadgeVariant;
 	} = $props();
 </script>
 

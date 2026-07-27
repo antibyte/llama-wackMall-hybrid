@@ -16,7 +16,7 @@
 
 	interface Props {
 		open: boolean;
-		onOpenChange: (open: boolean) => void;
+		onOpenChange?: (open: boolean) => void;
 		extra: DatabaseMessageExtraMcpResource;
 	}
 

@@ -36,8 +36,8 @@
 		children,
 		...restProps
 	}: WithoutChildrenOrChild<SheetPrimitive.ContentProps> & {
-		portalProps: SheetPrimitive.PortalProps;
-		side: Side;
+		portalProps?: SheetPrimitive.PortalProps;
+		side?: Side;
 		children: Snippet;
 	} = $props();
 </script>

@@ -16,7 +16,7 @@
 		role: MessageRole.USER | MessageRole.ASSISTANT;
 		justify: 'start' | 'end';
 		actionsPosition: 'left' | 'right';
-		siblingInfo: ChatMessageSiblingInfo | null;
+		siblingInfo?: ChatMessageSiblingInfo | null;
 		showDeleteDialog: boolean;
 		deletionInfo: {
 			totalCount: number;
@@ -25,17 +25,17 @@
 			messageTypes: string[];
 		} | null;
 		onCopy: () => void;
-		onEdit: () => void;
-		onRegenerate: () => void;
-		onContinue: () => void;
-		onForkConversation: (options: { name: string; includeAttachments: boolean }) => void;
+		onEdit?: () => void;
+		onRegenerate?: () => void;
+		onContinue?: () => void;
+		onForkConversation?: (options: { name: string; includeAttachments: boolean }) => void;
 		onDelete: () => void;
 		onConfirmDelete: () => void;
-		onNavigateToSibling: (siblingId: string) => void;
+		onNavigateToSibling?: (siblingId: string) => void;
 		onShowDeleteDialogChange: (show: boolean) => void;
-		showRawOutputSwitch: boolean;
-		rawOutputEnabled: boolean;
-		onRawOutputToggle: (enabled: boolean) => void;
+		showRawOutputSwitch?: boolean;
+		rawOutputEnabled?: boolean;
+		onRawOutputToggle?: (enabled: boolean) => void;
 	}
 
 	let {

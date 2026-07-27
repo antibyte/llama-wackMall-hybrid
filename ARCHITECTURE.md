@@ -104,7 +104,10 @@ otherwise the stock default. Manual -t always takes precedence.
 ## 5. Online adaptation (the cache policy)
 
 Graphs are built once and reused, so the learning hook is not in the graph:
-it runs after each graph_compute at ubatch granularity.
+it runs after each graph_compute at ubatch granularity. graph_compute is
+asynchronous, so the hook runs only after a full scheduler synchronize;
+hot-set swaps then touch only buffers no in-flight graph can be reading.
+This ordering is a hard invariant of the design.
 
 - Counting: the cold kernels increment counts[expert] (plus a total); the
   hook consumes and zeroes them.
@@ -173,6 +176,30 @@ Published here as part of the same disclosure:
   of uniformly.
 - Multi-GPU tier priority: per-tier .hot tensors, lut encodes tier+slot
   (Vulkan backend verified for the required quantized mul_mat_id types).
+- Predictive tiering (score-based prefetch): small per-layer predictor
+  heads trained on frozen hidden states output P(expert e fires within
+  the next w tokens) as a score; the runtime maps scores to tiers using
+  the actual VRAM/RAM budgets, so training is decoupled from cache
+  geometry (a direct cache/evict bit-vector target would need retraining
+  per cache size). Prediction horizon is matched to tier latency: about
+  one token of lead for RAM->VRAM, tens of tokens for disk->RAM, and
+  prompt-level for preload (the prompt's routing is measured during
+  prompt processing, never predicted). Caches consume set predictions
+  (union over a window), which degrade far more slowly with horizon than
+  exact-sequence predictions.
+- Semantic seeding: a local store of past usage profiles keyed by pooled
+  prompt hidden states (computed during prompt processing anyway - no
+  separate embedding model); nearest-centroid match warm-starts the hot
+  set per prompt class, falling back to the global profile below a
+  similarity threshold. Complements online adaptation rather than
+  replacing it.
+- Correlation (Markov) prefetch: per-layer expert-to-expert transition
+  tables harvested from activation traces, driving asynchronous prefetch
+  of likely successors - the frequency -> Markov -> learned ladder from
+  the hardware-prefetching literature. All predictive work is gated on a
+  measured oracle gap (clairvoyant top-S coverage vs the reactive
+  policy); if the gap is small, the remaining lever is cold-tier compute
+  speed, not prediction.
 
 ---
 

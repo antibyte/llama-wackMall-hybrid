@@ -7,14 +7,14 @@
 		open: boolean;
 		title: string;
 		description: string;
-		confirmText: string;
-		cancelText: string;
-		variant: 'default' | 'destructive';
-		icon: Component;
+		confirmText?: string;
+		cancelText?: string;
+		variant?: 'default' | 'destructive';
+		icon?: Component;
 		onConfirm: () => void;
 		onCancel: () => void;
-		onKeydown: (event: KeyboardEvent) => void;
-		children: Snippet;
+		onKeydown?: (event: KeyboardEvent) => void;
+		children?: Snippet;
 	}
 
 	let {

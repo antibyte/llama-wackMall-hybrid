@@ -16,17 +16,17 @@
 	import Badge from '$lib/components/ui/badge/badge.svelte';
 
 	interface Props {
-		class: string;
-		isOpen: boolean;
-		searchQuery: string;
-		onClose: () => void;
-		onPromptLoadStart: (
+		class?: string;
+		isOpen?: boolean;
+		searchQuery?: string;
+		onClose?: () => void;
+		onPromptLoadStart?: (
 			placeholderId: string,
 			promptInfo: MCPPromptInfo,
-			args: Record<string, string>
+			args?: Record<string, string>
 		) => void;
-		onPromptLoadComplete: (placeholderId: string, result: GetPromptResult) => void;
-		onPromptLoadError: (placeholderId: string, error: string) => void;
+		onPromptLoadComplete?: (placeholderId: string, result: GetPromptResult) => void;
+		onPromptLoadError?: (placeholderId: string, error: string) => void;
 	}
 
 	let {
@@ -322,7 +322,7 @@
 	}
 
 	let filteredPrompts = $derived.by(() => {
-		const sortedServers = mcpStore.getServersSorted();
+		const sortedServers = mcpStore.getServers();
 		const serverOrderMap = new Map(sortedServers.map((server, index) => [server.id, index]));
 
 		const sortedPrompts = [...prompts].sort((a, b) => {

@@ -13,7 +13,7 @@
 		children,
 		...restProps
 	}: WithoutChild<SelectPrimitive.ContentProps> & {
-		portalProps: SelectPrimitive.PortalProps;
+		portalProps?: SelectPrimitive.PortalProps;
 	} = $props();
 
 	let cleanupInternalListeners: (() => void) | undefined;

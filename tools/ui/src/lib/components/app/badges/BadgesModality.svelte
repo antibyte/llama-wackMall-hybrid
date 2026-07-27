@@ -4,7 +4,7 @@
 
 	interface Props {
 		modalities: ModelModality[];
-		class: string;
+		class?: string;
 	}
 
 	let { modalities, class: className = '' }: Props = $props();

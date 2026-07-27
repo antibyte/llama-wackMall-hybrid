@@ -2,7 +2,7 @@
 	import { Video } from '@lucide/svelte';
 
 	interface Props {
-		currentItem: { name: string } | null;
+		currentItem: { name?: string } | null;
 		videoSrc: string | null;
 	}
 

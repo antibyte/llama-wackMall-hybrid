@@ -23,22 +23,22 @@
 	interface PreviewItem {
 		id: string;
 		name: string;
-		size: number;
-		preview: string;
-		uploadedFile: ChatUploadedFile;
-		attachment: DatabaseMessageExtra;
-		textContent: string;
+		size?: number;
+		preview?: string;
+		uploadedFile?: ChatUploadedFile;
+		attachment?: DatabaseMessageExtra;
+		textContent?: string;
 		isImage: boolean;
 		isAudio: boolean;
 		isVideo: boolean;
 	}
 
 	interface Props {
-		uploadedFiles: ChatUploadedFile[];
-		attachments: DatabaseMessageExtra[];
-		activeModelId: string;
-		class: string;
-		previewFocusIndex: number;
+		uploadedFiles?: ChatUploadedFile[];
+		attachments?: DatabaseMessageExtra[];
+		activeModelId?: string;
+		class?: string;
+		previewFocusIndex?: number;
 	}
 
 	let {

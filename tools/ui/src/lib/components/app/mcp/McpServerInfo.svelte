@@ -3,8 +3,8 @@
 	import * as Collapsible from '$lib/components/ui/collapsible';
 
 	interface Props {
-		instructions: string;
-		class: string;
+		instructions?: string;
+		class?: string;
 	}
 
 	let { instructions, class: className }: Props = $props();

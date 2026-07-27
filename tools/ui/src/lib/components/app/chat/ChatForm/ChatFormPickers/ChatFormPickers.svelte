@@ -4,21 +4,21 @@
 	import type { GetPromptResult, MCPPromptInfo } from '$lib/types';
 
 	interface Props {
-		isPromptPickerOpen: boolean;
-		promptSearchQuery: string;
-		isInlineResourcePickerOpen: boolean;
-		resourceSearchQuery: string;
-		onPromptPickerClose: () => void;
-		onInlineResourcePickerClose: () => void;
-		onInlineResourceSelect: () => void;
-		onPromptLoadStart: (
+		isPromptPickerOpen?: boolean;
+		promptSearchQuery?: string;
+		isInlineResourcePickerOpen?: boolean;
+		resourceSearchQuery?: string;
+		onPromptPickerClose?: () => void;
+		onInlineResourcePickerClose?: () => void;
+		onInlineResourceSelect?: () => void;
+		onPromptLoadStart?: (
 			placeholderId: string,
 			promptInfo: MCPPromptInfo,
-			args: Record<string, string>
+			args?: Record<string, string>
 		) => void;
-		onPromptLoadComplete: (placeholderId: string, result: GetPromptResult) => void;
-		onPromptLoadError: (placeholderId: string, error: string) => void;
-		onInlineResourceBrowse: () => void;
+		onPromptLoadComplete?: (placeholderId: string, result: GetPromptResult) => void;
+		onPromptLoadError?: (placeholderId: string, error: string) => void;
+		onInlineResourceBrowse?: () => void;
 	}
 
 	let {

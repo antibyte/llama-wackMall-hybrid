@@ -1,8 +1,8 @@
 <script lang="ts">
 	interface Props {
-		class: string;
-		multiple: boolean;
-		onFileSelect: (files: File[]) => void;
+		class?: string;
+		multiple?: boolean;
+		onFileSelect?: (files: File[]) => void;
 	}
 
 	let { class: className = '', multiple = true, onFileSelect }: Props = $props();

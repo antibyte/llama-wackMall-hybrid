@@ -4,7 +4,6 @@
 
 	let { needRefresh: needRefreshProp, updateServiceWorker, forceReload } = $props();
 	let needRefresh = $derived(needRefreshProp ?? false);
-	// session-local only: not persisted, so the alert returns on page reload
 	let dismissed = $state(false);
 </script>
 
@@ -18,7 +17,7 @@
 			<p class="text-xs text-muted-foreground">A new version is available. Reload to update.</p>
 
 			<div class="flex justify-end gap-2">
-				<Button size="sm" variant="outline" onclick={() => (dismissed = true)}>Dismiss</Button>
+				<Button size="sm" variant="outline" onclick={() => (dismissed = true)}>Not now</Button>
 				<Button
 					size="sm"
 					onclick={() => {

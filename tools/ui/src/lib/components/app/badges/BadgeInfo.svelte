@@ -4,8 +4,8 @@
 
 	interface Props extends HTMLButtonAttributes {
 		children: Snippet;
-		class: string;
-		icon: Snippet;
+		class?: string;
+		icon?: Snippet;
 	}
 
 	let { children, class: className = '', icon, ...rest }: Props = $props();

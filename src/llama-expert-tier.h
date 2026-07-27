@@ -10,7 +10,7 @@ struct llama_model;
 // enabled via env:
 //   LLAMA_EXPERT_HOT   - path to heat csv with header "layer,expert,count"
 //                        (seed; optional if LLAMA_EXPERT_ADAPT=1)
-//   LLAMA_EXPERT_S     - hot slots per layer (unset/-1 = auto, 0 = off, N = force N)
+//   LLAMA_EXPERT_S     - hot slots per layer (default 16)
 //   LLAMA_EXPERT_TMAX  - max n_tokens for the hot/cold path (default 16)
 //   LLAMA_EXPERT_STATS - dump cold-hit stats at exit ("1" = stderr, else path)
 //   LLAMA_EXPERT_ADAPT - 1: online repin of hot slots (decay + hysteresis)
@@ -32,7 +32,7 @@ ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
 void update();
 
 // total bytes of routed-expert weight tensors (for dense-fit estimates)
-LLAMA_API size_t expert_weight_bytes(const llama_model & model);
+size_t expert_weight_bytes(const llama_model & model);
 
 // fused cold-expert path for one MoE layer, two calls per layer:
 // begin (before the expert matmuls): validates the layer and makes

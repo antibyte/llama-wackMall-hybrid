@@ -9,13 +9,13 @@
 	import McpResourcesBrowserServerItem from './McpResourcesBrowserServerItem.svelte';
 
 	interface Props {
-		onSelect: (resource: MCPResourceInfo, shiftKey: boolean) => void;
-		onToggle: (resource: MCPResourceInfo, checked: boolean) => void;
-		onTemplateSelect: (template: MCPResourceTemplateInfo) => void;
-		selectedUris: Set<string>;
-		selectedTemplateUri: string | null;
-		expandToUri: string;
-		class: string;
+		onSelect?: (resource: MCPResourceInfo, shiftKey?: boolean) => void;
+		onToggle?: (resource: MCPResourceInfo, checked: boolean) => void;
+		onTemplateSelect?: (template: MCPResourceTemplateInfo) => void;
+		selectedUris?: Set<string>;
+		selectedTemplateUri?: string | null;
+		expandToUri?: string;
+		class?: string;
 	}
 
 	let {

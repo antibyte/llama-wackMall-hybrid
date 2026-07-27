@@ -9,7 +9,7 @@
 		inset,
 		...restProps
 	}: ComponentProps<typeof DropdownMenuPrimitive.GroupHeading> & {
-		inset: boolean;
+		inset?: boolean;
 	} = $props();
 </script>
 

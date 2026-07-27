@@ -16,12 +16,12 @@
 	} from '$lib/components/app/chat';
 
 	interface Props {
-		class: string;
-		isOpen: boolean;
-		searchQuery: string;
-		onClose: () => void;
-		onResourceSelect: (resource: MCPResourceInfo) => void;
-		onBrowse: () => void;
+		class?: string;
+		isOpen?: boolean;
+		searchQuery?: string;
+		onClose?: () => void;
+		onResourceSelect?: (resource: MCPResourceInfo) => void;
+		onBrowse?: () => void;
 	}
 
 	let {
@@ -138,7 +138,7 @@
 	}
 
 	let filteredResources = $derived.by(() => {
-		const sortedServers = mcpStore.getServersSorted();
+		const sortedServers = mcpStore.getServers();
 		const serverOrderMap = new Map(sortedServers.map((server, index) => [server.id, index]));
 
 		const sortedResources = [...resources].sort((a, b) => {
