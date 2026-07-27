@@ -8,7 +8,7 @@ Qwen3.6-35B-A3B, gemma-4-26B-A4B - at high token-generation throughput on
 consumer GPUs with as little as 8 GB VRAM.
 
 First public disclosure: 2026-07-26. See [ARCHITECTURE.md](ARCHITECTURE.md)
-for the full technical specification. Released under the MIT License (see
+for the full technical specification. Released under the Apache 2.0 License (see
 [LICENSE](LICENSE)).
 
 ---
