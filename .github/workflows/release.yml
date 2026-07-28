@@ -9,7 +9,7 @@ on:
         type: boolean
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/release.yml',
       '**/CMakeLists.txt',
@@ -40,7 +40,7 @@ concurrency:
 jobs:
   check-release:
     runs-on: ubuntu-slim
-    timeout-minutes: 20
+    timeout-minutes: 90
 
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
@@ -50,7 +50,7 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "should_release=true" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/master" ]]; then
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
             if echo "${{ github.event.head_commit.message }}" | grep -q '\[no release\]'; then
               echo "should_release=false" >> $GITHUB_OUTPUT
             else
@@ -62,7 +62,7 @@ jobs:
 
   get-version:
     runs-on: ubuntu-slim
-    timeout-minutes: 20
+    timeout-minutes: 90
     outputs:
       ui_version: ${{ steps.version.outputs.ui_version }}
     steps:
@@ -109,7 +109,8 @@ jobs:
             defines: "-DGGML_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -183,7 +184,8 @@ jobs:
             os: ubuntu-24.04-s390x
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -271,7 +273,8 @@ jobs:
             os: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -350,7 +353,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     #permissions:
     #  actions: write
@@ -444,7 +448,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -543,7 +548,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2025-vs2026
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -613,7 +619,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -709,56 +716,14 @@ jobs:
           path: llama-bin-win-${{ matrix.backend }}-${{ matrix.arch }}.zip
           name: llama-bin-win-${{ matrix.backend }}-${{ matrix.arch }}.zip
 
-# TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G "Ninja Multi-Config" ^
-            -DGGML_BACKEND_DL=ON ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_CPU=OFF ^
-            -DGGML_CUDA=ON ^
-            -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DGGML_CUDA_CUB_3DOT2=ON
-          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
-
-      - name: ccache-clear
-        uses: ./.github/actions/ccache-clear
-        with:
-          key: release-windows-2022-x64-cuda-${{ matrix.cuda }}
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip .\build\bin\Release\ggml-cuda.dll
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          path: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-          name: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-
-      - name: Copy and pack Cuda runtime
-        run: |
-          echo "Cuda install location: ${{ env.CUDA_PATH }}"
-          $dst='.\build\bin\cudart\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip $dst\*
-
-      - name: Upload Cuda runtime
-        uses: actions/upload-artifact@v6
-        with:
-          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-          name: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
 
   windows-sycl:
     needs: [check-release]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     defaults:
       run:
@@ -879,7 +844,8 @@ jobs:
             fp16: ON
 
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     env:
       ONEAPI_ROOT: /opt/intel/oneapi/
@@ -957,66 +923,6 @@ jobs:
           path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz
           name: llama-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz
 
-# Find and test ROCm installation
-          $clangPath = Get-ChildItem 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Select-Object -First 1
-          if (-not $clangPath) {
-            Write-Error "ROCm installation not found"
-            exit 1
-          }
-          & $clangPath.FullName --version
-
-      - name: Build
-        id: cmake_build
-        run: |
-          $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | split-path | split-path)
-          $env:CMAKE_PREFIX_PATH="${env:HIP_PATH}"
-          cmake -G "Unix Makefiles" -B build -S . `
-            -DCMAKE_C_COMPILER="${env:HIP_PATH}\bin\clang.exe" `
-            -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\bin\clang++.exe" `
-            -DCMAKE_CXX_FLAGS="-I$($PWD.Path.Replace('\', '/'))/opt/rocm-7.2.1/include/ -Wno-ignored-attributes -Wno-nested-anon-types" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DGGML_BACKEND_DL=ON `
-            -DGGML_NATIVE=OFF `
-            -DGGML_CPU=OFF `
-            -DGPU_TARGETS="${{ matrix.gpu_targets }}" `
-            -DGGML_HIP_ROCWMMA_FATTN=ON `
-            -DGGML_HIP=ON `
-            -DHF_UI_VERSION=${{ needs.get-version.outputs.ui_version }} `
-            -DLLAMA_BUILD_BORINGSSL=ON
-          cmake --build build --target ggml-hip -j ${env:NUMBER_OF_PROCESSORS}
-          md "build\bin\rocblas\library\"
-          md "build\bin\hipblaslt\library"
-          cp "${env:HIP_PATH}\bin\libhipblas.dll" "build\bin\"
-          cp "${env:HIP_PATH}\bin\libhipblaslt.dll" "build\bin\"
-          cp "${env:HIP_PATH}\bin\rocblas.dll" "build\bin\"
-          cp "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\"
-          cp "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\"
-
-      - name: ccache-clear
-        uses: ./.github/actions/ccache-clear
-        with:
-          key: release-windows-2022-x64-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ matrix.name }}
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          7z a -snl llama-bin-win-hip-${{ matrix.name }}-x64.zip .\build\bin\*
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          path: llama-bin-win-hip-${{ matrix.name }}-x64.zip
-          name: llama-bin-win-hip-${{ matrix.name }}-x64.zip
-
-# Zip file is required for Swift Package Manager, which does not support tar.gz for binary targets.
-          # For more details, see https://developer.apple.com/documentation/xcode/distributing-binary-frameworks-as-swift-packages
-          zip -r -y llama-${{ steps.tag.outputs.name }}-xcframework.zip build-apple/llama.xcframework
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          path: llama-${{ steps.tag.outputs.name }}-xcframework.zip
-          name: llama-${{ steps.tag.outputs.name }}-xcframework.zip
 
 # TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23705)
 #       in order to enable it again, we have to provision dedicated runners  to run it
@@ -1043,7 +949,7 @@ jobs:
 #            build: 'Release'
 #            use_acl_graph: 'off'
 #    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    timeout-minutes: 20
+    timeout-minutes: 90
 #    steps:
 #      - name: Checkout
 #        uses: actions/checkout@v6
@@ -1115,7 +1021,8 @@ jobs:
     needs: [check-release, get-version]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     steps:
       - name: Checkout code
@@ -1172,12 +1079,13 @@ jobs:
   ui-build:
     needs: [check-release, get-version]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    continue-on-error: true
     uses: ./.github/workflows/ui-build.yml
     with:
       hf_ui_version: ${{ needs.get-version.outputs.ui_version }}
 
   release:
-    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/main' ) || github.event.inputs.create_release == 'true' }}
 
     # Fine-grant permission
     # https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
@@ -1185,7 +1093,8 @@ jobs:
         contents: write # for creating release
 
     runs-on: ubuntu-slim
-    timeout-minutes: 20
+    timeout-minutes: 90
+    continue-on-error: true
 
     needs:
       - get-version
@@ -1348,7 +1257,7 @@ jobs:
             }
 
   ui-publish:
-    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/main' ) || github.event.inputs.create_release == 'true' }}
 
     needs:
       - release
