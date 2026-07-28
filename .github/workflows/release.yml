@@ -853,7 +853,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 180
     continue-on-error: true
 
     permissions:
@@ -902,7 +902,8 @@ jobs:
             -DGGML_CPU=OFF ^
             -DGGML_CUDA=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DGGML_CUDA_CUB_3DOT2=ON
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DCMAKE_CUDA_FLAGS="-diag-suppress=177 -t0"
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
 
@@ -1562,7 +1563,6 @@ jobs:
         contents: write # for creating release
 
     runs-on: ubuntu-slim
-    timeout-minutes: 90
 
     needs:
       - get-version
