@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "llama.h"
 
 struct llama_model;
 
@@ -32,7 +33,7 @@ ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
 void update();
 
 // total bytes of routed-expert weight tensors (for dense-fit estimates)
-size_t expert_weight_bytes(const llama_model & model);
+LLAMA_API size_t expert_weight_bytes(const llama_model & model);
 
 // fused cold-expert path for one MoE layer, two calls per layer:
 // begin (before the expert matmuls): validates the layer and makes
