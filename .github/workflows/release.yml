@@ -949,7 +949,7 @@ jobs:
 #            build: 'Release'
 #            use_acl_graph: 'off'
 #    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    timeout-minutes: 90
+#    timeout-minutes: 90
 #    steps:
 #      - name: Checkout
 #        uses: actions/checkout@v6
@@ -1079,7 +1079,6 @@ jobs:
   ui-build:
     needs: [check-release, get-version]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
-    continue-on-error: true
     uses: ./.github/workflows/ui-build.yml
     with:
       hf_ui_version: ${{ needs.get-version.outputs.ui_version }}
