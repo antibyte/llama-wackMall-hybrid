@@ -1342,7 +1342,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     if (!params.cmoe) {
+#ifdef _WIN32
+        _putenv_s("LLAMA_EXPERT_S", "0");
+#else
         setenv("LLAMA_EXPERT_S", "0", 1);
+#endif
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);
