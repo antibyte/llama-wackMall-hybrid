@@ -1,3 +1,5 @@
+This project is in active development. The public branch is a few days of commits behind because im trying to iron out a lot of the underlying systems before i publish. Feel free to contact me if you wish to help me test it at miltiadiskd@gmail.com
+
 # llama-wackMall
 
 > Expert-granular MoE tiering for llama.cpp: hot experts in VRAM, cold experts in RAM, adaptive online cache, zero-config auto-fit.
