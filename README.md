@@ -1,4 +1,4 @@
-This project is in active development. The public branch is a few days of commits behind because im trying to iron out a lot of the underlying systems before i publish. Feel free to contact me if you wish to help me test or contribute to the latest version at miltiadiskd@gmail.com
+This project is in active development. The public branch is a few days of commits behind because im trying to iron out a lot of the underlying systems before i publish as I am replacing mmap entirely. Feel free to contact me if you wish to help me test or contribute to the latest version at miltiadiskd@gmail.com
 
 # llama-wackMall
 
