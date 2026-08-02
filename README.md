@@ -207,7 +207,7 @@ q4_0/q4_0:
 ```bash
 -ctk q8_0 -ctv q4_0 \
 --spec-draft-type-k q4_0 --spec-draft-type-v q4_0 \
---reasoning-budget 64 \
+--reasoning-budget 256 \
 -n 4096
 ```
 
@@ -218,9 +218,11 @@ fell from 45.29 to 42.04 tok/s (-7.2%).  Strict C99 still exposed a generated
 `M_PI` portability defect, so this is evidence for a quality preference, not a
 claim that generated code no longer needs validation.  Larger GPUs should also
 test target q8_0/q8_0; on the 6-GiB card it auto-fitted the fixed tier down from
-S=33 to S=30.  The 64-token default prevents forced reasoning termination from
-landing in the middle of code for this tested prompt; clients can request a
-larger reasoning budget explicitly for tasks that genuinely need it.
+S=33 to S=30.  The deterministic quality screen used a 64-token reasoning
+budget.  Production currently uses 256 tokens as a quality-oriented compromise:
+64 was visibly too terse in interactive use, while 1,024 had already started
+drafting final code inside the reasoning block before the forced transition.
+Clients can still request a different reasoning budget explicitly.
 
 ### Safe dynamic learning mode
 
