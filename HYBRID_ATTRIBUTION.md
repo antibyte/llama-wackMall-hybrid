@@ -74,9 +74,7 @@ The warmcache state machine and slot transaction code are a new implementation f
   `tools/aggregate_expert_profiles.py`, `tools/optimize_expert_placement.py`,
   `tools/debug_sigsegv_backtrace.cpp`, `scripts/collect_expert_profiles.sh`,
   `scripts/hybrid_profile_corpus.jsonl`, and `scripts/bench_hybrid.sh`.
-- New project records are `HYBRID_ANALYSIS.md`, `HYBRID_DESIGN.md`,
-  `HYBRID_ATTRIBUTION.md`, `HYBRID_EXPERIMENTS.md`, and the preserved raw
-  artifacts below `benchmark-results/`.
+- New project records are `HYBRID_ANALYSIS.md`, `HYBRID_DESIGN.md`, `HYBRID_ATTRIBUTION.md`, and `HYBRID_EXPERIMENTS.md`. Raw benchmark artifacts remain local and untracked below `benchmark-results/`.
 - New hybrid files are contributed under the repository's Apache-2.0 license unless a file states otherwise.
 - Files adapted from upstream llama.cpp retain the MIT attribution already present in `NOTICE`.
 

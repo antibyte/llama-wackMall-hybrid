@@ -1,3 +1,349 @@
+# llama-wackMall hybrid prototype
+
+This branch keeps llama-wackMall as the execution engine and adds a profiled static expert tier, strict LuceBox Spark profile conversion, layer-variable placement, request-balanced profile collection, an experimental bounded warm cache, and guarded CPU/synchronization experiments. The normal llama.cpp CUDA path and wackMall MTP-1/2/3 decoding remain authoritative.
+
+The safe defaults preserve existing wackMall behavior. Every experimental feature is controlled by an environment variable, so the same code can be tuned for cards with more VRAM without hard-coding GTX 1660 Ti limits.
+
+## Current measured status
+
+The fastest reproducible local configuration on an NVIDIA GTX 1660 Ti is MTP-2, a learned top-33 fixed placement, no warm slots, q4_0/q4_0 target and draft KV, and optional cold-row reuse. Three 2,000-token runs with row reuse reached 46.593, 46.508, and 46.335 token/s, for a median of 46.508 token/s. The matching control median was 46.362 token/s, so row reuse remains default-off because the gain is only 0.31% and can be hardware dependent.
+
+MTP-3 is implemented and tested, but it was slower than MTP-2 on this machine. The warm cache is correct and remains available for larger GPUs, but W=1/2/4 caused copy churn and was slower on the 6-GiB card. Do not interpret either result as a limit for other GPUs; use the reproducible sizing and benchmark procedure below.
+
+See [HYBRID_EXPERIMENTS.md](HYBRID_EXPERIMENTS.md) for measured runs and rejected approaches, [HYBRID_DESIGN.md](HYBRID_DESIGN.md) for flags and invariants, [HYBRID_ANALYSIS.md](HYBRID_ANALYSIS.md) for the architecture comparison, and [HYBRID_ATTRIBUTION.md](HYBRID_ATTRIBUTION.md) for LuceBox attribution.
+
+## Repository contents
+
+| Path | Purpose |
+|---|---|
+| `tools/convert_luce_spark_profile.py` | Strict Spark-to-wackMall profile conversion with GGUF validation |
+| `tools/aggregate_expert_profiles.py` | Prompt-balanced aggregation of request-local usage profiles |
+| `tools/optimize_expert_placement.py` | Exact byte-budget optimizer for layer-variable static placement |
+| `scripts/collect_expert_profiles.sh` | Reproducible profile collection over the included JSONL corpus |
+| `scripts/bench_hybrid.sh` | Fresh-process warm-up and repeated 2,000-token benchmark runner |
+| `tests/test-expert-warm-cache.cpp` | LRU slot, in-flight copy, LUT, and sentinel state tests |
+| `tests/test-expert-placement.cpp` | Placement manifest validation tests |
+
+Generated builds, local profiles, model files, traces, and `benchmark-results/` are intentionally excluded by `.gitignore`.
+
+## 1. Requirements
+
+The tested NVIDIA build needs Git, CMake, Ninja, GCC/G++ 12, Python 3, curl, the CUDA toolkit, and a compatible NVIDIA driver. On Pop!_OS or Ubuntu, install the ordinary build tools with:
+
+```bash
+sudo apt update
+sudo apt install -y git cmake ninja-build build-essential gcc-12 g++-12 python3 curl
+```
+
+Install the CUDA toolkit using the packaging method appropriate for the host, then verify the driver and compiler before configuring:
+
+```bash
+nvidia-smi
+nvcc --version
+```
+
+The benchmark monitor also requires `nvidia-smi`, `ps`, `sha256sum`, and curl. No Python packages outside the standard library are required by the hybrid tools.
+
+## 2. Clone and build
+
+Clone your fork into a new directory and keep model files outside the repository:
+
+```bash
+git clone https://github.com/YOUR_ACCOUNT/llama-wackMall.git llama-wackMall-hybrid
+cd llama-wackMall-hybrid
+git switch codex/hybrid-profile-placement
+```
+
+Use the native CUDA architecture for the target GPU. The GTX 1660 Ti uses SM 75:
+
+```bash
+cmake -S . -B build-hybrid -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=75 \
+    -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12 \
+    -DLLAMA_BUILD_TESTS=ON
+
+cmake --build build-hybrid -j 8 --target llama-server llama-cli
+```
+
+For another NVIDIA GPU, replace `75` with its native SM architecture and retain a separate build directory for each architecture. This project does not force `GGML_CUDA_FORCE_MMQ`; it was slower on SM 75.
+
+## 3. Validate local inputs
+
+Set paths explicitly and verify them before conversion or inference:
+
+```bash
+MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+LUCE_MODEL="$HOME/models/qwen3.6-35b-a3b-luce/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+SPARK="$LUCE_MODEL.spark.csv"
+
+test -f "$MODEL"
+test -f "$LUCE_MODEL"
+test -f "$SPARK"
+```
+
+Never commit `.gguf` files, private prompts, raw request profiles, or benchmark responses. The repository ignores standard local locations, but review `git status` before every commit.
+
+## 4. Convert a LuceBox Spark profile
+
+Create a local output directory and run the strict converter. It refuses to overwrite an existing output, validates layer/expert dimensions and model metadata, and reports conversion statistics:
+
+```bash
+mkdir -p local-profiles
+
+python3 tools/convert_luce_spark_profile.py \
+    --input "$SPARK" \
+    --output local-profiles/luce-warmstart.csv \
+    --model "$MODEL" \
+    --source-model "$LUCE_MODEL"
+```
+
+Raw lifetime counts can dominate online adaptation. For a static top-33 placement seed, request the policy explicitly:
+
+```bash
+python3 tools/convert_luce_spark_profile.py \
+    --input "$SPARK" \
+    --output local-profiles/luce-placement-s33.csv \
+    --model "$MODEL" \
+    --source-model "$LUCE_MODEL" \
+    --placement-slots 33
+```
+
+The Luce profile is only a warm start. A profile learned from the intended workload is normally a better production choice.
+
+## 5. Learn a request-balanced profile
+
+The included corpus covers several workload categories. The collector starts a fresh server for each selected prompt, writes session-only expert usage, validates it against JSON statistics, and normalizes every request before aggregation:
+
+```bash
+PROFILE="$PWD/local-profiles/luce-placement-s33.csv" \
+MODEL="$MODEL" \
+OUTPUT_DIR="$PWD/benchmark-results/profile-corpus-general" \
+N_PREDICT=256 \
+MTP_N=2 \
+FIXED_S=33 \
+CPU_THREADS=8 \
+DRAFT_THREADS=8 \
+./scripts/collect_expert_profiles.sh
+
+GENERAL_PROFILE="$PWD/local-profiles/general-profile.csv"
+if [[ -e "$GENERAL_PROFILE" ]]; then
+    echo "Output already exists and was not overwritten: $GENERAL_PROFILE" >&2
+else
+    cp benchmark-results/profile-corpus-general/general-profile.csv "$GENERAL_PROFILE"
+fi
+```
+
+Use `PROFILE_IDS=id1,id2,...` to build a category-specific profile from entries in `scripts/hybrid_profile_corpus.jsonl`. Use separate outputs such as `general-profile.csv`, `coding-profile.csv`, and `tools-profile.csv`, then select one only at server startup or between requests. Do not swap placement during an active MTP verification batch.
+
+## 6. Run the stable MTP-2 configuration
+
+This is the tested 6-GiB recipe. It uses eight physical CPU workers because the Ryzen 7 4800H has eight physical cores; seeing fewer than 16 logical CPUs fully occupied is not by itself an error. Test thread counts on the target host instead of optimizing for CPU utilization percentage.
+
+```bash
+PROFILE="$PWD/local-profiles/general-profile.csv"
+
+CUDA_VISIBLE_DEVICES=0 \
+LLAMA_CMOE_BATCH=32 \
+LLAMA_CMOE_UBATCH=32 \
+LLAMA_EXPERT_HOT="$PROFILE" \
+LLAMA_EXPERT_S=33 \
+LLAMA_EXPERT_ADAPT=0 \
+LLAMA_EXPERT_WARM_SLOTS=0 \
+LLAMA_EXPERT_STATIC_NO_SYNC=1 \
+LLAMA_EXPERT_STATS=0 \
+LLAMA_EXPERT_STATS_JSON=0 \
+LLAMA_EXPERT_USAGE=0 \
+LLAMA_EXPERT_CPU_REUSE_ROWS=1 \
+./build-hybrid/bin/llama-server \
+    -m "$MODEL" \
+    --load-mode mmap \
+    -c 32768 \
+    -ctk q4_0 \
+    -ctv q4_0 \
+    -fa on \
+    -cmoe \
+    -np 1 \
+    --threads 8 \
+    --threads-batch 8 \
+    --no-mmproj \
+    --spec-type draft-mtp \
+    --spec-draft-n-max 2 \
+    --spec-draft-ngl auto \
+    --spec-draft-type-k q4_0 \
+    --spec-draft-type-v q4_0 \
+    --spec-draft-threads 8 \
+    --spec-draft-threads-batch 8 \
+    --reasoning-budget 16384 \
+    --ctx-checkpoints 0 \
+    --cache-ram 0 \
+    --jinja \
+    --offline \
+    --host 127.0.0.1 \
+    --port 8080 \
+    -a qwen3.6-35b-a3b-hybrid
+```
+
+Set `LLAMA_EXPERT_CPU_REUSE_ROWS=0` for the conservative cross-platform behavior. Static no-sync activates only when adaptation, warm slots, statistics, timing, and usage output are all disabled; the server log must contain `expert_tier: static no-sync enabled`.
+
+Change `--spec-draft-n-max` to 1 or 3 for MTP-1/MTP-3, or remove all `--spec-*` options for a no-MTP control. Always compare token/output hashes and MTP acceptance, not throughput alone.
+
+## 7. Run a reproducible benchmark
+
+The runner keeps context, prompt, temperature, batch sizes, warm-up procedure, and process lifetime fixed. Case `SC` is a fixed static profile with no warm cache and guarded no-sync:
+
+```bash
+RESULTS_DIR="$PWD/benchmark-results/mtp2-s33-$(date -u +%Y%m%dT%H%M%SZ)" \
+MODEL="$MODEL" \
+PROFILE="$PWD/local-profiles/general-profile.csv" \
+CASES=SC \
+REPEATS=3 \
+N_PREDICT=2000 \
+WARMUP_TOKENS=64 \
+STATIC_FIXED_S=33 \
+CPU_THREADS=8 \
+DRAFT_THREADS=8 \
+DRAFT_TYPE_K=q4_0 \
+DRAFT_TYPE_V=q4_0 \
+CPU_REUSE_ROWS=1 \
+./scripts/bench_hybrid.sh
+```
+
+Use `MTP_OVERRIDE=0`, `1`, `2`, or `3` for comparable MTP screens. Case `SD` enables expert statistics and the required synchronization for diagnostics. Cases `SV` and `SVC` use a layer-variable placement manifest through `PLACEMENT=...`. Warm-cache cases are available in the script but remain experimental, and MTP warm residency is guarded off by default.
+
+The primary metric is median sustained decode token/s over 2,000 tokens. Reject a candidate if hashes unexpectedly diverge, output quality fails, CUDA hangs, NVIDIA Xid appears, VRAM OOM occurs, or throughput regresses more than the experiment's declared threshold.
+
+## 8. Optimize placement for the target GPU
+
+First benchmark fixed static placement with W=0. Leave `LLAMA_EXPERT_S` unset for auto-fit, then test a small integer range around the logged auto-fit value. Do not pass the literal value `auto` to `LLAMA_EXPERT_S`. Keep `LLAMA_EXPERT_VRAM_RESERVE_MIB=512` until the complete 32K-context configuration has demonstrated safe headroom.
+
+Then allocate the same exact fixed-expert byte budget unevenly across layers:
+
+```bash
+python3 tools/optimize_expert_placement.py \
+    --profile "$PWD/local-profiles/general-profile.csv" \
+    --model "$MODEL" \
+    --output "$PWD/local-profiles/placement-reference-s33.csv" \
+    --reference-slots 33 \
+    --min-slots 8 \
+    --max-slots 96 \
+    --objective counts-per-byte
+```
+
+Run the result with both `LLAMA_EXPERT_HOT` and `LLAMA_EXPERT_PLACEMENT`, with adaptation disabled and W=0. The runtime verifies the profile SHA-256, tensor sizes, byte budget, dimensions, architecture, and available VRAM before publishing the LUT.
+
+To weight placement by measured cold CPU cost, first run a diagnostic case with timing enabled, then feed its per-layer JSON to a new optimizer output:
+
+```bash
+RESULTS_DIR="$PWD/benchmark-results/layer-timing" \
+MODEL="$MODEL" \
+PROFILE="$PWD/local-profiles/general-profile.csv" \
+CASES=SD \
+REPEATS=1 \
+N_PREDICT=512 \
+STATIC_FIXED_S=33 \
+EXPERT_TIMING=1 \
+./scripts/bench_hybrid.sh
+
+python3 tools/optimize_expert_placement.py \
+    --profile "$PWD/local-profiles/general-profile.csv" \
+    --model "$MODEL" \
+    --output "$PWD/local-profiles/placement-cost-s33.csv" \
+    --reference-slots 33 \
+    --min-slots 8 \
+    --max-slots 96 \
+    --objective counts-per-byte \
+    --layer-stats-json "$PWD/benchmark-results/layer-timing/SD-run1.experts.json"
+```
+
+For a larger GPU, use `--fixed-budget-mib` or a larger `--reference-slots` value rather than copying the GTX 1660 Ti's S=33. The optimizer derives per-layer expert bytes from the GGUF, so heterogeneous layer sizes remain correctly budgeted. An optional `--layer-stats-json` weights avoided cold selections by measured CPU cost.
+
+Only after static placement is optimized should a larger GPU test the warm tier. Start with bounded values such as W=4, 8, and 16, monitor copy volume and evictions, and compare against W=0. `LLAMA_EXPERT_WARM_SLOTS=auto` consumes remaining measured capacity, while `LLAMA_EXPERT_WARM_AUTO_MAX` raises the conservative default cap of four. If synchronous W improves throughput, test one async prefetch stream with a small in-flight limit before adding concurrency.
+
+Recommended optimization order:
+
+1. Representative request-balanced profile.
+2. Fixed S and thread-count sweep with W=0.
+3. Layer-variable placement under the same byte budget.
+4. CPU-cost-weighted placement from timing statistics.
+5. MTP-0/1/2/3 comparison with deterministic hashes.
+6. Warm-cache sizing on GPUs with real remaining VRAM.
+7. Async prefetch only after synchronous residency is beneficial.
+
+Test physical-core and SMT thread counts such as 6, 8, 12, and 16. More occupied cores do not guarantee more token/s because target CPU experts, the MTP draft context, CUDA submission, and memory bandwidth compete for the same resources.
+
+Key portable controls:
+
+| Variable | Safe default | Purpose |
+|---|---:|---|
+| `LLAMA_EXPERT_HOT` | unset | Validated ranking/usage CSV used to choose fixed experts |
+| `LLAMA_EXPERT_S` | unset (auto-fit) | Uniform fixed slots per layer; omit when using a placement manifest |
+| `LLAMA_EXPERT_PLACEMENT` | unset | Validated layer-variable static slot manifest |
+| `LLAMA_EXPERT_ADAPT` | 1 | Long-term online score updates and repinning |
+| `LLAMA_EXPERT_USAGE` | unset | Persist expert usage to a CSV at orderly shutdown |
+| `LLAMA_EXPERT_USAGE_MODE` | cumulative | Select cumulative or request/session-only export |
+| `LLAMA_EXPERT_STATS_JSON` | unset | Machine-readable counters and optional timing output |
+| `LLAMA_EXPERT_TIMING` | 0 | Detailed CPU expert phase timing; use only for diagnosis |
+| `LLAMA_EXPERT_WARM_SLOTS` | 0 | Additional bounded LRU slots per layer; integer or auto |
+| `LLAMA_EXPERT_WARM_AUTO_MAX` | 4 | Safety cap for automatic warm slots; raise only after measuring a larger GPU |
+| `LLAMA_EXPERT_VRAM_RESERVE_MIB` | 512 | Headroom retained after model and runtime allocations |
+| `LLAMA_EXPERT_WARM_PREFETCH` | 0 | Experimental asynchronous H2D population of warm slots |
+| `LLAMA_EXPERT_STATIC_NO_SYNC` | 0 | Skip only the expert-tier update barrier under strict immutable-tier conditions |
+| `LLAMA_EXPERT_CPU_REUSE_ROWS` | 0 | Reuse quantized cold rows across repeated MTP expert selections |
+| `LLAMA_EXPERT_CPU_ASYNC` | 0 | Experimental CPU-cold/GPU-hot overlap; benchmark before use |
+
+## 9. Correctness tests
+
+Run the hybrid Python suites:
+
+```bash
+python3 -m unittest \
+    tests/test-convert-luce-spark-profile.py \
+    tests/test-aggregate-expert-profiles.py \
+    tests/test-optimize-expert-placement.py
+```
+
+Build and run the targeted C++ tests:
+
+```bash
+cmake --build build-hybrid -j 8 --target test-expert-warm-cache test-expert-placement test-arg-parser test-backend-ops
+
+./build-hybrid/bin/test-expert-warm-cache
+./build-hybrid/bin/test-expert-placement
+./build-hybrid/bin/test-arg-parser
+./build-hybrid/bin/test-backend-ops
+```
+
+The full CTest suite may require Git LFS test data and generated upstream fixtures. Read [HYBRID_EXPERIMENTS.md](HYBRID_EXPERIMENTS.md) before interpreting failures outside the changed expert-tier paths.
+
+## 10. Prepare a GitHub push
+
+This checkout may still use the upstream repository as `origin`. Point a separate `origin` at your own fork and retain upstream under a distinct name:
+
+```bash
+git remote -v
+git remote rename origin upstream
+git remote add origin git@github.com:YOUR_ACCOUNT/llama-wackMall.git
+```
+
+Review exactly what Git would publish:
+
+```bash
+git status --short
+git diff --check
+git check-ignore -v benchmark-results/example local-profiles/example build-hybrid/CMakeCache.txt
+git ls-files | grep -E '(^|/)(benchmark-results|local-profiles|build-hybrid)/' || true
+git diff --cached --name-only | grep -E '\.(gguf|log|nsys-rep|qdstrm)$' || true
+git diff --stat
+```
+
+Commit and push only after reviewing every changed line and understanding the implementation. Follow [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md); the upstream project explicitly forbids automated PR submission and AI-written PR descriptions or review responses.
+
+---
+
+## Original llama-wackMall documentation
+
 This project is in active development. The public branch is a few days of commits behind because im trying to iron out a lot of the underlying systems before i publish as I am replacing mmap entirely. Feel free to contact me if you wish to help me test or contribute to the latest version at miltiadiskd@gmail.com
 
 # llama-wackMall

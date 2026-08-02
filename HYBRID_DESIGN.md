@@ -1,15 +1,7 @@
 # Hybrid design
 
 Date: 2026-08-02
-Status: Phases 0-3 are implemented behind default-off feature flags. Async
-prefetch is validated for no-MTP execution. Warmcache plus MTP is guarded off
-by default after deterministic controls failed for both synchronous and async
-warm residency. Phase 4 has a strictly guarded static no-sync experiment;
-deferred adaptation and double-buffered counts are not implemented. A strict
-offline layer-variable static placement prototype, prompt-balanced profile
-aggregation, session-local usage export, and CPU cold timing are implemented.
-The production winner remains fixed placement with W=0; draft KV q4_0/q4_0
-raised the measured MTP-2 median to 46.433 token/s.
+Status: Phases 0-3 are implemented behind default-off feature flags. Async prefetch is validated for no-MTP execution. Warmcache plus MTP is guarded off by default after deterministic controls failed for both synchronous and async warm residency. Phase 4 has a strictly guarded static no-sync experiment; deferred adaptation and double-buffered counts are not implemented. A strict offline layer-variable static placement prototype, prompt-balanced profile aggregation, session-local usage export, and CPU cold timing are implemented. The production winner remains fixed placement with W=0. Draft KV q4_0/q4_0 reached a measured MTP-2 median of 46.433 token/s; optional cold-row reuse later reached 46.508 token/s but remains default-off because the measured gain was only 0.31%.
 
 ## Goals and non-goals
 

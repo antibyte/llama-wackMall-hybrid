@@ -38,6 +38,8 @@
 
 /gcovr-report/
 /lcov-report/
+*.profraw
+*.profdata
 
 # Build Artifacts
 
@@ -96,6 +98,9 @@
 
 /.venv
 __pycache__/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
 */poetry.lock
 poetry.toml
 poetry.lock
@@ -141,6 +146,18 @@ flake.lock
 /run-chat.sh
 /run-spec.sh
 /.ccache/
+
+# Hybrid local artifacts
+
+/benchmark-results/
+/local-profiles/
+*.nsys-rep
+*.qdstrm
+/perf.data
+/perf.data.old
+/core
+/core.[0-9]*
+/vgcore.*
 
 # IDE
 
