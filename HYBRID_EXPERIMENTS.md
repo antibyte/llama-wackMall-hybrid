@@ -394,3 +394,160 @@ The best learned static profile was also checked without warm slots:
 MTP-3 was first screened at 41.541 tok/s over 512 tokens, then explicitly
 confirmed with the full 2,000-token run. All modes completed correctly, but
 their different accepted draft paths produce different deterministic hashes.
+
+## Prompt-balanced profiles and layer-variable placement
+
+Session-local usage export was validated over a 64-token MTP-2 run: the sparse
+CSV contained 36,800 selections, exactly equal to JSON `selected_total`, and no
+seed count leaked into it. A twelve-prompt corpus collector then produced
+independent profiles for German/English reasoning, Go/Python code, Linux/Yocto,
+tool JSON, product planning, quantitative reasoning, security, short answers,
+translation, and structured extraction.
+
+Eight 128-token training prompts were normalized independently and held out
+four categories. On 512-token holdout traces their static top-33 coverage was:
+
+| Profile | Mean top-33 coverage |
+|---|---:|
+| Luce placement warmstart | 38.746% |
+| benchmark-prompt specialist | 34.017% |
+| prompt-balanced train-128 | 44.477% |
+| prompt-balanced train-512 | 43.378% |
+| mixed train-128/train-512 | 44.256% |
+
+Single 512-token static MTP-2 screens for the train-128 profile versus the
+Luce placement measured +1.15% on security, -0.26% on concise QA, +2.10% on
+translation, and +2.11% on structured extraction. These are screens, not
+three-run medians, but they support a general profile bank rather than using
+the benchmark-specific 45-TPS profile for unrelated traffic.
+
+The strict layer-variable runtime was exercised with 1,321 fixed slots in a
+16..43 range under the fixed-byte budget of uniform S=33. All 40 layer records,
+36,800 selections, LUTs, and sentinels validated. The first 64-token MTP-2
+control was hash-identical to uniform S=33. On a 512-token structured holdout,
+variable placement reduced cold share from 63.130% to 60.088% but slowed from
+41.031 to 39.647 tok/s and changed the token path. Without MTP it screened
+0.80% faster over 256 tokens, also on a changed path. This general placement is
+retained as experimental, not selected for production.
+
+An offline capacity sweep demonstrates that the implementation is not tied to
+6 GiB. Including one sentinel per layer, uniform-reference fixed budgets and
+prompt-balanced holdout coverage were:
+
+| Reference S | Tier GiB | Uniform coverage | Variable coverage |
+|---:|---:|---:|---:|
+| 33 | 2.419 | 44.477% | 44.505% |
+| 64 | 4.627 | 62.501% | 62.580% |
+| 96 | 6.905 | 75.133% | 75.218% |
+| 128 | 9.182 | 83.412% | 83.739% |
+| 160 | 11.461 | 89.833% | 90.162% |
+| 192 | 13.739 | 94.573% | 94.917% |
+
+These are offline coverage estimates, not throughput claims for untested GPUs.
+They show why byte budgets, slot bounds, warm auto cap, and reserve remain
+parameters. Larger cards should first spend VRAM on static fixed experts, then
+re-evaluate a larger warmcache after measuring remaining churn.
+
+## CPU cold timing and cost-based placement
+
+`LLAMA_EXPERT_TIMING=1` measured 3,273.377 ms of fused CPU cold-node wall time
+over a 512-token specialist run, or 6.393 ms per output token. Layer 0 used
+159.182 ms; layers 2 and 1 used 143.665 and 140.067 ms. The q6_K down-weight
+layers and several early layers had the highest time per cold selection.
+
+A cost-weighted S=33-byte placement screened at 46.159 tok/s over 512 tokens
+and lowered cold share from 38.542% to 31.908%. The required sustained probe,
+however, reached only 44.445 tok/s over 2,000 tokens, 1.79% below the stable
+45.253 median. Further repetitions stopped. The runtime and optimizer remain
+useful for larger budgets, but this concrete 6-GiB layout is not a winner.
+
+The fused op already uses scheduler-owned persistent scratch. A bit-identical
+singleton row-chunk sweep measured 44.208, 44.872, 44.963, 44.683, and 44.707
+tok/s for chunks 16, 32, 64, 128, and 256. The original/default 64 remains best
+on the Ryzen 7 4800H. Average process CPU utilization does not imply only four
+workers: all eight participate during the cold-node phases, while GPU work,
+sampling, and waits lower the whole-request average.
+
+## MTP parameter screens and new best result
+
+MTP-2 `p_min` values 0.05 and 0.10 did not change draft behavior. Values 0.20
+and 0.30 changed the path and fell to 43.073 and 42.587 tok/s. Moving draft
+sampling from the backend to the host preserved hashes but fell to 43.687
+tok/s. Both directions stopped.
+
+Changing only the MTP draft KV from q8_0/q4_0 to q4_0/q4_0 preserved the exact
+512-token hashes, acceptance, and mean accepted length while reducing peak VRAM
+by about 8 MiB. The serious 3x2,000-token run measured:
+
+| Run | Decode tok/s | Acceptance | Mean length | Peak VRAM |
+|---:|---:|---:|---:|---:|
+| 1 | 46.538 | 0.806409 | 2.61 | 5,530 MiB |
+| 2 | 46.433 | 0.806409 | 2.61 | 5,530 MiB |
+| 3 | 46.271 | 0.806409 | 2.61 | 5,530 MiB |
+
+Median sustained decode is **46.433 tok/s**. All three output hashes and token
+hashes are identical and equal to the prior q8_0/q4_0 specialist result. This
+is 2.61% above the previous 45.253 median and 16.36% above the older 39.906
+reference. Artifact:
+`benchmark-results/mtp2-draft-kv-q4q4-2000-repeat3-20260802T150000Z`.
+
+MTP-3 with q4_0/q4_0 reached only 41.292 tok/s in its 512-token screen
+(acceptance 0.5924, mean length 2.78). The earlier full MTP-3 run was already
+40.406 tok/s, so another long run is not justified. MTP-2 remains the winner.
+
+## Cold phase decomposition and activation parallelism
+
+The runtime timing mode was extended to decompose the fused CPU cold operation
+into Gate/Up dot products, activation plus intermediate quantization, and Down
+dot products. Two deterministic 256-token MTP-2 q4_0/q4_0 screens used the
+specialist S=33 placement, W=0, eight target/draft threads, static no-sync, and
+otherwise identical settings:
+
+| Activation scheduling | Decode tok/s | Gate/Up ms | Activation ms | Down ms | Whole cold ms |
+|---|---:|---:|---:|---:|---:|
+| original | 43.097 | 1,072.500 | 40.004 | 715.545 | 1,920.669 |
+| block-parallel | 43.192 | 1,070.198 | 32.114 | 716.290 | 1,911.099 |
+
+Output and token hashes were identical. Block parallelism reduced its target
+phase by 19.72%, but improved total throughput by only 0.22%, because activation
+was about 2.1% of the measured cold-node wall time. The option remains
+parameterized for CPUs with more cores and defaults off; it does not justify a
+long benchmark on this CPU. Gate/Up and Down quantized dot products account for
+the useful CPU optimization target. Artifacts:
+`benchmark-results/cpu-act-phase-baseline-256-20260802T160500Z` and
+`benchmark-results/cpu-act-phase-parallel-256-20260802T161000Z`.
+
+This also explains the observed whole-process utilization of roughly four
+logical CPUs. Eight workers participate in the cold dot-product phases, but
+GPU execution, sampling, cross-backend waits, uneven expert work, and the short
+activation phase reduce the request-wide average. Pinning one SMT thread per
+physical core (`5555`) and using more than eight workers had already reduced
+throughput, so maximizing the utilization display is not an optimization goal.
+
+## CUDA/backend timeline
+
+Nsight Systems 2022.4.2 captured one 64-token static MTP-2 q4_0/q4_0 request.
+The profiler itself lowered decode to 39.64 tok/s, so absolute throughput from
+this run is not comparable to uninstrumented results. Within the approximately
+1.63-second decode window, the trace recorded:
+
+- 10,082 `cudaStreamSynchronize` calls on the server thread, totaling 707.2 ms
+  of host-call duration;
+- about 112.5 ms summed CUDA-kernel duration on the two active streams;
+- 1,892 H2D operations totaling 226.3 MiB and 38.4 ms of device-copy duration;
+- 2,296 D2H operations totaling 94.1 MiB and 16.1 ms of device-copy duration.
+
+The sums can overlap and include profiler overhead, so they are not additive.
+They nevertheless disprove the idea that the previously tested tier-specific
+post-ubatch barrier was the only synchronization cost. The generic scheduler
+alternates CUDA and CPU splits around every cold layer. CPU backend execution
+is synchronous, and cross-backend copies synchronize source or destination
+backends, so the intended hot-GPU/cold-CPU graph independence does not yet
+guarantee real overlap.
+
+The imported report, SQLite export, and summaries are preserved at
+`benchmark-results/nsys-static-mtp2-q4q4-64-20260802T162000Z`. The original
+target-side `nsys` command could capture but not import; using the installed
+host `QdstrmImporter` recovered the report. This evidence justifies a narrowly
+guarded asynchronous CPU-split prototype, but not an unconditional scheduler
+rewrite.

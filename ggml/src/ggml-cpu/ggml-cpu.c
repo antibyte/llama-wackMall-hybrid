@@ -34,6 +34,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <stdatomic.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
@@ -58,6 +59,91 @@
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
 // and we'll use C++ attribute syntax.
 #define GGML_CACHE_LINE  64
+
+#define GGML_MOE_PROFILE_MAX_LAYERS 4096
+
+static atomic_bool g_moe_profile_enabled;
+static atomic_uint_fast64_t g_moe_profile_runs[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_uint_fast64_t g_moe_profile_wall_us[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_uint_fast64_t g_moe_profile_gate_up_us[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_uint_fast64_t g_moe_profile_activation_us[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_uint_fast64_t g_moe_profile_down_us[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_int g_moe_single_row_chunk = 64;
+static atomic_bool g_moe_parallel_activation;
+
+void ggml_cpu_moe_profile_enable(bool enabled) {
+    atomic_store_explicit(&g_moe_profile_enabled, enabled, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_profile_reset(void) {
+    for (int layer = 0; layer < GGML_MOE_PROFILE_MAX_LAYERS; ++layer) {
+        atomic_store_explicit(&g_moe_profile_runs[layer], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_moe_profile_wall_us[layer], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_moe_profile_gate_up_us[layer], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_moe_profile_activation_us[layer], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_moe_profile_down_us[layer], 0, memory_order_relaxed);
+    }
+}
+
+bool ggml_cpu_moe_profile_get_phases(
+        int layer, uint64_t * gate_up_us, uint64_t * activation_us, uint64_t * down_us) {
+    if (layer < 0 || layer >= GGML_MOE_PROFILE_MAX_LAYERS ||
+            !gate_up_us || !activation_us || !down_us) {
+        return false;
+    }
+    *gate_up_us = atomic_load_explicit(&g_moe_profile_gate_up_us[layer], memory_order_relaxed);
+    *activation_us = atomic_load_explicit(&g_moe_profile_activation_us[layer], memory_order_relaxed);
+    *down_us = atomic_load_explicit(&g_moe_profile_down_us[layer], memory_order_relaxed);
+    return true;
+}
+
+bool ggml_cpu_moe_profile_get(int layer, uint64_t * runs, uint64_t * wall_us) {
+    if (layer < 0 || layer >= GGML_MOE_PROFILE_MAX_LAYERS || !runs || !wall_us) {
+        return false;
+    }
+    *runs = atomic_load_explicit(&g_moe_profile_runs[layer], memory_order_relaxed);
+    *wall_us = atomic_load_explicit(&g_moe_profile_wall_us[layer], memory_order_relaxed);
+    return *runs > 0;
+}
+
+void ggml_cpu_moe_set_single_row_chunk(int chunk_size) {
+    GGML_ASSERT(chunk_size > 0);
+    atomic_store_explicit(&g_moe_single_row_chunk, chunk_size, memory_order_relaxed);
+}
+
+int ggml_cpu_moe_get_single_row_chunk(void) {
+    return atomic_load_explicit(&g_moe_single_row_chunk, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_parallel_activation(bool enabled) {
+    atomic_store_explicit(&g_moe_parallel_activation, enabled, memory_order_relaxed);
+}
+
+bool ggml_cpu_moe_get_parallel_activation(void) {
+    return atomic_load_explicit(&g_moe_parallel_activation, memory_order_relaxed);
+}
+
+static bool ggml_cpu_moe_profile_is_enabled(void) {
+    return atomic_load_explicit(&g_moe_profile_enabled, memory_order_relaxed);
+}
+
+static void ggml_cpu_moe_profile_record(int layer, uint64_t wall_us) {
+    if (layer < 0 || layer >= GGML_MOE_PROFILE_MAX_LAYERS) {
+        return;
+    }
+    atomic_fetch_add_explicit(&g_moe_profile_runs[layer], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_moe_profile_wall_us[layer], wall_us, memory_order_relaxed);
+}
+
+static void ggml_cpu_moe_profile_record_phases(
+        int layer, uint64_t gate_up_us, uint64_t activation_us, uint64_t down_us) {
+    if (layer < 0 || layer >= GGML_MOE_PROFILE_MAX_LAYERS) {
+        return;
+    }
+    atomic_fetch_add_explicit(&g_moe_profile_gate_up_us[layer], gate_up_us, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_moe_profile_activation_us[layer], activation_us, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_moe_profile_down_us[layer], down_us, memory_order_relaxed);
+}
 
 #if defined(__clang__) || defined(__GNUC__)
 #define GGML_CACHE_ALIGN __attribute__((aligned(GGML_CACHE_LINE)))
@@ -1968,6 +2054,23 @@ static void ggml_compute_forward_moe_count(
     ((float *) dst->data)[0] = 0.0f;
 }
 
+static void ggml_moe_activate_range(
+        float * gate, const float * up, int64_t begin, int64_t end, bool is_gelu) {
+    if (is_gelu) {
+        for (int64_t i = begin; i < end; i++) {
+            const float g = gate[i];
+            const float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * g * (1.0f + 0.044715f * g * g)));
+            gate[i] = gelu_g * up[i];
+        }
+    } else {
+        for (int64_t i = begin; i < end; i++) {
+            const float g = gate[i];
+            const float silu_g = g / (1.0f + expf(-g));
+            gate[i] = silu_g * up[i];
+        }
+    }
+}
+
 static void ggml_compute_forward_moe_cold(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -2032,7 +2135,15 @@ static void ggml_compute_forward_moe_cold(
     float * up_out   = gate_out + n_ff*maxc;
     char  * act_q    = (char *)  incr_ptr_aligned(&wdata_cur, q_ff*maxc, CACHE_LINE_SIZE);
 
+    // Shared only while optional profiling is active. Keeping it in the
+    // graph work buffer avoids process-global timing state between barriers.
+    int64_t * phase_clock =
+        (int64_t *) incr_ptr_aligned(&wdata_cur, 4*sizeof(int64_t), sizeof(int64_t));
+
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
+
+    const bool profile_phases = ggml_cpu_moe_profile_is_enabled();
+    const int profile_layer = profile_phases ? dst->op_params[0] : -1;
 
     // quantize x once, shared by all experts
     for (int64_t t = ith; t < n_tokens; t++) {
@@ -2074,6 +2185,12 @@ static void ggml_compute_forward_moe_cold(
     }
 
     ggml_barrier(params->threadpool);
+    if (profile_phases) {
+        if (ith == 0) {
+            phase_clock[0] = ggml_time_us();
+        }
+        ggml_barrier(params->threadpool);
+    }
 
     // phase A: gate/up dots for all cold slots into gate_out/up_out
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -2089,7 +2206,7 @@ static void ggml_compute_forward_moe_cold(
 
         int chunk_size = 16;
         if (nr1 == 1) {
-            chunk_size = 64;
+            chunk_size = ggml_cpu_moe_get_single_row_chunk();
         }
         const bool disable_chunking = ggml_is_numa();
         int64_t nchunk0 = (nr0 + chunk_size - 1)/chunk_size;
@@ -2131,28 +2248,46 @@ static void ggml_compute_forward_moe_cold(
     }
 
     ggml_barrier(params->threadpool);
+    if (profile_phases) {
+        if (ith == 0) {
+            phase_clock[1] = ggml_time_us();
+        }
+        ggml_barrier(params->threadpool);
+    }
 
     // phase B (multi-threaded): activation (SwiGLU/GELU) + quantize the intermediate
     const int64_t total_cols = n_as > 0 ? (col0[n_as - 1] + matrix_row_counts[n_as - 1]) : 0;
     const bool is_gelu = (w_gate == w_up);
 
-    for (int64_t c = ith; c < total_cols; c += nth) {
-        float * go = gate_out + c*n_ff;
-        const float * uo = up_out + c*n_ff;
-        if (is_gelu) {
-            for (int64_t i = 0; i < n_ff; i++) {
-                const float g = go[i];
-                const float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * g * (1.0f + 0.044715f * g * g)));
-                go[i] = gelu_g * uo[i];
-            }
-        } else {
-            for (int64_t i = 0; i < n_ff; i++) {
-                const float g = go[i];
-                const float silu_g = g / (1.0f + expf(-g));
-                go[i] = silu_g * uo[i];
-            }
+    if (ggml_cpu_moe_get_parallel_activation()) {
+        // A decode graph often has fewer cold columns than CPU workers. Split
+        // the activation at quant-block boundaries so all workers can help a
+        // singleton column without changing any quantization block's inputs.
+        const int64_t block = ggml_blck_size(vdt_d);
+        GGML_ASSERT(block > 0 && n_ff % block == 0);
+        const int64_t blocks_per_col = n_ff / block;
+        const int64_t total_blocks = total_cols * blocks_per_col;
+        int64_t current = total_blocks * ith / nth;
+        const int64_t end = total_blocks * (ith + 1) / nth;
+
+        while (current < end) {
+            const int64_t c = current / blocks_per_col;
+            const int64_t column_end = MIN(end, (c + 1)*blocks_per_col);
+            const int64_t i0 = (current % blocks_per_col)*block;
+            const int64_t i1 = i0 + (column_end - current)*block;
+            float * go = gate_out + c*n_ff;
+            const float * uo = up_out + c*n_ff;
+            ggml_moe_activate_range(go, uo, i0, i1, is_gelu);
+            from_fa(go + i0, act_q + c*q_ff + ggml_row_size(vdt_d, i0), i1 - i0);
+            current = column_end;
         }
-        from_fa(go, act_q + c*q_ff, n_ff);
+    } else {
+        for (int64_t c = ith; c < total_cols; c += nth) {
+            float * go = gate_out + c*n_ff;
+            const float * uo = up_out + c*n_ff;
+            ggml_moe_activate_range(go, uo, 0, n_ff, is_gelu);
+            from_fa(go, act_q + c*q_ff, n_ff);
+        }
     }
 
     if (ith == 0) {
@@ -2164,6 +2299,12 @@ static void ggml_compute_forward_moe_cold(
     }
 
     ggml_barrier(params->threadpool);
+    if (profile_phases) {
+        if (ith == 0) {
+            phase_clock[2] = ggml_time_us();
+        }
+        ggml_barrier(params->threadpool);
+    }
 
     // phase C: down dots for all cold slots, scattered into dst
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -2178,7 +2319,7 @@ static void ggml_compute_forward_moe_cold(
 
         int chunk_size = 16;
         if (nr1 == 1) {
-            chunk_size = 64;
+            chunk_size = ggml_cpu_moe_get_single_row_chunk();
         }
         const bool disable_chunking = ggml_is_numa();
         int64_t nchunk0 = (nr0 + chunk_size - 1)/chunk_size;
@@ -2214,6 +2355,18 @@ static void ggml_compute_forward_moe_cold(
                 break;
             }
             current_chunk = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
+        }
+    }
+
+    if (profile_phases) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) {
+            phase_clock[3] = ggml_time_us();
+            ggml_cpu_moe_profile_record_phases(
+                    profile_layer,
+                    (uint64_t) (phase_clock[1] - phase_clock[0]),
+                    (uint64_t) (phase_clock[2] - phase_clock[1]),
+                    (uint64_t) (phase_clock[3] - phase_clock[2]));
         }
     }
 }
@@ -3426,6 +3579,8 @@ struct ggml_cplan ggml_graph_plan(
                         cur += 2*w_gate->ne[1]*maxc*sizeof(float) + CACHE_LINE_SIZE;
                         // act_q
                         cur += ggml_row_size(vdt_d, w_gate->ne[1])*maxc + CACHE_LINE_SIZE;
+                        // optional phase timing scratch
+                        cur += 4*sizeof(int64_t) + sizeof(int64_t);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
@@ -3640,6 +3795,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    int pending_last_moe_layer = -1;
+    int64_t pending_last_moe_started_us = 0;
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3651,6 +3808,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        const bool profile_moe = node->op == GGML_OP_MOE_COLD && ggml_cpu_moe_profile_is_enabled();
+        const int profile_layer = profile_moe ? node->op_params[0] : -1;
+        const int64_t profile_started_us = profile_moe && state->ith == 0 ? ggml_time_us() : 0;
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
@@ -3669,6 +3830,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            if (profile_moe && state->ith == 0) {
+                ggml_cpu_moe_profile_record(profile_layer, (uint64_t) (ggml_time_us() - profile_started_us));
+            }
+        } else if (profile_moe && state->ith == 0) {
+            pending_last_moe_layer = profile_layer;
+            pending_last_moe_started_us = profile_started_us;
         }
     }
 
@@ -3679,6 +3846,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+    if (state->ith == 0 && pending_last_moe_layer >= 0) {
+        ggml_cpu_moe_profile_record(
+                pending_last_moe_layer,
+                (uint64_t) (ggml_time_us() - pending_last_moe_started_us));
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);

@@ -125,6 +125,19 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_cpu_init(void);
 
+    // Optional wall-clock telemetry for fused CPU cold-expert nodes. Disabled
+    // by default; layer is supplied in GGML_OP_MOE_COLD op_params[0].
+    GGML_BACKEND_API void ggml_cpu_moe_profile_enable(bool enabled);
+    GGML_BACKEND_API void ggml_cpu_moe_profile_reset(void);
+    GGML_BACKEND_API bool ggml_cpu_moe_profile_get(
+            int layer, uint64_t * runs, uint64_t * wall_us);
+    GGML_BACKEND_API bool ggml_cpu_moe_profile_get_phases(
+            int layer, uint64_t * gate_up_us, uint64_t * activation_us, uint64_t * down_us);
+    GGML_BACKEND_API void ggml_cpu_moe_set_single_row_chunk(int chunk_size);
+    GGML_BACKEND_API int  ggml_cpu_moe_get_single_row_chunk(void);
+    GGML_BACKEND_API void ggml_cpu_moe_set_parallel_activation(bool enabled);
+    GGML_BACKEND_API bool ggml_cpu_moe_get_parallel_activation(void);
+
     //
     // CPU backend
     //

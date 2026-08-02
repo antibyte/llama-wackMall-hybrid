@@ -5,7 +5,11 @@ Status: Phases 0-3 are implemented behind default-off feature flags. Async
 prefetch is validated for no-MTP execution. Warmcache plus MTP is guarded off
 by default after deterministic controls failed for both synchronous and async
 warm residency. Phase 4 has a strictly guarded static no-sync experiment;
-deferred adaptation and double-buffered counts are not implemented.
+deferred adaptation and double-buffered counts are not implemented. A strict
+offline layer-variable static placement prototype, prompt-balanced profile
+aggregation, session-local usage export, and CPU cold timing are implemented.
+The production winner remains fixed placement with W=0; draft KV q4_0/q4_0
+raised the measured MTP-2 median to 46.433 token/s.
 
 ## Goals and non-goals
 
@@ -51,6 +55,46 @@ Raw conversion preserves every source count exactly. The explicit
 layer's top-S order but emits bounded scores S..1 and zeros elsewhere. This
 prevents large lifetime Spark counts from dominating wackMall's online
 adaptation score for an entire request.
+
+### Request-balanced profiles and profile bank
+
+`LLAMA_EXPERT_USAGE_MODE=session` exports only observations made by the current
+process; the default `cumulative` mode retains the legacy seed-plus-observation
+behavior. `scripts/collect_expert_profiles.sh` starts a fresh server for every
+corpus item and accepts an explicit `PROFILE_IDS` split. It validates that each
+usage total equals the JSON selection total before aggregation.
+
+`tools/aggregate_expert_profiles.py` validates every sparse profile against the
+GGUF dimensions, normalizes each prompt independently, applies optional prompt
+weights, and refuses to overwrite output. This prevents long generations from
+silently dominating a mixed production profile. The intended profile bank is
+static and process-scoped: general, coding, tools, or other profiles are chosen
+through `LLAMA_EXPERT_HOT` at server start or a safe between-request restart;
+profiles are never swapped during an MTP verify batch.
+
+### Layer-variable fixed placement
+
+`tools/optimize_expert_placement.py` reads the GGUF tensor directory and derives
+the exact bytes of one routed expert in every layer. It accepts either an
+explicit MiB budget or the byte budget of a uniform reference S, a per-layer
+floor/cap, and optional measured `cpu_cold_ms/cold_hits` cost multipliers. The
+output manifest records model architecture/dimensions/file size, source-profile
+SHA-256, exact per-layer slot bytes, budgets, and totals.
+
+`LLAMA_EXPERT_PLACEMENT` loads this manifest together with its matching
+`LLAMA_EXPERT_HOT` profile. Runtime validation checks dimensions, architecture,
+source-profile SHA-256, per-layer tensor bytes, totals, slot bounds, physical
+free VRAM, and the ordinary LUT/sentinel invariants. The prototype initially
+requires W=0 and adaptation off. Each layer allocates `S[layer] + 1` slots;
+the final slot remains its zero sentinel. MTP sees a static mapping for the
+whole request.
+
+This feature is deliberately not sized for one GPU. `--fixed-budget-mib`,
+`--reference-slots`, `--min-slots`, and `--max-slots` allow offline layouts for
+larger cards. `LLAMA_EXPERT_VRAM_RESERVE_MIB` controls the conservative
+post-load reserve (default 512 MiB). `LLAMA_EXPERT_WARM_AUTO_MAX` raises the
+default W=auto cap of four only when a larger GPU has been measured. Defaults
+remain the tested 6-GiB-safe behavior.
 
 ## Phase 2: synchronous warmcache
 
@@ -156,7 +200,11 @@ diagnostics. The benchmark evidence and first divergent token are recorded in
 
 ## VRAM auto-fit
 
-The existing tier initialization runs after model, KV, and compute allocation. It measures physical free VRAM at that point and subtracts the existing 512 MiB safety reserve.
+The existing tier initialization runs after model, KV, and compute allocation.
+It measures physical free VRAM at that point and subtracts a 512 MiB safety
+reserve by default. `LLAMA_EXPERT_VRAM_RESERVE_MIB` makes the reserve explicit
+for cards with different display/runtime headroom; reducing it is an expert
+override and must be followed by graph-capture and long-context OOM tests.
 
 The allocation decision is:
 
@@ -167,7 +215,10 @@ available -= fixed_effective * bytes_per_all_layer_slot
 warm_effective = min(requested_warm, available / bytes_per_all_layer_slot)
 ```
 
-This preserves the requested priority: dense model, KV, compute, reserve, fixed hot slots, then warm slots. Both requested and effective S/W plus total GiB are logged. `W=1`, `W=2`, and `W=4` are the only initial benchmark sizes.
+This preserves the requested priority: dense model, KV, compute, reserve, fixed
+hot slots, then warm slots. Both requested and effective S/W plus total GiB are
+logged. `W=1`, `W=2`, and `W=4` are the initial 6-GiB benchmark sizes; integer W
+and `LLAMA_EXPERT_WARM_AUTO_MAX` allow larger measured configurations elsewhere.
 
 ## Phase 3: asynchronous prefetch
 
@@ -264,16 +315,53 @@ not justify double-buffered counts or lock-free adaptation on this hardware.
 
 Existing text stats and `LLAMA_EXPERT_USAGE` remain supported. Optional JSON at
 `LLAMA_EXPERT_STATS_JSON` is written at orderly shutdown and contains the model
-description, per-layer counts, S/W, hit categories, repins, warm
-promotions/evictions, transfer counters, timing buckets, and decode fields.
+description, per-layer counts and fixed-slot counts, total/min/max fixed slots,
+S/W, hit categories, repins, warm promotions/evictions, transfer counters,
+timing buckets, and decode fields.
 
 MTP draft width is wired from parsed common parameters and appears in `mtp_n`.
-Context, decode timing, CPU/GPU expert time, and synchronization time are not
-yet wired into the expert-tier module and therefore appear as literal zero.
-The benchmark client and server log provide the available request-level
-values. Runtime counters use uint64 and duration totals use milliseconds.
+`LLAMA_EXPERT_TIMING=1` measures the completed fused CPU cold node per layer and
+populates `cpu_cold_runs`, `cpu_cold_ms`, `cpu_gate_up_ms`,
+`cpu_activation_ms`, `cpu_down_ms`, and the matching aggregate phase totals.
+It is off by default. Profiling adds barriers at the phase boundaries and is
+therefore diagnostic, not a production mode. Context, decode timing, GPU
+expert time, and synchronization time are not yet wired into the expert-tier
+module and remain literal zero; the benchmark client, server log, and external
+timeline tools provide request-level values. Runtime counters use uint64 and
+duration totals use milliseconds.
 For all three output variables, the literal value `0` now means disabled and
 does not create a file named `0`.
+
+### CPU cold scheduling and MTP parameters
+
+The fused cold op already uses scheduler-owned persistent scratch for quantized
+input, gate/up intermediates, activation, row maps, and atomic chunk counters;
+there is no per-token heap allocation to remove. `LLAMA_EXPERT_CPU_CHUNK`
+parameterizes only the singleton expert row chunk (power of two, 16..256), with
+64 preserving the original implementation. Individual dot products and output
+ownership do not change, so the tested chunk sweep was bit-identical. This knob
+targets CPU topology and is independent of CUDA generation.
+
+`LLAMA_EXPERT_CPU_ACT_PARALLEL=1` additionally distributes activation and
+intermediate quantization by quantization block when only a few cold expert
+columns are present. It is experimental and defaults to `0`. The option is
+independent of CUDA architecture and may help CPUs with more physical cores,
+but the Ryzen 7 4800H measurement showed that this phase accounts for only a
+small part of cold compute. It must be selected by measurement rather than
+core-utilization appearance.
+
+An Nsight Systems trace of the static MTP-2 path found many synchronization
+calls inside normal cross-backend graph execution even after the separate tier
+barrier was disabled. Removing those waits safely requires moving router/input
+readback before hot work, running the CPU cold split asynchronously, and waiting
+only before the cold result upload/combine. That is a distinct experiment from
+`LLAMA_EXPERT_STATIC_NO_SYNC`; it must remain feature-gated because it changes
+backend scheduling and tensor lifetime rather than only tier bookkeeping.
+
+The benchmark runner also exposes draft `K/V` types, `p_min`, and backend
+sampling. These are existing llama.cpp features, not hybrid arithmetic. On the
+GTX 1660 Ti, MTP-2 with draft q4_0/q4_0 is the measured winner; other GPUs may
+select different types without changing the placement/cache implementation.
 
 ## Validation and abort diagnostics
 

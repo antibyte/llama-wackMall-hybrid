@@ -724,8 +724,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     };
 
+    std::set<std::string> seen_args;
     auto parse_cli_args = [&]() {
-        std::set<std::string> seen_args;
 
         for (int i = 1; i < argc; i++) {
             const std::string arg_prefix = "--";
@@ -802,6 +802,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    auto has_cli_arg = [&](std::initializer_list<const char *> names) {
+        return std::any_of(names.begin(), names.end(), [&](const char * name) {
+            return seen_args.count(name);
+        });
+    };
+
     if (params.cmoe) {
         params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         params.fit_params = true;
@@ -809,11 +815,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (params.n_parallel < 0) {
             params.n_parallel = 1;
         }
-        auto cmoe_batch_from_env = [](const char * name, int fallback) {
+        auto cmoe_batch_from_env = [](const char * name, int & target) {
             const char * value = std::getenv(name);
 
             if (value == nullptr || *value == '\0') {
-                return fallback;
+                return false;
             }
 
             const int parsed = std::stoi(value);
@@ -823,17 +829,29 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     std::string(name) + " must be greater than zero");
             }
 
-            return parsed;
+            target = parsed;
+            return true;
         };
 
-        params.n_batch =
-            cmoe_batch_from_env("LLAMA_CMOE_BATCH", 256);
-        params.n_ubatch =
-            cmoe_batch_from_env("LLAMA_CMOE_UBATCH", 256);
+        // Environment overrides intentionally win over CLI parsing.  In their
+        // absence, retain explicit -b/-ub values and apply the cmoe defaults
+        // only to parameters that the user did not set.
+        const bool batch_from_env  = cmoe_batch_from_env("LLAMA_CMOE_BATCH",  params.n_batch);
+        const bool ubatch_from_env = cmoe_batch_from_env("LLAMA_CMOE_UBATCH", params.n_ubatch);
+        const bool batch_from_cli  = has_cli_arg({"-b", "--batch-size"});
+        const bool ubatch_from_cli = has_cli_arg({"-ub", "--ubatch-size"});
+        if (!batch_from_env && !batch_from_cli && params.n_batch == 2048) {
+            // Preserve programmatic values. If only ubatch was explicitly
+            // configured, make the logical batch large enough to contain it.
+            params.n_batch = (ubatch_from_env || ubatch_from_cli) ? std::max(256, params.n_ubatch) : 256;
+        }
+        if (!ubatch_from_env && !ubatch_from_cli && params.n_ubatch == 512) {
+            params.n_ubatch = std::min(256, params.n_batch);
+        }
 
         if (params.n_ubatch > params.n_batch) {
             throw std::invalid_argument(
-                "LLAMA_CMOE_UBATCH must not exceed LLAMA_CMOE_BATCH");
+                "cmoe ubatch size must not exceed batch size");
         }
 
         LOG_INF("cmoe batch/ubatch = %d/%d\n",
@@ -2615,12 +2633,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- none: no special loading mode\n"
         "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
         "- mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
+        "- mmap+mlock: explicit mmap plus mlock mode\n"
         "- dio: use DirectIO if available\n",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "none")  { params.load_mode = LLAMA_LOAD_MODE_NONE;      }
             else if (value == "mmap")  { params.load_mode = LLAMA_LOAD_MODE_MMAP;      }
-            else if (value == "mlock") { params.load_mode = LLAMA_LOAD_MODE_MLOCK;     }
-            else if (value == "dio")   { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO; }
+            else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
+            else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
+            else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));

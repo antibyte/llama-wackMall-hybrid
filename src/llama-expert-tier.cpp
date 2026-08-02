@@ -1,6 +1,7 @@
 #include "llama-expert-tier.h"
 
 #include "llama-expert-cache.h"
+#include "llama-expert-placement.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -20,6 +21,7 @@
 #include <deque>
 #include <fstream>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -39,6 +41,11 @@ enum class warm_admission_mode {
     frequency,
 };
 
+enum class expert_usage_mode {
+    cumulative,
+    session,
+};
+
 struct store {
     ggml_tensor * w_hot  = nullptr; // [ne0, ne1, n_slots] on GPU, sentinel slot zeroed
     ggml_tensor * lut    = nullptr; // i32 [n_expert] on GPU: expert -> hot slot | sentinel
@@ -53,13 +60,15 @@ struct layer_tier {
     int il       = -1;
     int n_expert = 0;
     int n_slots  = 0; // incl. sentinel slot
+    int n_fixed  = 0;
     int sentinel = 0;
     store * sd = nullptr; // store holding the down weight (counts source)
     std::vector<std::pair<const ggml_tensor *, store *>> ws;
     std::vector<int32_t> slot_expert; // [n_slots], -1 = empty
     std::vector<int32_t> lut_host;    // [n_expert]
     std::vector<float>   score;       // [n_expert], cumulative (LLAMA_EXPERT_DECAY)
-    std::vector<uint64_t> cum;        // [n_expert], exact counts for persistence
+    std::vector<uint64_t> cum;        // [n_expert], seed + observations (legacy persistence)
+    std::vector<uint64_t> observed;   // [n_expert], observations from this process only
     std::vector<int32_t> dwell;       // [n_slots]
     llama_expert_cache::state warm_cache;
     llama_expert_cache::second_hit_admission warm_admission;
@@ -78,18 +87,27 @@ static int  g_tmax     = 16;
 static bool g_adapt    = false;
 static bool g_hot_only = false; // set by build_moe_cold per layer
 static bool g_warm_auto = false;
+static int  g_warm_auto_max = 4;
+static int  g_vram_reserve_mib = 512;
 static bool g_warm_reset_request = true;
 static warm_admission_mode g_warm_admission = warm_admission_mode::immediate;
+static expert_usage_mode g_usage_mode = expert_usage_mode::cumulative;
 static int  g_warm_admission_window = 8;
 static bool g_prefetch_requested = false;
 static bool g_prefetch_ready = false;
 static bool g_collect_counts = true;
+static bool g_timing_enabled = false;
+static int  g_cpu_single_row_chunk = 64;
+static bool g_cpu_parallel_activation = false;
 static bool g_static_no_sync_requested = false;
 static bool g_static_no_sync_active = false;
 static int  g_prefetch_streams = 1;
 static int  g_prefetch_max_inflight = 2;
 static int  g_mtp_n = 0;
 static bool g_warm_mtp_guarded = false;
+static bool g_variable_placement = false;
+static bool g_configured_enabled = false;
+static llama_expert_placement::manifest g_placement;
 
 static ggml_context * g_ctx_gpu = nullptr; // owned for process lifetime
 static ggml_context * g_ctx_cpu = nullptr;
@@ -629,6 +647,7 @@ static void maybe_update_warm(layer_tier & L) {
         }
         L.score[expert] = L.score[expert]*decay + (float) selected;
         L.cum[expert] += (uint64_t) selected;
+        L.observed[expert] += (uint64_t) selected;
         if (selected > 0) {
             switch (L.warm_cache.locate(expert)) {
                 case llama_expert_cache::location::fixed:
@@ -814,6 +833,7 @@ static void maybe_update_fixed(layer_tier & L) {
     for (int e = 0; e < n; e++) {
         L.score[e] = L.score[e]*decay + (float) cnt[e];
         L.cum[e]  += (uint64_t) cnt[e];
+        L.observed[e] += (uint64_t) cnt[e];
         if (mask[e]) {
             L.cum_cold += (uint64_t) cnt[e];
         }
@@ -934,6 +954,19 @@ static void dump_stats() {
                             100.0*(double) L.cum_cold/(double) L.cum_total,
                             (unsigned long long) L.cum_graphs);
                 }
+                if (g_timing_enabled) {
+                    uint64_t runs = 0;
+                    uint64_t wall_us = 0;
+                    uint64_t gate_up_us = 0;
+                    uint64_t activation_us = 0;
+                    uint64_t down_us = 0;
+                    ggml_cpu_moe_profile_get(L.il, &runs, &wall_us);
+                    ggml_cpu_moe_profile_get_phases(L.il, &gate_up_us, &activation_us, &down_us);
+                    fprintf(f, "layer %2d: cpu_cold_ms %.3f cpu_gate_up_ms %.3f cpu_activation_ms %.3f cpu_down_ms %.3f cpu_cold_runs %llu\n", L.il,
+                            (double) wall_us/1000.0, (double) gate_up_us/1000.0,
+                            (double) activation_us/1000.0, (double) down_us/1000.0,
+                            (unsigned long long) runs);
+                }
             }
             // invariant: mask agrees with lut, slot<->expert bijection holds
             for (const auto & L : g_layers) {
@@ -975,12 +1008,13 @@ static void dump_stats() {
         if (f) {
             fprintf(f, "layer,expert,count\n");
             for (const auto & L : g_layers) {
-                if (L.cum.empty()) {
+                const auto & usage = g_usage_mode == expert_usage_mode::session ? L.observed : L.cum;
+                if (usage.empty()) {
                     continue;
                 }
                 for (int e = 0; e < L.n_expert; e++) {
-                    if (L.cum[e] > 0) {
-                        fprintf(f, "%d,%d,%llu\n", L.il, e, (unsigned long long) L.cum[e]);
+                    if (usage[e] > 0) {
+                        fprintf(f, "%d,%d,%llu\n", L.il, e, (unsigned long long) usage[e]);
                     }
                 }
             }
@@ -998,32 +1032,75 @@ static void dump_stats() {
         uint64_t fixed_hits = 0;
         uint64_t warm_hits = 0;
         uint64_t cold_hits = 0;
+        uint64_t cpu_cold_us = 0;
+        uint64_t cpu_gate_up_us = 0;
+        uint64_t cpu_activation_us = 0;
+        uint64_t cpu_down_us = 0;
+        int hot_slots_total = 0;
+        int hot_slots_min = INT32_MAX;
+        int hot_slots_max = 0;
         for (const auto & L : g_layers) {
+            if (L.ws.empty()) {
+                continue;
+            }
             selected_total += L.cum_total;
             fixed_hits += L.warm_enabled ? L.cum_fixed : L.cum_total - L.cum_cold;
             warm_hits += L.cum_warm;
             cold_hits += L.cum_cold;
+            uint64_t runs = 0;
+            uint64_t wall_us = 0;
+            ggml_cpu_moe_profile_get(L.il, &runs, &wall_us);
+            cpu_cold_us += wall_us;
+            uint64_t gate_up_us = 0;
+            uint64_t activation_us = 0;
+            uint64_t down_us = 0;
+            ggml_cpu_moe_profile_get_phases(L.il, &gate_up_us, &activation_us, &down_us);
+            cpu_gate_up_us += gate_up_us;
+            cpu_activation_us += activation_us;
+            cpu_down_us += down_us;
+            hot_slots_total += L.n_fixed;
+            hot_slots_min = std::min(hot_slots_min, L.n_fixed);
+            hot_slots_max = std::max(hot_slots_max, L.n_fixed);
+        }
+        if (hot_slots_min == INT32_MAX) {
+            hot_slots_min = 0;
         }
         fputs("{\n  \"model\": ", f);
         write_json_string(f, g_model_desc);
         fprintf(f,
-                ",\n  \"context\": 0,\n  \"mtp_n\": %d,\n  \"layers\": [", g_mtp_n);
+                ",\n  \"context\": 0,\n  \"mtp_n\": %d,\n  \"timing_enabled\": %s,\n  \"layers\": [",
+                g_mtp_n, g_timing_enabled ? "true" : "false");
         bool first = true;
         for (const auto & L : g_layers) {
             if (L.ws.empty()) {
                 continue;
             }
-            fprintf(f, "%s\n    {\"layer\": %d, \"selected_total\": %llu, \"hot_hits\": %llu, \"warm_hits\": %llu, \"cold_hits\": %llu, \"warm_promotions\": %llu, \"warm_evictions\": %llu}",
-                    first ? "" : ",", L.il, (unsigned long long) L.cum_total,
+            uint64_t cpu_cold_runs = 0;
+            uint64_t layer_cpu_cold_us = 0;
+            uint64_t layer_gate_up_us = 0;
+            uint64_t layer_activation_us = 0;
+            uint64_t layer_down_us = 0;
+            ggml_cpu_moe_profile_get(L.il, &cpu_cold_runs, &layer_cpu_cold_us);
+            ggml_cpu_moe_profile_get_phases(L.il, &layer_gate_up_us, &layer_activation_us, &layer_down_us);
+            fprintf(f, "%s\n    {\"layer\": %d, \"fixed_slots\": %d, \"selected_total\": %llu, \"hot_hits\": %llu, \"warm_hits\": %llu, \"cold_hits\": %llu, \"warm_promotions\": %llu, \"warm_evictions\": %llu, \"cpu_cold_runs\": %llu, \"cpu_cold_ms\": %.3f, \"cpu_gate_up_ms\": %.3f, \"cpu_activation_ms\": %.3f, \"cpu_down_ms\": %.3f}",
+                    first ? "" : ",", L.il, L.n_fixed, (unsigned long long) L.cum_total,
                     (unsigned long long) (L.warm_enabled ? L.cum_fixed : L.cum_total - L.cum_cold),
                     (unsigned long long) L.cum_warm, (unsigned long long) L.cum_cold,
-                    (unsigned long long) L.warm_promotions, (unsigned long long) L.warm_evictions);
+                    (unsigned long long) L.warm_promotions, (unsigned long long) L.warm_evictions,
+                    (unsigned long long) cpu_cold_runs, (double) layer_cpu_cold_us/1000.0,
+                    (double) layer_gate_up_us/1000.0, (double) layer_activation_us/1000.0,
+                    (double) layer_down_us/1000.0);
             first = false;
         }
         fprintf(f,
                 "\n  ],\n"
                 "  \"hot_slots_per_layer\": %d,\n"
+                "  \"hot_slots_total\": %d,\n"
+                "  \"hot_slots_min\": %d,\n"
+                "  \"hot_slots_max\": %d,\n"
                 "  \"warm_slots_per_layer\": %d,\n"
+                "  \"cpu_single_row_chunk\": %d,\n"
+                "  \"cpu_parallel_activation\": %s,\n"
                 "  \"selected_total\": %llu,\n"
                 "  \"hot_hits\": %llu,\n"
                 "  \"warm_hits\": %llu,\n"
@@ -1035,18 +1112,25 @@ static void dump_stats() {
                 "  \"h2d_copies\": %llu,\n"
                 "  \"h2d_bytes\": %llu,\n"
                 "  \"h2d_copy_ms\": %.3f,\n"
-                "  \"cpu_expert_ms\": 0.0,\n"
+                "  \"cpu_expert_ms\": %.3f,\n"
+                "  \"cpu_gate_up_ms\": %.3f,\n"
+                "  \"cpu_activation_ms\": %.3f,\n"
+                "  \"cpu_down_ms\": %.3f,\n"
                 "  \"gpu_expert_ms\": 0.0,\n"
                 "  \"sync_wait_ms\": 0.0,\n"
                 "  \"decode_tokens\": 0,\n"
                 "  \"decode_tokens_per_second\": 0.0\n"
                 "}\n",
-                g_S, g_W, (unsigned long long) selected_total, (unsigned long long) fixed_hits,
+                g_variable_placement ? -1 : g_S, hot_slots_total, hot_slots_min, hot_slots_max,
+                g_W, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "true" : "false",
+                (unsigned long long) selected_total, (unsigned long long) fixed_hits,
                 (unsigned long long) warm_hits, (unsigned long long) cold_hits,
                 (unsigned long long) g_repins, (unsigned long long) g_warm_promotions,
                 (unsigned long long) g_warm_evictions, (unsigned long long) g_warm_admission_deferrals,
                 (unsigned long long) g_h2d_copies,
-                (unsigned long long) g_h2d_bytes, (double) g_h2d_copy_us/1000.0);
+                (unsigned long long) g_h2d_bytes, (double) g_h2d_copy_us/1000.0,
+                (double) cpu_cold_us/1000.0, (double) cpu_gate_up_us/1000.0,
+                (double) cpu_activation_us/1000.0, (double) cpu_down_us/1000.0);
         fclose(f);
     }
 }
@@ -1117,7 +1201,42 @@ size_t expert_weight_bytes(const llama_model & model) {
     return b;
 }
 
+void configure_enabled(bool enabled) {
+    g_configured_enabled = enabled;
+}
+
+static bool explicitly_requested_by_env() {
+    static const char * controls[] = {
+        "LLAMA_EXPERT_HOT",
+        "LLAMA_EXPERT_S",
+        "LLAMA_EXPERT_PLACEMENT",
+        "LLAMA_EXPERT_ADAPT",
+        "LLAMA_EXPERT_STATS",
+        "LLAMA_EXPERT_USAGE",
+        "LLAMA_EXPERT_STATS_JSON",
+        "LLAMA_EXPERT_TIMING",
+        "LLAMA_EXPERT_CPU_CHUNK",
+        "LLAMA_EXPERT_CPU_ACT_PARALLEL",
+        "LLAMA_EXPERT_WARM_SLOTS",
+        "LLAMA_EXPERT_STATIC_NO_SYNC",
+    };
+    for (const char * name : controls) {
+        if (getenv(name) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void init(const llama_model & model) {
+    // libllama's architecture and state tests create several unrelated model
+    // contexts in one process. The tier owns process-wide caches, so it must
+    // not attach implicitly to those direct API contexts. CLI/common users
+    // keep the zero-config -cmoe default via configure_enabled(true), while an
+    // explicit LLAMA_EXPERT_* control remains a supported direct opt-in.
+    if (!g_configured_enabled && !explicitly_requested_by_env()) {
+        return;
+    }
     if (!g_layers.empty()) {
         return; // already initialized
     }
@@ -1127,6 +1246,7 @@ void init(const llama_model & model) {
 
     const char * env_s   = getenv("LLAMA_EXPERT_S");
     const char * env_hot = getenv("LLAMA_EXPERT_HOT");
+    const char * env_placement = getenv("LLAMA_EXPERT_PLACEMENT");
     if (const char * e = getenv("LLAMA_EXPERT_ADAPT")) {
         g_adapt = atoi(e) != 0;
     } else {
@@ -1150,6 +1270,12 @@ void init(const llama_model & model) {
     if (const char * e = getenv("LLAMA_EXPERT_TMAX")) {
         g_tmax = std::max(0, atoi(e));
     }
+    if (const char * e = getenv("LLAMA_EXPERT_VRAM_RESERVE_MIB")) {
+        if (!parse_nonnegative_int(e, g_vram_reserve_mib) || g_vram_reserve_mib > 65536) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_VRAM_RESERVE_MIB='%s'; expected 0..65536\n", __func__, e);
+            return;
+        }
+    }
 
     bool warm_requested = false;
     if (const char * e = getenv("LLAMA_EXPERT_WARM_SLOTS")) {
@@ -1164,6 +1290,12 @@ void init(const llama_model & model) {
         }
     }
     if (warm_requested) {
+        if (const char * e = getenv("LLAMA_EXPERT_WARM_AUTO_MAX")) {
+            if (!parse_nonnegative_int(e, g_warm_auto_max) || g_warm_auto_max < 1 || g_warm_auto_max > 4096) {
+                TIER_LOG("%s: invalid LLAMA_EXPERT_WARM_AUTO_MAX='%s'; expected 1..4096\n", __func__, e);
+                return;
+            }
+        }
         const char * policy = getenv("LLAMA_EXPERT_WARM_POLICY");
         if (policy && strcmp(policy, "lru")) {
             TIER_LOG("%s: unsupported LLAMA_EXPERT_WARM_POLICY='%s'; warm cache disabled\n", __func__, policy);
@@ -1253,6 +1385,52 @@ void init(const llama_model & model) {
     const bool stats_enabled = output_env_enabled("LLAMA_EXPERT_STATS");
     const bool usage_enabled = output_env_enabled("LLAMA_EXPERT_USAGE");
     const bool json_stats_enabled = output_env_enabled("LLAMA_EXPERT_STATS_JSON");
+    if (const char * timing = getenv("LLAMA_EXPERT_TIMING")) {
+        int value = 0;
+        if (!parse_nonnegative_int(timing, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_TIMING='%s'; expected 0 or 1\n", __func__, timing);
+            return;
+        }
+        g_timing_enabled = value == 1;
+    }
+    if (const char * chunk = getenv("LLAMA_EXPERT_CPU_CHUNK")) {
+        if (!parse_nonnegative_int(chunk, g_cpu_single_row_chunk) ||
+                g_cpu_single_row_chunk < 16 || g_cpu_single_row_chunk > 256 ||
+                (g_cpu_single_row_chunk & (g_cpu_single_row_chunk - 1)) != 0) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_CHUNK='%s'; expected a power of two in 16..256\n",
+                    __func__, chunk);
+            return;
+        }
+    }
+    if (const char * parallel = getenv("LLAMA_EXPERT_CPU_ACT_PARALLEL")) {
+        int value = 0;
+        if (!parse_nonnegative_int(parallel, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_ACT_PARALLEL='%s'; expected 0 or 1\n",
+                    __func__, parallel);
+            return;
+        }
+        g_cpu_parallel_activation = value == 1;
+    }
+    ggml_cpu_moe_set_single_row_chunk(g_cpu_single_row_chunk);
+    ggml_cpu_moe_set_parallel_activation(g_cpu_parallel_activation);
+    ggml_cpu_moe_profile_reset();
+    ggml_cpu_moe_profile_enable(g_timing_enabled);
+    if (g_timing_enabled && !stats_enabled && !json_stats_enabled) {
+        TIER_LOG("%s: LLAMA_EXPERT_TIMING is enabled without a stats output path\n", __func__);
+    }
+    if (const char * mode = getenv("LLAMA_EXPERT_USAGE_MODE")) {
+        if (!strcmp(mode, "cumulative")) {
+            g_usage_mode = expert_usage_mode::cumulative;
+        } else if (!strcmp(mode, "session")) {
+            g_usage_mode = expert_usage_mode::session;
+        } else {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_USAGE_MODE='%s'; expected cumulative or session\n", __func__, mode);
+            return;
+        }
+        if (!usage_enabled) {
+            TIER_LOG("%s: LLAMA_EXPERT_USAGE_MODE is ignored because LLAMA_EXPERT_USAGE is disabled\n", __func__);
+        }
+    }
 
     const int n_layer  = model.hparams.n_layer();
     const int n_expert = model.hparams.n_expert;
@@ -1260,6 +1438,42 @@ void init(const llama_model & model) {
     std::vector<std::vector<std::pair<int64_t, int32_t>>> heat;
     if (env_hot && env_hot[0] && !parse_heat_csv(env_hot, n_layer, n_expert, heat)) {
         return;
+    }
+    if (env_placement && env_placement[0]) {
+        if (!env_hot || !env_hot[0]) {
+            TIER_LOG("%s: LLAMA_EXPERT_PLACEMENT requires LLAMA_EXPERT_HOT for expert rankings\n", __func__);
+            return;
+        }
+        if (manual_S) {
+            TIER_LOG("%s: LLAMA_EXPERT_PLACEMENT and LLAMA_EXPERT_S are mutually exclusive\n", __func__);
+            return;
+        }
+        if (g_adapt || warm_config_requested) {
+            TIER_LOG("%s: variable placement currently requires LLAMA_EXPERT_ADAPT=0 and no warm slots\n", __func__);
+            return;
+        }
+        std::string placement_error;
+        if (!llama_expert_placement::parse_manifest(
+                    env_placement, n_layer, n_expert, g_placement, placement_error)) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_PLACEMENT: %s\n", __func__, placement_error.c_str());
+            return;
+        }
+        if (g_placement.model_architecture != model.arch_name()) {
+            TIER_LOG("%s: placement architecture '%s' does not match loaded model '%s'\n",
+                    __func__, g_placement.model_architecture.c_str(), model.arch_name().c_str());
+            return;
+        }
+        std::string profile_digest;
+        if (!llama_expert_placement::sha256_file(env_hot, profile_digest, placement_error)) {
+            TIER_LOG("%s: cannot validate placement profile: %s\n", __func__, placement_error.c_str());
+            return;
+        }
+        if (profile_digest != g_placement.profile_sha256) {
+            TIER_LOG("%s: placement profile SHA-256 %s does not match LLAMA_EXPERT_HOT %s\n",
+                    __func__, g_placement.profile_sha256.c_str(), profile_digest.c_str());
+            return;
+        }
+        g_variable_placement = true;
     }
     if (stats_enabled || usage_enabled || json_stats_enabled) {
         atexit(dump_stats);
@@ -1273,6 +1487,7 @@ void init(const llama_model & model) {
 
     // Calculate per-expert slot memory size across all layers for Auto-Fit
     size_t bytes_per_slot_all_layers = 0;
+    std::vector<size_t> bytes_per_slot_by_layer(n_layer, 0);
     size_t max_layer_staging_bytes = 0;
     int n_tensors = 0;
     for (int il = 0; il < n_layer; il++) {
@@ -1284,6 +1499,7 @@ void init(const llama_model & model) {
                 if (n_expert > 0) {
                     const size_t slice = ggml_nbytes(w) / n_expert;
                     bytes_per_slot_all_layers += slice;
+                    bytes_per_slot_by_layer[il] += slice;
                     if (w->ne[3] == 1 && (int) w->ne[2] == n_expert) {
                         layer_staging_bytes += slice;
                     }
@@ -1298,14 +1514,62 @@ void init(const llama_model & model) {
         return;
     }
 
-    // Reserve 512 MB for the CUDA runtime, display, alignment and the graph
-    // capture buffers that allocate after this sizing (300 MB let capture OOM)
-    const size_t safety_buffer = 512ULL * 1024 * 1024;
+    // Reserve memory for the CUDA runtime, display, alignment and graph-capture
+    // buffers that allocate after this sizing. The default is 512 MiB because
+    // 300 MiB caused capture OOM on the original 6 GiB test card.
+    const size_t safety_buffer = (size_t) g_vram_reserve_mib*1024*1024;
     size_t free_vram = 0, total_vram = 0;
     ggml_backend_dev_memory(dev, &free_vram, &total_vram);
     const size_t usable_vram = (free_vram > safety_buffer) ? (free_vram - safety_buffer) : 0;
 
-    if (!manual_S && bytes_per_slot_all_layers > 0 && !warm_requested) {
+    if (g_variable_placement) {
+        uint64_t fixed_bytes = 0;
+        uint64_t sentinel_bytes = 0;
+        int min_slots = n_expert;
+        int max_slots = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & config = g_placement.layers[il];
+            if (config.slot_bytes != bytes_per_slot_by_layer[il]) {
+                TIER_LOG("%s: placement layer %d slot bytes %llu do not match loaded tensor bytes %zu\n",
+                        __func__, il, (unsigned long long) config.slot_bytes, bytes_per_slot_by_layer[il]);
+                return;
+            }
+            fixed_bytes += (uint64_t) config.fixed_slots*config.slot_bytes;
+            sentinel_bytes += config.slot_bytes;
+            min_slots = std::min(min_slots, config.fixed_slots);
+            max_slots = std::max(max_slots, config.fixed_slots);
+        }
+        if (fixed_bytes != g_placement.fixed_bytes_used || sentinel_bytes != g_placement.sentinel_bytes) {
+            TIER_LOG("%s: placement byte totals changed after model load\n", __func__);
+            return;
+        }
+        const uint64_t required = fixed_bytes + sentinel_bytes;
+        // Match the established fixed-S autofit contract: the configured hot
+        // budget must fit after the safety reserve, while the one sentinel per
+        // layer must at least fit in actual free memory. This preserves exact
+        // byte parity with a proven uniform S configuration. Report when the
+        // sentinels consume part of the conservative reserve.
+        if (fixed_bytes > usable_vram || required > free_vram) {
+            TIER_LOG("%s: variable placement requires %.2f MiB fixed + %.2f MiB sentinels; %.2f MiB fixed-budget and %.2f MiB physical free VRAM are available\n",
+                    __func__, (double) fixed_bytes/(1024.0*1024.0),
+                    (double) sentinel_bytes/(1024.0*1024.0),
+                    (double) usable_vram/(1024.0*1024.0),
+                    (double) free_vram/(1024.0*1024.0));
+            return;
+        }
+        if (required > usable_vram) {
+            TIER_LOG("%s: variable placement sentinels consume %.2f MiB of the conservative VRAM reserve\n",
+                    __func__, (double) (required - usable_vram)/(1024.0*1024.0));
+        }
+        g_S = max_slots;
+        TIER_LOG("%s: variable placement validated: %d total fixed slots, range %d..%d, %.2f MiB fixed + %.2f MiB sentinels\n",
+                __func__, std::accumulate(g_placement.layers.begin(), g_placement.layers.end(), 0,
+                    [](int total, const auto & layer) { return total + layer.fixed_slots; }),
+                min_slots, max_slots, (double) fixed_bytes/(1024.0*1024.0),
+                (double) sentinel_bytes/(1024.0*1024.0));
+    }
+
+    if (!g_variable_placement && !manual_S && bytes_per_slot_all_layers > 0 && !warm_requested) {
         if (usable_vram >= bytes_per_slot_all_layers) {
             int autofit_s = (int) (usable_vram / bytes_per_slot_all_layers);
             g_S = std::clamp(autofit_s, 1, n_expert);
@@ -1321,7 +1585,7 @@ void init(const llama_model & model) {
     }
 
     // clamp a forced S to what fits; the unclamped path OOMs at graph capture
-    if (manual_S && bytes_per_slot_all_layers > 0 && !warm_requested) {
+    if (!g_variable_placement && manual_S && bytes_per_slot_all_layers > 0 && !warm_requested) {
         const int afford = (int) (usable_vram / bytes_per_slot_all_layers);
         if (g_S > afford) {
             TIER_LOG("%s: manual S = %d exceeds free VRAM, clamping to %d\n", __func__, g_S, afford);
@@ -1331,7 +1595,8 @@ void init(const llama_model & model) {
 
     // With an explicitly requested warm tier, keep the existing/default fixed
     // tier first, reserve its sentinel, then consume only remaining slot-sized
-    // VRAM. The optional auto mode is deliberately capped at four slots.
+    // VRAM. Auto remains conservatively capped at four slots by default, but
+    // the cap is explicit so larger GPUs can use a measured higher limit.
     if (warm_requested && bytes_per_slot_all_layers > 0) {
         const int slot_budget = (int) (usable_vram / bytes_per_slot_all_layers);
         const int fixed_afford = std::max(slot_budget - 1, 0);
@@ -1341,7 +1606,7 @@ void init(const llama_model & model) {
             g_S = fixed_afford;
         }
         const int warm_afford = std::max(slot_budget - g_S - 1, 0);
-        const int requested = g_warm_auto ? std::min(warm_afford, 4) : g_W;
+        const int requested = g_warm_auto ? std::min(warm_afford, std::min(g_warm_auto_max, n_expert)) : g_W;
         g_W = std::min(requested, warm_afford);
         if (!g_warm_auto && g_W < requested) {
             TIER_LOG("%s: warm W = %d exceeds remaining VRAM, clamping to %d\n", __func__, requested, g_W);
@@ -1379,6 +1644,7 @@ void init(const llama_model & model) {
 
     for (int il = 0; il < n_layer; il++) {
         const llama_layer & l = model.layers[il];
+        const int fixed_s = g_variable_placement ? g_placement.layers[il].fixed_slots : g_S;
 
         // top-S experts of this layer by heat
         std::vector<int32_t> top;
@@ -1391,7 +1657,7 @@ void init(const llama_model & model) {
             for (const auto & p : h) {
                 layer_total += p.first;
             }
-            for (int i = 0; i < (int) h.size() && i < g_S; i++) {
+            for (int i = 0; i < (int) h.size() && i < fixed_s; i++) {
                 top.push_back(h[i].second);
                 hits += h[i].first;
             }
@@ -1401,19 +1667,19 @@ void init(const llama_model & model) {
             if (!g_adapt && g_W == 0) {
                 continue;
             }
-            for (int i = 0; i < std::min(g_S, n_expert); i++) {
+            for (int i = 0; i < std::min(fixed_s, n_expert); i++) {
                 top.push_back(i);
             }
         }
-        if (g_W > 0 && (int) top.size() < g_S) {
-            for (int expert = 0; expert < n_expert && (int) top.size() < g_S; ++expert) {
+        if (g_W > 0 && (int) top.size() < fixed_s) {
+            for (int expert = 0; expert < n_expert && (int) top.size() < fixed_s; ++expert) {
                 if (std::find(top.begin(), top.end(), expert) == top.end()) {
                     top.push_back(expert);
                 }
             }
         }
 
-        const int sentinel = g_W > 0 ? g_S + g_W : (int) top.size();
+        const int sentinel = g_W > 0 ? fixed_s + g_W : (int) top.size();
         std::fill(lut_host.begin(),  lut_host.end(),  (int32_t) sentinel);
         std::fill(mask_host.begin(), mask_host.end(), 1);
         for (int s = 0; s < (int) top.size(); s++) {
@@ -1431,7 +1697,7 @@ void init(const llama_model & model) {
             const size_t slice = ggml_nbytes(w)/n_expert;
 
             store s;
-            const int n_slots = g_W > 0 ? g_S + g_W + 1 : (g_adapt ? g_S + 1 : (int) top.size() + 1);
+            const int n_slots = g_W > 0 ? fixed_s + g_W + 1 : (g_adapt ? fixed_s + 1 : (int) top.size() + 1);
             s.w_hot  = ggml_new_tensor_3d(g_ctx_gpu, w->type, w->ne[0], w->ne[1], n_slots);
             s.lut    = ggml_new_tensor_2d(g_ctx_gpu, GGML_TYPE_I32, 1, n_expert);
             s.mask   = ggml_new_tensor_1d(g_ctx_cpu, GGML_TYPE_I32, n_expert);
@@ -1467,6 +1733,7 @@ void init(const llama_model & model) {
     g_layers.resize(n_layer);
     for (int il = 0; il < n_layer; il++) {
         const llama_layer & l = model.layers[il];
+        const int fixed_s = g_variable_placement ? g_placement.layers[il].fixed_slots : g_S;
 
         std::vector<int32_t> top;
         if (il < (int) heat.size() && !heat[il].empty()) {
@@ -1474,7 +1741,7 @@ void init(const llama_model & model) {
             std::sort(h.begin(), h.end(), [](const auto & a, const auto & b) {
                 return a.first != b.first ? a.first > b.first : a.second < b.second;
             });
-            for (int i = 0; i < (int) h.size() && i < g_S; i++) {
+            for (int i = 0; i < (int) h.size() && i < fixed_s; i++) {
                 top.push_back(h[i].second);
             }
         }
@@ -1482,19 +1749,19 @@ void init(const llama_model & model) {
             if (!g_adapt && g_W == 0) {
                 continue;
             }
-            for (int i = 0; i < std::min(g_S, n_expert); i++) {
+            for (int i = 0; i < std::min(fixed_s, n_expert); i++) {
                 top.push_back(i);
             }
         }
-        if (g_W > 0 && (int) top.size() < g_S) {
-            for (int expert = 0; expert < n_expert && (int) top.size() < g_S; ++expert) {
+        if (g_W > 0 && (int) top.size() < fixed_s) {
+            for (int expert = 0; expert < n_expert && (int) top.size() < fixed_s; ++expert) {
                 if (std::find(top.begin(), top.end(), expert) == top.end()) {
                     top.push_back(expert);
                 }
             }
         }
 
-        const int sentinel = g_W > 0 ? g_S + g_W : (int) top.size();
+        const int sentinel = g_W > 0 ? fixed_s + g_W : (int) top.size();
         std::fill(lut_host.begin(),  lut_host.end(),  (int32_t) sentinel);
         std::fill(mask_host.begin(), mask_host.end(), 1);
         for (int s = 0; s < (int) top.size(); s++) {
@@ -1532,12 +1799,14 @@ void init(const llama_model & model) {
         L.il       = il;
         L.n_expert = n_expert;
         L.sentinel = sentinel;
-        L.n_slots  = g_W > 0 ? g_S + g_W + 1 : (g_adapt ? g_S + 1 : (int) top.size() + 1);
+        L.n_fixed  = fixed_s;
+        L.n_slots  = g_W > 0 ? fixed_s + g_W + 1 : (g_adapt ? fixed_s + 1 : (int) top.size() + 1);
         L.slot_expert.assign(L.n_slots, -1);
-        L.dwell.assign(g_W > 0 ? g_S : L.n_slots, 0);
+        L.dwell.assign(g_W > 0 ? fixed_s : L.n_slots, 0);
         L.lut_host = lut_host;
         L.score.assign(n_expert, 0.0f);
         L.cum.assign(n_expert, 0);
+        L.observed.assign(n_expert, 0);
         if (il < (int) heat.size()) {
             for (const auto & p : heat[il]) {
                 L.cum[p.second]   = (uint64_t) p.first;
@@ -1548,7 +1817,7 @@ void init(const llama_model & model) {
             L.slot_expert[s] = top[s];
         }
         if (g_W > 0) {
-            L.warm_cache.reset(n_expert, g_S, g_W, top);
+            L.warm_cache.reset(n_expert, fixed_s, g_W, top);
             L.warm_admission.reset(n_expert, (uint64_t) g_warm_admission_window);
             L.warm_frequency.assign(n_expert, 0.0f);
             L.warm_pending.assign(g_W, -1);
@@ -1585,7 +1854,7 @@ void init(const llama_model & model) {
         }
     }
 
-    g_collect_counts = g_adapt || g_W > 0 || stats_enabled || usage_enabled || json_stats_enabled;
+    g_collect_counts = g_adapt || g_W > 0 || stats_enabled || usage_enabled || json_stats_enabled || g_timing_enabled;
     if (g_static_no_sync_requested) {
         std::vector<const char *> blockers;
         if (g_adapt) {
@@ -1594,7 +1863,7 @@ void init(const llama_model & model) {
         if (g_W > 0 || warm_config_requested) {
             blockers.push_back("warm slots are enabled or requested");
         }
-        if (stats_enabled || usage_enabled || json_stats_enabled) {
+        if (stats_enabled || usage_enabled || json_stats_enabled || g_timing_enabled) {
             blockers.push_back("expert stats or usage output is enabled");
         }
         if (blockers.empty()) {
@@ -1610,9 +1879,21 @@ void init(const llama_model & model) {
         }
     }
 
-    TIER_LOG("%s: expert tiering on: %d fixed + %d warm slots/layer, %zu tensors, %.2f GiB pinned, seed coverage %.1f%%\n",
-            __func__, g_S, g_W, g_stores.size(), (double) total_bytes/(1 << 30),
-            total > 0 ? 100.0*hits/total : 0.0);
+    if (g_variable_placement) {
+        TIER_LOG("%s: expert tiering on: variable fixed slots (max %d) + %d warm slots/layer, %zu tensors, %.2f GiB pinned, seed coverage %.1f%%\n",
+                __func__, g_S, g_W, g_stores.size(), (double) total_bytes/(1 << 30),
+                total > 0 ? 100.0*hits/total : 0.0);
+    } else {
+        TIER_LOG("%s: expert tiering on: %d fixed + %d warm slots/layer, %zu tensors, %.2f GiB pinned, seed coverage %.1f%%\n",
+                __func__, g_S, g_W, g_stores.size(), (double) total_bytes/(1 << 30),
+                total > 0 ? 100.0*hits/total : 0.0);
+    }
+    if (usage_enabled) {
+        TIER_LOG("%s: expert usage export mode: %s\n", __func__,
+                g_usage_mode == expert_usage_mode::session ? "session" : "cumulative");
+    }
+    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s\n",
+            __func__, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "on" : "off");
     if (g_W > 0) {
         if (g_warm_admission == warm_admission_mode::frequency) {
             TIER_LOG("%s: warm admission frequency window=%d graphs\n", __func__, g_warm_admission_window);
@@ -1672,7 +1953,10 @@ ggml_tensor * end_moe_cold(ggml_context * ctx,
         return nullptr;
     }
     store & sd = g_stores[down_w];
-    return ggml_moe_cold(ctx, gate_w, up_w, down_w, x, ids, sd.mask, g_collect_counts ? sd.counts : nullptr);
+    ggml_tensor * result = ggml_moe_cold(ctx, gate_w, up_w, down_w, x, ids, sd.mask,
+            g_collect_counts ? sd.counts : nullptr);
+    result->op_params[0] = sd.il;
+    return result;
 }
 
 ggml_tensor * build_moe_count(ggml_context * ctx, ggml_tensor * down_w, ggml_tensor * ids) {

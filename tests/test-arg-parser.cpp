@@ -166,6 +166,24 @@ static void test(void) {
 #else
     printf("test-arg-parser: test environment variables (valid + invalid usages)\n\n");
 
+    // The hybrid-specific CMOE environment knobs are intentionally applied
+    // after CLI parsing, but absent variables must not replace explicit CLI
+    // values. This preserves the established benchmark override contract.
+    unsetenv("LLAMA_CMOE_BATCH");
+    unsetenv("LLAMA_CMOE_UBATCH");
+    argv = {"binary_name", "--batch-size", "9090", "--ubatch-size", "8080"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.n_batch == 9090);
+    assert(params.n_ubatch == 8080);
+
+    setenv("LLAMA_CMOE_BATCH", "64", true);
+    setenv("LLAMA_CMOE_UBATCH", "32", true);
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.n_batch == 64);
+    assert(params.n_ubatch == 32);
+    unsetenv("LLAMA_CMOE_BATCH");
+    unsetenv("LLAMA_CMOE_UBATCH");
+
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

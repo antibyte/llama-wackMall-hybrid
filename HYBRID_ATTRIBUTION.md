@@ -59,18 +59,28 @@ The warmcache state machine and slot transaction code are a new implementation f
 
 - Existing wackMall/llama.cpp files retain their original license and copyright
   notices. The hybrid modifies `NOTICE`, `common/arg.cpp`, `common/common.cpp`,
+  `ggml/include/ggml-cpu.h`, `ggml/src/ggml-cpu/ggml-cpu.c`,
   `src/CMakeLists.txt`, `src/llama-context.cpp`, `src/llama-expert-tier.cpp`,
   `src/llama-expert-tier.h`, `tests/CMakeLists.txt`, and
   `tools/server/server-context.cpp`.
 - New implementation/test/tool files are `src/llama-expert-cache.cpp`,
   `src/llama-expert-cache.h`, `tests/test-expert-warm-cache.cpp`,
+  `src/llama-expert-placement.cpp`, `src/llama-expert-placement.h`,
+  `tests/test-expert-placement.cpp`, `tests/test-aggregate-expert-profiles.py`,
+  `tests/test-optimize-expert-placement.py`,
   `tests/test-convert-luce-spark-profile.py`,
   `tools/convert_luce_spark_profile.py`, `tools/bench_hybrid_client.py`,
-  `tools/debug_sigsegv_backtrace.cpp`, and `scripts/bench_hybrid.sh`.
+  `tools/aggregate_expert_profiles.py`, `tools/optimize_expert_placement.py`,
+  `tools/debug_sigsegv_backtrace.cpp`, `scripts/collect_expert_profiles.sh`,
+  `scripts/hybrid_profile_corpus.jsonl`, and `scripts/bench_hybrid.sh`.
 - New project records are `HYBRID_ANALYSIS.md`, `HYBRID_DESIGN.md`,
   `HYBRID_ATTRIBUTION.md`, `HYBRID_EXPERIMENTS.md`, and the preserved raw
   artifacts below `benchmark-results/`.
 - New hybrid files are contributed under the repository's Apache-2.0 license unless a file states otherwise.
 - Files adapted from upstream llama.cpp retain the MIT attribution already present in `NOTICE`.
+
+The CPU phase timers and block-parallel activation scheduling are original
+implementations for the existing wackMall fused cold operation. Their design
+was driven by local measurements and does not copy LuceBox runtime code.
 
 If later work copies or closely adapts LuceBox code, this file must be updated with the exact source path, function/range, copyright notice, nature of modifications, and corresponding `NOTICE` entry before distribution.

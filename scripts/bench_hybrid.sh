@@ -6,7 +6,9 @@ SERVER="${SERVER:-$ROOT/build-hybrid/bin/llama-server}"
 CLIENT="${CLIENT:-$ROOT/tools/bench_hybrid_client.py}"
 MODEL="${MODEL:-$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 PROFILE="${PROFILE:-${7:-$HOME/models/qwen3.6-35b-a3b-mtp/luce-warmstart.csv}}"
+PLACEMENT="${PLACEMENT:-}"
 RESULTS_DIR="${RESULTS_DIR:-${5:-$ROOT/benchmark-results/hybrid-$(date -u +%Y%m%dT%H%M%SZ)}}"
+PROMPT_SOURCE="${PROMPT_SOURCE:-}"
 PORT="${PORT:-18081}"
 REPEATS="${REPEATS:-${2:-3}}"
 N_PREDICT="${N_PREDICT:-${3:-2000}}"
@@ -16,12 +18,22 @@ HYBRID_FIXED_S="${HYBRID_FIXED_S:-28}"
 STATIC_FIXED_S="${STATIC_FIXED_S:-33}"
 CPU_THREADS="${CPU_THREADS:-}"
 DRAFT_THREADS="${DRAFT_THREADS:-$CPU_THREADS}"
+DRAFT_P_MIN="${DRAFT_P_MIN:-}"
+DRAFT_BACKEND_SAMPLING="${DRAFT_BACKEND_SAMPLING:-}"
+EFFECTIVE_DRAFT_BACKEND_SAMPLING="${DRAFT_BACKEND_SAMPLING:-1}"
+DRAFT_TYPE_K="${DRAFT_TYPE_K:-q8_0}"
+DRAFT_TYPE_V="${DRAFT_TYPE_V:-q4_0}"
 SAVE_EXPERT_USAGE="${SAVE_EXPERT_USAGE:-0}"
+EXPERT_TIMING="${EXPERT_TIMING:-0}"
+CPU_CHUNK="${CPU_CHUNK:-64}"
+CPU_ACT_PARALLEL="${CPU_ACT_PARALLEL:-0}"
 CPU_MASK="${CPU_MASK:-}"
 CPU_POLL="${CPU_POLL:-}"
 BEST_W="${BEST_W:-${6:-2}}"
 WARM_ADMISSION="${WARM_ADMISSION:-immediate}"
 WARM_ADMISSION_WINDOW="${WARM_ADMISSION_WINDOW:-8}"
+WARM_AUTO_MAX="${WARM_AUTO_MAX:-4}"
+VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-512}"
 PREFETCH_STREAMS="${PREFETCH_STREAMS:-1}"
 PREFETCH_MAX_INFLIGHT="${PREFETCH_MAX_INFLIGHT:-2}"
 MTP_OVERRIDE="${MTP_OVERRIDE:-}"
@@ -41,9 +53,17 @@ if [[ -e "$RESULTS_DIR" ]]; then
     exit 1
 fi
 mkdir -p "$RESULTS_DIR"
-printf '%s\n' \
-  'Entwirf detailliert eine robuste Architektur fuer einen lokalen KI-Agenten in Go. Behandle Nebenlaeufigkeit, Werkzeuge, Speicher, Fehlerbehandlung, Tests und Sicherheit.' \
-  > "$PROMPT_FILE"
+if [[ -n "$PROMPT_SOURCE" ]]; then
+    if [[ ! -f "$PROMPT_SOURCE" ]]; then
+        echo "Fehlende Promptdatei: $PROMPT_SOURCE" >&2
+        exit 1
+    fi
+    cp -- "$PROMPT_SOURCE" "$PROMPT_FILE"
+else
+    printf '%s\n' \
+      'Entwirf detailliert eine robuste Architektur fuer einen lokalen KI-Agenten in Go. Behandle Nebenlaeufigkeit, Werkzeuge, Speicher, Fehlerbehandlung, Tests und Sicherheit.' \
+      > "$PROMPT_FILE"
+fi
 
 for path in "$SERVER" "$CLIENT" "$MODEL"; do
     if [[ ! -e "$path" ]]; then
@@ -52,14 +72,22 @@ for path in "$SERVER" "$CLIENT" "$MODEL"; do
     fi
 done
 needs_profile=0
+needs_placement=0
 IFS=',' read -r -a CONFIGS <<< "$CASES"
 for config in "${CONFIGS[@]}"; do
     if [[ "$config" != A ]]; then
         needs_profile=1
     fi
+    if [[ "$config" == SV || "$config" == SVC ]]; then
+        needs_placement=1
+    fi
 done
 if [[ "$needs_profile" == 1 && ! -e "$PROFILE" ]]; then
     echo "Fehlender Pfad: $PROFILE" >&2
+    exit 1
+fi
+if [[ "$needs_placement" == 1 && ( -z "$PLACEMENT" || ! -f "$PLACEMENT" ) ]]; then
+    echo "Konfiguration SV benoetigt eine vorhandene PLACEMENT-Datei: ${PLACEMENT:-<leer>}" >&2
     exit 1
 fi
 for command in curl python3 nvidia-smi ps sha256sum; do
@@ -73,6 +101,16 @@ if [[ "$needs_profile" == 1 ]]; then
     PROFILE_SHA256=$(sha256sum "$PROFILE")
     PROFILE_SHA256=${PROFILE_SHA256%% *}
 fi
+PLACEMENT_SHA256=none
+if [[ "$needs_placement" == 1 ]]; then
+    PLACEMENT_SHA256=$(sha256sum "$PLACEMENT")
+    PLACEMENT_SHA256=${PLACEMENT_SHA256%% *}
+    MANIFEST_PROFILE_SHA256=$(sed -n 's/^# profile_sha256=//p' "$PLACEMENT")
+    if [[ "$MANIFEST_PROFILE_SHA256" != "$PROFILE_SHA256" ]]; then
+        echo "Placement wurde fuer ein anderes Profil erzeugt: $MANIFEST_PROFILE_SHA256 != $PROFILE_SHA256" >&2
+        exit 1
+    fi
+fi
 POWER_PROFILE=unknown
 if command -v system76-power >/dev/null; then
     POWER_PROFILE=$(system76-power profile 2>/dev/null | sed -n 's/^Power Profile: //p' | tr '[:upper:]' '[:lower:]')
@@ -80,7 +118,7 @@ if command -v system76-power >/dev/null; then
 fi
 
 printf '%s\n' \
-  'config,rep,fixed_s,warm_s,mtp_n,cpu_threads,draft_threads,profile_sha256,power_profile,cpu_mask,cpu_poll,adapt,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
+  'config,rep,fixed_s,warm_s,mtp_n,cpu_threads,draft_threads,draft_type_k,draft_type_v,draft_p_min,draft_backend_sampling,cpu_chunk,cpu_act_parallel,profile_sha256,placement_sha256,power_profile,cpu_mask,cpu_poll,adapt,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,cpu_gate_up_ms,cpu_activation_ms,cpu_down_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
   > "$RUNS_CSV"
 
 PID=""
@@ -124,6 +162,8 @@ case_settings() {
         SB) FIXED_S="$STATIC_FIXED_S"; ADAPT=0; EXPERT_STATS=0 ;;
         SC) FIXED_S="$STATIC_FIXED_S"; ADAPT=0; STATIC_NO_SYNC=1; EXPERT_STATS=0 ;;
         SD) FIXED_S="$STATIC_FIXED_S"; ADAPT=0; EXPERT_STATS=1 ;;
+        SV) FIXED_S=variable; ADAPT=0; EXPERT_STATS=1 ;;
+        SVC) FIXED_S=variable; ADAPT=0; STATIC_NO_SYNC=1; EXPERT_STATS=0 ;;
         *) echo "Unbekannte Konfiguration: $config" >&2; return 1 ;;
     esac
     if [[ -n "$MTP_OVERRIDE" ]]; then
@@ -188,7 +228,7 @@ for config in "${CONFIGS[@]}"; do
         warmup_stats="$RESULTS_DIR/$stem.warmup.experts.json"
         usage_file="$RESULTS_DIR/$stem.usage.csv"
 
-        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT static_no_sync=$STATIC_NO_SYNC ==="
+        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V pmin=${DRAFT_P_MIN:-default} backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT static_no_sync=$STATIC_NO_SYNC ==="
 
         env_args=(
             CUDA_VISIBLE_DEVICES=0
@@ -198,6 +238,9 @@ for config in "${CONFIGS[@]}"; do
             LLAMA_EXPERT_STATS_JSON=0
             LLAMA_EXPERT_USAGE=0
             "LLAMA_EXPERT_ADAPT=$ADAPT"
+            "LLAMA_EXPERT_TIMING=$EXPERT_TIMING"
+            "LLAMA_EXPERT_CPU_CHUNK=$CPU_CHUNK"
+            "LLAMA_EXPERT_CPU_ACT_PARALLEL=$CPU_ACT_PARALLEL"
             "LLAMA_EXPERT_STATIC_NO_SYNC=$STATIC_NO_SYNC"
             LLAMA_EXPERT_DECAY=1.0
             "LLAMA_EXPERT_WARM_SLOTS=$WARM_S"
@@ -205,6 +248,8 @@ for config in "${CONFIGS[@]}"; do
             LLAMA_EXPERT_WARM_RESET=request
             "LLAMA_EXPERT_WARM_ADMISSION=$WARM_ADMISSION"
             "LLAMA_EXPERT_WARM_ADMISSION_WINDOW=$WARM_ADMISSION_WINDOW"
+            "LLAMA_EXPERT_WARM_AUTO_MAX=$WARM_AUTO_MAX"
+            "LLAMA_EXPERT_VRAM_RESERVE_MIB=$VRAM_RESERVE_MIB"
             "LLAMA_EXPERT_WARM_PREFETCH=$PREFETCH"
             "LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL=$WARM_MTP_EXPERIMENTAL"
         )
@@ -212,7 +257,11 @@ for config in "${CONFIGS[@]}"; do
             env_args+=("LLAMA_EXPERT_HOT=$PROFILE")
         fi
         if [[ "$FIXED_S" != auto ]]; then
-            env_args+=("LLAMA_EXPERT_S=$FIXED_S")
+            if [[ "$FIXED_S" == variable ]]; then
+                env_args+=("LLAMA_EXPERT_PLACEMENT=$PLACEMENT")
+            else
+                env_args+=("LLAMA_EXPERT_S=$FIXED_S")
+            fi
         fi
         if [[ "$PREFETCH" == 1 ]]; then
             env_args+=(
@@ -251,9 +300,18 @@ for config in "${CONFIGS[@]}"; do
                 --spec-type draft-mtp
                 --spec-draft-n-max "$MTP_N"
                 --spec-draft-ngl auto
-                --spec-draft-type-k q8_0
-                --spec-draft-type-v q4_0
+                --spec-draft-type-k "$DRAFT_TYPE_K"
+                --spec-draft-type-v "$DRAFT_TYPE_V"
             )
+            if [[ -n "$DRAFT_P_MIN" ]]; then
+                server_args+=(--spec-draft-p-min "$DRAFT_P_MIN")
+            fi
+            if [[ "$DRAFT_BACKEND_SAMPLING" == 0 ]]; then
+                server_args+=(--no-spec-draft-backend-sampling)
+            elif [[ -n "$DRAFT_BACKEND_SAMPLING" && "$DRAFT_BACKEND_SAMPLING" != 1 ]]; then
+                echo "DRAFT_BACKEND_SAMPLING muss 0, 1 oder leer sein" >&2
+                exit 1
+            fi
         fi
         if [[ -n "$CPU_THREADS" ]]; then
             server_args+=(
@@ -309,7 +367,10 @@ for config in "${CONFIGS[@]}"; do
             measured_env_args+=("LLAMA_EXPERT_STATS_JSON=$stats_file")
         fi
         if [[ "$SAVE_EXPERT_USAGE" == 1 ]]; then
-            measured_env_args+=("LLAMA_EXPERT_USAGE=$usage_file")
+            measured_env_args+=(
+                "LLAMA_EXPERT_USAGE=$usage_file"
+                LLAMA_EXPERT_USAGE_MODE=session
+            )
         fi
         env "${measured_env_args[@]}" \
             "$SERVER" "${server_args[@]}" > "$log_file" 2>&1 &
@@ -330,8 +391,13 @@ for config in "${CONFIGS[@]}"; do
             grep -E 'static no-sync|expert tiering' "$log_file" >&2 || true
             exit 1
         fi
+        if [[ "$FIXED_S" == variable ]] && ! grep -q 'variable placement validated:' "$log_file"; then
+            echo "Variable Placement wurde angefordert, aber nicht aktiviert:" >&2
+            grep -E 'placement|expert tiering' "$log_file" >&2 || true
+            exit 1
+        fi
 
-        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$PROFILE_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$STATIC_NO_SYNC" \
+        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$STATIC_NO_SYNC" \
             "$response_file" "$stats_file" "$samples_file" "$log_file" >> "$RUNS_CSV" <<'PY'
 import csv
 import json
@@ -340,7 +406,7 @@ import statistics
 import sys
 from pathlib import Path
 
-config, rep, fixed_s, warm_s, mtp_n, cpu_threads, draft_threads, profile_sha256, power_profile, cpu_mask, cpu_poll, adapt, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
+config, rep, fixed_s, warm_s, mtp_n, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, cpu_chunk, cpu_act_parallel, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
 response = json.loads(Path(response_path).read_text())
 stats_file = Path(stats_path)
 stats = json.loads(stats_file.read_text()) if stats_file.exists() else {}
@@ -373,7 +439,7 @@ total = float(stats.get("selected_total", 0) or 0)
 cold = float(stats.get("cold_hits", 0) or 0)
 
 row = [
-    config, rep, fixed_s, warm_s, mtp_n, cpu_threads, draft_threads, profile_sha256, power_profile, cpu_mask, cpu_poll, adapt, static_requested, int(static_active),
+    config, rep, fixed_s, warm_s, mtp_n, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, cpu_chunk, cpu_act_parallel, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, static_requested, int(static_active),
     timings.get("prompt_per_second", 0),
     response.get("ttft_ms", 0),
     timings.get("predicted_per_second", 0),
@@ -384,7 +450,9 @@ row = [
     cold / total if total else 0,
     stats.get("repins", 0), stats.get("warm_promotions", 0), stats.get("warm_evictions", 0),
     stats.get("h2d_copies", 0), stats.get("h2d_bytes", 0), stats.get("h2d_copy_ms", 0),
-    stats.get("cpu_expert_ms", 0), stats.get("gpu_expert_ms", 0), stats.get("sync_wait_ms", 0),
+    stats.get("cpu_expert_ms", 0), stats.get("cpu_gate_up_ms", 0),
+    stats.get("cpu_activation_ms", 0), stats.get("cpu_down_ms", 0),
+    stats.get("gpu_expert_ms", 0), stats.get("sync_wait_ms", 0),
     max(vram, default=0), max(rss, default=0) / 1024.0,
     statistics.fmean(gpu) if gpu else 0, statistics.fmean(cpu) if cpu else 0,
     timings.get("predicted_n", response.get("tokens_predicted", 0)),
@@ -416,12 +484,13 @@ numeric = [
     "mtp_acceptance", "mean_accepted_length",
     "hot_hits", "warm_hits", "cold_hits", "cold_share", "repins",
     "warm_promotions", "warm_evictions", "h2d_copies", "h2d_bytes", "h2d_ms",
-    "cpu_expert_ms", "gpu_expert_ms", "sync_wait_ms",
+    "cpu_expert_ms", "cpu_gate_up_ms", "cpu_activation_ms", "cpu_down_ms",
+    "gpu_expert_ms", "sync_wait_ms",
     "vram_peak_mib", "ram_peak_mib", "gpu_util_avg", "cpu_util_avg",
     "predicted_tokens",
 ]
 with open(destination, "w", newline="") as handle:
-    fields = ["config", "repeats", "fixed_s", "warm_s", "mtp_n", "cpu_threads", "draft_threads", "profile_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
+    fields = ["config", "repeats", "fixed_s", "warm_s", "mtp_n", "cpu_threads", "draft_threads", "draft_type_k", "draft_type_v", "draft_p_min", "draft_backend_sampling", "cpu_chunk", "cpu_act_parallel", "profile_sha256", "placement_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
         "output_hashes_identical", "token_hashes_identical", "output_sha256", "token_sha256",
     ]
     writer = csv.DictWriter(handle, fieldnames=fields)
@@ -438,7 +507,14 @@ with open(destination, "w", newline="") as handle:
             "mtp_n": group[0]["mtp_n"],
             "cpu_threads": group[0]["cpu_threads"],
             "draft_threads": group[0]["draft_threads"],
+            "draft_type_k": group[0]["draft_type_k"],
+            "draft_type_v": group[0]["draft_type_v"],
+            "draft_p_min": group[0]["draft_p_min"],
+            "draft_backend_sampling": group[0]["draft_backend_sampling"],
+            "cpu_chunk": group[0]["cpu_chunk"],
+            "cpu_act_parallel": group[0]["cpu_act_parallel"],
             "profile_sha256": group[0]["profile_sha256"],
+            "placement_sha256": group[0]["placement_sha256"],
             "power_profile": group[0]["power_profile"],
             "cpu_mask": group[0]["cpu_mask"],
             "cpu_poll": group[0]["cpu_poll"],

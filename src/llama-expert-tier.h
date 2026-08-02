@@ -12,12 +12,21 @@ struct llama_model;
 //   LLAMA_EXPERT_HOT   - path to heat csv with header "layer,expert,count"
 //                        (seed; optional if LLAMA_EXPERT_ADAPT=1)
 //   LLAMA_EXPERT_S     - hot slots per layer (default 16)
+//   LLAMA_EXPERT_PLACEMENT - optional validated per-layer static-slot manifest;
+//                            requires W=0 and adaptation off
 //   LLAMA_EXPERT_TMAX  - max n_tokens for the hot/cold path (default 16)
 //   LLAMA_EXPERT_STATS - dump cold-hit stats at exit ("1" = stderr, "0" = off, else path)
 //   LLAMA_EXPERT_ADAPT - 1: online repin of hot slots (decay + hysteresis)
 //   LLAMA_EXPERT_USAGE - dump learned hot set at exit (heat csv path, "0" = off)
+//   LLAMA_EXPERT_USAGE_MODE - cumulative (seed + observations, default) or
+//                             session (only observations from this process)
 //   LLAMA_EXPERT_STATS_JSON - dump machine-readable stats (path, "0" = off)
+//   LLAMA_EXPERT_TIMING - 1: collect optional per-layer CPU cold-node wall time
+//   LLAMA_EXPERT_CPU_CHUNK - singleton cold-expert row chunk, power of two 16..256
+//   LLAMA_EXPERT_CPU_ACT_PARALLEL - 1: split activation/quantization across
+//                                   quant blocks when cold columns are sparse
 //   LLAMA_EXPERT_WARM_SLOTS - extra bounded warm slots/layer (default 0)
+//   LLAMA_EXPERT_WARM_AUTO_MAX - cap for W=auto (default 4; tune on larger GPUs)
 //   LLAMA_EXPERT_WARM_POLICY - warm replacement policy (currently lru)
 //   LLAMA_EXPERT_WARM_RESET - request or persistent LRU aging
 //   LLAMA_EXPERT_WARM_ADMISSION - immediate, second-hit, or frequency
@@ -26,13 +35,19 @@ struct llama_model;
 //   LLAMA_EXPERT_WARM_PREFETCH - 0: synchronous fill; 1: asynchronous H2D fill
 //   LLAMA_EXPERT_PREFETCH_STREAMS - async streams (currently exactly 1)
 //   LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT - global in-flight copy limit (default 2)
+//   LLAMA_EXPERT_VRAM_RESERVE_MIB - conservative post-load reserve (default 512)
 //   LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL - 1 bypasses the default MTP warm guard
 //   LLAMA_EXPERT_STATIC_NO_SYNC - 1 skips the tier-update barrier only when
 //                                 adaptation, warm slots, and stats are disabled
 
 namespace llama_expert_tier {
 
-// call once after the model tensors are loaded; no-op unless LLAMA_EXPERT_HOT is set
+// Enable the tier for contexts created through common.cpp. Direct libllama
+// callers remain stock unless they explicitly set an LLAMA_EXPERT_* control.
+void configure_enabled(bool enabled);
+
+// call once after the model tensors are loaded; no-op unless configured by
+// common.cpp or an explicit LLAMA_EXPERT_* environment control is present
 void init(const llama_model & model);
 
 // drop-in replacement for ggml_mul_mat_id on MoE expert weights:

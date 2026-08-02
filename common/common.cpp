@@ -1344,14 +1344,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     llama_expert_tier::configure_mtp(has_mtp ? std::max(1, params.speculative.draft.n_max) : 0);
-
-    if (!params.cmoe) {
-#ifdef _WIN32
-        _putenv_s("LLAMA_EXPERT_S", "0");
-#else
-        setenv("LLAMA_EXPERT_S", "0", 1);
-#endif
-    }
+    llama_expert_tier::configure_enabled(params.cmoe);
 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
