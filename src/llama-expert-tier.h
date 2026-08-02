@@ -25,6 +25,8 @@ struct llama_model;
 //   LLAMA_EXPERT_CPU_CHUNK - singleton cold-expert row chunk, power of two 16..256
 //   LLAMA_EXPERT_CPU_ACT_PARALLEL - 1: split activation/quantization across
 //                                   quant blocks when cold columns are sparse
+//   LLAMA_EXPERT_CPU_ASYNC - 1: experimental CPU-cold/GPU-hot layer overlap
+//   LLAMA_EXPERT_CPU_DOWN_PREFETCH - down-weight row prefetch distance, 0..8
 //   LLAMA_EXPERT_WARM_SLOTS - extra bounded warm slots/layer (default 0)
 //   LLAMA_EXPERT_WARM_AUTO_MAX - cap for W=auto (default 4; tune on larger GPUs)
 //   LLAMA_EXPERT_WARM_POLICY - warm replacement policy (currently lru)
@@ -89,6 +91,10 @@ LLAMA_API size_t expert_weight_bytes(const llama_model & model);
 bool begin_moe_cold(bool eligible,
         ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,
         ggml_tensor * ids);
+
+// True only for the explicit asynchronous cold-split experiment. Graph
+// builders use it to place the cold branch before the hot branch in node order.
+bool cpu_async_enabled();
 
 ggml_tensor * end_moe_cold(ggml_context * ctx,
         ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,

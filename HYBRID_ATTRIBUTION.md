@@ -60,8 +60,9 @@ The warmcache state machine and slot transaction code are a new implementation f
 - Existing wackMall/llama.cpp files retain their original license and copyright
   notices. The hybrid modifies `NOTICE`, `common/arg.cpp`, `common/common.cpp`,
   `ggml/include/ggml-cpu.h`, `ggml/src/ggml-cpu/ggml-cpu.c`,
+  `ggml/src/ggml-cpu/ggml-cpu.cpp`,
   `src/CMakeLists.txt`, `src/llama-context.cpp`, `src/llama-expert-tier.cpp`,
-  `src/llama-expert-tier.h`, `tests/CMakeLists.txt`, and
+  `src/llama-expert-tier.h`, `src/llama-graph.cpp`, `tests/CMakeLists.txt`, and
   `tools/server/server-context.cpp`.
 - New implementation/test/tool files are `src/llama-expert-cache.cpp`,
   `src/llama-expert-cache.h`, `tests/test-expert-warm-cache.cpp`,
@@ -82,5 +83,10 @@ The warmcache state machine and slot transaction code are a new implementation f
 The CPU phase timers and block-parallel activation scheduling are original
 implementations for the existing wackMall fused cold operation. Their design
 was driven by local measurements and does not copy LuceBox runtime code.
+
+The experimental CPU-split coordinator, graph reordering, Down-row prefetch,
+and associated telemetry are also new wackMall implementations. LuceBox's
+high-level readback-before-hot and delayed-join concept motivated the ordering;
+no LuceBox scheduler, worker, graph, or synchronization code was copied.
 
 If later work copies or closely adapts LuceBox code, this file must be updated with the exact source path, function/range, copyright notice, nature of modifications, and corresponding `NOTICE` entry before distribution.

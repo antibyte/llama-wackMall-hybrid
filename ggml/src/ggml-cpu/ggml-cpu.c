@@ -70,6 +70,7 @@ static atomic_uint_fast64_t g_moe_profile_activation_us[GGML_MOE_PROFILE_MAX_LAY
 static atomic_uint_fast64_t g_moe_profile_down_us[GGML_MOE_PROFILE_MAX_LAYERS];
 static atomic_int g_moe_single_row_chunk = 64;
 static atomic_bool g_moe_parallel_activation;
+static atomic_int g_moe_down_prefetch;
 
 void ggml_cpu_moe_profile_enable(bool enabled) {
     atomic_store_explicit(&g_moe_profile_enabled, enabled, memory_order_relaxed);
@@ -121,6 +122,15 @@ void ggml_cpu_moe_set_parallel_activation(bool enabled) {
 
 bool ggml_cpu_moe_get_parallel_activation(void) {
     return atomic_load_explicit(&g_moe_parallel_activation, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_down_prefetch(int rows) {
+    GGML_ASSERT(rows >= 0);
+    atomic_store_explicit(&g_moe_down_prefetch, rows, memory_order_relaxed);
+}
+
+int ggml_cpu_moe_get_down_prefetch(void) {
+    return atomic_load_explicit(&g_moe_down_prefetch, memory_order_relaxed);
 }
 
 static bool ggml_cpu_moe_profile_is_enabled(void) {
@@ -2307,6 +2317,7 @@ static void ggml_compute_forward_moe_cold(
     }
 
     // phase C: down dots for all cold slots, scattered into dst
+    const int down_prefetch = ggml_cpu_moe_get_down_prefetch();
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) {
@@ -2344,10 +2355,21 @@ static void ggml_compute_forward_moe_cold(
                 const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
                 const char * acol = act_q + (col0[cur_a] + c)*q_ff;
                 float * dst_col = (float *) ((char *) dst->data + rm.i1*dst->nb[1] + (int64_t) rm.i2*dst->nb[2]);
-                for (int64_t j = ir0_start; j < ir0_end; j++) {
-                    float res = 0.0f;
-                    vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
-                    dst_col[j] += res;
+                if (down_prefetch > 0) {
+                    for (int64_t j = ir0_start; j < ir0_end; j++) {
+                        if (j + down_prefetch < ir0_end) {
+                            __builtin_prefetch(wd + (j + down_prefetch)*w_down->nb[1], 0, 3);
+                        }
+                        float res = 0.0f;
+                        vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
+                        dst_col[j] += res;
+                    }
+                } else {
+                    for (int64_t j = ir0_start; j < ir0_end; j++) {
+                        float res = 0.0f;
+                        vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
+                        dst_col[j] += res;
+                    }
                 }
             }
 

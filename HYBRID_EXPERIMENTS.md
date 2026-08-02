@@ -25,6 +25,8 @@ an exact control for the new measurements.
   and without `GGML_CUDA_FORCE_MMQ`.
 - `llama-server` and `llama-cli` linked successfully.
 - The strict profile converter has 16 passing tests.
+- Converter, profile-bank, and placement-optimizer Python suites have 31
+  passing tests in total.
 - The C++ warm-cache state machine test passes in the release build.
 - The source Spark table has 40 layers, 256 experts/layer, top-8 routing,
   10,240 cells, 829,760 selections, 8,393 nonzero cells, and exactly 20,744
@@ -551,3 +553,84 @@ target-side `nsys` command could capture but not import; using the installed
 host `QdstrmImporter` recovered the report. This evidence justifies a narrowly
 guarded asynchronous CPU-split prototype, but not an unconditional scheduler
 rewrite.
+
+## Async overlap, model loading, and final memory screens
+
+The guarded asynchronous CPU split preserved exact deterministic hashes but
+did not improve this machine. With MTP-2, 64-token static S=33 q4_0/q4_0
+controls measured 46.245 tok/s synchronously and 42.971 tok/s asynchronously
+(-7.08%). The async run dispatched 1,120 cold jobs and still waited 583.698 ms
+at their real output dependencies. Reducing target/draft workers to seven
+reached only 39.685 tok/s over 256 tokens.
+
+The no-MTP control separates the result from speculative scheduling:
+
+| Mode | CPU async | Decode tok/s | Hash relationship |
+|---|---:|---:|---|
+| no MTP | 0 | 38.629 | identical |
+| no MTP | 1 | 35.504 | identical |
+
+The -8.09% no-MTP result confirms that simultaneous GPU work slows the cold
+job and/or its scheduling more than the overlap saves on this 8-core system.
+The mode remains parameterized for systems with a different CPU/GPU balance,
+but defaults off and hit the local stop condition. Artifacts begin with
+`benchmark-results/cpu-async-overlap-*` and
+`benchmark-results/cpu-async-nomtp-*`.
+
+The model loader's recommendation to avoid mmap for CPU tensor overrides was
+also tested. `load_mode=none` auto-clamped the safe tier to S=32. At the same
+S=32 and exact hashes, `none` reached 41.980 tok/s versus 42.780 tok/s for
+`mmap` (-1.87%), while taking much longer to load. Forcing more slots was not
+justified. `mmap` remains the recommendation on this machine; the runner keeps
+the loading mode explicit for platforms with different VM behavior.
+
+A Down-weight software-prefetch distance of one preserved hashes but reached
+42.898 versus 43.517 tok/s for distance zero over 256 tokens (-1.42%). Larger
+distances were not pursued after the negative first screen. The option remains
+off by default for CPU-specific experiments.
+
+Finally, lowering the reserve to 400 MiB allowed uniform S=34 with a 5,602 MiB
+peak and no OOM/Xid. It reached only 42.416 tok/s versus 43.517 for the nearby
+S=33 screen and changed the MTP path (acceptance 0.6486 versus 0.7095). S=33 is
+therefore the measured 6-GiB optimum; merely filling VRAM is not sufficient.
+Larger GPUs should still screen S=64/96/etc. because the offline coverage gains
+are substantial, but each hardware/model pair needs a throughput and MTP gate.
+
+After all feature-gated changes, a default-off 512-token regression control
+measured 45.266 tok/s versus the earlier 45.280 tok/s (-0.03%), with exact
+matching output/token hashes, acceptance, mean accepted length, and 5,530 MiB
+peak VRAM. The production recommendation remains static S=33, W=0, MTP-2,
+draft KV q4_0/q4_0, eight target/draft threads, mmap, and all three experimental
+CPU switches disabled.
+
+The final current-source 2,000-token validation measured 46.245, 46.419, and
+46.231 tok/s, for a **46.245 tok/s median**. All three runs reproduced output
+SHA-256 `49852a17cf69c3add0226110990beda292a590c083a23b8444886e7fda766fbe`,
+token SHA-256 `1aaa24431d19af491551b7415fda4e30a2d18236e06b6bba698bf9ab11d5b66e`,
+acceptance 0.806409, mean length 2.61, and 5,530 MiB peak VRAM. This current
+median is 0.41% below the earlier 46.433 median and does not constitute a
+regression under the 3% gate. Artifacts:
+`benchmark-results/final-default-q4q4-2000-20260802T183000Z` and
+`benchmark-results/final-default-q4q4-2000-repeat2-20260802T184000Z`.
+
+## Final full-suite validation
+
+The final `ctest -j8 --output-on-failure` run passed 54 of 59 registered tests.
+Most importantly for the last backend change, `test-backend-ops` passed its
+full CPU/CUDA matrix after 244.54 seconds. The targeted argument-parser,
+warm-cache, placement, and save/load tests also passed.
+
+The five non-passing registrations are outside the modified hybrid paths:
+
+- `test-tokenizers-ggml-vocabs` sees Git-LFS pointer text (`vers`) instead of
+  downloaded GGUF vocabulary data.
+- `test-quant-type-selection` reports stale Qwen3.5 quantization snapshots
+  (9/11 models pass, one is skipped).
+- `test-generate-models` and `test-llama-archs` abort in the existing
+  MiniMax-M3 `build_ffn` path at `llama-graph.cpp:1716`, before the modified
+  MoE builder region.
+- `test-recurrent-state-rollback` is not run because it depends on the failed
+  generated-model test.
+
+No failure points at the async coordinator, cold op, expert LUT, warm slots,
+sentinel handling, placement parser, or MTP state paths changed here.

@@ -1975,6 +1975,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool moe_cold = llama_expert_tier::begin_moe_cold(cold_ok,
             gw, uw, down_exps, selected_experts);
     ggml_tensor * x_in = cur;
+    ggml_tensor * cold = nullptr;
+
+    // The synchronous CPU backend must keep the historical late node order.
+    // In the guarded async mode, expand the cold branch immediately after the
+    // router. Its input readback completes before hot work, its coordinator
+    // job then runs while the CUDA hot branch is submitted, and the later
+    // combine copy is the first point that joins the CPU result.
+    if (moe_cold && llama_expert_tier::cpu_async_enabled()) {
+        cold = llama_expert_tier::end_moe_cold(ctx0, gw, uw, down_exps, x_in, selected_experts);
+        if (cold) {
+            ggml_build_forward_expand(gf, cold);
+        }
+    }
 
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
@@ -2109,7 +2122,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_scaled", il);
     }
     if (moe_cold) {
-        ggml_tensor * cold = llama_expert_tier::end_moe_cold(ctx0, gw, uw, down_exps, x_in, selected_experts);
+        if (!cold) {
+            cold = llama_expert_tier::end_moe_cold(ctx0, gw, uw, down_exps, x_in, selected_experts);
+        }
         if (cold) {
             if (down_exps_s) {
                 ggml_tensor * s = ggml_reshape_3d(ctx0, down_exps_s, 1, down_exps_s->ne[0], 1);

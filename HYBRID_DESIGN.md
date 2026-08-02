@@ -329,6 +329,9 @@ expert time, and synchronization time are not yet wired into the expert-tier
 module and remain literal zero; the benchmark client, server log, and external
 timeline tools provide request-level values. Runtime counters use uint64 and
 duration totals use milliseconds.
+Async runs additionally expose `cpu_async`, `cpu_async_jobs`, and
+`cpu_async_wait_ms`; the configured Down prefetch distance is recorded as
+`cpu_down_prefetch`.
 For all three output variables, the literal value `0` now means disabled and
 does not create a file named `0`.
 
@@ -350,6 +353,11 @@ but the Ryzen 7 4800H measurement showed that this phase accounts for only a
 small part of cold compute. It must be selected by measurement rather than
 core-utilization appearance.
 
+`LLAMA_EXPERT_CPU_DOWN_PREFETCH=0..8` optionally issues software prefetches for
+future Down-weight rows. It defaults to `0`, so the established inner loop is
+unchanged. This knob is CPU/cache dependent; a distance of one regressed on
+the Ryzen 7 4800H and is not recommended there.
+
 An Nsight Systems trace of the static MTP-2 path found many synchronization
 calls inside normal cross-backend graph execution even after the separate tier
 barrier was disabled. Removing those waits safely requires moving router/input
@@ -358,10 +366,31 @@ only before the cold result upload/combine. That is a distinct experiment from
 `LLAMA_EXPERT_STATIC_NO_SYNC`; it must remain feature-gated because it changes
 backend scheduling and tensor lifetime rather than only tier bookkeeping.
 
+### Experimental asynchronous CPU cold split
+
+`LLAMA_EXPERT_CPU_ASYNC=1` enables a guarded implementation of the ordering
+required by the timeline analysis. The graph builder expands the cold branch
+immediately after router outputs, before the hot expert branch. A CPU backend
+split containing exactly one `GGML_OP_MOE_COLD` node is dispatched to a lazy,
+persistent coordinator thread. Cross-backend input copies still complete
+before dispatch, and the backend's synchronize callback joins the job before
+the cold output is uploaded for the CUDA combine. Backend destruction drains
+the job and joins the coordinator.
+
+All other CPU graphs remain synchronous. `cpu_async_jobs` and
+`cpu_async_wait_ms` report dispatches and the remaining join wait. The mode is
+off by default and does not alter expert ownership, LUTs, MTP state, KV state,
+or numerical operations. It preserved hashes both with MTP-2 and without MTP,
+but regressed throughput on the Ryzen/GTX system; it is retained only for
+measured use on different CPU/GPU balances.
+
 The benchmark runner also exposes draft `K/V` types, `p_min`, and backend
 sampling. These are existing llama.cpp features, not hybrid arithmetic. On the
 GTX 1660 Ti, MTP-2 with draft q4_0/q4_0 is the measured winner; other GPUs may
 select different types without changing the placement/cache implementation.
+The runner additionally records `CPU_ASYNC`, `CPU_DOWN_PREFETCH`, and
+`LOAD_MODE` (`mmap` by default), so heterogeneous results are not silently
+mixed.
 
 ## Validation and abort diagnostics
 
