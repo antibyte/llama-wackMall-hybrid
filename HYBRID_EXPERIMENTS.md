@@ -959,6 +959,9 @@ prompt, not proof of production-grade generated code or a broad quality win.
 The measured local cost was 7.2% decode throughput in the comparable 64-token
 reasoning run.  Production was switched to target q8_0/q4_0 while retaining
 draft q4_0/q4_0 and S=33.  To prevent another unbounded reasoning excursion,
-the server default reasoning budget is 1,024 and its global fallback output
-limit is 4,096 tokens.  Per-request client limits still take precedence.
+the tested server default reasoning budget is 64 and its global fallback output
+limit is 4,096 tokens.  A 1,024-token budget was rejected as the default because
+the model had already started drafting final code inside the reasoning block
+when the forced end transition occurred.  Per-request client limits and
+explicitly larger reasoning budgets still take precedence.
 Artifacts are under `benchmark-results/target-kv-{fit,quality}-*`.
