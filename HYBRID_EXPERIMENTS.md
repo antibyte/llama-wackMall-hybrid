@@ -916,3 +916,49 @@ slot.  The 2-GiB RAM cache is bounded, and saving/loading adds roughly 0.1--0.2
 seconds in this test.  Artifacts begin with
 `benchmark-results/prompt-cache-{branch,ram-idle,ram-forced}-*`; the runner is
 `scripts/test_prompt_cache.sh`.
+
+## Target KV precision quality screen
+
+After one production `"fft in c"` request spent 9,927 output tokens in a
+self-correcting reasoning loop, target KV precision was isolated from draft KV
+precision.  The original request had temperature 1, a random seed, no output
+limit, and a 16,384-token reasoning budget, so it did not by itself establish a
+KV-cache defect.  It nevertheless motivated a deterministic code-quality A/B.
+
+All probes used the same learned profile, MTP-2, draft q4_0/q4_0, 32K context,
+376/376, W=0, and no adaptation or usage output.  Startup fit was:
+
+| Target K/V | Effective fixed S | Startup VRAM |
+|---|---:|---:|
+| q4_0/q4_0 | 33 | 5,578 MiB |
+| q8_0/q4_0 | 33 | 5,486 MiB |
+| q8_0/q8_0 | 30 | 5,518 MiB |
+
+Thus q8_0/q4_0 permits a fair S=33 comparison on this card; q8_0/q8_0 changes
+expert placement and was not used for the first quality decision.
+
+A 1,024-token reasoning budget plus a 2,048-token total limit caused both
+variants to hit the length stop and split the forced reasoning-to-content
+transition while drafting code.  This exposed a reasoning-budget/total-budget
+interaction rather than a clean KV comparison.  Reducing the reasoning budget
+to 64 with a 1,024-token total limit produced visible code in both cases:
+
+| Target K/V | Decode | MTP acceptance | Generated result |
+|---|---:|---:|---|
+| q4_0/q4_0 | 45.29 tok/s | 0.8652 | truncated multi-file answer; core fails to compile |
+| q8_0/q4_0 | 42.04 tok/s | 0.8342 | complete single-file core and example; exact roundtrip under GNU-C99 |
+
+The q4 core used a `double` as an array subscript, exchanged complex samples
+through an `int`, and used an incorrect stage twiddle expression.  The q8/q4
+program compiled under GNU-C99 and recovered `[1,2,3,4,4,3,2,1]` with zero
+error at its printed precision.  Under strict C99 it still failed because the
+generated answer used non-standard `M_PI`, and it omitted an explicit
+power-of-two check.  The result is therefore a measurable improvement for this
+prompt, not proof of production-grade generated code or a broad quality win.
+
+The measured local cost was 7.2% decode throughput in the comparable 64-token
+reasoning run.  Production was switched to target q8_0/q4_0 while retaining
+draft q4_0/q4_0 and S=33.  To prevent another unbounded reasoning excursion,
+the server default reasoning budget is 1,024 and its global fallback output
+limit is 4,096 tokens.  Per-request client limits still take precedence.
+Artifacts are under `benchmark-results/target-kv-{fit,quality}-*`.

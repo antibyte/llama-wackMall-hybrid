@@ -200,6 +200,26 @@ upstream 2048/512 logical/physical defaults in that sweep.
 
 Change `--spec-draft-n-max` to 1 or 3 for MTP-1/MTP-3, or remove all `--spec-*` options for a no-MTP control. Always compare token/output hashes and MTP acceptance, not throughput alone.
 
+For a quality-oriented 32K configuration, target `q8_0/q4_0` is a tested
+alternative to the fastest `q4_0/q4_0` recipe while the MTP draft cache remains
+q4_0/q4_0:
+
+```bash
+-ctk q8_0 -ctv q4_0 \
+--spec-draft-type-k q4_0 --spec-draft-type-v q4_0 \
+--reasoning-budget 1024 \
+-n 4096
+```
+
+On the local GTX 1660 Ti this retained S=33 and improved the generated
+`"fft in c"` implementation from a non-compiling/truncated q4 result to an
+executing exact FFT/IFFT roundtrip under GNU-C99.  The comparable short screen
+fell from 45.29 to 42.04 tok/s (-7.2%).  Strict C99 still exposed a generated
+`M_PI` portability defect, so this is evidence for a quality preference, not a
+claim that generated code no longer needs validation.  Larger GPUs should also
+test target q8_0/q8_0; on the 6-GiB card it auto-fitted the fixed tier down from
+S=33 to S=30.
+
 ### Safe dynamic learning mode
 
 Dynamic adaptation uses one stable fixed-tier mapping for an entire request.
