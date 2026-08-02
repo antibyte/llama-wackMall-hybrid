@@ -27,6 +27,7 @@ struct llama_model;
 //                                   quant blocks when cold columns are sparse
 //   LLAMA_EXPERT_CPU_ASYNC - 1: experimental CPU-cold/GPU-hot layer overlap
 //   LLAMA_EXPERT_CPU_DOWN_PREFETCH - down-weight row prefetch distance, 0..8
+//   LLAMA_EXPERT_CPU_REUSE_ROWS - 1: reuse weight rows across repeated MTP experts
 //   LLAMA_EXPERT_WARM_SLOTS - extra bounded warm slots/layer (default 0)
 //   LLAMA_EXPERT_WARM_AUTO_MAX - cap for W=auto (default 4; tune on larger GPUs)
 //   LLAMA_EXPERT_WARM_POLICY - warm replacement policy (currently lru)

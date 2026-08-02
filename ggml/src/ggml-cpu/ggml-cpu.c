@@ -71,6 +71,7 @@ static atomic_uint_fast64_t g_moe_profile_down_us[GGML_MOE_PROFILE_MAX_LAYERS];
 static atomic_int g_moe_single_row_chunk = 64;
 static atomic_bool g_moe_parallel_activation;
 static atomic_int g_moe_down_prefetch;
+static atomic_bool g_moe_reuse_rows;
 
 void ggml_cpu_moe_profile_enable(bool enabled) {
     atomic_store_explicit(&g_moe_profile_enabled, enabled, memory_order_relaxed);
@@ -131,6 +132,14 @@ void ggml_cpu_moe_set_down_prefetch(int rows) {
 
 int ggml_cpu_moe_get_down_prefetch(void) {
     return atomic_load_explicit(&g_moe_down_prefetch, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_reuse_rows(bool enabled) {
+    atomic_store_explicit(&g_moe_reuse_rows, enabled, memory_order_relaxed);
+}
+
+bool ggml_cpu_moe_get_reuse_rows(void) {
+    return atomic_load_explicit(&g_moe_reuse_rows, memory_order_relaxed);
 }
 
 static bool ggml_cpu_moe_profile_is_enabled(void) {
@@ -2154,6 +2163,7 @@ static void ggml_compute_forward_moe_cold(
 
     const bool profile_phases = ggml_cpu_moe_profile_is_enabled();
     const int profile_layer = profile_phases ? dst->op_params[0] : -1;
+    const bool reuse_rows = ggml_cpu_moe_get_reuse_rows();
 
     // quantize x once, shared by all experts
     for (int64_t t = ith; t < n_tokens; t++) {
@@ -2237,16 +2247,31 @@ static void ggml_compute_forward_moe_cold(
             const int64_t ir0_start = dr0*ith0, ir0_end = MIN(ir0_start + dr0, nr0);
             const int64_t ir1_start = dr1*ith1, ir1_end = MIN(ir1_start + dr1, nr1);
 
-            for (int64_t c = ir1_start; c < ir1_end; c++) {
-                const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
-                const char * xcol = xq + (int64_t) rm.i2*q_embd;
-                float * gout = gate_out + (col0[cur_a] + c)*n_ff;
-                float * uout = up_out   + (col0[cur_a] + c)*n_ff;
+            if (reuse_rows && ir1_end - ir1_start > 1) {
                 for (int64_t i = ir0_start; i < ir0_end; i++) {
                     __builtin_prefetch(wg + (i + 1)*w_gate->nb[1], 0, 3);
                     __builtin_prefetch(wu + (i + 1)*w_up->nb[1], 0, 3);
-                    vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
-                    vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                    for (int64_t c = ir1_start; c < ir1_end; c++) {
+                        const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
+                        const char * xcol = xq + (int64_t) rm.i2*q_embd;
+                        float * gout = gate_out + (col0[cur_a] + c)*n_ff;
+                        float * uout = up_out   + (col0[cur_a] + c)*n_ff;
+                        vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
+                        vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                    }
+                }
+            } else {
+                for (int64_t c = ir1_start; c < ir1_end; c++) {
+                    const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
+                    const char * xcol = xq + (int64_t) rm.i2*q_embd;
+                    float * gout = gate_out + (col0[cur_a] + c)*n_ff;
+                    float * uout = up_out   + (col0[cur_a] + c)*n_ff;
+                    for (int64_t i = ir0_start; i < ir0_end; i++) {
+                        __builtin_prefetch(wg + (i + 1)*w_gate->nb[1], 0, 3);
+                        __builtin_prefetch(wu + (i + 1)*w_up->nb[1], 0, 3);
+                        vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
+                        vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                    }
                 }
             }
 
@@ -2351,24 +2376,40 @@ static void ggml_compute_forward_moe_cold(
             const int64_t ir0_start = dr0*ith0, ir0_end = MIN(ir0_start + dr0, nr0);
             const int64_t ir1_start = dr1*ith1, ir1_end = MIN(ir1_start + dr1, nr1);
 
-            for (int64_t c = ir1_start; c < ir1_end; c++) {
-                const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
-                const char * acol = act_q + (col0[cur_a] + c)*q_ff;
-                float * dst_col = (float *) ((char *) dst->data + rm.i1*dst->nb[1] + (int64_t) rm.i2*dst->nb[2]);
-                if (down_prefetch > 0) {
-                    for (int64_t j = ir0_start; j < ir0_end; j++) {
-                        if (j + down_prefetch < ir0_end) {
-                            __builtin_prefetch(wd + (j + down_prefetch)*w_down->nb[1], 0, 3);
-                        }
+            if (reuse_rows && ir1_end - ir1_start > 1) {
+                for (int64_t j = ir0_start; j < ir0_end; j++) {
+                    if (down_prefetch > 0 && j + down_prefetch < ir0_end) {
+                        __builtin_prefetch(wd + (j + down_prefetch)*w_down->nb[1], 0, 3);
+                    }
+                    for (int64_t c = ir1_start; c < ir1_end; c++) {
+                        const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
+                        const char * acol = act_q + (col0[cur_a] + c)*q_ff;
+                        float * dst_col = (float *) ((char *) dst->data + rm.i1*dst->nb[1] + (int64_t) rm.i2*dst->nb[2]);
                         float res = 0.0f;
                         vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
                         dst_col[j] += res;
                     }
-                } else {
-                    for (int64_t j = ir0_start; j < ir0_end; j++) {
-                        float res = 0.0f;
-                        vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
-                        dst_col[j] += res;
+                }
+            } else {
+                for (int64_t c = ir1_start; c < ir1_end; c++) {
+                    const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
+                    const char * acol = act_q + (col0[cur_a] + c)*q_ff;
+                    float * dst_col = (float *) ((char *) dst->data + rm.i1*dst->nb[1] + (int64_t) rm.i2*dst->nb[2]);
+                    if (down_prefetch > 0) {
+                        for (int64_t j = ir0_start; j < ir0_end; j++) {
+                            if (j + down_prefetch < ir0_end) {
+                                __builtin_prefetch(wd + (j + down_prefetch)*w_down->nb[1], 0, 3);
+                            }
+                            float res = 0.0f;
+                            vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
+                            dst_col[j] += res;
+                        }
+                    } else {
+                        for (int64_t j = ir0_start; j < ir0_end; j++) {
+                            float res = 0.0f;
+                            vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
+                            dst_col[j] += res;
+                        }
                     }
                 }
             }

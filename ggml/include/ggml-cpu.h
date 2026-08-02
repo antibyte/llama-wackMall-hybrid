@@ -139,6 +139,8 @@ extern "C" {
     GGML_BACKEND_API bool ggml_cpu_moe_get_parallel_activation(void);
     GGML_BACKEND_API void ggml_cpu_moe_set_down_prefetch(int rows);
     GGML_BACKEND_API int  ggml_cpu_moe_get_down_prefetch(void);
+    GGML_BACKEND_API void ggml_cpu_moe_set_reuse_rows(bool enabled);
+    GGML_BACKEND_API bool ggml_cpu_moe_get_reuse_rows(void);
     // Experimental: execute a graph split consisting only of GGML_OP_MOE_COLD
     // on a persistent coordinator thread. The backend synchronization point
     // joins the job before its output is consumed.

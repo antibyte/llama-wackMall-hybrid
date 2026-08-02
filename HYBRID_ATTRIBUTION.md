@@ -85,8 +85,9 @@ implementations for the existing wackMall fused cold operation. Their design
 was driven by local measurements and does not copy LuceBox runtime code.
 
 The experimental CPU-split coordinator, graph reordering, Down-row prefetch,
-and associated telemetry are also new wackMall implementations. LuceBox's
-high-level readback-before-hot and delayed-join concept motivated the ordering;
-no LuceBox scheduler, worker, graph, or synchronization code was copied.
+MTP row-reuse loop, and associated telemetry are also new wackMall
+implementations. LuceBox's high-level readback-before-hot and delayed-join
+concept motivated the ordering; no LuceBox scheduler, worker, graph, or
+synchronization code was copied.
 
 If later work copies or closely adapts LuceBox code, this file must be updated with the exact source path, function/range, copyright notice, nature of modifications, and corresponding `NOTICE` entry before distribution.

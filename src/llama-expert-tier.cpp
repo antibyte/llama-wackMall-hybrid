@@ -101,6 +101,7 @@ static int  g_cpu_single_row_chunk = 64;
 static bool g_cpu_parallel_activation = false;
 static bool g_cpu_async = false;
 static int  g_cpu_down_prefetch = 0;
+static bool g_cpu_reuse_rows = false;
 static bool g_static_no_sync_requested = false;
 static bool g_static_no_sync_active = false;
 static int  g_prefetch_streams = 1;
@@ -1114,6 +1115,7 @@ static void dump_stats() {
                 "  \"cpu_single_row_chunk\": %d,\n"
                 "  \"cpu_parallel_activation\": %s,\n"
                 "  \"cpu_down_prefetch\": %d,\n"
+                "  \"cpu_reuse_rows\": %s,\n"
                 "  \"cpu_async\": %s,\n"
                 "  \"cpu_async_jobs\": %llu,\n"
                 "  \"cpu_async_wait_ms\": %.3f,\n"
@@ -1139,7 +1141,7 @@ static void dump_stats() {
                 "}\n",
                 g_variable_placement ? -1 : g_S, hot_slots_total, hot_slots_min, hot_slots_max,
                 g_W, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "true" : "false",
-                g_cpu_down_prefetch,
+                g_cpu_down_prefetch, g_cpu_reuse_rows ? "true" : "false",
                 g_cpu_async ? "true" : "false", (unsigned long long) cpu_async_jobs,
                 (double) cpu_async_wait_us/1000.0,
                 (unsigned long long) selected_total, (unsigned long long) fixed_hits,
@@ -1238,6 +1240,7 @@ static bool explicitly_requested_by_env() {
         "LLAMA_EXPERT_CPU_ACT_PARALLEL",
         "LLAMA_EXPERT_CPU_ASYNC",
         "LLAMA_EXPERT_CPU_DOWN_PREFETCH",
+        "LLAMA_EXPERT_CPU_REUSE_ROWS",
         "LLAMA_EXPERT_WARM_SLOTS",
         "LLAMA_EXPERT_STATIC_NO_SYNC",
     };
@@ -1448,9 +1451,19 @@ void init(const llama_model & model) {
             return;
         }
     }
+    if (const char * reuse = getenv("LLAMA_EXPERT_CPU_REUSE_ROWS")) {
+        int value = 0;
+        if (!parse_nonnegative_int(reuse, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_REUSE_ROWS='%s'; expected 0 or 1\n",
+                    __func__, reuse);
+            return;
+        }
+        g_cpu_reuse_rows = value == 1;
+    }
     ggml_cpu_moe_set_single_row_chunk(g_cpu_single_row_chunk);
     ggml_cpu_moe_set_parallel_activation(g_cpu_parallel_activation);
     ggml_cpu_moe_set_down_prefetch(g_cpu_down_prefetch);
+    ggml_cpu_moe_set_reuse_rows(g_cpu_reuse_rows);
     ggml_cpu_moe_set_async(g_cpu_async);
     ggml_cpu_moe_async_stats_reset();
     ggml_cpu_moe_profile_reset();
@@ -1932,9 +1945,9 @@ void init(const llama_model & model) {
         TIER_LOG("%s: expert usage export mode: %s\n", __func__,
                 g_usage_mode == expert_usage_mode::session ? "session" : "cumulative");
     }
-    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s; down prefetch: %d; async overlap: %s\n",
+    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s; down prefetch: %d; row reuse: %s; async overlap: %s\n",
             __func__, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "on" : "off",
-            g_cpu_down_prefetch, g_cpu_async ? "on" : "off");
+            g_cpu_down_prefetch, g_cpu_reuse_rows ? "on" : "off", g_cpu_async ? "on" : "off");
     if (g_W > 0) {
         if (g_warm_admission == warm_admission_mode::frequency) {
             TIER_LOG("%s: warm admission frequency window=%d graphs\n", __func__, g_warm_admission_window);

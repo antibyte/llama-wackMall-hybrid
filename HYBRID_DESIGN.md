@@ -331,7 +331,7 @@ timeline tools provide request-level values. Runtime counters use uint64 and
 duration totals use milliseconds.
 Async runs additionally expose `cpu_async`, `cpu_async_jobs`, and
 `cpu_async_wait_ms`; the configured Down prefetch distance is recorded as
-`cpu_down_prefetch`.
+`cpu_down_prefetch`, and the row traversal mode as `cpu_reuse_rows`.
 For all three output variables, the literal value `0` now means disabled and
 does not create a file named `0`.
 
@@ -357,6 +357,17 @@ core-utilization appearance.
 future Down-weight rows. It defaults to `0`, so the established inner loop is
 unchanged. This knob is CPU/cache dependent; a distance of one regressed on
 the Ryzen 7 4800H and is not recommended there.
+
+`LLAMA_EXPERT_CPU_REUSE_ROWS=1` is a separate MTP-oriented memory-bandwidth
+experiment. When two or more tokens in the same graph select the same cold
+expert, the Gate/Up and Down loops traverse output rows first and token columns
+second. Each quantized weight row can therefore remain in cache across those
+dot products. Every individual dot product, destination, and combine remains
+unchanged; single-token/single-column work follows the original loop. The
+default is `0` because the measured GTX/Ryzen gain is only about three tenths
+of one percent, while CPU cache hierarchies and MTP batch overlap vary widely.
+It is expected to be most relevant when a faster GPU makes CPU cold work the
+bottleneck, but must be selected by a sustained A/B measurement.
 
 An Nsight Systems trace of the static MTP-2 path found many synchronization
 calls inside normal cross-backend graph execution even after the separate tier
@@ -388,9 +399,9 @@ The benchmark runner also exposes draft `K/V` types, `p_min`, and backend
 sampling. These are existing llama.cpp features, not hybrid arithmetic. On the
 GTX 1660 Ti, MTP-2 with draft q4_0/q4_0 is the measured winner; other GPUs may
 select different types without changing the placement/cache implementation.
-The runner additionally records `CPU_ASYNC`, `CPU_DOWN_PREFETCH`, and
-`LOAD_MODE` (`mmap` by default), so heterogeneous results are not silently
-mixed.
+The runner additionally records `CPU_ASYNC`, `CPU_DOWN_PREFETCH`,
+`CPU_REUSE_ROWS`, and `LOAD_MODE` (`mmap` by default), so heterogeneous results
+are not silently mixed.
 
 ## Validation and abort diagnostics
 

@@ -599,9 +599,10 @@ are substantial, but each hardware/model pair needs a throughput and MTP gate.
 After all feature-gated changes, a default-off 512-token regression control
 measured 45.266 tok/s versus the earlier 45.280 tok/s (-0.03%), with exact
 matching output/token hashes, acceptance, mean accepted length, and 5,530 MiB
-peak VRAM. The production recommendation remains static S=33, W=0, MTP-2,
-draft KV q4_0/q4_0, eight target/draft threads, mmap, and all three experimental
-CPU switches disabled.
+peak VRAM. The conservative production recommendation remains static S=33,
+W=0, MTP-2, draft KV q4_0/q4_0, eight target/draft threads, mmap, and
+experimental CPU switches disabled. The later row-reuse experiment below is a
+slightly faster local option but is not a portable default.
 
 The final current-source 2,000-token validation measured 46.245, 46.419, and
 46.231 tok/s, for a **46.245 tok/s median**. All three runs reproduced output
@@ -634,3 +635,44 @@ The five non-passing registrations are outside the modified hybrid paths:
 
 No failure points at the async coordinator, cold op, expert LUT, warm slots,
 sentinel handling, placement parser, or MTP state paths changed here.
+
+## MTP cold-weight row reuse
+
+The final CPU-layout experiment reverses the inner row/column traversal only
+when multiple tokens select the same cold expert. This keeps a quantized weight
+row cache-resident across those token dot products. It is controlled by
+`LLAMA_EXPERT_CPU_REUSE_ROWS=0|1` and defaults off.
+
+With phase timing enabled, the 256-token MTP-2 A/B was hash-identical:
+
+| Row reuse | Decode tok/s | Gate/Up ms | Activation ms | Down ms | Whole cold ms |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 43.242 | 1,061.206 | 39.176 | 717.474 | 1,909.885 |
+| 1 | 43.205 | 1,062.443 | 38.983 | 701.934 | 1,895.692 |
+
+Thus Down improved 2.17% and the whole cold node 0.74%, but timing overhead hid
+the change in end-to-end throughput. A corresponding MTP-3 timing A/B was also
+hash-identical and flat at 36.772 versus 36.767 tok/s; it does not change the
+earlier conclusion that MTP-2 is faster on this hardware.
+
+Without timing/statistics, a 512-token production-path screen reached 45.404
+versus 44.800 tok/s (+1.35%). The required direct three-run 2,000-token A/B was:
+
+| Mode | Runs (tok/s) | Median |
+|---|---|---:|
+| row reuse 0 | 46.365, 46.362, 46.361 | 46.362 |
+| row reuse 1 | 46.593, 46.508, 46.335 | 46.508 |
+
+The sustained median gain is 0.31%. A separate enabled probe reached 46.614
+tok/s. Every 2,000-token run reproduced output SHA-256
+`49852a17cf69c3add0226110990beda292a590c083a23b8444886e7fda766fbe`,
+token SHA-256 `1aaa24431d19af491551b7415fda4e30a2d18236e06b6bba698bf9ab11d5b66e`,
+acceptance 0.806409, mean length 2.61, and 5,530 MiB peak VRAM.
+
+This is the fastest measured local option, but its margin is too small to
+enable globally. It remains a portable knob for machines where repeated MTP
+cold experts and CPU memory bandwidth are a larger fraction of decode time.
+Artifacts begin with `benchmark-results/cpu-row-reuse-*`.
+
+After this loop change, `test-backend-ops` was rerun: all 13,327 supported CUDA
+operation cases passed and both registered backends completed successfully.
