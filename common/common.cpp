@@ -1218,6 +1218,11 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    llama_expert_tier::configure_mtp(has_mtp ? std::max(1, params.speculative.draft.n_max) : 0);
+    llama_expert_tier::configure_enabled(params.cmoe);
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1340,11 +1345,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
-
-    const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    llama_expert_tier::configure_mtp(has_mtp ? std::max(1, params.speculative.draft.n_max) : 0);
-    llama_expert_tier::configure_enabled(params.cmoe);
 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {

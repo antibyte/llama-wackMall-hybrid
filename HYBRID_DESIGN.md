@@ -1,7 +1,7 @@
 # Hybrid design
 
 Date: 2026-08-02
-Status: Phases 0-3 are implemented behind default-off feature flags. Async prefetch is validated for no-MTP execution. Warmcache plus MTP is guarded off by default after deterministic controls failed for both synchronous and async warm residency. Phase 4 has a strictly guarded static no-sync experiment; deferred adaptation and double-buffered counts are not implemented. A strict offline layer-variable static placement prototype, prompt-balanced profile aggregation, session-local usage export, and CPU cold timing are implemented. The production winner remains fixed placement with W=0. Draft KV q4_0/q4_0 reached a measured MTP-2 median of 46.433 token/s; optional cold-row reuse later reached 46.508 token/s but remains default-off because the measured gain was only 0.31%.
+Status: Phases 0-3 are implemented behind default-off feature flags. Async prefetch is validated for no-MTP execution. Warmcache plus MTP is guarded off by default after deterministic controls failed for both synchronous and async warm residency. Phase 4 includes a strictly guarded static no-sync experiment and request-boundary fixed-tier adaptation; double-buffered counts are not implemented. A strict offline layer-variable static placement prototype, prompt-balanced profile aggregation, atomic request checkpoints, session-local usage export, and CPU cold timing are implemented. The upstream bounded RAM prompt cache is validated for single-slot A -> B -> A restoration with dynamic MTP-2 and MTP-3 when divergent branches are routed through its save/load path. The production decode winner remains fixed placement with W=0. Draft KV q4_0/q4_0 reached a measured MTP-2 median of 46.433 token/s; optional cold-row reuse later reached 46.508 token/s but remains default-off because the measured gain was only 0.31%.
 
 ## Goals and non-goals
 
@@ -55,6 +55,12 @@ process; the default `cumulative` mode retains the legacy seed-plus-observation
 behavior. `scripts/collect_expert_profiles.sh` starts a fresh server for every
 corpus item and accepts an explicit `PROFILE_IDS` split. It validates that each
 usage total equals the JSON selection total before aggregation.
+
+The server enables request-scoped collection before model/context creation.
+Count buffers produced by internal target and MTP warm-up graphs are cleared
+without updating scores, cumulative counts, session counts, hit statistics, or
+adaptation dwell. The first validated request opens collection through
+`request_begin()`. Non-server callers retain context-lifetime collection.
 
 `tools/aggregate_expert_profiles.py` validates every sparse profile against the
 GGUF dimensions, normalizes each prompt independently, applies optional prompt
@@ -272,8 +278,8 @@ Instrumentation precedes synchronization changes. Timers are runtime-disabled by
 Candidate changes, in order:
 
 1. Skip the tier-specific unconditional barrier when tier mutation and tier stats are both disabled, relying on the normal output dependency.
-2. Update adaptation less often, with double-buffered counts, so most tokens do not mutate weights.
-3. Keep repinning at request or larger intervals, outside MTP verify batches.
+2. Harvest adaptation counts after each synchronized graph but publish fixed repins only at request boundaries.
+3. Keep CUDA graph capture/reuse disabled while expert weights can be overwritten; investigate targeted graph invalidation separately.
 4. Use pinned cold-output buffers and enqueue combine upload after CPU completion.
 5. Replace global tier waits with backend/slot events only after graph ownership is tracked.
 
@@ -419,11 +425,27 @@ sentinel-byte readback is not implemented in this MVP.
 
 ## Benchmark gate
 
+### Physical prefill ubatch sizing
+
+`LLAMA_CMOE_BATCH` and `LLAMA_CMOE_UBATCH` configure maximum logical and
+physical graph sizes. They do not pad a one-token decode or an MTP verify graph
+to that maximum. The same context can therefore process prompt chunks with a
+large physical ubatch and retain 1--3 token decode graphs without an explicit
+phase switch.
+
+The maximum graph is reserved before expert-tier auto-fit, so physical ubatch
+and fixed hot slots compete for VRAM. This is intentionally a runtime tradeoff:
+the benchmark runner records requested batch/ubatch and the effective fixed
+slot count parsed from the server log. A target GPU should sweep physical
+ubatch under its normal context, KV, MTP, and safety-reserve settings, then keep
+separate balanced and TTFT-max presets if the auto-fit boundary removes a hot
+slot. No GPU-specific batch value is embedded in the tier implementation.
+
 The benchmark script runs a warm-up process and a fresh measured
 server process for each repetition. It fixes model/prompt/context/KV/batch/
 ubatch/temperature/output length and records raw logs plus a summary. The
-process split avoids contaminating measurements with the independently found
-MTP second-request failure; it is a workaround, not a fix. A serious candidate
+separate adaptive multi-request regression exercises repeated requests in one
+server process and atomic usage checkpoints. A serious candidate
 gets at least three repetitions and reports the median. The primary metric is
 sustained decode over 2,000 output tokens.
 
@@ -437,5 +459,8 @@ Warm+MTP changed deterministic output for both sync and async modes and is
 guarded off. The earlier nondeterministic fault resolves to
 `dequantize_row_q4_0`; three later 2,000-token release repetitions completed,
 but do not prove that independent fault fixed. The guarded Phase 4 upper-bound
-experiment is complete, while deferred adaptation remains unimplemented. See
+experiment is complete. Request-boundary adaptation is implemented under a
+shared target/draft graph guard. CUDA graph capture/reuse is disabled for
+mutable expert weights after reproducing the second-request failure with valid GEMM
+dimensions and eliminating it with graph caching disabled. See
 `HYBRID_EXPERIMENTS.md` for exact evidence and limitations.

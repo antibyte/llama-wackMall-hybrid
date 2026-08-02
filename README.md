@@ -145,8 +145,8 @@ This is the tested 6-GiB recipe. It uses eight physical CPU workers because the 
 PROFILE="$PWD/local-profiles/general-profile.csv"
 
 CUDA_VISIBLE_DEVICES=0 \
-LLAMA_CMOE_BATCH=32 \
-LLAMA_CMOE_UBATCH=32 \
+LLAMA_CMOE_BATCH=376 \
+LLAMA_CMOE_UBATCH=376 \
 LLAMA_EXPERT_HOT="$PROFILE" \
 LLAMA_EXPERT_S=33 \
 LLAMA_EXPERT_ADAPT=0 \
@@ -187,7 +187,118 @@ LLAMA_EXPERT_CPU_REUSE_ROWS=1 \
 
 Set `LLAMA_EXPERT_CPU_REUSE_ROWS=0` for the conservative cross-platform behavior. Static no-sync activates only when adaptation, warm slots, statistics, timing, and usage output are all disabled; the server log must contain `expert_tier: static no-sync enabled`.
 
+`LLAMA_CMOE_BATCH` and `LLAMA_CMOE_UBATCH` are maximum graph sizes, not
+forced decode widths. A 1--3 token MTP decode still uses its actual small
+graph, while a long prompt can use the larger physical ubatch. On the tested
+6-GiB GTX 1660 Ti, `376/376` is the largest measured value that retains all 33
+fixed slots with the default 512-MiB expert VRAM reserve. `512/512` is the
+optional TTFT-oriented setting; auto-fit safely reduces it to 32 fixed slots.
+Do not hard-code these values for another GPU: sweep physical ubatch sizes and
+verify the logged effective fixed-slot count, peak VRAM, long decode throughput,
+and output stability. Larger-memory GPUs should include 512, 1024, and the
+upstream 2048/512 logical/physical defaults in that sweep.
+
 Change `--spec-draft-n-max` to 1 or 3 for MTP-1/MTP-3, or remove all `--spec-*` options for a no-MTP control. Always compare token/output hashes and MTP acceptance, not throughput alone.
+
+### Safe dynamic learning mode
+
+Dynamic adaptation uses one stable fixed-tier mapping for an entire request.
+Counts and scores are still harvested after every completed graph, but at most
+one fixed expert per layer is published at the next request boundary. Target
+and MTP draft contexts share a graph guard, so no graph can observe a partial
+weight/LUT/mask transaction.
+
+In server mode, collection is request-scoped.  Internal target/MTP context
+warm-up graphs are cleared before the first real request, so restarts do not
+pollute a persistent usage profile.  Look for two startup log messages that
+discard 640 pre-request selections each on this 40-layer Top-8 model.  CLI and
+direct libllama callers keep context-lifetime collection semantics.
+
+CUDA graph capture/reuse is automatically disabled while mutable expert weights
+are enabled. Its interaction with fixed-slot copies reproducibly caused
+`cublasSgemm` to abort on the next request. Do not set
+`LLAMA_EXPERT_ADAPT_CUDA_GRAPHS=1` outside controlled diagnostics.
+
+Use a distinct output path for the learned cumulative profile. It is written
+through a temporary file and atomically renamed after every completed or
+cancelled server request, then written once more at orderly shutdown:
+
+```bash
+SEED="$PWD/local-profiles/luce-placement-s33.csv"
+LEARNED="$PWD/local-profiles/workload-learned.csv"
+
+LLAMA_EXPERT_HOT="$SEED" \
+LLAMA_CMOE_BATCH=376 \
+LLAMA_CMOE_UBATCH=376 \
+LLAMA_EXPERT_S=33 \
+LLAMA_EXPERT_ADAPT=1 \
+LLAMA_EXPERT_ADAPT_INTERVAL=request \
+LLAMA_EXPERT_WARM_SLOTS=0 \
+LLAMA_EXPERT_STATIC_NO_SYNC=0 \
+LLAMA_EXPERT_USAGE="$LEARNED" \
+LLAMA_EXPERT_USAGE_MODE=cumulative \
+LLAMA_EXPERT_USAGE_CHECKPOINT=request \
+./build-hybrid/bin/llama-server ...
+```
+
+On the next server start, use `LLAMA_EXPERT_HOT="$LEARNED"` to continue from
+the saved counts. Never enable static no-sync together with adaptation.
+
+Run the single-process multi-request regression before deploying another GPU,
+MTP width, slot count, or profile:
+
+```bash
+PROFILE="$SEED" \
+MODEL="$MODEL" \
+SERVER="$PWD/build-hybrid/bin/llama-server" \
+CMOE_BATCH=376 \
+CMOE_UBATCH=376 \
+MTP_N=2 \
+REQUESTS=4 \
+N_PREDICT=128 \
+./scripts/test_adaptive_multi_request.sh
+```
+
+### Optional RAM prompt cache for switching conversations
+
+The model's hybrid KV layout cannot shift, so the server disables
+`--cache-reuse`.  The bounded RAM prompt cache is still useful with one live
+slot when a client switches between conversations and later returns.  The
+tested configuration is:
+
+```bash
+./build-hybrid/bin/llama-server \
+    ... \
+    -np 1 \
+    --slot-prompt-similarity 0.70 \
+    --ctx-checkpoints 4 \
+    --checkpoint-min-step 1024 \
+    --cache-ram 2048 \
+    --no-cache-idle-slots
+```
+
+The similarity threshold is important for one-slot branch switching.  It
+causes a sufficiently divergent prompt to save the current slot into the RAM
+bank before overwriting it.  `--cache-idle-slots` alone did not save the only
+slot because it was already selected for the next request.  On the local
+A -> B -> A test, restored A processed 4 rather than about 3,500 prompt tokens,
+cutting TTFT from about 48.1 seconds to 0.39 seconds.  A1/A3 token and output
+hashes matched with dynamic adaptation in both MTP-2 and MTP-3.
+
+This does not accelerate the first unseen prompt or sustained decoding.  A
+linear continuation normally reuses the live slot already; the RAM bank helps
+when returning to an evicted conversation.  Size `--cache-ram` for available
+system RAM, and benchmark the save/load overhead and hit rate on the actual
+client workload.  Reproduce the branch test with:
+
+```bash
+PROFILE="$LEARNED" \
+SERVER="$PWD/build-hybrid/bin/llama-server" \
+CONFIGS=ram_forced \
+ADAPT=1 \
+MTP_N=2 \
+./scripts/test_prompt_cache.sh
+```
 
 ## 7. Run a reproducible benchmark
 
@@ -207,6 +318,8 @@ DRAFT_THREADS=8 \
 DRAFT_TYPE_K=q4_0 \
 DRAFT_TYPE_V=q4_0 \
 CPU_REUSE_ROWS=1 \
+CMOE_BATCH=376 \
+CMOE_UBATCH=376 \
 ./scripts/bench_hybrid.sh
 ```
 
@@ -281,8 +394,11 @@ Key portable controls:
 | `LLAMA_EXPERT_S` | unset (auto-fit) | Uniform fixed slots per layer; omit when using a placement manifest |
 | `LLAMA_EXPERT_PLACEMENT` | unset | Validated layer-variable static slot manifest |
 | `LLAMA_EXPERT_ADAPT` | 1 | Long-term online score updates and repinning |
-| `LLAMA_EXPERT_USAGE` | unset | Persist expert usage to a CSV at orderly shutdown |
+| `LLAMA_EXPERT_ADAPT_INTERVAL` | request | Publish fixed repins at a request boundary; MTP rejects graph-level publication |
+| `LLAMA_EXPERT_ADAPT_CUDA_GRAPHS` | 0 | Unsafe diagnostic opt-in for CUDA graph caching with mutable expert weights |
+| `LLAMA_EXPERT_USAGE` | unset | Persist expert usage to a CSV atomically |
 | `LLAMA_EXPERT_USAGE_MODE` | cumulative | Select cumulative or request/session-only export |
+| `LLAMA_EXPERT_USAGE_CHECKPOINT` | request | Persist after each request or only at process exit |
 | `LLAMA_EXPERT_STATS_JSON` | unset | Machine-readable counters and optional timing output |
 | `LLAMA_EXPERT_TIMING` | 0 | Detailed CPU expert phase timing; use only for diagnosis |
 | `LLAMA_EXPERT_WARM_SLOTS` | 0 | Additional bounded LRU slots per layer; integer or auto |
@@ -307,8 +423,9 @@ python3 -m unittest \
 Build and run the targeted C++ tests:
 
 ```bash
-cmake --build build-hybrid -j 8 --target test-expert-warm-cache test-expert-placement test-arg-parser test-backend-ops
+cmake --build build-hybrid -j 8 --target test-expert-adaptation test-expert-warm-cache test-expert-placement test-arg-parser test-backend-ops
 
+./build-hybrid/bin/test-expert-adaptation
 ./build-hybrid/bin/test-expert-warm-cache
 ./build-hybrid/bin/test-expert-placement
 ./build-hybrid/bin/test-arg-parser

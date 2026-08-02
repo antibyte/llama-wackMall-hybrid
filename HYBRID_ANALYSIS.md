@@ -119,7 +119,7 @@ The verified Spark file is dense 40 x 256 with declared top-8 routing. Conversio
 
 ### 4.1 Explicit application-level synchronization
 
-1. `llama_context::process_ubatch()`, `src/llama-context.cpp`: every ubatch normally calls `ggml_backend_sched_synchronize()` after asynchronous graph submission, then calls `llama_expert_tier::update()`. This is the expert-tier global barrier. The experimental static no-sync guard skips this pair only when adaptation, warm slots, and every count/stat consumer are disabled; normal output dependencies are unchanged. Mutable modes still require the barrier because `update()` can overwrite `.hot` weights, LUTs, masks, and count buffers.
+1. `llama_context::process_ubatch()`, `src/llama-context.cpp`: every ubatch normally calls `ggml_backend_sched_synchronize()` after asynchronous graph submission, then calls `llama_expert_tier::update()`. This is the expert-tier global barrier. The experimental static no-sync guard skips this pair only when adaptation, warm slots, and every count/stat consumer are disabled; normal output dependencies are unchanged. Mutable modes retain the barrier for count ownership. A process-wide graph guard serializes target/draft construction through post-graph harvesting, while fixed repins publish only from `request_begin()`.
 2. `llama_context::process_ubatch()`, lines 1335-1340: graph reuse synchronizes before input mutation when pipeline parallelism is enabled.
 3. `llama_context::synchronize()`, lines 698-720: public output/performance synchronization waits all scheduler backends. Logit, embedding, sampling, and MTP hidden-state consumers ultimately use this barrier when host data is needed.
 4. `llama_context::output_reserve()` synchronizes before replacing a host output buffer. This is allocation-only, not a per-token steady-state barrier.
@@ -202,6 +202,8 @@ The hybrid must not change those KV, SSM, hidden-row, sampling, or rollback oper
 - An asynchronous fill is not published while any graph can reference that slot.
 - Fixed repinning and warm eviction are forbidden inside a running verify graph.
 - One verify graph sees one stable LUT for all of its tokens.
+- CUDA graph capture/reuse is disabled while fixed expert weights are mutable;
+  the CUDA graph path failed on the request after an otherwise valid repin.
 
 No-MTP, MTP-1, MTP-2, and MTP-3 exercise the same target cache. The completed
 implementation preserves graph-lifetime rules for both synchronous and async
@@ -288,7 +290,7 @@ guarded after the deterministic failure described above.
 | VRAM OOM | Warm allocation consumes graph-capture/KV reserve | Fixed allocation first; warm slots use only remaining measured budget; clamp manual request; conservative W=1/2/4 tests |
 | Hidden memory regression | One `W` means one slot in every MoE layer and every routed tensor | Report bytes per all-layer slot and actual total before allocation; `W=0` default |
 | Deadlock | Waiting for a copy event on a stream that depends on compute holding metadata | No blocking while holding metadata lock; one-way event dependencies; bounded in-flight queue; shutdown drain test |
-| Data race in global state | Multiple contexts/parallel requests mutate process-global tier maps | Initial server target is `-np 1`; add request/context ownership before claiming multi-request safety; validation abort includes context/request data |
+| Data race in global state | Multiple contexts/parallel requests mutate process-global tier maps | Shared graph guard covers target/draft execution and publication; request-boundary transaction plus validation abort includes request/MTP data |
 | Counter race/overflow | CPU counts are read/reset while a graph writes them, or int32 wraps | MVP retains scheduler barrier; use uint64 cumulative totals; future readback uses double-buffered counters/events |
 | Performance regression | Warm copies and global update cost exceed saved CPU work | Feature off by default; benchmark 2,000-token sustained decode; stop if median drops more than 3 percent |
 | Turing kernel fault | Reduced-stack/MMQ behavior differs on sm_75 | Preserve wackMall `.hot` CUDA fixes; native arch 75; do not force MMQ; stop on hang, Xid, or incoherent output |

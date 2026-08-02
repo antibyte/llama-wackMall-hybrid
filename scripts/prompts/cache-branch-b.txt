@@ -1,0 +1,1 @@
+Vertiefe stattdessen eine Rust-Implementierung mit Besitzmodell, Fehlerpfaden, Tests und Sicherheitsinvarianten.

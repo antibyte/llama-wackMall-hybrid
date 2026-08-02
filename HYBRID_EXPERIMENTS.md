@@ -674,5 +674,245 @@ enable globally. It remains a portable knob for machines where repeated MTP
 cold experts and CPU memory bandwidth are a larger fraction of decode time.
 Artifacts begin with `benchmark-results/cpu-row-reuse-*`.
 
+## Physical prefill ubatch sweep
+
+The production override originally forced both maximum logical batch and
+maximum physical ubatch to 32. A 2,051-token prompt confirmed 32-token progress
+steps and only 19.829 prompt tok/s. Raising only the logical batch to 256 left
+throughput unchanged at 19.833 tok/s. Raising the physical ubatch produced the
+following single-run screens from the same profile seed, MTP-2, dynamic
+request-boundary adaptation, S requested as 33, W=0, q4_0/q4_0 KV, and 256
+output tokens:
+
+| Batch / ubatch | Effective S | Prompt tok/s | TTFT ms | Decode tok/s | Peak VRAM MiB |
+|---:|---:|---:|---:|---:|---:|
+| 32 / 32 | 33 | 19.829 | 103,459 | 35.452 | 5,510 |
+| 256 / 32 | 33 | 19.833 | 103,437 | 35.465 | 5,510 |
+| 256 / 64 | 33 | 26.680 | 76,898 | 35.776 | 5,518 |
+| 256 / 128 | 33 | 34.167 | 60,053 | 36.587 | 5,534 |
+| 256 / 256 | 33 | 57.817 | 35,499 | 35.588 | 5,562 |
+| 376 / 376 | 33 | 73.131 | 28,071 | 35.713 | 5,590 |
+| 384 / 384 | 32 (auto-fit) | 73.532 | 27,918 | 35.432 | 5,518 |
+| 512 / 512 | 32 (auto-fit) | 94.377 | 21,756 | 36.514 | 5,548 |
+| 512 / 512, reserve 384 | 33 | 94.141 | 21,811 | 36.941 | 5,622 |
+
+The reduced-reserve 512/S33 screen left only 127 MiB of real free VRAM and is
+not the production default. With the default 512-MiB expert reserve, startup
+probes found that ubatch 376 retains S=33 while 384 crosses the auto-fit
+boundary. This threshold is model-, context-, KV-, MTP-, driver-, and
+GPU-specific; the runner therefore exposes `CMOE_BATCH` and `CMOE_UBATCH`
+rather than embedding a hardware value.
+
+At 8,207 prompt tokens, 376/S33 reached 72.484 prompt tok/s and 113,261 ms TTFT.
+The TTFT-oriented 512/S32 mode reached 89.511 prompt tok/s and 91,723 ms TTFT.
+For a 2,000-token decode using the current mixed workload profile, 376/S33
+measured 38.236, 38.033, and 37.458 tok/s (median 38.033) with identical output
+and token hashes across the three runs. 512/S32 measured 37.709 tok/s in its
+screen, 1.38% below the first matching 376/S33 run. Thus 376/S33 is the balanced
+6-GiB production setting and 512/S32 remains an explicit TTFT-max option.
+
+Different physical prefill batch shapes diverged after token 35 even with
+adaptation completely disabled. This is normal floating-point batch-shape
+dependence, not a mutable-tier race. A decode control whose prompt fits in one
+32-token graph produced identical 2,000-token output/token hashes, identical
+MTP acceptance 0.787371 and mean accepted length 2.57 at 32/32 and 376/376;
+decode was 45.676 versus 45.778 tok/s. The large maximum ubatch therefore does
+not force a large decode graph or regress identical-path decode.
+
+Four consecutive dynamic requests at 376/376 passed with MTP-2. Every request
+atomically produced a different cumulative profile hash, and decode improved
+from 41.46 to 45.72 tok/s without a CUDA or invariant failure. MTP-3 also
+passed four requests and wrote four distinct checkpoints, but its extra verify
+memory auto-fits this 6-GiB card to S=32 even at the older small ubatches. A
+2,000-token current-profile comparison measured 38.236 tok/s for MTP-2 versus
+35.647 tok/s for MTP-3, so MTP-2 remains the production choice.
+
+Artifacts begin with `benchmark-results/prefill-*`,
+`benchmark-results/decode-control-*`, and
+`benchmark-results/adaptive-multi-request-u376-*`.
+
+## Dynamic CUDA-graph upper bound
+
+Dynamic adaptation normally disables CUDA graph capture/reuse because a graph
+used after a fixed-tier repin reproduced a next-request `cublasSgemm` abort.
+Before implementing graph-cache invalidation, a safe upper-bound A/B ran only
+the first request of every fresh process. No process was allowed to execute a
+graph after publishing learned placement. Both sides used the same current
+profile seed, 376/376, S=33, W=0, MTP-2 q4_0/q4_0, eight target/draft threads,
+row reuse, a sub-32-token control prompt, and three deterministic 2,000-token
+runs:
+
+| Dynamic CUDA graphs | Runs (tok/s) | Median | Peak VRAM | Hashes |
+|---:|---|---:|---:|---|
+| 0 | 37.574, 37.619, 37.438 | 37.574 | 5,580 MiB | identical |
+| 1, unsafe diagnostic | 37.760, 37.626, 37.731 | 37.731 | 5,600 MiB | identical |
+
+The measured upper bound is only +0.42% and consumes about 20 MiB more VRAM.
+This is below the threshold for implementing and validating targeted graph
+invalidation on this GPU. `LLAMA_EXPERT_ADAPT_CUDA_GRAPHS=0` remains mandatory
+for the multi-request learning service. Artifacts begin with
+`benchmark-results/cuda-graph-upper-bound-{off,on}-u376-*`.
+
 After this loop change, `test-backend-ops` was rerun: all 13,327 supported CUDA
 operation cases passed and both registered backends completed successfully.
+
+## Request-boundary dynamic adaptation repair
+
+The OpenWebUI learning service originally completed one adaptive MTP-2 request
+and aborted during the next request in `cublasSgemm_v2`. W was zero, no OOM or
+Xid was present, and the direct-at-exit usage writer lost the current profile.
+A matching static control processed two consecutive 128-token requests at
+42.729 and 42.130 tok/s without failure.
+
+The first repair separated graph-level count harvesting from fixed-tier
+publication. Scores still consume every completed graph, but fixed slots now
+change only before the next server request. A process-wide graph guard covers
+target and MTP draft graph construction, compute, synchronization, count
+harvesting, and publication. Fixed publication copies all weight slices first,
+then publishes all LUTs and masks, then commits host ownership. A tested pure
+policy selects one deterministic replacement per layer, and permanent fixed
+invariants require a final sentinel, unique owners, LUT/mask agreement, and no
+empty fixed slots.
+
+Request boundaries alone did not fix the abort. With 39 valid fixed repins, the
+next request still failed. Added failure-only CUDA diagnostics identified a
+dense shared-expert gate in layer 33, not a hot expert matmul:
+
+```text
+src0=blk.33.ffn_gate_inp_shexp.weight f32 [2048,1,1,1]
+src1=attn_post_norm-33 f32 [2048,32,1,1]
+dst=shared_expert_gate-33 f32 [1,32,1,1]
+m=1 n=32 k=2048 lda=2048 ldb=2048 ldc=1
+```
+
+All dimensions, leading dimensions, and pointers were non-null and valid.
+Disabling CUDA graph capture/reuse eliminated the failure across repeated repins.
+The runtime now disables the CUDA graph path before inference whenever
+`LLAMA_EXPERT_ADAPT=1`; the CUDA backend no longer caches the environment
+decision before expert-tier initialization. The explicit
+`LLAMA_EXPERT_ADAPT_CUDA_GRAPHS=1` escape hatch is diagnostic and unsafe.
+
+The repaired source was exercised in one server process per mode with a
+placement-only S=33 seed, W=0, q4_0/q4_0 KV, 8/8 threads, and 128 output tokens
+per request:
+
+| Mode | Requests | Repins at later boundaries | Decode tok/s | Result |
+|---|---:|---|---|---|
+| no MTP | 3 | 40, 39 | 37.81, 37.34, 39.46 | pass |
+| MTP-1 | 3 | 39, 38 | 42.87, 43.64, 43.20 | pass |
+| MTP-2 | 4 | 39, 39, 38 | 43.52, 44.40, 43.73, 43.71 | pass |
+| MTP-3 | 4 | 39, 39, 38 | 38.15, 38.23, 41.34, 41.72 | pass |
+
+Every request produced a final stop event, the server health check passed after
+every request, and every request atomically replaced the cumulative usage CSV.
+The MTP-2 learned file ended at SHA-256
+`6d4e25e94700e8a2dd51b18b3f988d87b65d3e6ebb1a8dde284cd8f811fdc6f8`;
+the MTP-3 file ended at
+`12223243dd24147fe45e48bbb116b4083fcfa4cde6f590865e40a8f958182d2e`.
+These are correctness screens, not 2,000-token medians. Artifacts are under
+`benchmark-results/adaptation-multi-request-20260802T161825Z`.
+
+The tracked multi-request runner was then used for two consecutive 2,000-token
+MTP-2 requests in one process. Request 1 sustained 38.26 tok/s with acceptance
+0.72338 and mean accepted length 2.45. Its atomic checkpoint had SHA-256
+`b84503b30b497e816eabd7407a7c1f907064a72c6141b00a01a39b79304fc2f4`.
+The next boundary published 40 fixed repins. Request 2 sustained 38.35 tok/s
+with acceptance 0.90640 and mean length 2.81; it completed all 2,000 tokens and
+published profile SHA-256
+`b9abe343cc772ba9f524295fbad126397ac0ff4dc19f8af05bcb4d8e7dcea98f`.
+The server remained healthy with no CUDA, invariant, OOM, Xid, or missing-stop
+failure. Output hashes differ because the fixed CPU/GPU placement changed at
+the request boundary; no claim of bit identity is made. This is a two-request
+correctness/stability result, not a three-run throughput median. Artifacts:
+`benchmark-results/adaptation-mtp2-long-20260802T164157Z`.
+
+The final CUDA backend regression was run after the graph-policy and
+failure-diagnostic changes with the production SM75 build and no model process
+occupying VRAM. All 13,327 supported CUDA operation cases passed against the
+CPU reference, including `MUL_MAT_ID`, `MUL_MAT_ID_FUSION`, Q4_0/Q4_K Top-8
+MoE cases, and Flash Attention. The CUDA backend and the overall backend suite
+both reported `OK`.
+
+The LAN/OpenWebUI service was then switched to the repaired binary with one
+slot, MTP-2, S=33, W=0, request-boundary adaptation, and one shared persistent
+input/output profile under `~/.local/state`. Two consecutive 128-token API
+requests completed at 41.92 and 42.31 tok/s, both accepted 80 of 92 draft
+tokens, and atomically changed the profile after each request. The PID stayed
+constant, the restart counter stayed zero, and health remained `ok`. A
+controlled service restart loaded the last checkpoint successfully; a further
+128-token request completed, changed the profile again, and left the restarted
+process healthy. This validates persistence and continuation across restart in
+addition to the earlier repin-heavy regression tests.
+
+### Excluding server warm-up from learned usage
+
+A later no-request restart exposed a smaller persistence correctness issue:
+the old server added exactly 1,280 selections to the cumulative profile at
+shutdown despite serving no inference request.  The delta was 40 layers x 8
+selected experts x 4 internal tokens.  Target and MTP context warm-up each
+contributed 640 selections.  Repeated restarts would therefore teach the
+placement from synthetic initialization graphs rather than only real usage.
+
+The server now declares request-scoped collection before model/context load.
+Completed graphs still clear their count buffers, but selections are discarded
+until the first validated server request calls `request_begin()`.  CLI and
+direct-library callers retain their previous context-lifetime collection
+behavior.  A private-profile integration test produced:
+
+```text
+no API inference:
+  discarded target warm-up = 640
+  discarded MTP warm-up    = 640
+  profile SHA before       = 8905adde740f35e2003bca76b80d601c1800bcbfd6c30b7d2d74ba0f6893b6b3
+  profile SHA after        = 8905adde740f35e2003bca76b80d601c1800bcbfd6c30b7d2d74ba0f6893b6b3
+
+one real 17+16-token MTP-2 request:
+  profile SHA after        = fdd8db98455ebb1c0eb12f1c14743e243de58a7293e16435f24ecd15e5f78da4
+  atomic request checkpoint present
+  decode                   = 46.17 tok/s
+```
+
+The active production profile contains one already-persisted 1,280-selection
+warm-up sample from discovering the issue (0.0063% of its then-current total).
+It was documented rather than silently rewriting a user data file.  The
+corrected production process logs both discarded 640-selection warm-ups and
+does not add further restart samples.  Artifacts are under
+`benchmark-results/startup-usage-filter-*`.
+
+## Single-slot RAM prompt-cache branch restore
+
+The Qwen3.6 hybrid context reports that KV shifting is unavailable, so
+`--cache-reuse` is disabled by the server and cannot accelerate this model.
+The separate RAM prompt cache can still save and restore complete target and
+MTP draft states.  A deterministic A -> B -> A test used a roughly 3,500-token
+synthetic prompt, one live slot, cache-prompt requests, 376/376, S=33, W=0,
+q4_0/q4_0 KV, and 16 generated tokens per request.
+
+Neither the ordinary live-slot behavior nor `--cache-idle-slots` helped with
+`-np 1`: the selected single slot is already marked processing by the time the
+idle-slot save loop runs.  A3 therefore re-evaluated about 3,500 tokens in
+48.1 seconds.  Setting `--slot-prompt-similarity 0.70` deliberately routes the
+about-0.59-similar branch through the existing LRU/RAM-cache path, preserving A
+before B overwrites the live slot:
+
+| Mode | A1 prompt / TTFT | B prompt / TTFT | A3 prompt / TTFT | A1/A3 hashes |
+|---|---:|---:|---:|---|
+| base | 3,492 / 47.86 s | 3,455 / 47.36 s | 3,509 / 48.20 s | not restored |
+| RAM + idle save | 3,492 / 48.05 s | 3,442 / 47.18 s | 3,496 / 48.09 s | not restored |
+| RAM + similarity 0.70 | 3,492 / 47.99 s | 3,442 / 47.35 s | 4 / 0.390 s | identical |
+| same, dynamic MTP-2 | 3,492 / 48.19 s | 3,442 / 47.53 s | 4 / 0.396 s | identical |
+| same, dynamic MTP-3 | 3,492 / 48.23 s | 3,442 / 47.61 s | 4 / 0.390 s | identical |
+
+The dynamic MTP-2 run published 11 fixed repins before restored A3; MTP-3
+published nine.  In both runs A1 and A3 had identical token and output hashes,
+and identical MTP acceptance/mean length.  No CUDA, invariant, OOM, or server
+failure occurred.  The active production profile was never used as an output;
+each adaptive test learned into a private result-directory copy.
+
+This is a TTFT/cache result, not a decode-TPS improvement.  It is most useful
+when a one-slot OpenWebUI server switches between conversations and later
+returns to one of them.  A linear continuation already benefits from its live
+slot.  The 2-GiB RAM cache is bounded, and saving/loading adds roughly 0.1--0.2
+seconds in this test.  Artifacts begin with
+`benchmark-results/prompt-cache-{branch,ram-idle,ram-forced}-*`; the runner is
+`scripts/test_prompt_cache.sh`.

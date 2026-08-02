@@ -20,6 +20,12 @@ struct llama_model;
 //   LLAMA_EXPERT_USAGE - dump learned hot set at exit (heat csv path, "0" = off)
 //   LLAMA_EXPERT_USAGE_MODE - cumulative (seed + observations, default) or
 //                             session (only observations from this process)
+//   LLAMA_EXPERT_USAGE_CHECKPOINT - request (default) or exit; request writes
+//                                   the usage profile atomically on completion
+//   LLAMA_EXPERT_ADAPT_INTERVAL - request (default) or graph. MTP always uses
+//                                 request-boundary publication.
+//   LLAMA_EXPERT_ADAPT_CUDA_GRAPHS - 0 (default) disables CUDA graph caching
+//                                    while repinning; 1 is unsafe/diagnostic
 //   LLAMA_EXPERT_STATS_JSON - dump machine-readable stats (path, "0" = off)
 //   LLAMA_EXPERT_TIMING - 1: collect optional per-layer CPU cold-node wall time
 //   LLAMA_EXPERT_CPU_CHUNK - singleton cold-expert row chunk, power of two 16..256
@@ -45,9 +51,30 @@ struct llama_model;
 
 namespace llama_expert_tier {
 
+// Mutable tier tensors and count buffers are process-wide and shared by target
+// and MTP draft contexts. Hold this guard from graph construction through the
+// post-graph synchronization/update so another context cannot publish a new
+// LUT or overwrite shared counts concurrently.
+class graph_guard {
+public:
+    graph_guard();
+    ~graph_guard();
+
+    graph_guard(const graph_guard &) = delete;
+    graph_guard & operator=(const graph_guard &) = delete;
+
+private:
+    bool locked_ = false;
+};
+
 // Enable the tier for contexts created through common.cpp. Direct libllama
 // callers remain stock unless they explicitly set an LLAMA_EXPERT_* control.
 void configure_enabled(bool enabled);
+
+// Server processes call this before model/context initialization so internal
+// model warm-up graphs are not persisted as real request usage.  CLI/library
+// callers retain the legacy context-lifetime collection behavior.
+void configure_request_scoped(bool enabled);
 
 // call once after the model tensors are loaded; no-op unless configured by
 // common.cpp or an explicit LLAMA_EXPERT_* environment control is present
@@ -73,9 +100,15 @@ bool requires_post_graph_sync();
 // warm tier at a context-creation boundary.
 void configure_mtp(int mtp_n);
 
-// Mark a server request boundary. With LLAMA_EXPERT_WARM_RESET=request this
-// rebases LRU ages and clears admission probation; it never changes ownership.
+// Mark a server request boundary. Request-granular fixed adaptation publishes
+// at most one replacement per layer here, while no graph can observe a partial
+// transaction. Warm request-local ages are also reset here when requested.
 LLAMA_API void request_begin();
+
+// Mark completion/cancellation of a server request. When request checkpoints
+// are enabled, atomically persist learned usage without waiting for process
+// exit.
+LLAMA_API void request_end();
 
 // total bytes of routed-expert weight tensors (for dense-fit estimates)
 LLAMA_API size_t expert_weight_bytes(const llama_model & model);

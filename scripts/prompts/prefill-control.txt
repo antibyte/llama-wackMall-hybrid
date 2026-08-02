@@ -1,0 +1,1 @@
+Entwirf detailliert eine robuste Architektur fuer einen lokalen KI-Agenten in Go. Behandle Nebenlaeufigkeit, Werkzeuge, Speicher, Fehlerbehandlung, Tests und Sicherheit.

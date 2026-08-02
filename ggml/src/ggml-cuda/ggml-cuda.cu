@@ -1538,12 +1538,29 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
     if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
-        CUBLAS_CHECK(
-            cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                    ne01, ne11, ne10,
-                    (const float *) alpha, (const float *) src0_ptr, s01,
-                                           (const float *) src1_ptr, s11,
-                    (const float *) beta,  (float       *)  dst_ptr, ne0));
+        const cublasStatus_t status = cublasSgemm(
+                ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ne10,
+                (const float *) alpha, (const float *) src0_ptr, s01,
+                                       (const float *) src1_ptr, s11,
+                (const float *) beta,  (float       *) dst_ptr, ne0);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("cublasSgemm tensor diagnostic: src0='%s' type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ptr=%p converted=%p; "
+                    "src1='%s' type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ptr=%p converted=%p; "
+                    "dst='%s' ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ptr=%p selected=%p; m=%lld n=%lld k=%lld lda=%lld ldb=%lld ldc=%lld\n",
+                    src0->name, ggml_type_name(src0->type),
+                    (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03,
+                    nb00, nb01, nb02, nb03, src0->data, src0_ptr,
+                    src1->name, ggml_type_name(src1->type),
+                    (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                    nb10, nb11, nb12, nb13, src1->data, src1_ptr,
+                    dst->name,
+                    (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3,
+                    nb0, nb1, nb2, nb3, dst->data, dst_ptr,
+                    (long long) ne01, (long long) ne11, (long long) ne10,
+                    (long long) s01, (long long) s11, (long long) ne0);
+        }
+        CUBLAS_CHECK(status);
     } else if (ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,

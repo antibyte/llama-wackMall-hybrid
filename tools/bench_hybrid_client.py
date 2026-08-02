@@ -15,6 +15,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
+    parser.add_argument("--prompt-repeat", type=int, default=1)
+    parser.add_argument("--prompt-suffix-file", type=Path)
+    parser.add_argument("--prompt-suffix-repeat", type=int, default=1)
+    parser.add_argument("--cache-prompt", action="store_true")
     parser.add_argument("--n-predict", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=1200.0)
@@ -23,7 +27,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    prompt = args.prompt_file.read_text(encoding="utf-8")
+    if args.prompt_repeat < 1:
+        raise ValueError("--prompt-repeat must be at least 1")
+    if args.prompt_suffix_repeat < 1:
+        raise ValueError("--prompt-suffix-repeat must be at least 1")
+    prompt_unit = args.prompt_file.read_text(encoding="utf-8").rstrip("\n")
+    prompt = "\n".join([prompt_unit] * args.prompt_repeat)
+    if args.prompt_suffix_file is not None:
+        suffix_unit = args.prompt_suffix_file.read_text(encoding="utf-8").rstrip("\n")
+        prompt += "\n" + "\n".join([suffix_unit] * args.prompt_suffix_repeat)
     payload = {
         "prompt": prompt,
         "temperature": 0.0,
@@ -31,7 +43,7 @@ def main() -> int:
         "seed": 42,
         "n_predict": args.n_predict,
         "ignore_eos": True,
-        "cache_prompt": False,
+        "cache_prompt": args.cache_prompt,
         "return_tokens": True,
         "stream": True,
     }
@@ -81,6 +93,8 @@ def main() -> int:
         "token_ids": tokens,
         "stream_token_count": len(tokens),
         "content_bytes": len(content.encode("utf-8")),
+        "prompt_bytes": len(prompt.encode("utf-8")),
+        "cache_prompt": args.cache_prompt,
         "timings": final.get("timings", {}),
         "stop_type": final.get("stop_type", ""),
         "tokens_predicted": final.get("tokens_predicted", len(tokens)),

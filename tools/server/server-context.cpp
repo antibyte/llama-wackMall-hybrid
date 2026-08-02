@@ -493,6 +493,7 @@ struct server_slot {
 
             reset();
 
+            llama_expert_tier::request_end();
             callback_on_release(id);
         }
     }
@@ -999,6 +1000,10 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        // Exclude model/context warm-up graphs from persistent expert usage.
+        // Real inference becomes collectable at request_begin().
+        llama_expert_tier::configure_request_scoped(true);
+
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");

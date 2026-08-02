@@ -267,6 +267,14 @@ target_include_directories(test-expert-warm-cache PRIVATE ../src)
 target_compile_features(test-expert-warm-cache PRIVATE cxx_std_17)
 llama_test(test-expert-warm-cache)
 
+add_executable(test-expert-adaptation
+    test-expert-adaptation.cpp
+    ../src/llama-expert-adaptation.cpp
+)
+target_include_directories(test-expert-adaptation PRIVATE ../src)
+target_compile_features(test-expert-adaptation PRIVATE cxx_std_17)
+llama_test(test-expert-adaptation)
+
 add_executable(test-expert-placement
     test-expert-placement.cpp
     ../src/llama-expert-placement.cpp

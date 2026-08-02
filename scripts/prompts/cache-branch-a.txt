@@ -1,0 +1,1 @@
+Vertiefe nun die Go-Implementierung mit konkreten Datenstrukturen, Fehlerpfaden, Tests und Sicherheitsinvarianten.
