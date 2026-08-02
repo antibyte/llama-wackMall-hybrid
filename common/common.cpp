@@ -1341,6 +1341,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    llama_expert_tier::configure_mtp(has_mtp ? std::max(1, params.speculative.draft.n_max) : 0);
+
     if (!params.cmoe) {
 #ifdef _WIN32
         _putenv_s("LLAMA_EXPERT_S", "0");

@@ -259,6 +259,14 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 
+add_executable(test-expert-warm-cache
+    test-expert-warm-cache.cpp
+    ../src/llama-expert-cache.cpp
+)
+target_include_directories(test-expert-warm-cache PRIVATE ../src)
+target_compile_features(test-expert-warm-cache PRIVATE cxx_std_17)
+llama_test(test-expert-warm-cache)
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)

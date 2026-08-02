@@ -13,9 +13,22 @@ struct llama_model;
 //                        (seed; optional if LLAMA_EXPERT_ADAPT=1)
 //   LLAMA_EXPERT_S     - hot slots per layer (default 16)
 //   LLAMA_EXPERT_TMAX  - max n_tokens for the hot/cold path (default 16)
-//   LLAMA_EXPERT_STATS - dump cold-hit stats at exit ("1" = stderr, else path)
+//   LLAMA_EXPERT_STATS - dump cold-hit stats at exit ("1" = stderr, "0" = off, else path)
 //   LLAMA_EXPERT_ADAPT - 1: online repin of hot slots (decay + hysteresis)
-//   LLAMA_EXPERT_USAGE - dump learned hot set at exit (heat csv format)
+//   LLAMA_EXPERT_USAGE - dump learned hot set at exit (heat csv path, "0" = off)
+//   LLAMA_EXPERT_STATS_JSON - dump machine-readable stats (path, "0" = off)
+//   LLAMA_EXPERT_WARM_SLOTS - extra bounded warm slots/layer (default 0)
+//   LLAMA_EXPERT_WARM_POLICY - warm replacement policy (currently lru)
+//   LLAMA_EXPERT_WARM_RESET - request or persistent LRU aging
+//   LLAMA_EXPERT_WARM_ADMISSION - immediate, second-hit, or frequency
+//                                 (default immediate)
+//   LLAMA_EXPERT_WARM_ADMISSION_WINDOW - graph window/half-life (default 8)
+//   LLAMA_EXPERT_WARM_PREFETCH - 0: synchronous fill; 1: asynchronous H2D fill
+//   LLAMA_EXPERT_PREFETCH_STREAMS - async streams (currently exactly 1)
+//   LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT - global in-flight copy limit (default 2)
+//   LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL - 1 bypasses the default MTP warm guard
+//   LLAMA_EXPERT_STATIC_NO_SYNC - 1 skips the tier-update barrier only when
+//                                 adaptation, warm slots, and stats are disabled
 
 namespace llama_expert_tier {
 
@@ -31,6 +44,20 @@ ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
 // consume accumulated expert selection counts, update scores and
 // (LLAMA_EXPERT_ADAPT) repin hot slots; call after each ubatch compute
 void update();
+
+// Whether the asynchronous graph must be synchronized before update(). The
+// explicit static no-sync mode returns false only after strict validation.
+bool requires_post_graph_sync();
+
+// Declare the process-wide MTP draft width before target-context creation.
+// Warm slots are guarded off for MTP unless the explicit experimental opt-in
+// is set. A later MTP context declaration also clears a still-empty/runtime
+// warm tier at a context-creation boundary.
+void configure_mtp(int mtp_n);
+
+// Mark a server request boundary. With LLAMA_EXPERT_WARM_RESET=request this
+// rebases LRU ages and clears admission probation; it never changes ownership.
+LLAMA_API void request_begin();
 
 // total bytes of routed-expert weight tensors (for dense-fit estimates)
 LLAMA_API size_t expert_weight_bytes(const llama_model & model);

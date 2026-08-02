@@ -30,3 +30,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+----------------------------------------------------------------------
+Hybrid expert-cache architecture reference
+
+The experimental hybrid design documented in HYBRID_ANALYSIS.md and
+HYBRID_ATTRIBUTION.md was informed by LuceBox's Apache-2.0-licensed Spark
+expert placement, bounded cache, and CPU/GPU overlap work:
+
+Copyright (c) 2026 Lucebox contributors
+https://github.com/Luce-Org/lucebox-hub
+
+No LuceBox source code is copied in the initial hybrid implementation. See
+HYBRID_ATTRIBUTION.md for the exact files examined and the distinction between
+referenced concepts and new implementation.

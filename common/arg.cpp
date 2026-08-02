@@ -809,8 +809,35 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (params.n_parallel < 0) {
             params.n_parallel = 1;
         }
-        params.n_batch = 256;
-        params.n_ubatch = 256;
+        auto cmoe_batch_from_env = [](const char * name, int fallback) {
+            const char * value = std::getenv(name);
+
+            if (value == nullptr || *value == '\0') {
+                return fallback;
+            }
+
+            const int parsed = std::stoi(value);
+
+            if (parsed <= 0) {
+                throw std::invalid_argument(
+                    std::string(name) + " must be greater than zero");
+            }
+
+            return parsed;
+        };
+
+        params.n_batch =
+            cmoe_batch_from_env("LLAMA_CMOE_BATCH", 256);
+        params.n_ubatch =
+            cmoe_batch_from_env("LLAMA_CMOE_UBATCH", 256);
+
+        if (params.n_ubatch > params.n_batch) {
+            throw std::invalid_argument(
+                "LLAMA_CMOE_UBATCH must not exceed LLAMA_CMOE_BATCH");
+        }
+
+        LOG_INF("cmoe batch/ubatch = %d/%d\n",
+                params.n_batch, params.n_ubatch);
         params.kv_unified = true;
         params.no_kv_offload = false;
     }

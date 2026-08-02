@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-expert-tier.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1752,6 +1753,8 @@ private:
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
+
+        llama_expert_tier::request_begin();
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 

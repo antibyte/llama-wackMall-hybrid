@@ -1382,9 +1382,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    // compute is async: update() may overwrite tiering buffers the graph is still reading
-    ggml_backend_sched_synchronize(sched.get());
-    llama_expert_tier::update();
+    if (llama_expert_tier::requires_post_graph_sync()) {
+        // compute is async: update() may overwrite tiering buffers the graph is still reading
+        ggml_backend_sched_synchronize(sched.get());
+        llama_expert_tier::update();
+    }
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -3581,6 +3583,12 @@ llama_context * llama_init_from_model(
         model->hparams.n_layer_nextn == 0) {
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
         return nullptr;
+    }
+
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        // Fallback for API callers that construct contexts without common.cpp.
+        // The common path supplies the exact draft width before target init.
+        llama_expert_tier::configure_mtp(1);
     }
 
     try {
