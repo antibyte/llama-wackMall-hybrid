@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-expert-lookahead.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -177,6 +178,50 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    const bool lookahead_active = llama_expert_lookahead::graph_enabled(
+            params.ubatch.n_tokens, params.ubatch.n_seqs, params.gtype == LLM_GRAPH_TYPE_DECODER_MTP);
+    const int lookahead_distance = lookahead_active ? llama_expert_lookahead::distance() : 0;
+    const int lookahead_top_m = lookahead_active ? llama_expert_lookahead::top_m((int) n_expert) : 0;
+    const auto lookahead_point = llama_expert_lookahead::point();
+    const auto lookahead_norm = llama_expert_lookahead::norm();
+
+    auto build_lookahead_prediction = [&](ggml_tensor * source, int source_layer) {
+        if (!lookahead_active || !source || lookahead_top_m <= 0) {
+            return;
+        }
+        const int target_layer = source_layer + lookahead_distance;
+        if (target_layer < 0 || target_layer >= n_layer) {
+            return;
+        }
+        const int norm_layer = lookahead_norm == llama_expert_lookahead::norm_source::target ?
+                target_layer : source_layer;
+        ggml_tensor * predictor_input = build_norm(
+                source, model.layers[norm_layer].attn_post_norm, nullptr, LLM_NORM_RMS, target_layer);
+        cb(predictor_input, "lookahead_norm", target_layer);
+        ggml_tensor * predictor_logits = build_lora_mm(model.layers[target_layer].ffn_gate_inp, predictor_input);
+        cb(predictor_logits, "lookahead_logits", target_layer);
+        ggml_tensor * predictor_probs = ggml_soft_max(ctx0, predictor_logits);
+        cb(predictor_probs, "lookahead_probs", target_layer);
+        ggml_tensor * predicted_ids = ggml_argsort_top_k(ctx0, predictor_probs, lookahead_top_m);
+        cb(predicted_ids->src[0], "lookahead_argsort", target_layer);
+        cb(predicted_ids, "lookahead_topk", target_layer);
+
+        // CONT keeps the I32 snapshot on CUDA, unlike DUP, while assigning dedicated storage for deferred readback.
+        ggml_tensor * predicted_snapshot = ggml_cont(ctx0, predicted_ids);
+        cb(predicted_snapshot, "lookahead_topk_snapshot", target_layer);
+
+        // Expansion here fixes the predictor's graph order at the requested source point.
+        ggml_build_forward_expand(gf, predicted_snapshot);
+        res->add_lookahead_prediction({
+                source_layer,
+                target_layer,
+                lookahead_top_m,
+                predicted_snapshot,
+                nullptr,
+                nullptr,
+        });
+    };
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -209,12 +254,27 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Save the tensor before post-attention norm for residual connection
         ggml_tensor * ffn_residual = cur;
 
+        if (lookahead_point == llama_expert_lookahead::prediction_point::post_attn) {
+            build_lookahead_prediction(ffn_residual, il);
+        }
+
         // Post-attention norm
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
         // MOE FFN layer
-        cur = build_layer_ffn(attn_post_norm, il);
+        ggml_tensor * actual_ids = nullptr;
+        ggml_tensor * actual_weights = nullptr;
+        cur = build_layer_ffn(attn_post_norm, il, &actual_ids, &actual_weights);
+        if (lookahead_active) {
+            ggml_tensor * actual_ids_snapshot = ggml_cont(ctx0, actual_ids);
+            ggml_tensor * actual_weights_snapshot = ggml_dup(ctx0, actual_weights);
+            cb(actual_ids_snapshot, "lookahead_actual_topk_snapshot", il);
+            cb(actual_weights_snapshot, "lookahead_actual_weights_snapshot", il);
+            ggml_build_forward_expand(gf, actual_ids_snapshot);
+            ggml_build_forward_expand(gf, actual_weights_snapshot);
+            res->set_lookahead_actual(il, actual_ids_snapshot, actual_weights_snapshot);
+        }
         cb(cur, "ffn_out", il);
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
@@ -223,6 +283,10 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+
+        if (lookahead_point == llama_expert_lookahead::prediction_point::post_moe) {
+            build_lookahead_prediction(cur, il);
+        }
 
         // Input for next layer
         inpL = cur;
@@ -493,7 +557,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(
+        ggml_tensor * cur,
+        const int il,
+        ggml_tensor ** selected_experts_out,
+        ggml_tensor ** weights_out) {
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
@@ -511,7 +579,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr,
+            selected_experts_out,
+            weights_out);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation

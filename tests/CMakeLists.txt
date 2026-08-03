@@ -283,6 +283,14 @@ target_include_directories(test-expert-placement PRIVATE ../src)
 target_compile_features(test-expert-placement PRIVATE cxx_std_17)
 llama_test(test-expert-placement)
 
+add_executable(test-expert-lookahead
+    test-expert-lookahead.cpp
+    ../src/llama-expert-lookahead-metrics.cpp
+)
+target_include_directories(test-expert-lookahead PRIVATE ../src)
+target_compile_features(test-expert-lookahead PRIVATE cxx_std_17)
+llama_test(test-expert-lookahead)
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)

@@ -791,6 +791,15 @@ struct llm_graph_fused_node {
     int il;
 };
 
+struct llm_graph_lookahead_trace {
+    int source_layer = -1;
+    int target_layer = -1;
+    int top_m = 0;
+    ggml_tensor * predicted_ids = nullptr;
+    ggml_tensor * actual_ids = nullptr;
+    ggml_tensor * actual_weights = nullptr;
+};
+
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -826,7 +835,11 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
+    void add_lookahead_prediction(llm_graph_lookahead_trace trace);
+    void set_lookahead_actual(int target_layer, ggml_tensor * actual_ids, ggml_tensor * actual_weights);
+
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+    const std::vector<llm_graph_lookahead_trace> & get_lookahead_traces() const { return lookahead_traces; }
 
     void set_params(const llm_graph_params & params);
 
@@ -847,6 +860,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<llm_graph_lookahead_trace> lookahead_traces;
 
     ggml_context_ptr ctx_compute;
 
@@ -1017,7 +1031,9 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor ** selected_experts_out = nullptr,
+             ggml_tensor ** weights_out = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1043,7 +1059,9 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor ** selected_experts_out = nullptr,
+             ggml_tensor ** weights_out = nullptr) const;
 
     //
     // inputs

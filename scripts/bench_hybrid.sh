@@ -49,6 +49,10 @@ MTP_OVERRIDE="${MTP_OVERRIDE:-}"
 PREFETCH_OVERRIDE="${PREFETCH_OVERRIDE:-}"
 SIGSEGV_PRELOAD="${SIGSEGV_PRELOAD:-}"
 WARM_MTP_EXPERIMENTAL="${WARM_MTP_EXPERIMENTAL:-0}"
+LOOKAHEAD_DISTANCE="${LOOKAHEAD_DISTANCE:-1}"
+LOOKAHEAD_TOP_M="${LOOKAHEAD_TOP_M:-16}"
+LOOKAHEAD_POINT="${LOOKAHEAD_POINT:-post-attn}"
+LOOKAHEAD_NORM="${LOOKAHEAD_NORM:-target}"
 # Safe default after the documented stop conditions. C-J remain selectable
 # explicitly for later debugging once the repin crash is resolved.
 CASES="${CASES:-${1:-A}}"
@@ -156,6 +160,7 @@ case_settings() {
     ADAPT=1
     STATIC_NO_SYNC=0
     EXPERT_STATS=1
+    LOOKAHEAD_TRACE=0
     case "$config" in
         A) USE_PROFILE=0; FIXED_S=auto ;;
         B) FIXED_S=auto ;;
@@ -173,6 +178,8 @@ case_settings() {
         SD) FIXED_S="$STATIC_FIXED_S"; ADAPT=0; EXPERT_STATS=1 ;;
         SV) FIXED_S=variable; ADAPT=0; EXPERT_STATS=1 ;;
         SVC) FIXED_S=variable; ADAPT=0; STATIC_NO_SYNC=1; EXPERT_STATS=0 ;;
+        L0) FIXED_S="$STATIC_FIXED_S"; WARM_S=0; MTP_N=0; ADAPT=0; EXPERT_STATS=1 ;;
+        LT) FIXED_S="$STATIC_FIXED_S"; WARM_S=0; MTP_N=0; ADAPT=0; EXPERT_STATS=1; LOOKAHEAD_TRACE=1 ;;
         *) echo "Unbekannte Konfiguration: $config" >&2; return 1 ;;
     esac
     if [[ -n "$MTP_OVERRIDE" ]]; then
@@ -236,8 +243,10 @@ for config in "${CONFIGS[@]}"; do
         warmup_log="$RESULTS_DIR/$stem.warmup.log"
         warmup_stats="$RESULTS_DIR/$stem.warmup.experts.json"
         usage_file="$RESULTS_DIR/$stem.usage.csv"
+        warmup_lookahead_file="$RESULTS_DIR/$stem.warmup.lookahead-%r.json"
+        lookahead_file="$RESULTS_DIR/$stem.lookahead-%r.json"
 
-        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N batch=$CMOE_BATCH/$CMOE_UBATCH prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V pmin=${DRAFT_P_MIN:-default} backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC ==="
+        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N batch=$CMOE_BATCH/$CMOE_UBATCH prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V pmin=${DRAFT_P_MIN:-default} backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC lookahead_trace=$LOOKAHEAD_TRACE ==="
 
         env_args=(
             CUDA_VISIBLE_DEVICES=0
@@ -359,6 +368,16 @@ for config in "${CONFIGS[@]}"; do
         fi
 
         warmup_env_args=("${env_args[@]}")
+        if [[ "$LOOKAHEAD_TRACE" == 1 ]]; then
+            warmup_env_args+=(
+                LLAMA_EXPERT_LOOKAHEAD_TRACE=1
+                "LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON=$warmup_lookahead_file"
+                "LLAMA_EXPERT_LOOKAHEAD_DISTANCE=$LOOKAHEAD_DISTANCE"
+                "LLAMA_EXPERT_LOOKAHEAD_TOP_M=$LOOKAHEAD_TOP_M"
+                "LLAMA_EXPERT_LOOKAHEAD_POINT=$LOOKAHEAD_POINT"
+                "LLAMA_EXPERT_LOOKAHEAD_NORM=$LOOKAHEAD_NORM"
+            )
+        fi
         if [[ "$EXPERT_STATS" == 1 ]]; then
             warmup_env_args+=("LLAMA_EXPERT_STATS_JSON=$warmup_stats")
         fi
@@ -378,6 +397,16 @@ for config in "${CONFIGS[@]}"; do
         # while the warm-up still primes model pages and the CUDA runtime.
         cleanup
         measured_env_args=("${env_args[@]}")
+        if [[ "$LOOKAHEAD_TRACE" == 1 ]]; then
+            measured_env_args+=(
+                LLAMA_EXPERT_LOOKAHEAD_TRACE=1
+                "LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON=$lookahead_file"
+                "LLAMA_EXPERT_LOOKAHEAD_DISTANCE=$LOOKAHEAD_DISTANCE"
+                "LLAMA_EXPERT_LOOKAHEAD_TOP_M=$LOOKAHEAD_TOP_M"
+                "LLAMA_EXPERT_LOOKAHEAD_POINT=$LOOKAHEAD_POINT"
+                "LLAMA_EXPERT_LOOKAHEAD_NORM=$LOOKAHEAD_NORM"
+            )
+        fi
         if [[ "$EXPERT_STATS" == 1 ]]; then
             measured_env_args+=("LLAMA_EXPERT_STATS_JSON=$stats_file")
         fi
@@ -411,6 +440,26 @@ for config in "${CONFIGS[@]}"; do
             echo "Variable Placement wurde angefordert, aber nicht aktiviert:" >&2
             grep -E 'placement|expert tiering' "$log_file" >&2 || true
             exit 1
+        fi
+        if [[ "$LOOKAHEAD_TRACE" == 1 ]]; then
+            python3 - "$RESULTS_DIR" "$stem" <<'PY'
+import glob
+import json
+import sys
+from pathlib import Path
+
+results_dir, stem = sys.argv[1:]
+matches = glob.glob(str(Path(results_dir) / f"{stem}.lookahead-*.json"))
+if len(matches) != 1:
+    raise SystemExit(f"expected one request-local lookahead trace, found {len(matches)}: {matches}")
+trace = json.loads(Path(matches[0]).read_text())
+if trace.get("schema") != "llama-wackmall-router-lookahead-v1":
+    raise SystemExit("invalid lookahead trace schema")
+if trace.get("status", {}).get("productive_prefetch") is not False:
+    raise SystemExit("Phase 1 trace unexpectedly reports productive prefetch")
+if not trace.get("records"):
+    raise SystemExit("lookahead trace contains no routing records")
+PY
         fi
 
         python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$CPU_ASYNC" "$CPU_DOWN_PREFETCH" "$CPU_REUSE_ROWS" "$LOAD_MODE" "$CMOE_BATCH" "$CMOE_UBATCH" "$PROMPT_REPEAT" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$ADAPT_CUDA_GRAPHS" "$STATIC_NO_SYNC" \

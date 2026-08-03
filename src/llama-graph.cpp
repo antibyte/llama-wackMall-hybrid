@@ -1208,6 +1208,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    lookahead_traces.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1270,6 +1271,14 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(t);
         }
     }
+    for (const auto & trace : lookahead_traces) {
+        GGML_ASSERT(trace.predicted_ids != nullptr);
+        GGML_ASSERT(trace.actual_ids != nullptr);
+        GGML_ASSERT(trace.actual_weights != nullptr);
+        ggml_set_output(trace.predicted_ids);
+        ggml_set_output(trace.actual_ids);
+        ggml_set_output(trace.actual_weights);
+    }
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -1311,6 +1320,33 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
 
 void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
     fused_nodes.push_back(result);
+}
+
+void llm_graph_result::add_lookahead_prediction(llm_graph_lookahead_trace trace) {
+    GGML_ASSERT(trace.source_layer >= 0);
+    GGML_ASSERT(trace.target_layer > trace.source_layer);
+    GGML_ASSERT(trace.top_m > 0);
+    GGML_ASSERT(trace.predicted_ids != nullptr);
+    for (const auto & existing : lookahead_traces) {
+        GGML_ASSERT(existing.target_layer != trace.target_layer);
+    }
+    lookahead_traces.push_back(trace);
+}
+
+void llm_graph_result::set_lookahead_actual(
+        int target_layer,
+        ggml_tensor * actual_ids,
+        ggml_tensor * actual_weights) {
+    for (auto & trace : lookahead_traces) {
+        if (trace.target_layer != target_layer) {
+            continue;
+        }
+        GGML_ASSERT(trace.actual_ids == nullptr);
+        GGML_ASSERT(trace.actual_weights == nullptr);
+        trace.actual_ids = actual_ids;
+        trace.actual_weights = actual_weights;
+        return;
+    }
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
@@ -1764,7 +1800,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor ** selected_experts_out,
+         ggml_tensor ** weights_out) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1785,7 +1823,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        selected_experts_out,
+        weights_out
     );
 }
 
@@ -1813,7 +1853,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor ** selected_experts_out,
+         ggml_tensor ** weights_out) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1948,6 +1990,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    if (selected_experts_out) {
+        *selected_experts_out = selected_experts;
+    }
+    if (weights_out) {
+        *weights_out = weights;
     }
 
     //call early so that topk-moe can be used

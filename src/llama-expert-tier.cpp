@@ -2,6 +2,7 @@
 
 #include "llama-expert-adaptation.h"
 #include "llama-expert-cache.h"
+#include "llama-expert-lookahead.h"
 #include "llama-expert-placement.h"
 
 #include "llama-impl.h"
@@ -508,6 +509,7 @@ static bool schedule_async_copy(layer_tier & L, llama_expert_cache::state & next
 }
 
 void configure_mtp(int mtp_n) {
+    llama_expert_lookahead::configure_mtp(mtp_n);
     if (mtp_n <= 0) {
         return;
     }
@@ -1379,6 +1381,7 @@ void request_begin() {
 
     g_request_id++;
     g_request_seen = true;
+    llama_expert_lookahead::request_begin();
     if (!g_warm_reset_request) {
         return;
     }
@@ -1397,6 +1400,7 @@ void request_begin() {
 }
 
 void request_end() {
+    llama_expert_lookahead::request_end();
     if (!g_usage_checkpoint_request || g_usage_path.empty()) {
         return;
     }
@@ -1409,6 +1413,23 @@ void request_end() {
         TIER_LOG("expert_tier: atomically checkpointed learned usage after request %llu to %s\n",
                 (unsigned long long) g_request_id, g_usage_path.c_str());
     }
+}
+
+std::vector<uint8_t> fixed_expert_mask(int il, int n_expert) {
+    if (n_expert <= 0) {
+        return {};
+    }
+    std::vector<uint8_t> result((size_t) n_expert, 0);
+    if (il < 0 || il >= (int) g_layers.size()) {
+        return result;
+    }
+    const auto & layer = g_layers[(size_t) il];
+    const int limit = std::min(n_expert, layer.n_expert);
+    for (int expert = 0; expert < limit; ++expert) {
+        const int slot = expert < (int) layer.lut_host.size() ? layer.lut_host[(size_t) expert] : layer.sentinel;
+        result[(size_t) expert] = slot >= 0 && slot < layer.n_fixed ? 1 : 0;
+    }
+    return result;
 }
 
 size_t expert_weight_bytes(const llama_model & model) {
@@ -1444,6 +1465,7 @@ static bool explicitly_requested_by_env() {
         "LLAMA_EXPERT_CPU_REUSE_ROWS",
         "LLAMA_EXPERT_WARM_SLOTS",
         "LLAMA_EXPERT_STATIC_NO_SYNC",
+        "LLAMA_EXPERT_LOOKAHEAD_TRACE",
     };
     for (const char * name : controls) {
         if (getenv(name) != nullptr) {
@@ -1482,6 +1504,7 @@ void configure_enabled(bool enabled) {
 void configure_request_scoped(bool enabled) {
     g_request_scoped = enabled;
     g_request_seen = false;
+    llama_expert_lookahead::configure_request_scoped(enabled);
 }
 
 void init(const llama_model & model) {
@@ -1493,6 +1516,7 @@ void init(const llama_model & model) {
     if (!g_configured_enabled && !explicitly_requested_by_env()) {
         return;
     }
+    llama_expert_lookahead::init(model);
     if (!g_layers.empty()) {
         return; // already initialized
     }
@@ -2207,6 +2231,9 @@ void init(const llama_model & model) {
         }
         if (stats_enabled || usage_enabled || json_stats_enabled || g_timing_enabled) {
             blockers.push_back("expert stats or usage output is enabled");
+        }
+        if (llama_expert_lookahead::enabled()) {
+            blockers.push_back("lookahead trace is enabled");
         }
         if (blockers.empty()) {
             g_static_no_sync_active = true;

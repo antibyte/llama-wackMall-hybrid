@@ -173,6 +173,12 @@ unavailable. It must not substitute an assumed PCIe bandwidth. Backend event
 instrumentation or a controlled microbenchmark is required before the timing
 gate can be closed.
 
+The first runtime implementation exposed another allocator constraint. `ggml_argsort_top_k()` returns a view into the full argsort tensor. Marking only that view as an output did not preserve the backing bytes until the deferred readback. Later layers reused the allocation and produced valid-looking but incorrect trace IDs. The final trace creates dedicated snapshot tensors. I32 snapshots use `GGML_OP_CONT` because the CUDA backend rejects I32 `GGML_OP_DUP`; F32 weight snapshots use `GGML_OP_DUP`. A zero-copy attempt that marked the argsort backing tensors as outputs kept valid IDs but changed the deterministic response hash by changing graph allocation and in-place decisions, so it was rejected.
+
+On the GTX 1660 Ti all three final snapshot tensors are assigned to `CUDA0`, and the deferred destination uses the CUDA host buffer type. The trace reports this as pinned host readback. No predictor ID is consumed by the CPU inside the model graph.
+
+The tested model has per-expert routed-weight slices of 1,900,544 or 2,039,808 bytes depending on the layer. Phase 1 records these model-derived values and reports candidate transfer bytes. It does not convert bytes into milliseconds without a measured transfer model.
+
 ## Scratch and CUDA graph lifetime analysis
 
 A per-layer scratch slot is simple to reason about but scales VRAM with layer

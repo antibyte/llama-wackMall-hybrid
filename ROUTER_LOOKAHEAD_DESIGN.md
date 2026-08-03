@@ -72,6 +72,8 @@ For each target layer with a valid source:
 
 The predictor output is not connected to the true FFN branch.
 
+Retained IDs are explicit CUDA-capable I32 `CONT` snapshots. Retained true weights are F32 `DUP` snapshots. The extra copies are trace-only and prevent allocator reuse from corrupting deferred observations. They make trace throughput unsuitable as a production performance estimate.
+
 ## Deferred asynchronous observation
 
 After graph compute is enqueued, the context submits small asynchronous D2H
@@ -133,6 +135,8 @@ Counts include:
 - actual cold experts missed by the prediction,
 - totals per layer and for the complete request.
 
+The model-derived expert bytes are reported per layer. Each prefix aggregate includes estimated candidate H2D bytes and estimated useful H2D bytes. These are byte counts only. Estimated H2D milliseconds and timely fractions remain `null` until Phase 2 supplies measured transfer and layer timing data.
+
 Raw per-token records are retained in trace mode so Phase 2 can replay Top-M
 and distance policies without model execution. Records contain actual IDs,
 actual weights, predicted IDs, and the fixed-residency snapshot. They contain
@@ -181,6 +185,8 @@ Phase 1 is complete only when:
 - multiple prompts and at least 512 output tokens have been measured,
 - recall and weighted cold coverage are available per layer,
 - trace overhead is reported separately from model throughput.
+
+Phase 1 routing-quality collection can complete while the scheduling gate remains open. No productive prefetch is authorized until predictor cost, source-to-target lead time, pinned H2D time, and the Oracle schedule are measured.
 
 Phase 2 may simulate transfers only after real pinned H2D measurements exist.
 It must calculate an Oracle with the same scratch and bandwidth constraints.

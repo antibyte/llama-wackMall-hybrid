@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-expert-tier.h"
+#include "llama-expert-lookahead.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -1387,10 +1388,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // Phase 1 lookahead tracing only submits small asynchronous D2H reads.
+    // Completion is consumed after the tier's existing scheduler barrier; the
+    // trace path never introduces a barrier of its own.
+    llama_expert_lookahead::enqueue_graph(sched.get(), *res, cparams.n_ctx);
+
     if (llama_expert_tier::requires_post_graph_sync()) {
         // compute is async: update() may overwrite tiering buffers the graph is still reading
         ggml_backend_sched_synchronize(sched.get());
         llama_expert_tier::update();
+        llama_expert_lookahead::complete_graph();
     }
 
     ret = GGML_STATUS_SUCCESS;

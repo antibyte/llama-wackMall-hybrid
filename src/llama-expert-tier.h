@@ -3,6 +3,9 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <cstdint>
+#include <vector>
+
 struct llama_model;
 
 // expert hot-tiering: pins the most-used routed experts of each MoE layer in
@@ -109,6 +112,10 @@ LLAMA_API void request_begin();
 // are enabled, atomically persist learned usage without waiting for process
 // exit.
 LLAMA_API void request_end();
+
+// Snapshot fixed-tier residency for observational routing traces. The result
+// never includes warm slots or pending asynchronous copies.
+std::vector<uint8_t> fixed_expert_mask(int il, int n_expert);
 
 // total bytes of routed-expert weight tensors (for dense-fit estimates)
 LLAMA_API size_t expert_weight_bytes(const llama_model & model);
