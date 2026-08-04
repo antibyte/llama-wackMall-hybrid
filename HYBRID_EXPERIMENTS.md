@@ -968,3 +968,76 @@ started drafting final code inside the reasoning block when the forced end
 transition occurred.  Per-request client limits and explicitly different
 reasoning budgets still take precedence.
 Artifacts are under `benchmark-results/target-kv-{fit,quality}-*`.
+
+## Multi-output target backend sampling with a reasoning budget
+
+The implementation from llama.cpp PR #25532 (tested head
+`4cbb71d3b754af4c3f3c502cc227702686e2bdf9`) was ported onto the hybrid in an
+isolated worktree.  It allows the target sampler to remain on its backend for
+all output rows of an MTP verification graph.  This is distinct from the
+already enabled draft backend sampler.
+
+The upstream proposal rejected target backend sampling whenever a reasoning
+budget sampler existed.  The local compatibility bridge keeps the budget state
+on the CPU and treats it as one of two modes:
+
+- while the budget is idle or counting, the backend-selected token remains
+  authoritative;
+- while the budget is forcing its configured closing sequence, the exact next
+  forced token overrides the precomputed backend token before MTP comparison
+  and acceptance.
+
+Acceptance then advances both the reasoning-budget state and the transactional
+backend RNG exactly once.  A forced token that was filtered from the compact
+backend candidate list is represented by a one-entry CPU candidate array; the
+model logits and the actual MTP routing/verification graph are not changed.
+Grammar-constrained requests still disable backend sampling because their
+valid token set cannot be handled by this small bridge.
+
+During the semantic port, the initial implementation exposed an output-lifetime
+bug: reshaped candidate views could be reused by the graph allocator and then
+contain floating-point logit bits instead of token IDs.  Keeping the actual
+`get_rows` result as the graph output, as in the upstream PR, fixed the issue.
+The dedicated mixed-chain test now passes on both CPU and CUDA.
+
+### Correctness probes
+
+The real Qwen3.6 model was tested with target q8_0/q4_0, draft q4_0/q4_0,
+S=33, W=0, temperature zero, seed 123, a 64-token reasoning budget, and 512
+generated tokens.  MTP-2 and MTP-3 produced identical reasoning and answer
+hashes with target backend sampling off and on.  Draft generated/accepted
+counts were also identical.  MTP-2 was additionally checked at temperature
+0.8 and seed 4242; CPU and transactional backend sampling again produced
+identical hashes and 317/387 accepted draft tokens.  These runs cross the
+forced reasoning-to-content transition inside normal speculative decoding.
+
+### GTX 1660 Ti sustained result
+
+The sustained screen used a fresh server per run, 32K context, q8_0/q4_0
+target KV, q4_0/q4_0 draft KV, S=33, W=0, 376/376, eight CPU threads,
+temperature zero, `ignore_eos`, 2,000 output tokens, and three repetitions.
+The machine was in the `balanced` power profile, so the paired relative result
+is the useful comparison rather than an older absolute record.
+
+| MTP | Target backend sampling | Median decode | Acceptance | Mean accepted length | Peak VRAM |
+|---|---|---:|---:|---:|---:|
+| 2 | off | 37.571 tok/s | 0.7770 | 2.55 | 5,646 MiB |
+| 2 | on  | 38.037 tok/s | 0.7770 | 2.55 | 5,672 MiB |
+| 3 | off | 35.499 tok/s | 0.6678 | 3.00 | 5,708 MiB |
+| 3 | on  | 35.873 tok/s | 0.6678 | 3.00 | 5,736 MiB |
+
+This is a measured gain of 1.24% for MTP-2 and 1.05% for MTP-3.  All three
+output hashes and token hashes were identical within every configuration and
+also across off/on.  MTP-2 remains 6.0% faster than MTP-3 with backend sampling
+on, so MTP-2 is still the production choice on this GPU.  The extra sampler
+graphs cost about 26--28 MiB VRAM.
+
+The result is positive but small on the GTX 1660 Ti.  It remains worth testing
+on the GTX 1080: the PR reports roughly 4% on an sm_61 Tesla P40, and avoiding
+host sampling can matter more with that machine's older CPU.  Because the
+upstream PR is still open and under review, target backend sampling remains
+default-off and is enabled explicitly with `-bs` or
+`TARGET_BACKEND_SAMPLING=1` in the benchmark runner.
+
+Artifacts are under
+`benchmark-results/backend-sampling-mtp{2,3}-{off,on}-3x2000-20260804`.

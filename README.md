@@ -206,6 +206,43 @@ upstream 2048/512 logical/physical defaults in that sweep.
 
 Change `--spec-draft-n-max` to 1 or 3 for MTP-1/MTP-3, or remove all `--spec-*` options for a no-MTP control. Always compare token/output hashes and MTP acceptance, not throughput alone.
 
+### Experimental target backend sampling
+
+This tree contains a semantic port of llama.cpp PR #25532.  Add `-bs` to keep
+target sampling on the backend for all output rows of an MTP verification
+graph.  The existing `--spec-draft-backend-sampling` flag controls only the
+draft sampler and is independent:
+
+```bash
+./build-backend-sampling-sm75/bin/llama-server \
+    ... \
+    -bs \
+    --spec-type draft-mtp \
+    --spec-draft-n-max 2 \
+    --reasoning-budget 256
+```
+
+The local reasoning-budget bridge preserves exact forced closing tokens even
+when the budget expires in the middle of a multi-token MTP verification step.
+It was checked with greedy and seeded stochastic sampling.  Grammar-constrained
+requests still fall back to CPU sampling.  The feature remains default-off
+because the upstream PR is open and the measured GTX 1660 Ti gain is modest:
+1.24% for MTP-2 and 1.05% for MTP-3 over three 2,000-token runs.  MTP-2 remains
+the faster mode on this card.
+
+The benchmark runner exposes the two relevant controls without changing its
+old defaults:
+
+```bash
+TARGET_BACKEND_SAMPLING=1 \
+REASONING_BUDGET=256 \
+MTP_OVERRIDE=2 \
+./scripts/bench_hybrid.sh SB
+```
+
+See `HYBRID_EXPERIMENTS.md` for hashes, acceptance, VRAM, exact test settings,
+and the GTX 1080 follow-up recommendation.
+
 For a quality-oriented 32K configuration, target `q8_0/q4_0` is a tested
 alternative to the fastest `q4_0/q4_0` recipe while the MTP draft cache remains
 q4_0/q4_0:

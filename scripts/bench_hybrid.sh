@@ -29,6 +29,8 @@ ADAPT_CUDA_GRAPHS="${ADAPT_CUDA_GRAPHS:-0}"
 DRAFT_P_MIN="${DRAFT_P_MIN:-}"
 DRAFT_BACKEND_SAMPLING="${DRAFT_BACKEND_SAMPLING:-}"
 EFFECTIVE_DRAFT_BACKEND_SAMPLING="${DRAFT_BACKEND_SAMPLING:-1}"
+TARGET_BACKEND_SAMPLING="${TARGET_BACKEND_SAMPLING:-0}"
+REASONING_BUDGET="${REASONING_BUDGET:-16384}"
 DRAFT_TYPE_K="${DRAFT_TYPE_K:-q8_0}"
 DRAFT_TYPE_V="${DRAFT_TYPE_V:-q4_0}"
 SAVE_EXPERT_USAGE="${SAVE_EXPERT_USAGE:-0}"
@@ -134,7 +136,7 @@ if command -v system76-power >/dev/null; then
 fi
 
 printf '%s\n' \
-  'config,rep,fixed_s,effective_fixed_s,warm_s,mtp_n,context,target_type_k,target_type_v,cpu_threads,draft_threads,draft_type_k,draft_type_v,draft_p_min,draft_backend_sampling,cpu_chunk,cpu_act_parallel,cpu_async,cpu_down_prefetch,cpu_reuse_rows,load_mode,cmoe_batch,cmoe_ubatch,prompt_repeat,profile_sha256,placement_sha256,power_profile,cpu_mask,cpu_poll,adapt,adapt_cuda_graphs,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,cpu_gate_up_ms,cpu_activation_ms,cpu_down_ms,cpu_async_jobs,cpu_async_wait_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
+  'config,rep,fixed_s,effective_fixed_s,warm_s,mtp_n,context,target_type_k,target_type_v,cpu_threads,draft_threads,draft_type_k,draft_type_v,draft_p_min,draft_backend_sampling,target_backend_sampling,reasoning_budget,cpu_chunk,cpu_act_parallel,cpu_async,cpu_down_prefetch,cpu_reuse_rows,load_mode,cmoe_batch,cmoe_ubatch,prompt_repeat,profile_sha256,placement_sha256,power_profile,cpu_mask,cpu_poll,adapt,adapt_cuda_graphs,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,cpu_gate_up_ms,cpu_activation_ms,cpu_down_ms,cpu_async_jobs,cpu_async_wait_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
   > "$RUNS_CSV"
 
 PID=""
@@ -249,7 +251,7 @@ for config in "${CONFIGS[@]}"; do
         warmup_lookahead_file="$RESULTS_DIR/$stem.warmup.lookahead-%r.json"
         lookahead_file="$RESULTS_DIR/$stem.lookahead-%r.json"
 
-        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N context=$CONTEXT target_kv=$TARGET_TYPE_K/$TARGET_TYPE_V batch=$CMOE_BATCH/$CMOE_UBATCH prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V pmin=${DRAFT_P_MIN:-default} backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC lookahead_trace=$LOOKAHEAD_TRACE ==="
+        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N context=$CONTEXT target_kv=$TARGET_TYPE_K/$TARGET_TYPE_V batch=$CMOE_BATCH/$CMOE_UBATCH prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V pmin=${DRAFT_P_MIN:-default} draft_backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING target_backend_sampling=$TARGET_BACKEND_SAMPLING reasoning_budget=$REASONING_BUDGET cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC lookahead_trace=$LOOKAHEAD_TRACE ==="
 
         env_args=(
             CUDA_VISIBLE_DEVICES=0
@@ -312,7 +314,7 @@ for config in "${CONFIGS[@]}"; do
             -cmoe
             -np 1
             --no-mmproj
-            --reasoning-budget 16384
+            --reasoning-budget "$REASONING_BUDGET"
             --ctx-checkpoints 0
             --cache-ram 0
             --jinja
@@ -321,6 +323,12 @@ for config in "${CONFIGS[@]}"; do
             --port "$PORT"
             -a "hybrid-$config"
         )
+        if [[ "$TARGET_BACKEND_SAMPLING" == 1 ]]; then
+            server_args+=(-bs)
+        elif [[ "$TARGET_BACKEND_SAMPLING" != 0 ]]; then
+            echo "TARGET_BACKEND_SAMPLING muss 0 oder 1 sein" >&2
+            exit 1
+        fi
         if [[ "$MTP_N" -gt 0 ]]; then
             server_args+=(
                 --spec-type draft-mtp
@@ -465,7 +473,7 @@ if not trace.get("records"):
 PY
         fi
 
-        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "$CONTEXT" "$TARGET_TYPE_K" "$TARGET_TYPE_V" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$CPU_ASYNC" "$CPU_DOWN_PREFETCH" "$CPU_REUSE_ROWS" "$LOAD_MODE" "$CMOE_BATCH" "$CMOE_UBATCH" "$PROMPT_REPEAT" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$ADAPT_CUDA_GRAPHS" "$STATIC_NO_SYNC" \
+        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "$CONTEXT" "$TARGET_TYPE_K" "$TARGET_TYPE_V" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$TARGET_BACKEND_SAMPLING" "$REASONING_BUDGET" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$CPU_ASYNC" "$CPU_DOWN_PREFETCH" "$CPU_REUSE_ROWS" "$LOAD_MODE" "$CMOE_BATCH" "$CMOE_UBATCH" "$PROMPT_REPEAT" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$ADAPT_CUDA_GRAPHS" "$STATIC_NO_SYNC" \
             "$response_file" "$stats_file" "$samples_file" "$log_file" >> "$RUNS_CSV" <<'PY'
 import csv
 import json
@@ -474,7 +482,7 @@ import statistics
 import sys
 from pathlib import Path
 
-config, rep, fixed_s, warm_s, mtp_n, context, target_type_k, target_type_v, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
+config, rep, fixed_s, warm_s, mtp_n, context, target_type_k, target_type_v, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
 response = json.loads(Path(response_path).read_text())
 stats_file = Path(stats_path)
 stats = json.loads(stats_file.read_text()) if stats_file.exists() else {}
@@ -509,7 +517,7 @@ total = float(stats.get("selected_total", 0) or 0)
 cold = float(stats.get("cold_hits", 0) or 0)
 
 row = [
-    config, rep, fixed_s, effective_fixed_s, warm_s, mtp_n, context, target_type_k, target_type_v, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, int(static_active),
+    config, rep, fixed_s, effective_fixed_s, warm_s, mtp_n, context, target_type_k, target_type_v, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, int(static_active),
     timings.get("prompt_per_second", 0),
     response.get("ttft_ms", 0),
     timings.get("predicted_per_second", 0),
@@ -562,7 +570,7 @@ numeric = [
     "predicted_tokens",
 ]
 with open(destination, "w", newline="") as handle:
-    fields = ["config", "repeats", "fixed_s", "effective_fixed_s", "warm_s", "mtp_n", "context", "target_type_k", "target_type_v", "cpu_threads", "draft_threads", "draft_type_k", "draft_type_v", "draft_p_min", "draft_backend_sampling", "cpu_chunk", "cpu_act_parallel", "cpu_async", "cpu_down_prefetch", "cpu_reuse_rows", "load_mode", "cmoe_batch", "cmoe_ubatch", "prompt_repeat", "profile_sha256", "placement_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "adapt_cuda_graphs", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
+    fields = ["config", "repeats", "fixed_s", "effective_fixed_s", "warm_s", "mtp_n", "context", "target_type_k", "target_type_v", "cpu_threads", "draft_threads", "draft_type_k", "draft_type_v", "draft_p_min", "draft_backend_sampling", "target_backend_sampling", "reasoning_budget", "cpu_chunk", "cpu_act_parallel", "cpu_async", "cpu_down_prefetch", "cpu_reuse_rows", "load_mode", "cmoe_batch", "cmoe_ubatch", "prompt_repeat", "profile_sha256", "placement_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "adapt_cuda_graphs", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
         "output_hashes_identical", "token_hashes_identical", "output_sha256", "token_sha256",
     ]
     writer = csv.DictWriter(handle, fieldnames=fields)
@@ -587,6 +595,8 @@ with open(destination, "w", newline="") as handle:
             "draft_type_v": group[0]["draft_type_v"],
             "draft_p_min": group[0]["draft_p_min"],
             "draft_backend_sampling": group[0]["draft_backend_sampling"],
+            "target_backend_sampling": group[0]["target_backend_sampling"],
+            "reasoning_budget": group[0]["reasoning_budget"],
             "cpu_chunk": group[0]["cpu_chunk"],
             "cpu_act_parallel": group[0]["cpu_act_parallel"],
             "cpu_async": group[0]["cpu_async"],
