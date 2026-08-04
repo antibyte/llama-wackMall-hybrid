@@ -12,7 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from bench_expert_compute import aggregate as aggregate_compute_runs  # noqa: E402
+from bench_expert_bridge_ab import (  # noqa: E402
+    BridgeBenchError,
+    bootstrap_median_ci,
+    validate_pair,
+)
 from bench_expert_transport import aggregate_runs  # noqa: E402
+from simulate_expert_bridge_cache import simulate_lru  # noqa: E402
 from simulate_expert_streaming import Timing, rank_precision, simulate  # noqa: E402
 
 
@@ -93,6 +99,45 @@ class TestComputeAggregation(unittest.TestCase):
             summary["results"][0]["latency_ms_median_of_medians"], 0.3
         )
         self.assertAlmostEqual(summary["by_size_mode"][0]["latency_ms_median"], 0.45)
+
+
+class TestBridgeAB(unittest.TestCase):
+    def test_bootstrap_constant_delta(self) -> None:
+        low, high = bootstrap_median_ci([1.25] * 7, samples=100, seed=7)
+        self.assertEqual((low, high), (1.25, 1.25))
+
+    def test_pair_requires_identical_tokens(self) -> None:
+        baseline = {
+            "output_sha256": "output",
+            "token_sha256": "baseline",
+            "predicted_tokens": "256",
+            "mtp_acceptance": "0.75",
+            "mean_accepted_length": "2.5",
+        }
+        bridge = dict(baseline, token_sha256="bridge")
+        with self.assertRaisesRegex(BridgeBenchError, "token_sha256"):
+            validate_pair(baseline, bridge)
+
+    def test_pair_accepts_identical_results(self) -> None:
+        result = {
+            "output_sha256": "output",
+            "token_sha256": "tokens",
+            "predicted_tokens": "256",
+            "mtp_acceptance": "0.75",
+            "mean_accepted_length": "2.5",
+        }
+        validate_pair(result, dict(result))
+
+
+class TestBridgeCacheSimulation(unittest.TestCase):
+    def test_lru_reuses_candidates_until_eviction(self) -> None:
+        steps = [([1, 2], {1}), ([1, 3], {1, 3}), ([2], {2})]
+        result = simulate_lru(steps, slots=2, expert_bytes=100)
+        self.assertEqual(result["candidates"], 5)
+        self.assertEqual(result["copies"], 4)
+        self.assertEqual(result["avoided_copies"], 1)
+        self.assertEqual(result["useful_cache_hits"], 1)
+        self.assertEqual(result["avoided_bytes"], 100)
 
 
 class TestStreamingSimulation(unittest.TestCase):

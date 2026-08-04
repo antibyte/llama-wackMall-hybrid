@@ -316,7 +316,7 @@ The implementation progressed through these stages:
 6. The manager was generalized to at most four independent layer states, workers, streams, and scratch allocations.
 7. Secondary-layer prediction was changed to graph-neutral recurrence after additional lookahead branches were proven to alter output.
 
-The relevant implementation surface is the CUDA backend bridge and kernel, the CPU Gate+Up claim/fetch hook, target router observation in the graph/model path, and lookahead configuration. The work remains an uncommitted private experiment.
+The relevant implementation surface is the CUDA backend bridge and kernel, the CPU Gate+Up claim/fetch hook, target router observation in the graph/model path, and lookahead configuration. The work remains a private experiment.
 
 ### Deterministic CUDA kernel validation
 
@@ -387,6 +387,60 @@ The final hybrid representative metrics were 204 layer-1 copies with 139 useful 
 
 The hybrid median was 0.288062 percent above the current single-layer manager median. The spread between runs is comparable to the gain, so the conclusion is a small measured positive direction, not a robust production-level speedup. Longer interleaved tests and more prompts are required before making a stronger claim.
 
+### Measurement and bridge optimization phase
+
+The next phase added `tools/bench_expert_bridge_ab.py`, a counterbalanced paired A/B harness. Each side receives a fresh warmup server and a fresh measured server. Pair order alternates, prompt and profile hashes are recorded, and a pair is rejected immediately if predicted token count, output hash, token hash, MTP acceptance, or mean accepted length differs. The summary contains paired deltas and a deterministic bootstrap interval. This is stricter than comparing independent medians, although three pairs are still too few for a narrow interval.
+
+The system sampler in `scripts/bench_hybrid.sh` now records GPU utilization, VRAM, SM clock, power, temperature, PCIe generation and width, P-state, process CPU use, and RSS. The bridge JSON schema is v6. Optional diagnostic CUDA events and host timers add worker queue, router wait, router-to-compute, result latency, claim/fetch wait, result copy, input D2H, device quantization, input H2D, kernel, and output D2H timing. Diagnostic events are created only with `GGML_CUDA_EXPERT_BRIDGE_TELEMETRY=1` and are not part of normal measurements.
+
+The first 16-token diagnostic comparison was hash-identical and measured -0.051585 percent, which is only a smoke result. On the original layer-1 host-input path, eight diagnostic jobs totaled about 0.091 ms CPU quantization, 0.065 ms input D2H, 0.073 ms input H2D, 0.757 ms kernel, 0.054 ms output D2H, 0.952 ms compute, and 1.177 ms router-to-result latency. Claim and fetch waits were effectively zero. This directed work toward input preparation and unnecessary candidate compute rather than claim synchronization.
+
+#### Device Q8_K input quantization
+
+A deterministic warp-parallel CUDA Q8_K quantizer was added. One warp handles one 256-value Q8_K block, retains the CPU first-maximum tie rule, and uses explicit round-to-nearest operations. It avoids float input D2H, CPU Q8_K quantization, and Q8_K H2D for direct lookahead. The earlier sequential GPU smoke was hash-identical but measured -1.170479 percent; nine layer-1 rows used about 0.408 ms of device quantization. It was replaced by the warp implementation.
+
+Recurrence layers normally prepare all current graph rows before the matching token is known. GPU-quantizing every recurrence row lost more than it saved, so `GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT=1` applies to lookahead layers and is disabled automatically on recurrence layers. `GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT_RECURRENCE=1` exists only for explicit experimentation.
+
+All device-quantization comparisons were hash-identical. The warp smoke measured +1.313311 percent and layer-1 diagnostic totals of about 0.103 ms for nine quantized rows and 1.067 ms result latency. The three-pair 256-token replay deltas were -0.543480, +1.710512, and +0.790187 percent, giving median +0.790187 percent and bootstrap interval [-0.543480, +1.710512]. The one-pair 256-token calibration comparison measured +0.420631 percent. The direction was positive but the replay interval included zero.
+
+#### Hit-only compute and readback
+
+After the actual router result is known, the worker now has an opt-in indexed kernel path that computes only candidates which are actual hits. Weight slot and output slot are mapped separately, allowing the same kernel to support compact compute and persistent cache slots. Only hit candidate output rows are copied back to the host.
+
+The 16-token diagnostic run was hash-identical. Layer-1 kernel time fell from about 0.746 to 0.617 ms, compute from 0.878 to 0.743 ms, and result latency from 1.067 to 0.933 ms. Its -2.492779 percent throughput delta demonstrates why short smoke throughput is ignored. In a three-pair 256-token comparison against the bridge-disabled baseline, all deltas were positive: +0.503125, +0.416901, and +0.356146 percent, for median +0.416901 percent and interval [+0.356146, +0.503125]. The isolated comparison against the same device-quant bridge without hit-only produced median +0.371360 percent and interval [-0.577782, +2.463536]. Hit-only is retained as an opt-in part of the recommended experimental path.
+
+#### Rejected event completion path
+
+An event plus host-callback path was implemented for weight H2D completion to test removal of the worker-side stream synchronization. Its 16-token smoke was hash-identical but measured -0.899605 percent, 0.943 ms layer-1 router-to-result latency, and zero skipped predictions. It did not improve the preceding 0.933 ms hit-only critical latency. The implementation and its harness flags were removed. The artifact is retained so the rejected direction remains documented.
+
+#### Persistent expert cache
+
+`tools/simulate_expert_bridge_cache.py` replays a small LRU Gate+Up cache against the held-out routing traces. For layer-1 lookahead K=2 with eight slots, predicted avoided-copy ratios were only 10.96 percent on replay and 13.41 percent on calibration, below the 20 percent implementation gate. Layer-2 recurrence K=1 with eight slots predicted 23.73 and 20.63 percent and therefore passed the gate. With 12 slots those ratios became 29.80 and 25.93 percent; with 16 slots they became 31.96 and 29.47 percent.
+
+The implemented cache is bounded to 16 device slots and enabled only by `GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS` plus `GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS`. The host staging allocation remains K-sized. An indexed weight-slot mapping lets a hit compute directly from its persistent slot while misses replace the least-recently-used slot.
+
+The layer-2 eight-slot smoke was hash-identical and observed two hits and seven misses over nine predictions. In the isolated three-pair 256-token replay, each cache run avoided 16 of 102 layer-2 copies, reducing copied data from 120,324,096 to 101,449,728 bytes. Representative staging plus transfer totals fell from about 39.4 to 34.4 ms, 40.3 to 34.1 ms, and 41.1 to 33.3 ms. The paired throughput median was nevertheless -0.165643 percent with interval [-0.329626, +1.115792]. The saved milliseconds are too small relative to the full generation. The cache remains available for diagnostics and future workloads but is not enabled in the recommended configuration.
+
+#### MTP compatibility
+
+MTP-1, MTP-2, and MTP-3 each completed a paired 16-token smoke with device quantization and hit-only enabled. Every pair had identical output hash, token hash, MTP acceptance, and mean accepted length. The descriptive deltas were -2.883876, +1.355805, and +8.130283 percent respectively. These single short pairs establish compatibility only and must not be used to rank MTP settings. MTP-2 remains the measured primary configuration.
+
+#### Counterbalanced multi-prompt and soak results
+
+The final bridge-disabled versus device-quant plus hit-only comparison used three counterbalanced 256-token pairs for each external prompt. All 12 measured runs were hash-identical within pairs and acceptance-identical.
+
+| Prompt | Pair deltas | Median delta |
+| --- | --- | ---: |
+| replay | +0.443749%, -0.281278%, +0.226529% | +0.226529% |
+| calibration | -0.335574%, +0.502585%, +0.105359% | +0.105359% |
+| combined | six pairs above | +0.165944% |
+
+The combined mean was +0.110228 percent and the bootstrap median interval was [-0.308426, +0.473167]. Replay runs reproduced output hash `4f2ed06aec4d8b43d783836e0b1e5445c941aff2a0f5778142e1d4a024b980d3`, token hash `1300454af2cbdfe4553d9c4e1ae15df613377286f5c1930b4efc4736e0aaeea9`, acceptance 0.782828, and mean accepted length 2.57. Calibration runs reproduced output hash `a2bbe2f727986628c690fa53908f72a998d47631e75bcd671ab77ebf1be63084`, token hash `046b2902954239f47fcab586ae107ae913e26d3339d4dfb6a672386755f6f2fc`, acceptance 0.706161, and mean accepted length 2.41.
+
+A final replay soak generated exactly 1,024 tokens on both sides. It was hash-identical with output hash `5ff0b4cae9ad51f80d0e18c40e8510d26733e77232e90ac8d36ab075d1f994e2`, token hash `640ed3e6bdf25657649a38007ed4cc46a0e880324c394afe8e234eaa9eadd790`, acceptance 0.792668, and mean accepted length 2.58. Baseline measured 28.590162 token/s and bridge 28.766105 token/s, a descriptive single-pair delta of +0.615395 percent. Average sampled GPU power was 93.31 versus 94.38 W; SM clock remained 2,025 MHz, PCIe remained Gen3 x16, P-state remained P2, and maximum temperature was 62 versus 61 C.
+
+The stronger harness confirms a small positive direction and long-run correctness but narrows the performance conclusion: the combined multi-prompt interval includes zero. The bridge should remain explicit opt-in. Device quantization and hit-only reduce measured internal work, while the end-to-end gain on this model and host is still near the noise floor.
+
 ### Recommended experimental configuration
 
 The current best correctness-preserving configuration is:
@@ -397,12 +451,14 @@ GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_LAYERS=2
 GGML_CUDA_EXPERT_BRIDGE_K=2
 GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_K=1
 GGML_CUDA_EXPERT_BRIDGE_CONSUME=1
+GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT=1
+GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY=1
 GGML_CUDA_EXPERT_BRIDGE_JSON=/root/gtx1080-hybrid-results/bridge.json
 ```
 
 `GGML_CUDA_EXPERT_BRIDGE_LAYER` remains a backward-compatible singular fallback. Candidate K is bounded to 1 through 3. The bridge manager supports at most four selected layers. Any selected layer after the first is forced to recurrence even if it is omitted from `GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_LAYERS`.
 
-The bridge is explicit opt-in, produces per-layer v5 JSON metrics, and should remain disabled for ordinary runs. Verification can be enabled with `GGML_CUDA_EXPERT_BRIDGE_VERIFY=1` when validating math, at substantial diagnostic overhead.
+The bridge is explicit opt-in, produces per-layer v6 JSON metrics, and should remain disabled for ordinary runs. Verification can be enabled with `GGML_CUDA_EXPERT_BRIDGE_VERIFY=1` when validating math, at substantial diagnostic overhead. Fine timing can be enabled with `GGML_CUDA_EXPERT_BRIDGE_TELEMETRY=1`; timing results must not be mixed with ordinary throughput results. The persistent cache is intentionally omitted from the recommended configuration.
 
 ### Artifact index
 
@@ -438,6 +494,24 @@ The main evidence directories and files are:
 /root/gtx1080-hybrid-results/mtp2-direct-view-baseline-256-r3/
 /root/gtx1080-hybrid-results/mtp2-manager-l1-k2-256-r3/
 /root/gtx1080-hybrid-results/mtp2-hybrid-l1-r2k1-256-r3/
+/root/gtx1080-hybrid-results/phase1-ab-telemetry-smoke-16/
+/root/gtx1080-hybrid-results/phase2-device-quant-telemetry-smoke-16/
+/root/gtx1080-hybrid-results/phase2-device-quant-warp-smoke-16/
+/root/gtx1080-hybrid-results/phase2-device-quant-warp-replay-256-p3/
+/root/gtx1080-hybrid-results/phase2-device-quant-warp-calibration-256-p1/
+/root/gtx1080-hybrid-results/phase3-hit-only-telemetry-smoke-16/
+/root/gtx1080-hybrid-results/phase3-hit-only-replay-256-p3/
+/root/gtx1080-hybrid-results/phase3-hit-only-vs-device-quant-replay-256-p3/
+/root/gtx1080-hybrid-results/phase3-async-copy-telemetry-smoke-16/
+/root/gtx1080-hybrid-results/phase4-cache-simulation-v1.json
+/root/gtx1080-hybrid-results/phase4-cache-simulation-slots16.json
+/root/gtx1080-hybrid-results/phase4-cache-l2-telemetry-smoke-16/
+/root/gtx1080-hybrid-results/phase4-cache-l2-vs-hit-only-replay-256-p3/
+/root/gtx1080-hybrid-results/phase5-mtp1-replay-smoke-16/
+/root/gtx1080-hybrid-results/phase5-mtp2-replay-smoke-16/
+/root/gtx1080-hybrid-results/phase5-mtp3-replay-smoke-16/
+/root/gtx1080-hybrid-results/phase6-final-multiprompt-mtp2-256-p3/
+/root/gtx1080-hybrid-results/phase6-soak-replay-mtp2-1024-p1/
 ```
 
 Each inference result directory contains its run CSV, median CSV, response JSON, logs, and any bridge JSON emitted for that run. Host, compiler, Git starting state, GPU link, and input hash captures are stored directly under `/root/gtx1080-hybrid-results/`.
@@ -453,10 +527,16 @@ additional router snapshot tensors: rejected for correctness
 multiple simultaneous lookahead branches: rejected for correctness
 direct observation of existing router views: retained
 deterministic Q4_K x Q8_K Gate+Up kernel: retained
+deterministic device Q8_K input quantization: retained as opt-in experiment
+hit-only candidate compute and readback: retained as opt-in experiment
 single-layer K=2 bridge: retained as opt-in experiment
 secondary-layer K=1 recurrence: retained as opt-in experiment
+event plus host-callback H2D completion: rejected and removed
+eight-slot layer-2 persistent cache: correct but not recommended for throughput
+MTP-1/MTP-2/MTP-3 bridge compatibility: passed short hash and acceptance gate
+1,024-token replay stability: passed hash and acceptance gate
 default enablement: rejected pending broader evidence
 upstream merge or submission: not planned
 ```
 
-The next useful optimization work is to reduce host staging and synchronization cost, interleave baseline and bridge repetitions to control thermal and clock drift, test longer generations and multiple held-out prompts, measure power and active PCIe state for every comparison, and explore reuse-aware candidate suppression. Any new path must preserve graph structure or prove full-stream hash identity before its throughput is considered.
+The next useful work is to increase the number of counterbalanced pairs, add more held-out prompt families, and test whether larger MTP verification batches expose more benefit from device quantization and hit-only compute. Kernel launch fusion or a graph-neutral direct consumer would have to save substantially more than the cache's few milliseconds per 256 tokens to matter end to end. Any new path must preserve graph structure or prove full-stream hash identity before its throughput is considered.

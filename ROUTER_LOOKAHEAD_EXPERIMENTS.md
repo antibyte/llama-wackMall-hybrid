@@ -177,6 +177,10 @@ No H2D copy has been authorized. Predictor GPU time, predictor-ID D2H completion
 
 The native sm_75 build and lookahead unit test pass. The requested sm_61 plus GCC-13 CUDA-host build cannot be configured with the local CUDA 12.0 toolkit because nvcc 12.0 rejects GCC newer than 12. A separate sm_61 build using GCC 13 for C/C++ and G++ 12 only as the nvcc host compiler is used as the local architecture compile check. The exact CUDA 12.4 plus GCC-13 configuration remains to be verified on the GTX 1080 host.
 
+## GTX 1080 completion note
+
+The GTX 1080 work described as pending below was completed on 2026-08-04. Native SM 61 calibration, held-out replay, productive bridge implementation, deterministic kernel validation, MTP compatibility, counterbalanced multi-prompt measurement, and a 1,024-token stability run are recorded in `TRANSIENT_EXPERT_EXPERIMENTS.md`. This file preserves the earlier routing investigation and its historical phase gates.
+
 ## Phase 2 Oracle and schedule simulation
 
 Status: transport, resident-compute, and first routing replay complete on the
@@ -197,13 +201,11 @@ ms/token but requires four slots in every layer, about 291.6 MiB. Predictor
 runtime, real exposed copy time, and contention are still excluded. This fails
 the Phase 3 gate on the GTX 1660 Ti.
 
-The GTX 1080 plus old i7 remains unevaluated. It must collect target-specific
-CPU timing, transport, resident GPU compute, and fixed-residency traces before
-the decision is reused.
+The later GTX 1080 run collected target-specific CPU timing, transport, resident GPU compute, and fixed-residency traces. Its productive opt-in result and rejected paths are documented in `TRANSIENT_EXPERT_EXPERIMENTS.md`.
 
 ## Productive prefetch
 
-Status: not implemented.
+Status: not implemented for the GTX 1660 Ti. A separate opt-in GTX 1080 bridge was implemented only after its target-specific gate passed.
 
 The implementation stops after Phase 1 unless the requested measurement and
 Oracle gates are positive. MTP lookahead remains disabled by default even if a

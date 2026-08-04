@@ -196,9 +196,9 @@ case_settings() {
 start_monitor() {
     local sample_file="$1"
     (
-        printf 'unix_s,gpu_util_pct,vram_mib,cpu_pct,rss_kib\n'
+        printf 'unix_s,gpu_util_pct,vram_mib,sm_clock_mhz,power_w,temp_c,pcie_gen,pcie_width,pstate,cpu_pct,rss_kib\n'
         while kill -0 "$PID" 2>/dev/null; do
-            local_gpu="$(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader,nounits -i 0 2>/dev/null || printf ',')"
+            local_gpu="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,clocks.current.sm,power.draw,temperature.gpu,pcie.link.gen.current,pcie.link.width.current,pstate --format=csv,noheader,nounits -i 0 2>/dev/null || printf ',,,,,,,')"
             local_ps="$(ps -p "$PID" -o %cpu=,rss= 2>/dev/null || printf '0 0')"
             printf '%s,%s,%s\n' "$(date +%s.%N)" "${local_gpu// /}" "$(tr -s ' ' ',' <<< "${local_ps# }")"
             sleep 0.5

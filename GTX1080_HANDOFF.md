@@ -2,6 +2,8 @@
 
 Date: 2026-08-04
 
+Status: completed. This document preserves the original run procedure. Final measurements, productive bridge configuration, rejected paths, and artifact locations are recorded in `TRANSIENT_EXPERT_EXPERIMENTS.md`.
+
 This handoff is for Codex running on the GTX 1080 host. The first objective is to repeat the measured transport, resident GPU compute, CPU cold timing, routing trace, and Oracle replay on native SM 61. Do not implement productive transient transfers until the target-specific gates pass.
 
 ## Expected target
