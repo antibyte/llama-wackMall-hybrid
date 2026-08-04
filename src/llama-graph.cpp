@@ -1802,7 +1802,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor ** selected_experts_out,
-         ggml_tensor ** weights_out) const {
+         ggml_tensor ** weights_out,
+                bool   snapshot_selected_experts) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1825,7 +1826,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         selected_experts_out,
-        weights_out
+        weights_out,
+        snapshot_selected_experts
     );
 }
 
@@ -1855,7 +1857,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor ** selected_experts_out,
-         ggml_tensor ** weights_out) const {
+         ggml_tensor ** weights_out,
+                bool   snapshot_selected_experts) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2001,6 +2004,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+    if (snapshot_selected_experts && selected_experts_out) {
+        cb(selected_experts, "lookahead_actual_topk_snapshot", il);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 

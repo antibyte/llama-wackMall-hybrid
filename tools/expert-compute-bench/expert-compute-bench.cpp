@@ -3,11 +3,13 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "ggml-quants.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -21,6 +23,15 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
+
+#if defined(GGML_USE_CUDA)
+extern "C" bool expert_compute_q4_k_avx2(
+        const void * weights, const void * input, int n_embd, int rows,
+        int iterations, float * output, double * kernel_ms);
+extern "C" bool expert_compute_q4_k_avx2_f32(
+        const void * weights, const float * input, int n_embd, int rows,
+        int iterations, float * output, void * quantized, double * kernel_ms);
+#endif
 
 namespace {
 
@@ -79,6 +90,15 @@ struct mode_result {
     summary latency_ms;
     summary queued_ms;
     double checksum = 0.0;
+};
+
+struct comparison_result {
+    std::string name;
+    size_t elements = 0;
+    size_t exact = 0;
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    double kernel_ms = 0.0;
 };
 
 static uint64_t parse_u64(const std::string & text, const char * name) {
@@ -284,8 +304,56 @@ static double output_checksum(ggml_tensor * tensor) {
     return checksum;
 }
 
+static comparison_result compare_tensors(
+        const std::string & name, ggml_tensor * first, ggml_tensor * second) {
+    if (!ggml_are_same_shape(first, second) || first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32) {
+        throw std::runtime_error("cannot compare incompatible tensors: " + name);
+    }
+    std::vector<float> a((size_t) ggml_nelements(first));
+    std::vector<float> b(a.size());
+    ggml_backend_tensor_get(first, a.data(), 0, a.size()*sizeof(float));
+    ggml_backend_tensor_get(second, b.data(), 0, b.size()*sizeof(float));
+    comparison_result result;
+    result.name = name;
+    result.elements = a.size();
+    double total_abs = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+            throw std::runtime_error("comparison produced a non-finite value: " + name);
+        }
+        if (a[i] == b[i]) {
+            result.exact++;
+        }
+        const double error = std::abs((double) a[i] - (double) b[i]);
+        result.max_abs = std::max(result.max_abs, error);
+        total_abs += error;
+    }
+    result.mean_abs = a.empty() ? 0.0 : total_abs/a.size();
+    return result;
+}
+
+static comparison_result compare_values(
+        const std::string & name, const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.size() != b.size()) {
+        throw std::runtime_error("cannot compare incompatible values: " + name);
+    }
+    comparison_result result;
+    result.name = name;
+    result.elements = a.size();
+    double total_abs = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] == b[i]) result.exact++;
+        const double error = std::abs((double) a[i] - (double) b[i]);
+        result.max_abs = std::max(result.max_abs, error);
+        total_abs += error;
+    }
+    result.mean_abs = a.empty() ? 0.0 : total_abs/a.size();
+    return result;
+}
+
 static std::string make_json(const options & config, const llama_model & model,
-        ggml_backend_dev_t device, const std::vector<mode_result> & results) {
+        ggml_backend_dev_t device, const ggml_tensor * gate_weight,
+        const std::vector<mode_result> & results, const std::vector<comparison_result> & comparisons) {
     std::ostringstream output;
     output << std::fixed << std::setprecision(9);
     output << "{\n  \"schema\":\"llama-wackmall-expert-compute-v1\","
@@ -295,7 +363,9 @@ static std::string make_json(const options & config, const llama_model & model,
            << ",\n  \"config\":{\"device_ordinal\":" << config.device
            << ",\"layer\":" << config.layer << ",\"expert\":" << config.expert
            << ",\"repeats\":" << config.repeats << ",\"warmups\":" << config.warmups
-           << ",\"queued_iterations\":" << config.queued_iterations << "},"
+           << ",\"queued_iterations\":" << config.queued_iterations
+           << ",\"weight_type\":\"" << ggml_type_name(gate_weight->type) << "\""
+           << ",\"n_embd\":" << gate_weight->ne[0] << ",\"n_ff\":" << gate_weight->ne[1] << "},"
            << "\n  \"results\":[";
     bool first = true;
     const auto write_summary = [&](const summary & value) {
@@ -309,6 +379,18 @@ static std::string make_json(const options & config, const llama_model & model,
         output << ",\"queued_ms\":";
         write_summary(result.queued_ms);
         output << ",\"checksum\":" << result.checksum << '}';
+        first = false;
+    }
+    output << "\n  ],\n  \"cpu_gpu_comparison\":[";
+    first = true;
+    for (const comparison_result & comparison : comparisons) {
+        output << (first ? "" : ",") << "\n    {\"name\":\"" << comparison.name
+               << "\",\"elements\":" << comparison.elements
+               << ",\"exact\":" << comparison.exact
+               << ",\"exact_fraction\":" << (comparison.elements ? (double) comparison.exact/comparison.elements : 0.0)
+               << ",\"max_abs\":" << comparison.max_abs
+               << ",\"mean_abs\":" << comparison.mean_abs
+               << ",\"kernel_ms\":" << comparison.kernel_ms << '}';
         first = false;
     }
     output << "\n  ]\n}\n";
@@ -406,9 +488,13 @@ int main(int argc, char ** argv) {
         ggml_set_name(down_output, "down.output");
 
         ggml_cgraph * graph_gate_up = ggml_new_graph_custom(context.get(), GGML_DEFAULT_GRAPH_SIZE, false);
+        ggml_cgraph * graph_gate = ggml_new_graph_custom(context.get(), GGML_DEFAULT_GRAPH_SIZE, false);
+        ggml_cgraph * graph_up = ggml_new_graph_custom(context.get(), GGML_DEFAULT_GRAPH_SIZE, false);
         ggml_cgraph * graph_down = ggml_new_graph_custom(context.get(), GGML_DEFAULT_GRAPH_SIZE, false);
         ggml_cgraph * graph_full = ggml_new_graph_custom(context.get(), GGML_DEFAULT_GRAPH_SIZE, false);
         ggml_build_forward_expand(graph_gate_up, activated);
+        ggml_build_forward_expand(graph_gate, gate);
+        ggml_build_forward_expand(graph_up, up);
         ggml_build_forward_expand(graph_down, down_output);
         ggml_build_forward_expand(graph_full, full_output);
 
@@ -445,7 +531,119 @@ int main(int argc, char ** argv) {
             results.push_back(result);
         }
 
-        write_json(config, make_json(config, *model, device, results));
+        ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu_device) {
+            throw std::runtime_error("CPU backend is not available");
+        }
+        backend_ptr cpu_backend(ggml_backend_dev_init(cpu_device, nullptr));
+        if (!cpu_backend) {
+            throw std::runtime_error("failed to initialize CPU backend");
+        }
+        context_ptr cpu_context(ggml_init(context_params));
+        if (!cpu_context) {
+            throw std::runtime_error("failed to initialize CPU comparison context");
+        }
+        ggml_tensor * cpu_weight_gate = make_weight(cpu_context.get(), source_gate, "cpu.gate.weight");
+        ggml_tensor * cpu_weight_up = make_weight(cpu_context.get(), source_up, "cpu.up.weight");
+        ggml_tensor * cpu_input = ggml_new_tensor_2d(cpu_context.get(), GGML_TYPE_F32, source_gate->ne[0], 1);
+        ggml_tensor * cpu_gate = ggml_mul_mat(cpu_context.get(), cpu_weight_gate, cpu_input);
+        ggml_tensor * cpu_up = ggml_mul_mat(cpu_context.get(), cpu_weight_up, cpu_input);
+        ggml_tensor * cpu_activated = ggml_mul(cpu_context.get(), ggml_silu(cpu_context.get(), cpu_gate), cpu_up);
+        ggml_cgraph * cpu_graph = ggml_new_graph_custom(cpu_context.get(), GGML_DEFAULT_GRAPH_SIZE, false);
+        ggml_build_forward_expand(cpu_graph, cpu_activated);
+        ggml_cgraph * cpu_gate_graph = ggml_new_graph_custom(cpu_context.get(), GGML_DEFAULT_GRAPH_SIZE, false);
+        ggml_cgraph * cpu_up_graph = ggml_new_graph_custom(cpu_context.get(), GGML_DEFAULT_GRAPH_SIZE, false);
+        ggml_build_forward_expand(cpu_gate_graph, cpu_gate);
+        ggml_build_forward_expand(cpu_up_graph, cpu_up);
+        buffer_ptr cpu_buffer(ggml_backend_alloc_ctx_tensors(cpu_context.get(), cpu_backend.get()));
+        if (!cpu_buffer) {
+            throw std::runtime_error("failed to allocate CPU comparison tensors");
+        }
+        upload_expert(cpu_weight_gate, source_gate, config.expert);
+        upload_expert(cpu_weight_up, source_up, config.expert);
+        ggml_backend_tensor_set(cpu_input, input_values.data(), 0, input_values.size()*sizeof(float));
+        compute_graph(cpu_backend.get(), cpu_graph);
+        ggml_backend_synchronize(cpu_backend.get());
+        compute_graph(backend.get(), graph_gate);
+        compute_graph(backend.get(), graph_up);
+        ggml_backend_synchronize(backend.get());
+        compute_graph(cpu_backend.get(), cpu_gate_graph);
+        compute_graph(cpu_backend.get(), cpu_up_graph);
+        ggml_backend_synchronize(cpu_backend.get());
+
+        std::vector<comparison_result> comparisons;
+        comparisons.push_back(compare_tensors("gate", gate, cpu_gate));
+        comparisons.push_back(compare_tensors("up", up, cpu_up));
+        comparisons.push_back(compare_tensors("activated", activated, cpu_activated));
+#if defined(GGML_USE_CUDA)
+        if (source_gate->type == GGML_TYPE_Q4_K) {
+            std::vector<uint8_t> quantized_input(
+                    (size_t) (source_gate->ne[0]/QK_K)*sizeof(block_q8_K));
+            quantize_row_q8_K_ref(input_values.data(),
+                    (block_q8_K *) quantized_input.data(), source_gate->ne[0]);
+            std::vector<uint8_t> combined_weights(
+                    ggml_nbytes(source_gate)/(size_t) source_gate->ne[2] +
+                    ggml_nbytes(source_up)/(size_t) source_up->ne[2]);
+            const size_t gate_bytes = ggml_nbytes(source_gate)/(size_t) source_gate->ne[2];
+            const char * gate_source = (const char *) source_gate->data + source_gate->nb[2]*config.expert;
+            const char * up_source = (const char *) source_up->data + source_up->nb[2]*config.expert;
+            memcpy(combined_weights.data(), gate_source, gate_bytes);
+            memcpy(combined_weights.data() + gate_bytes, up_source, combined_weights.size() - gate_bytes);
+            std::vector<float> deterministic_combined(
+                    (size_t) source_gate->ne[1] + (size_t) source_up->ne[1]);
+            double deterministic_combined_ms = 0.0;
+            if (!expert_compute_q4_k_avx2(combined_weights.data(), quantized_input.data(),
+                        (int) source_gate->ne[0], (int) deterministic_combined.size(), 100,
+                        deterministic_combined.data(), &deterministic_combined_ms)) {
+                throw std::runtime_error("deterministic Q4_K CUDA comparison failed");
+            }
+            std::vector<float> deterministic_gate(
+                    deterministic_combined.begin(), deterministic_combined.begin() + source_gate->ne[1]);
+            std::vector<float> deterministic_up(
+                    deterministic_combined.begin() + source_gate->ne[1], deterministic_combined.end());
+            std::vector<float> cpu_gate_values(deterministic_gate.size());
+            std::vector<float> cpu_up_values(deterministic_up.size());
+            ggml_backend_tensor_get(cpu_gate, cpu_gate_values.data(), 0, cpu_gate_values.size()*sizeof(float));
+            ggml_backend_tensor_get(cpu_up, cpu_up_values.data(), 0, cpu_up_values.size()*sizeof(float));
+            comparison_result deterministic_gate_comparison =
+                compare_values("deterministic_gate", deterministic_gate, cpu_gate_values);
+            comparison_result deterministic_up_comparison =
+                compare_values("deterministic_up", deterministic_up, cpu_up_values);
+            deterministic_gate_comparison.kernel_ms = deterministic_combined_ms;
+            deterministic_up_comparison.kernel_ms = deterministic_combined_ms;
+            comparisons.push_back(deterministic_gate_comparison);
+            comparisons.push_back(deterministic_up_comparison);
+
+            std::vector<uint8_t> device_quantized_input(quantized_input.size());
+            std::vector<float> device_quantized_combined(deterministic_combined.size());
+            double device_quantized_ms = 0.0;
+            if (!expert_compute_q4_k_avx2_f32(combined_weights.data(), input_values.data(),
+                        (int) source_gate->ne[0], (int) device_quantized_combined.size(), 100,
+                        device_quantized_combined.data(), device_quantized_input.data(), &device_quantized_ms)) {
+                throw std::runtime_error("device-quantized deterministic Q4_K CUDA comparison failed");
+            }
+            if (device_quantized_input != quantized_input) {
+                throw std::runtime_error("device Q8_K quantization differs from CPU reference");
+            }
+            std::vector<float> device_quantized_gate(
+                    device_quantized_combined.begin(), device_quantized_combined.begin() + source_gate->ne[1]);
+            std::vector<float> device_quantized_up(
+                    device_quantized_combined.begin() + source_gate->ne[1], device_quantized_combined.end());
+            comparison_result device_quantized_gate_comparison =
+                compare_values("device_quantized_gate", device_quantized_gate, cpu_gate_values);
+            comparison_result device_quantized_up_comparison =
+                compare_values("device_quantized_up", device_quantized_up, cpu_up_values);
+            device_quantized_gate_comparison.kernel_ms = device_quantized_ms;
+            device_quantized_up_comparison.kernel_ms = device_quantized_ms;
+            comparisons.push_back(device_quantized_gate_comparison);
+            comparisons.push_back(device_quantized_up_comparison);
+        }
+#endif
+
+        write_json(config, make_json(config, *model, device, source_gate, results, comparisons));
+        cpu_buffer.reset();
+        cpu_context.reset();
+        cpu_backend.reset();
         buffer.reset();
         context.reset();
         backend.reset();

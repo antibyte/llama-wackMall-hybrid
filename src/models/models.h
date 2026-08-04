@@ -2079,7 +2079,8 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * cur,
                             int   il,
                     ggml_tensor ** selected_experts_out = nullptr,
-                    ggml_tensor ** weights_out = nullptr);
+                    ggml_tensor ** weights_out = nullptr,
+                           bool   snapshot_selected_experts = false);
 
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,

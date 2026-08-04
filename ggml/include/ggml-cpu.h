@@ -141,6 +141,14 @@ extern "C" {
     GGML_BACKEND_API int  ggml_cpu_moe_get_down_prefetch(void);
     GGML_BACKEND_API void ggml_cpu_moe_set_reuse_rows(bool enabled);
     GGML_BACKEND_API bool ggml_cpu_moe_get_reuse_rows(void);
+    typedef bool (*ggml_cpu_moe_transient_gate_up_claim_fn)(
+            int layer, int expert, int token, int64_t n_ff);
+    typedef bool (*ggml_cpu_moe_transient_gate_up_fetch_fn)(
+            int layer, int expert, int token, float * gate, float * up, int64_t n_ff);
+    GGML_BACKEND_API void ggml_cpu_moe_set_transient_gate_up(
+            ggml_cpu_moe_transient_gate_up_claim_fn claim,
+            ggml_cpu_moe_transient_gate_up_fetch_fn fetch);
+    GGML_BACKEND_API void ggml_cpu_moe_set_transient_gate_up_verify(bool enabled);
     // Experimental: execute a graph split consisting only of GGML_OP_MOE_COLD
     // on a persistent coordinator thread. The backend synchronization point
     // joins the job before its output is consumed.

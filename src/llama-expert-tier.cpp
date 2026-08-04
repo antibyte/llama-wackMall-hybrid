@@ -195,6 +195,30 @@ static bool parse_nonnegative_int(const char * value, int & result) {
     return true;
 }
 
+static bool parse_bridge_layers(const char * value, std::vector<int> & layers) {
+    layers.clear();
+    if (!value || !value[0]) return false;
+    const char * cursor = value;
+    while (*cursor && layers.size() < 4) {
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        char * end = nullptr;
+        errno = 0;
+        const long parsed = strtol(cursor, &end, 10);
+        if (errno || !end || end == cursor || parsed < 0 || parsed > INT32_MAX) return false;
+        if (std::find(layers.begin(), layers.end(), (int) parsed) == layers.end()) {
+            layers.push_back((int) parsed);
+        }
+        cursor = end;
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        if (*cursor == '\0') break;
+        if (*cursor != ',') return false;
+        ++cursor;
+        if (*cursor == '\0') return false;
+    }
+    while (*cursor == ' ' || *cursor == '\t') ++cursor;
+    return *cursor == '\0' && !layers.empty();
+}
+
 static bool output_env_enabled(const char * name) {
     const char * value = getenv(name);
     return value && value[0] && strcmp(value, "0");
@@ -2281,6 +2305,70 @@ void init(const llama_model & model) {
         } else {
             TIER_LOG("%s: warm admission immediate\n", __func__);
         }
+    }
+
+    const char * bridge_consume_env = getenv("GGML_CUDA_EXPERT_BRIDGE_CONSUME");
+    const bool bridge_consume = bridge_consume_env && !strcmp(bridge_consume_env, "1");
+    const char * bridge_layers_env = getenv("GGML_CUDA_EXPERT_BRIDGE_LAYERS");
+    if (!bridge_layers_env || !bridge_layers_env[0]) bridge_layers_env = getenv("GGML_CUDA_EXPERT_BRIDGE_LAYER");
+    if (bridge_layers_env && !g_adapt && g_W == 0 &&
+            (!bridge_consume || (!g_cpu_async && !g_static_no_sync_active))) {
+        std::vector<int> bridge_layers;
+        if (parse_bridge_layers(bridge_layers_env, bridge_layers)) {
+            using register_fn = bool (*)(
+                    int, const void *, size_t, const void *, size_t,
+                    int, int, int, int, const uint8_t *);
+            using claim_fn = bool (*)(int, int, int, int64_t);
+            using fetch_fn = bool (*)(int, int, int, float *, float *, int64_t);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            register_fn register_bridge = (register_fn) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_expert_bridge_register");
+            int registered_layers = 0;
+            for (int bridge_layer : bridge_layers) {
+                if (!register_bridge || bridge_layer >= n_layer || bridge_layer >= (int) g_layers.size()) {
+                    TIER_LOG("%s: CUDA expert bridge rejected invalid layer %d\n", __func__, bridge_layer);
+                    continue;
+                }
+                const llama_layer & layer = model.layers[bridge_layer];
+                const layer_tier & tier = g_layers[(size_t) bridge_layer];
+                ggml_tensor * gate = layer.ffn_gate_exps;
+                ggml_tensor * up = layer.ffn_up_exps;
+                if (gate && up && gate->data && up->data && tier.n_expert == n_expert &&
+                        gate->ne[3] == 1 && up->ne[3] == 1 &&
+                        gate->ne[2] == n_expert && up->ne[2] == n_expert) {
+                    std::vector<uint8_t> cold((size_t) n_expert, 1);
+                    for (int expert = 0; expert < n_expert; ++expert) {
+                        cold[(size_t) expert] = tier.lut_host[(size_t) expert] == tier.sentinel ? 1 : 0;
+                    }
+                    const size_t gate_slice = ggml_nbytes(gate)/(size_t) n_expert;
+                    const size_t up_slice = ggml_nbytes(up)/(size_t) n_expert;
+                    if (!register_bridge(bridge_layer, gate->data, gate_slice,
+                                up->data, up_slice, n_expert, gate->type,
+                                (int) gate->ne[0], (int) gate->ne[1], cold.data())) {
+                        TIER_LOG("%s: CUDA expert bridge registration rejected for layer %d\n", __func__, bridge_layer);
+                    } else {
+                        registered_layers++;
+                    }
+                }
+            }
+            if (registered_layers > 0 && bridge_consume) {
+                claim_fn claim = (claim_fn) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_expert_bridge_claim_gate_up");
+                fetch_fn fetch = (fetch_fn) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_expert_bridge_fetch_gate_up");
+                if (claim && fetch) {
+                    ggml_cpu_moe_set_transient_gate_up(claim, fetch);
+                    const char * verify = getenv("GGML_CUDA_EXPERT_BRIDGE_VERIFY");
+                    ggml_cpu_moe_set_transient_gate_up_verify(verify && !strcmp(verify, "1"));
+                }
+            }
+            if (registered_layers > 0 && g_mtp_n > 0) {
+                TIER_LOG("%s: CUDA expert bridge enabled for %d layers in MTP-%d target verification graphs\n",
+                        __func__, registered_layers, g_mtp_n);
+            }
+        }
+    } else if (bridge_layers_env) {
+        TIER_LOG("%s: CUDA expert bridge disabled by adaptation, warm slots, or an incompatible consume mode\n", __func__);
     }
 }
 

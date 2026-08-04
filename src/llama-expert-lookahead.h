@@ -23,6 +23,8 @@ enum class norm_source {
 // environment controls without requiring the runtime trace collector to have
 // been initialized yet.
 bool graph_enabled(uint32_t n_tokens, uint32_t n_seqs, bool mtp_graph);
+bool layer_enabled(int target_layer);
+bool predictor_enabled(int target_layer);
 prediction_point point();
 norm_source norm();
 int distance();

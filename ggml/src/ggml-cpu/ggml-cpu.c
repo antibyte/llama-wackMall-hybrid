@@ -72,6 +72,10 @@ static atomic_int g_moe_single_row_chunk = 64;
 static atomic_bool g_moe_parallel_activation;
 static atomic_int g_moe_down_prefetch;
 static atomic_bool g_moe_reuse_rows;
+static _Atomic(ggml_cpu_moe_transient_gate_up_claim_fn) g_moe_transient_gate_up_claim;
+static _Atomic(ggml_cpu_moe_transient_gate_up_fetch_fn) g_moe_transient_gate_up_fetch;
+static atomic_bool g_moe_transient_gate_up_verify;
+static atomic_bool g_moe_transient_gate_up_verify_seen;
 
 void ggml_cpu_moe_profile_enable(bool enabled) {
     atomic_store_explicit(&g_moe_profile_enabled, enabled, memory_order_relaxed);
@@ -140,6 +144,18 @@ void ggml_cpu_moe_set_reuse_rows(bool enabled) {
 
 bool ggml_cpu_moe_get_reuse_rows(void) {
     return atomic_load_explicit(&g_moe_reuse_rows, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_transient_gate_up(
+        ggml_cpu_moe_transient_gate_up_claim_fn claim,
+        ggml_cpu_moe_transient_gate_up_fetch_fn fetch) {
+    atomic_store_explicit(&g_moe_transient_gate_up_fetch, fetch, memory_order_release);
+    atomic_store_explicit(&g_moe_transient_gate_up_claim, claim, memory_order_release);
+}
+
+void ggml_cpu_moe_set_transient_gate_up_verify(bool enabled) {
+    atomic_store_explicit(&g_moe_transient_gate_up_verify_seen, false, memory_order_relaxed);
+    atomic_store_explicit(&g_moe_transient_gate_up_verify, enabled, memory_order_release);
 }
 
 static bool ggml_cpu_moe_profile_is_enabled(void) {
@@ -2121,6 +2137,7 @@ static void ggml_compute_forward_moe_cold(
     const int64_t n_out    = w_down->ne[1];
     const int n_ids = ids->ne[0];
     const int n_as  = w_gate->ne[2];
+    GGML_ASSERT(n_as > 0);
 
     ggml_vec_dot_t    const vec_dot_g = type_traits_cpu[type_g].vec_dot;
     enum ggml_type    const vdt_g     = type_traits_cpu[type_g].vec_dot_type;
@@ -2154,6 +2171,13 @@ static void ggml_compute_forward_moe_cold(
     float * up_out   = gate_out + n_ff*maxc;
     char  * act_q    = (char *)  incr_ptr_aligned(&wdata_cur, q_ff*maxc, CACHE_LINE_SIZE);
 
+    uint8_t * transient_gate_up =
+        (uint8_t *) incr_ptr_aligned(&wdata_cur, (size_t) maxc*sizeof(uint8_t), sizeof(int64_t));
+    int64_t * transient_count =
+        (int64_t *) incr_ptr_aligned(&wdata_cur, sizeof(int64_t), sizeof(int64_t));
+    float * transient_verify =
+        (float *) incr_ptr_aligned(&wdata_cur, 2*n_ff*sizeof(float), CACHE_LINE_SIZE);
+
     // Shared only while optional profiling is active. Keeping it in the
     // graph work buffer avoids process-global timing state between barriers.
     int64_t * phase_clock =
@@ -2164,6 +2188,7 @@ static void ggml_compute_forward_moe_cold(
     const bool profile_phases = ggml_cpu_moe_profile_is_enabled();
     const int profile_layer = profile_phases ? dst->op_params[0] : -1;
     const bool reuse_rows = ggml_cpu_moe_get_reuse_rows();
+    const bool verify_transient = atomic_load_explicit(&g_moe_transient_gate_up_verify, memory_order_acquire);
 
     // quantize x once, shared by all experts
     for (int64_t t = ith; t < n_tokens; t++) {
@@ -2195,6 +2220,22 @@ static void ggml_compute_forward_moe_cold(
         for (int e = 0; e < n_as; e++) {
             col0[e] = coff;
             coff += matrix_row_counts[e];
+        }
+        memset(transient_gate_up, 0, (size_t) maxc*sizeof(uint8_t));
+        *transient_count = 0;
+        ggml_cpu_moe_transient_gate_up_claim_fn claim =
+            atomic_load_explicit(&g_moe_transient_gate_up_claim, memory_order_acquire);
+        if (claim) {
+            const int layer = dst->op_params[0];
+            for (int e = 0; e < n_as; ++e) {
+                for (int64_t c = 0; c < matrix_row_counts[e]; ++c) {
+                    const struct mmid_row_mapping rm = matrix_rows[e*(int64_t)n_ids*n_tokens + c];
+                    if (claim(layer, e, rm.i2, n_ff)) {
+                        transient_gate_up[col0[e] + c] = 1;
+                        (*transient_count)++;
+                    }
+                }
+            }
         }
     }
 
@@ -2252,6 +2293,9 @@ static void ggml_compute_forward_moe_cold(
                     __builtin_prefetch(wg + (i + 1)*w_gate->nb[1], 0, 3);
                     __builtin_prefetch(wu + (i + 1)*w_up->nb[1], 0, 3);
                     for (int64_t c = ir1_start; c < ir1_end; c++) {
+                        if (transient_gate_up[col0[cur_a] + c] && !verify_transient) {
+                            continue;
+                        }
                         const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
                         const char * xcol = xq + (int64_t) rm.i2*q_embd;
                         float * gout = gate_out + (col0[cur_a] + c)*n_ff;
@@ -2262,6 +2306,9 @@ static void ggml_compute_forward_moe_cold(
                 }
             } else {
                 for (int64_t c = ir1_start; c < ir1_end; c++) {
+                    if (transient_gate_up[col0[cur_a] + c] && !verify_transient) {
+                        continue;
+                    }
                     const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
                     const char * xcol = xq + (int64_t) rm.i2*q_embd;
                     float * gout = gate_out + (col0[cur_a] + c)*n_ff;
@@ -2282,6 +2329,55 @@ static void ggml_compute_forward_moe_cold(
         }
     }
 
+    if (verify_transient) {
+        ggml_barrier(params->threadpool);
+    }
+    if (*transient_count > 0 && ith == 0) {
+        ggml_cpu_moe_transient_gate_up_fetch_fn fetch =
+            atomic_load_explicit(&g_moe_transient_gate_up_fetch, memory_order_acquire);
+        GGML_ASSERT(fetch);
+        const int layer = dst->op_params[0];
+        for (int e = 0; e < n_as; ++e) {
+            for (int64_t c = 0; c < matrix_row_counts[e]; ++c) {
+                if (transient_gate_up[col0[e] + c]) {
+                    const struct mmid_row_mapping rm = matrix_rows[e*(int64_t)n_ids*n_tokens + c];
+                    float * gate = gate_out + (col0[e] + c)*n_ff;
+                    float * up = up_out + (col0[e] + c)*n_ff;
+                    float * fetch_gate = verify_transient ? transient_verify : gate;
+                    float * fetch_up = verify_transient ? transient_verify + n_ff : up;
+                    GGML_ASSERT(fetch(layer, e, rm.i2, fetch_gate, fetch_up, n_ff));
+                    if (verify_transient) {
+                        const size_t bytes = (size_t) n_ff*sizeof(float);
+                        if (memcmp(gate, fetch_gate, bytes) != 0 || memcmp(up, fetch_up, bytes) != 0) {
+                            int64_t first = -1;
+                            bool first_is_up = false;
+                            for (int64_t i = 0; i < n_ff; ++i) {
+                                if (memcmp(gate + i, fetch_gate + i, sizeof(float)) != 0) {
+                                    first = i;
+                                    break;
+                                }
+                                if (memcmp(up + i, fetch_up + i, sizeof(float)) != 0) {
+                                    first = i;
+                                    first_is_up = true;
+                                    break;
+                                }
+                            }
+                            const float cpu = first_is_up ? up[first] : gate[first];
+                            const float gpu = first_is_up ? fetch_up[first] : fetch_gate[first];
+                            uint32_t cpu_bits;
+                            uint32_t gpu_bits;
+                            memcpy(&cpu_bits, &cpu, sizeof(cpu_bits));
+                            memcpy(&gpu_bits, &gpu, sizeof(gpu_bits));
+                            fprintf(stderr, "ggml_cpu_moe: transient mismatch layer=%d expert=%d token=%d part=%s index=%lld cpu=%08x gpu=%08x\n",
+                                    layer, e, rm.i2, first_is_up ? "up" : "gate", (long long) first, cpu_bits, gpu_bits);
+                        } else if (!atomic_exchange_explicit(&g_moe_transient_gate_up_verify_seen, true, memory_order_relaxed)) {
+                            fprintf(stderr, "ggml_cpu_moe: transient verification active; first row is bit-exact\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
     ggml_barrier(params->threadpool);
     if (profile_phases) {
         if (ith == 0) {
@@ -3642,6 +3738,10 @@ struct ggml_cplan ggml_graph_plan(
                         cur += 2*w_gate->ne[1]*maxc*sizeof(float) + CACHE_LINE_SIZE;
                         // act_q
                         cur += ggml_row_size(vdt_d, w_gate->ne[1])*maxc + CACHE_LINE_SIZE;
+                        // transient Gate+Up ownership flags
+                        cur += maxc*sizeof(uint8_t) + 2*sizeof(int64_t);
+                        // transient Gate+Up verification scratch
+                        cur += 2*w_gate->ne[1]*sizeof(float) + CACHE_LINE_SIZE;
                         // optional phase timing scratch
                         cur += 4*sizeof(int64_t) + sizeof(int64_t);
                     } break;

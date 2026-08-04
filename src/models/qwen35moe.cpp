@@ -182,6 +182,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
             params.ubatch.n_tokens, params.ubatch.n_seqs, params.gtype == LLM_GRAPH_TYPE_DECODER_MTP);
     const int lookahead_distance = lookahead_active ? llama_expert_lookahead::distance() : 0;
     const int lookahead_top_m = lookahead_active ? llama_expert_lookahead::top_m((int) n_expert) : 0;
+    const bool lookahead_trace = lookahead_active && llama_expert_lookahead::enabled();
     const auto lookahead_point = llama_expert_lookahead::point();
     const auto lookahead_norm = llama_expert_lookahead::norm();
 
@@ -191,6 +192,9 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         }
         const int target_layer = source_layer + lookahead_distance;
         if (target_layer < 0 || target_layer >= n_layer) {
+            return;
+        }
+        if (!llama_expert_lookahead::predictor_enabled(target_layer)) {
             return;
         }
         const int norm_layer = lookahead_norm == llama_expert_lookahead::norm_source::target ?
@@ -204,22 +208,20 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cb(predictor_probs, "lookahead_probs", target_layer);
         ggml_tensor * predicted_ids = ggml_argsort_top_k(ctx0, predictor_probs, lookahead_top_m);
         cb(predicted_ids->src[0], "lookahead_argsort", target_layer);
-        cb(predicted_ids, "lookahead_topk", target_layer);
-
-        // CONT keeps the I32 snapshot on CUDA, unlike DUP, while assigning dedicated storage for deferred readback.
-        ggml_tensor * predicted_snapshot = ggml_cont(ctx0, predicted_ids);
-        cb(predicted_snapshot, "lookahead_topk_snapshot", target_layer);
+        cb(predicted_ids, "lookahead_topk_snapshot", target_layer);
 
         // Expansion here fixes the predictor's graph order at the requested source point.
-        ggml_build_forward_expand(gf, predicted_snapshot);
-        res->add_lookahead_prediction({
-                source_layer,
-                target_layer,
-                lookahead_top_m,
-                predicted_snapshot,
-                nullptr,
-                nullptr,
-        });
+        ggml_build_forward_expand(gf, predicted_ids);
+        if (lookahead_trace) {
+            res->add_lookahead_prediction({
+                    source_layer,
+                    target_layer,
+                    lookahead_top_m,
+                    predicted_ids,
+                    nullptr,
+                    nullptr,
+            });
+        }
     };
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
@@ -265,15 +267,15 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // MOE FFN layer
         ggml_tensor * actual_ids = nullptr;
         ggml_tensor * actual_weights = nullptr;
-        cur = build_layer_ffn(attn_post_norm, il, &actual_ids, &actual_weights);
-        if (lookahead_active) {
-            ggml_tensor * actual_ids_snapshot = ggml_cont(ctx0, actual_ids);
-            ggml_tensor * actual_weights_snapshot = ggml_dup(ctx0, actual_weights);
-            cb(actual_ids_snapshot, "lookahead_actual_topk_snapshot", il);
-            cb(actual_weights_snapshot, "lookahead_actual_weights_snapshot", il);
-            ggml_build_forward_expand(gf, actual_ids_snapshot);
-            ggml_build_forward_expand(gf, actual_weights_snapshot);
-            res->set_lookahead_actual(il, actual_ids_snapshot, actual_weights_snapshot);
+        const bool snapshot_actual = lookahead_active && llama_expert_lookahead::layer_enabled(il);
+        cur = build_layer_ffn(attn_post_norm, il, &actual_ids, &actual_weights, snapshot_actual);
+        if (snapshot_actual) {
+            if (lookahead_trace) {
+                ggml_tensor * actual_weights_snapshot = ggml_dup(ctx0, actual_weights);
+                cb(actual_weights_snapshot, "lookahead_actual_weights_snapshot", il);
+                ggml_build_forward_expand(gf, actual_weights_snapshot);
+                res->set_lookahead_actual(il, actual_ids, actual_weights_snapshot);
+            }
         }
         cb(cur, "ffn_out", il);
 
@@ -561,7 +563,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(
         ggml_tensor * cur,
         const int il,
         ggml_tensor ** selected_experts_out,
-        ggml_tensor ** weights_out) {
+        ggml_tensor ** weights_out,
+        bool snapshot_selected_experts) {
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
@@ -582,7 +585,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(
             model.layers[il].ffn_down_exps_s,
             nullptr,
             selected_experts_out,
-            weights_out);
+            weights_out,
+            snapshot_selected_experts);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation

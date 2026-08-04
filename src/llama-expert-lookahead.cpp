@@ -26,6 +26,9 @@ namespace llama_expert_lookahead {
 struct config {
     bool loaded = false;
     bool requested = false;
+    bool productive_requested = false;
+    std::vector<int> productive_layers;
+    std::vector<int> recurrence_layers;
     bool valid = false;
     std::string json_path;
     prediction_point point = prediction_point::post_attn;
@@ -135,22 +138,79 @@ static bool parse_positive_int(const char * text, int & value) {
     return true;
 }
 
+static bool parse_layer_list(const char * text, std::vector<int> & layers) {
+    layers.clear();
+    if (!text || !text[0]) return false;
+    const char * cursor = text;
+    while (*cursor) {
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        char * end = nullptr;
+        errno = 0;
+        const long parsed = strtol(cursor, &end, 10);
+        if (errno || !end || end == cursor || parsed < 0 || parsed > INT32_MAX) return false;
+        if (std::find(layers.begin(), layers.end(), (int) parsed) == layers.end()) {
+            layers.push_back((int) parsed);
+        }
+        cursor = end;
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        if (*cursor == '\0') break;
+        if (*cursor != ',') return false;
+        ++cursor;
+        if (*cursor == '\0') return false;
+    }
+    return !layers.empty();
+}
+
 static void load_config_locked() {
     if (g_config.loaded) {
         return;
     }
     g_config.loaded = true;
     g_config.requested = env_enabled("LLAMA_EXPERT_LOOKAHEAD_TRACE");
-    if (!g_config.requested) {
+    const char * bridge_layer = getenv("GGML_CUDA_EXPERT_BRIDGE_LAYERS");
+    if (!bridge_layer || !bridge_layer[0]) bridge_layer = getenv("GGML_CUDA_EXPERT_BRIDGE_LAYER");
+    const char * bridge_json = getenv("GGML_CUDA_EXPERT_BRIDGE_JSON");
+    g_config.productive_requested = bridge_layer && bridge_layer[0] &&
+            bridge_json && bridge_json[0] && strcmp(bridge_json, "0") != 0;
+    if (g_config.productive_requested && !parse_layer_list(bridge_layer, g_config.productive_layers)) {
+        LOOKAHEAD_LOG("expert_lookahead: invalid CUDA expert bridge layer list '%s'; productive graph disabled\n",
+                bridge_layer);
+        g_config.productive_requested = false;
+    }
+    if (g_config.productive_requested) {
+        if (env_enabled("GGML_CUDA_EXPERT_BRIDGE_RECURRENCE")) {
+            g_config.recurrence_layers = g_config.productive_layers;
+        } else if (const char * recurrence = getenv("GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_LAYERS")) {
+            if (!parse_layer_list(recurrence, g_config.recurrence_layers)) {
+                LOOKAHEAD_LOG("expert_lookahead: invalid recurrence layer list '%s'; productive graph disabled\n",
+                        recurrence);
+                g_config.productive_requested = false;
+            }
+        }
+        for (size_t i = 1; i < g_config.productive_layers.size(); ++i) {
+            const int layer = g_config.productive_layers[i];
+            if (std::find(g_config.recurrence_layers.begin(), g_config.recurrence_layers.end(), layer) ==
+                    g_config.recurrence_layers.end()) {
+                g_config.recurrence_layers.push_back(layer);
+            }
+        }
+    }
+    if (!g_config.requested && !g_config.productive_requested) {
         return;
     }
 
-    const char * json_path = getenv("LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON");
-    if (!json_path || !json_path[0] || strcmp(json_path, "0") == 0) {
-        LOOKAHEAD_LOG("expert_lookahead: trace requested without LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON; trace disabled\n");
-        return;
+    if (g_config.requested) {
+        const char * json_path = getenv("LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON");
+        if (!json_path || !json_path[0] || strcmp(json_path, "0") == 0) {
+            LOOKAHEAD_LOG("expert_lookahead: trace requested without LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON; trace disabled\n");
+            g_config.requested = false;
+            if (!g_config.productive_requested) {
+                return;
+            }
+        } else {
+            g_config.json_path = json_path;
+        }
     }
-    g_config.json_path = json_path;
 
     if (const char * value = getenv("LLAMA_EXPERT_LOOKAHEAD_DISTANCE")) {
         if (!parse_positive_int(value, g_config.distance)) {
@@ -189,18 +249,49 @@ static void load_config_locked() {
 
 static bool config_graph_enabled_locked(uint32_t n_tokens, uint32_t n_seqs, bool mtp_graph) {
     load_config_locked();
-    if (!g_config.valid || g_mtp_n > 0 || mtp_graph) {
+    if (!g_config.valid || mtp_graph) {
         return false;
     }
-    return n_tokens == 1 && n_seqs == 1;
+    if (g_mtp_n > 0 && !g_config.productive_requested) {
+        return false;
+    }
+    if (n_seqs != 1) {
+        return false;
+    }
+    if (g_mtp_n > 0) {
+        return n_tokens > 0 && n_tokens <= (uint32_t) g_mtp_n + 1;
+    }
+    return n_tokens == 1;
 }
 
 bool graph_enabled(uint32_t n_tokens, uint32_t n_seqs, bool mtp_graph) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_initialized && !g_runtime_enabled) {
+    load_config_locked();
+    if (g_initialized && !g_runtime_enabled && !g_config.productive_requested) {
         return false;
     }
     return config_graph_enabled_locked(n_tokens, n_seqs, mtp_graph);
+}
+
+bool layer_enabled(int target_layer) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    load_config_locked();
+    return g_runtime_enabled || (g_config.productive_requested &&
+            std::find(g_config.productive_layers.begin(), g_config.productive_layers.end(), target_layer) !=
+                    g_config.productive_layers.end());
+}
+
+bool predictor_enabled(int target_layer) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    load_config_locked();
+    if (!g_runtime_enabled &&
+            std::find(g_config.recurrence_layers.begin(), g_config.recurrence_layers.end(), target_layer) !=
+                    g_config.recurrence_layers.end()) {
+        return false;
+    }
+    return g_runtime_enabled || (g_config.productive_requested &&
+            std::find(g_config.productive_layers.begin(), g_config.productive_layers.end(), target_layer) !=
+                    g_config.productive_layers.end());
 }
 
 prediction_point point() {
@@ -563,6 +654,9 @@ void init(const llama_model & model) {
     }
     g_initialized = true;
     if (!g_config.valid) {
+        return;
+    }
+    if (!g_config.requested) {
         return;
     }
     if (g_mtp_n > 0) {
