@@ -191,6 +191,12 @@ Phase 1 routing-quality collection can complete while the scheduling gate remain
 Phase 2 may simulate transfers only after real pinned H2D measurements exist.
 It must calculate an Oracle with the same scratch and bandwidth constraints.
 
+The implementation now follows a stricter feasibility ordering described in
+`TRANSIENT_EXPERT_DESIGN.md`: measured transport and routing-exact resident GPU
+compute precede productive predictor transfers. This prevents high recall from
+masking a hardware configuration where H2D plus GPU compute is slower than the
+existing CPU fallback.
+
 Phase 3 may start only if both the predictor schedule and the Oracle predict a
 material net saving after predictor cost, D2H, H2D, false positives, and late
 copies. A positive recall number alone is insufficient.

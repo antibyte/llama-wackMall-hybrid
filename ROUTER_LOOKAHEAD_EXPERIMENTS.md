@@ -179,13 +179,27 @@ The native sm_75 build and lookahead unit test pass. The requested sm_61 plus GC
 
 ## Phase 2 Oracle and schedule simulation
 
-Status: not started by design.
+Status: transport, resident-compute, and first routing replay complete on the
+GTX 1660 Ti. Productive code remains blocked.
 
 Phase 2 must use actual routing records plus measured pinned-transfer and
 per-layer timing data. Assumed PCIe bandwidth is not acceptable. Required
 outputs include useful prefetch ratio, useful bytes ratio, hidden copy ratio,
 theoretical CPU saving, theoretical net saving, simultaneous scratch demand,
 and an ideal Oracle under the same constraints.
+
+The measured transport and compute work is documented in
+`TRANSIENT_EXPERT_EXPERIMENTS.md`. With phase-matched no-MTP CPU timing and
+resident GPU compute included, the best global predictor replay saves only
+0.3123 ms/token under an optimistic always-ready transfer assumption while
+scheduling about 63.0 MiB/token. The best perfect Oracle examined saves 0.6757
+ms/token but requires four slots in every layer, about 291.6 MiB. Predictor
+runtime, real exposed copy time, and contention are still excluded. This fails
+the Phase 3 gate on the GTX 1660 Ti.
+
+The GTX 1080 plus old i7 remains unevaluated. It must collect target-specific
+CPU timing, transport, resident GPU compute, and fixed-residency traces before
+the decision is reused.
 
 ## Productive prefetch
 

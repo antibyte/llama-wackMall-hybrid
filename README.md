@@ -19,6 +19,12 @@ See [HYBRID_EXPERIMENTS.md](HYBRID_EXPERIMENTS.md) for measured runs and rejecte
 | `tools/convert_luce_spark_profile.py` | Strict Spark-to-wackMall profile conversion with GGUF validation |
 | `tools/aggregate_expert_profiles.py` | Prompt-balanced aggregation of request-local usage profiles |
 | `tools/optimize_expert_placement.py` | Exact byte-budget optimizer for layer-variable static placement |
+| `tools/bench_expert_transport.py` | Model-derived repeated H2D and mapped-memory benchmark wrapper |
+| `tools/bench_expert_compute.py` | Repeated early/middle/late resident GPU compute wrapper |
+| `tools/simulate_expert_streaming.py` | Routing-trace Oracle and predictor replay under measured costs |
+| `tools/expert-transport-bench/` | CUDA transport, staging, mapped-read, and overlap microbenchmark |
+| `tools/expert-compute-bench/` | Resident per-expert GPU compute microbenchmark |
+| `GTX1080_HANDOFF.md` | Native SM 61 build, measurement, replay, and gate procedure |
 | `scripts/collect_expert_profiles.sh` | Reproducible profile collection over the included JSONL corpus |
 | `scripts/bench_hybrid.sh` | Fresh-process warm-up and repeated 2,000-token benchmark runner |
 | `tests/test-expert-warm-cache.cpp` | LRU slot, in-flight copy, LUT, and sentinel state tests |
@@ -398,6 +404,54 @@ For a larger GPU, use `--fixed-budget-mib` or a larger `--reference-slots` value
 
 Only after static placement is optimized should a larger GPU test the warm tier. Start with bounded values such as W=4, 8, and 16, monitor copy volume and evictions, and compare against W=0. `LLAMA_EXPERT_WARM_SLOTS=auto` consumes remaining measured capacity, while `LLAMA_EXPERT_WARM_AUTO_MAX` raises the conservative default cap of four. If synchronous W improves throughput, test one async prefetch stream with a small in-flight limit before adding concurrency.
 
+### Measure transient expert feasibility
+
+Do not infer transient-streaming performance from routing recall or nominal
+PCIe bandwidth. Build the measurement tools with the native CUDA architecture,
+then derive every transfer size from the target model:
+
+```bash
+cmake --build build-hybrid -j 8 --target \
+    llama-expert-transport-bench llama-expert-compute-bench
+
+python3 tools/bench_expert_transport.py \
+    --model "$MODEL" \
+    --binary build-hybrid/bin/llama-expert-transport-bench \
+    --output-dir benchmark-results/transport-$(date -u +%Y%m%dT%H%M%SZ) \
+    --runs 3 \
+    --repeats 200 \
+    --working-set-mib 32
+```
+
+Measure resident GPU compute for representative early, middle, and late layer
+layouts. The tool maps the source model read-only and refuses to overwrite its
+JSON output:
+
+```bash
+python3 tools/bench_expert_compute.py \
+    --model "$MODEL" \
+    --binary build-hybrid/bin/llama-expert-compute-bench \
+    --output-dir benchmark-results/expert-compute-$(date -u +%Y%m%dT%H%M%SZ) \
+    --runs 3
+```
+
+Feed the resulting transport summary, model layout, CPU timing JSON, resident
+compute summary, and raw Phase 1 traces to
+`tools/simulate_expert_streaming.py`. Omit `--lead-ms` for a clearly labelled
+always-ready upper bound. Do not enable productive transfers unless target
+measurements pass the gates in `TRANSIENT_EXPERT_DESIGN.md`.
+
+Use one or more separate `--calibration-trace` inputs when estimating a real
+predictor policy. Without them, the simulator labels rank probabilities as an
+optimistic in-sample estimate. Oracle results do not use predictor precision.
+
+The current GTX 1660 Ti result is negative: full H2D plus resident GPU compute
+takes about 0.32--0.34 ms per expert versus about 0.05--0.07 ms on the Ryzen
+CPU. The tools remain hardware-parameterized because the GTX 1080 plus old i7,
+and newer GPUs with faster interconnects or more fixed-tier VRAM, can have a
+different crossover. See `TRANSIENT_EXPERT_ANALYSIS.md` and
+`TRANSIENT_EXPERT_EXPERIMENTS.md`.
+
 Recommended optimization order:
 
 1. Representative request-balanced profile.
@@ -432,6 +486,8 @@ Key portable controls:
 | `LLAMA_EXPERT_STATIC_NO_SYNC` | 0 | Skip only the expert-tier update barrier under strict immutable-tier conditions |
 | `LLAMA_EXPERT_CPU_REUSE_ROWS` | 0 | Reuse quantized cold rows across repeated MTP expert selections |
 | `LLAMA_EXPERT_CPU_ASYNC` | 0 | Experimental CPU-cold/GPU-hot overlap; benchmark before use |
+
+The benchmark runner also accepts `CONTEXT`, `TARGET_TYPE_K`, and `TARGET_TYPE_V`. Their defaults remain `32768`, `q4_0`, and `q4_0` so existing benchmark commands retain their behavior.
 
 ## 9. Correctness tests
 
