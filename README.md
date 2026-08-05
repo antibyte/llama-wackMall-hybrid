@@ -72,12 +72,13 @@ run per config. PPL = 1.6088 all configs (exact match to reference).
 
 | Model | Quant (size) | Stock | wackMall | Speedup |
 |---|---|---|---|---|
-| Qwen3.6-35B-A3B | IQ2_M (11 GB) | 42.70 tok/s | **74 tok/s** (server, n=1024) | +73% |
-| Qwen3.6-35B-A3B | Q4_K_M (20 GB) | 26.89 tok/s | **49.93 tok/s** (S=64) | +86% |
-| gemma-4-26B-A4B | Q5_K_S (17 GB) | 19.50 tok/s | **56 tok/s** (S=39) | +187% |
-| Qwen3.5-122B-A10B | IQ2_M (28 GB) | ~8.0 tok/s (best layer-split config) | **10.60 tok/s** (S=28) | +33% |
+| Qwen3.6-35B-A3B* | IQ2_M (11 GB) | 42.70 tok/s | **74 tok/s** (server, n=1024) | +73% |
+| Qwen3.6-35B-A3B* | Q4_K_M (20 GB) | 26.89 tok/s | **49.93 tok/s** (S=64) | +86% |
+| gemma-4-26B-A4B* | Q5_K_S (17 GB) | 19.50 tok/s | **56 tok/s** (S=39) | +187% |
+| Qwen3.5-122B-A10B* | IQ2_M (28 GB) | ~8.0 tok/s (best layer-split config) | **10.60 tok/s** (S=28) | +33% |
 | Long context (67k prompt) | - | CUDA OOM | **410.38 tok/s** (prompt eval) | runs cleanly |
-| Qwen3.5-122B, 16 GB RAM cap | IQ3_XS (34 GB) | 2.40 tok/s | **2.84 tok/s** | +18% |
+| Qwen3.5-122B, 16 GB RAM cap | IQ3_XS (34 GB) | 2.40 tok/s | **6.56 tok/s** | +~130% |
+Models marked with * have not been updated to include ram-pool performance. Its PROBABLY better
 
 Latest rebased tree (upstream `0e4a036`, 2026-07-27): 35B IQ2_M server at
 **63.25 tok/s** (n=1024, adaptation on, ~4250 online re-pins in one run),
