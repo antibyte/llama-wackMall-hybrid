@@ -31,6 +31,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #else
+#define NOMINMAX
 #include <malloc.h>
 #include <intrin.h>
 #include <windows.h>

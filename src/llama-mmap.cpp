@@ -84,9 +84,9 @@ struct llama_file::impl {
     }
 
     impl(const char * fname_, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname_) {
-        fp = ggml_fopen(fname, mode);
+        fp = ggml_fopen(fname.c_str(), mode);
         if (fp == NULL) {
-            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+            throw std::runtime_error(format("failed to open %s: %s", fname.c_str(), strerror(errno)));
         }
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
