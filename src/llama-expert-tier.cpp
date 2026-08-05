@@ -34,6 +34,8 @@
 #include <malloc.h>
 #include <intrin.h>
 #include <windows.h>
+#include <BaseTsd.h> // SSIZE_T
+typedef SSIZE_T ssize_t; // POSIX type not provided on Windows
 #endif
 
 // expert tiering hooks live in the CPU backend (ggml-cpu.c). Under
