@@ -656,6 +656,19 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // true if the host weight at p is file-mapped and not mlocked, i.e. its
+    // pages can be dropped (refault from the model file on next access)
+    bool weights_discardable(const void * p) const;
+
+    // model file path (first file for sharded models)
+    std::string path() const;
+
+    // mmap base address of the first mapping, or nullptr if no mmap
+    void * mmap_base() const;
+
+    // size of the first file mapping, or 0 if no mmap
+    size_t mmap_size() const;
+
     // total number of parameters in the model
     uint64_t n_elements() const;
 

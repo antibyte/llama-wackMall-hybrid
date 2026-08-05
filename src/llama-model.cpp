@@ -1008,6 +1008,7 @@ struct llama_model::impl {
     size_t n_bytes = 0;
 
     std::string desc_str;
+    std::string path_str;
 
     llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
 
@@ -1233,6 +1234,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
+
+    pimpl->path_str = ml.path();
 
     pimpl->ftype = ml.ftype;
 
@@ -1728,6 +1731,37 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         }
     }
     return ret;
+}
+
+bool llama_model::weights_discardable(const void * p) const {
+    if (!pimpl->mlock_mmaps.empty()) {
+        return false; // mlock: user asked for pinned pages
+    }
+    for (const auto & m : pimpl->mappings) {
+        const char * a = (const char *) m->addr();
+        if ((const char *) p >= a && (const char *) p < a + m->size()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string llama_model::path() const {
+    return pimpl->path_str;
+}
+
+void * llama_model::mmap_base() const {
+    if (pimpl->mappings.empty()) {
+        return nullptr;
+    }
+    return pimpl->mappings.front()->addr();
+}
+
+size_t llama_model::mmap_size() const {
+    if (pimpl->mappings.empty()) {
+        return 0;
+    }
+    return pimpl->mappings.front()->size();
 }
 
 uint64_t llama_model::n_elements() const {

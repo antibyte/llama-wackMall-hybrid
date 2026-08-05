@@ -1759,6 +1759,36 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+// expert tiering: optional residency probe for in-flight prefetch fills,
+// set by the tier module; keyed by the ptrs tensor's data pointer
+static const char * (*g_moe_probe_hook)(const void *, int64_t, const char *) = NULL;
+
+void ggml_set_moe_probe_hook(const char * (*fn)(const void *, int64_t, const char *)) {
+    g_moe_probe_hook = fn;
+}
+
+// expert tiering: optional demand-fetch hook (pread staging ring), set by
+// the tier module; keyed by the ptrs tensor's data pointer
+static const char * (*g_moe_fetch_hook)(const void *, int64_t, const char *) = NULL;
+
+void ggml_set_moe_fetch_hook(const char * (*fn)(const void *, int64_t, const char *)) {
+    g_moe_fetch_hook = fn;
+}
+
+// resolve a cold expert's weight address: ptrs table first (pool | mmap),
+// then the prefetch probe (READY in-flight slot), then the demand-fetch
+// staging ring, else the mmap fallback
+static const char * moe_cold_addr(const struct ggml_tensor * ptrs, const int64_t * addr, int64_t e, const char * fallback) {
+    const char * a = (addr && addr[e]) ? (const char *) (uintptr_t) addr[e] : fallback;
+    if (g_moe_probe_hook && ptrs) {
+        a = g_moe_probe_hook(ptrs->data, e, a);
+    }
+    if (g_moe_fetch_hook && ptrs) {
+        a = g_moe_fetch_hook(ptrs->data, e, a);
+    }
+    return a;
+}
+
 // same as ggml_compute_forward_mul_mat_id, but computes only experts with
 // cold_mask[i02] == 1; all other output slots are zeroed. cold_mask is src[3],
 // an i32 tensor with n_expert entries.
@@ -1770,8 +1800,10 @@ static void ggml_compute_forward_mul_mat_id_cold(
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids  = dst->src[2];
     const struct ggml_tensor * mask = dst->src[3];
+    const struct ggml_tensor * ptrs = dst->src[4];
 
     const int32_t * cold_mask = (const int32_t *) mask->data;
+    const int64_t * addr = ptrs ? (const int64_t *) ptrs->data : NULL;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1884,7 +1916,7 @@ static void ggml_compute_forward_mul_mat_id_cold(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = moe_cold_addr(ptrs, addr, cur_a, (const char *) src0->data + cur_a * nb02);
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1968,6 +2000,134 @@ static void ggml_compute_forward_moe_count(
     ((float *) dst->data)[0] = 0.0f;
 }
 
+// debug-only: per-token routing trace (LLAMA_EXPERT_TRACE=path); one record
+// per token: seq,ntok,e0..eN - seq identifies (step, layer) as (seq/nl, seq%nl)
+static void trace_moe_ids(const struct ggml_tensor * ids) {
+    static FILE * g_trace = NULL;
+    static int g_trace_state = -1;
+    static uint64_t g_trace_seq = 0;
+    if (g_trace_state < 0) {
+        const char * p = getenv("LLAMA_EXPERT_TRACE");
+        g_trace_state = 0;
+        if (p && p[0]) {
+            g_trace = fopen(p, "w");
+            g_trace_state = g_trace ? 1 : 0;
+        }
+    }
+    if (!g_trace_state) {
+        return;
+    }
+    for (int64_t t = 0; t < ids->ne[1]; t++) {
+        fprintf(g_trace, "%llu,%lld", (unsigned long long) g_trace_seq, (long long) ids->ne[1]);
+        for (int id = 0; id < ids->ne[0]; id++) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+            fprintf(g_trace, ",%d", e);
+        }
+        fprintf(g_trace, "\n");
+    }
+    g_trace_seq++;
+}
+
+// debug-only: per-token routing+router-input dump (LLAMA_EXPERT_TRACEX=path);
+// binary: 8B magic + i32 ne0; per token: u64 seq, i32 n_ids, i32 ids[n_ids],
+// f32 x[ne0]. seq identifies (step, layer) as (seq/nl, seq%nl). Only rows
+// present in both tensors are written (ids may be padded for graph reuse).
+static void trace_moe_dump(const struct ggml_tensor * ids, const struct ggml_tensor * x) {
+    static FILE * g_tracex = NULL;
+    static int g_tracex_state = -1;
+    static uint64_t g_tx_seq = 0;
+    static float g_row[16384];
+    if (g_tracex_state < 0) {
+        const char * p = getenv("LLAMA_EXPERT_TRACEX");
+        g_tracex_state = 0;
+        if (p && p[0]) {
+            g_tracex = fopen(p, "wb");
+            g_tracex_state = g_tracex ? 1 : 0;
+        }
+        if (g_tracex_state) {
+            const char magic[8] = {'M','E','X','T','X','0','1','\0'};
+            const int32_t ne0 = (int32_t) x->ne[0];
+            fwrite(magic, 1, 8, g_tracex);
+            fwrite(&ne0, 4, 1, g_tracex);
+        }
+    }
+    if (!g_tracex_state) {
+        return;
+    }
+    const int64_t ne0   = x->ne[0];
+    const int64_t n_ids = ids->ne[0];
+    const int64_t ntok  = ids->ne[1] < x->ne[1] ? ids->ne[1] : x->ne[1];
+    for (int64_t t = 0; t < ntok; t++) {
+        fwrite(&g_tx_seq, 8, 1, g_tracex);
+        const int32_t ni = (int32_t) n_ids;
+        fwrite(&ni, 4, 1, g_tracex);
+        for (int64_t id = 0; id < n_ids; id++) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+            fwrite(&e, 4, 1, g_tracex);
+        }
+        const char * src = (const char *) x->data + t*x->nb[1];
+        if (x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && ne0 <= 16384) {
+            fwrite(src, sizeof(float), ne0, g_tracex);
+            continue;
+        }
+        if (ne0 > 16384) {
+            memset(g_row, 0, sizeof(g_row));
+        } else if (x->type == GGML_TYPE_F32) {
+            for (int64_t i = 0; i < ne0; i++) {
+                g_row[i] = *(const float *) (src + i*x->nb[0]);
+            }
+        } else if (x->type == GGML_TYPE_F16) {
+            for (int64_t i = 0; i < ne0; i++) {
+                g_row[i] = GGML_FP16_TO_FP32(*(const ggml_fp16_t *) (src + i*x->nb[0]));
+            }
+        } else {
+            memset(g_row, 0, ne0*sizeof(float));
+        }
+        fwrite(g_row, sizeof(float), ne0, g_tracex);
+    }
+    g_tx_seq++;
+}
+
+// expert tiering: actual-routing trace for predicted-vs-actual joins
+static FILE * g_route_trace = NULL;
+static int    g_route_nlayers = 0;
+static uint64_t g_route_seq = 0;
+
+void ggml_set_route_trace(FILE * f, int n_layers) {
+    g_route_trace = f;
+    g_route_nlayers = n_layers;
+}
+
+static void trace_moe_route(const struct ggml_tensor * ids) {
+    if (!g_route_trace) {
+        return;
+    }
+    const int layer = g_route_nlayers > 0 ? (int)(g_route_seq % (uint64_t)g_route_nlayers) : -1;
+    for (int64_t t = 0; t < ids->ne[1]; t++) {
+        fprintf(g_route_trace, "%llu,%d", (unsigned long long) g_route_seq, layer);
+        for (int id = 0; id < ids->ne[0]; id++) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+            fprintf(g_route_trace, ",%d", e);
+        }
+        fprintf(g_route_trace, "\n");
+    }
+    g_route_seq++;
+}
+
+// expert tiering: wall-clock accumulator for MOE_COLD ops (ith==0 only)
+static uint64_t g_moe_cold_us = 0;
+
+uint64_t ggml_moe_cold_timer_us(void) {
+    return g_moe_cold_us;
+}
+
+// expert tiering: optional pre-gate prediction hook, set by the tier module
+static void (*g_moe_predict_hook)(const struct ggml_tensor *, const struct ggml_tensor *) = NULL;
+
+void ggml_set_moe_predict_hook(void (*fn)(const struct ggml_tensor *, const struct ggml_tensor *)) {
+    g_moe_predict_hook = fn;
+}
+
 static void ggml_compute_forward_moe_cold(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1981,6 +2141,11 @@ static void ggml_compute_forward_moe_cold(
     const struct ggml_tensor * counts = dst->src[6];
 
     const int32_t * cold_mask = (const int32_t *) mask->data;
+
+    // optional RAM-pool residency tables: per-expert weight source addresses
+    const int64_t * addr_g = dst->src[7] ? (const int64_t *) dst->src[7]->data : NULL;
+    const int64_t * addr_u = dst->src[8] ? (const int64_t *) dst->src[8]->data : NULL;
+    const int64_t * addr_d = dst->src[9] ? (const int64_t *) dst->src[9]->data : NULL;
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -2043,6 +2208,13 @@ static void ggml_compute_forward_moe_cold(
         memset(dst->data, 0, ggml_nbytes(dst));
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        trace_moe_ids(ids);
+        trace_moe_dump(ids, x);
+        trace_moe_route(ids);
+        if (g_moe_predict_hook) {
+            g_moe_predict_hook(counts, x);
+        }
+
         int32_t * cnt = counts ? (int32_t *) counts->data : NULL;
         for (int64_t t = 0; t < n_tokens; t++) {
             for (int id = 0; id < n_ids; id++) {
@@ -2081,8 +2253,9 @@ static void ggml_compute_forward_moe_cold(
         if (cne1 == 0) {
             continue;
         }
-        const char * wg = (const char *) w_gate->data + cur_a*w_gate->nb[2];
-        const char * wu = (w_gate == w_up) ? (wg + n_ff*w_gate->nb[1]) : ((const char *) w_up->data + cur_a*w_up->nb[2]);
+        const char * wg = moe_cold_addr(dst->src[7], addr_g, cur_a, (const char *) w_gate->data + cur_a*w_gate->nb[2]);
+        const char * wu = (w_gate == w_up) ? (wg + n_ff*w_gate->nb[1])
+                        : moe_cold_addr(dst->src[8], addr_u, cur_a, (const char *) w_up->data + cur_a*w_up->nb[2]);
 
         const int64_t nr0 = n_ff;
         const int64_t nr1 = cne1;
@@ -2116,8 +2289,10 @@ static void ggml_compute_forward_moe_cold(
                 float * gout = gate_out + (col0[cur_a] + c)*n_ff;
                 float * uout = up_out   + (col0[cur_a] + c)*n_ff;
                 for (int64_t i = ir0_start; i < ir0_end; i++) {
+#if defined(__clang__) || defined(__GNUC__)
                     __builtin_prefetch(wg + (i + 1)*w_gate->nb[1], 0, 3);
                     __builtin_prefetch(wu + (i + 1)*w_up->nb[1], 0, 3);
+#endif
                     vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
                     vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
                 }
@@ -2171,7 +2346,7 @@ static void ggml_compute_forward_moe_cold(
         if (cne1 == 0) {
             continue;
         }
-        const char * wd = (const char *) w_down->data + cur_a*w_down->nb[2];
+        const char * wd = moe_cold_addr(dst->src[9], addr_d, cur_a, (const char *) w_down->data + cur_a*w_down->nb[2]);
 
         const int64_t nr0 = n_out;
         const int64_t nr1 = cne1;
@@ -3654,6 +3829,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const int64_t t_cold_0 = (state->ith == 0 && node->op == GGML_OP_MOE_COLD) ? ggml_time_us() : 0;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -3669,6 +3845,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+
+        if (t_cold_0) {
+            g_moe_cold_us += (uint64_t)(ggml_time_us() - t_cold_0);
         }
     }
 

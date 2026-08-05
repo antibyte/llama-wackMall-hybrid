@@ -822,6 +822,13 @@ enum llm_arch llama_model_loader::get_arch() const {
     return llm_kv.arch;
 }
 
+std::string llama_model_loader::path() const {
+    if (files.empty()) {
+        return std::string();
+    }
+    return files.front()->path();
+}
+
 const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(const char * name) const {
     auto pos = weights_map.find(name);
     if (pos != weights_map.end()) {

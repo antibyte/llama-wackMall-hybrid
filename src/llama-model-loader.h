@@ -167,6 +167,8 @@ struct llama_model_loader {
 
     enum llm_arch get_arch() const;
 
+    std::string path() const;
+
     const llama_tensor_weight * get_weight(const char * name) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;

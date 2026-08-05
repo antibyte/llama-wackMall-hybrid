@@ -18,6 +18,7 @@ struct llama_file {
     llama_file(FILE * file);
     ~llama_file();
 
+    const std::string & path() const;
     size_t tell() const;
     size_t size() const;
 

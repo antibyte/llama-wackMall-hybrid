@@ -1453,12 +1453,15 @@ extern "C" {
 
     // like ggml_mul_mat_id, but computes only slots whose expert is marked cold
     // in cold_mask (i32 [n_expert], 1 = cold); hot slots are zeroed in the result
+    // ptrs (i64 [n_expert], may be NULL): per-expert weight source addresses,
+    // overriding src0->data + e*nb02 (RAM-pool residency table)
     GGML_API struct ggml_tensor * ggml_mul_mat_id_cold(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids,
-            struct ggml_tensor  * cold_mask);
+            struct ggml_tensor  * cold_mask,
+            struct ggml_tensor  * ptrs);
 
     // fused cold-expert MoE: for each slot (expert e, token t) with
     // cold_mask[e] == 1 computes down(silu(gate(x_t)) * up(x_t)); hot slots
@@ -1466,6 +1469,8 @@ extern "C" {
     // contract on x->ne[0], down contracts on ff = gate->ne[1].
     // counts (i32 [n_expert+1], may be NULL): [e] incremented per selection,
     // [n_expert] per slot total (hit stats; read on the host only).
+    // ptrs_* (i64 [n_expert], may be NULL): per-expert weight source
+    // addresses for gate/up/down, overriding w->data + e*nb[2]
     GGML_API struct ggml_tensor * ggml_moe_cold(
             struct ggml_context * ctx,
             struct ggml_tensor  * gate,
@@ -1474,7 +1479,10 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * ids,
             struct ggml_tensor  * cold_mask,
-            struct ggml_tensor  * counts);
+            struct ggml_tensor  * counts,
+            struct ggml_tensor  * ptrs_gate,
+            struct ggml_tensor  * ptrs_up,
+            struct ggml_tensor  * ptrs_down);
 
     // count-only sibling of ggml_moe_cold for large batches (prompt
     // harvesting): increments counts per selection and returns a scalar
@@ -1483,6 +1491,28 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * ids,
             struct ggml_tensor  * counts);
+
+    // expert tiering: optional pre-gate prediction hook; when set, the fused
+    // cold op calls it at ith==0 with the layer's counts tensor (registry
+    // key) and the router input x. Runs on the CPU compute thread.
+    GGML_API void ggml_set_moe_predict_hook(void (*fn)(const struct ggml_tensor * counts, const struct ggml_tensor * x));
+
+    // expert tiering: optional residency probe for in-flight prefetch fills;
+    // returns the READY pool slot address for the expert, else `fallback`
+    GGML_API void ggml_set_moe_probe_hook(const char * (*fn)(const void * key, int64_t expert, const char * fallback));
+
+    // expert tiering: optional demand-fetch hook (pread staging ring);
+    // returns a staged copy of the expert's weight slice, else `fallback`
+    GGML_API void ggml_set_moe_fetch_hook(const char * (*fn)(const void * key, int64_t expert, const char * fallback));
+
+    // expert tiering: actual-routing trace for offline predicted-vs-actual joins;
+    // writes seq,layer,id0..idN per token to f (opened by caller). n_layers
+    // used to derive layer from the seq counter (aligned with predict hook).
+    GGML_API void ggml_set_route_trace(FILE * f, int n_layers);
+
+    // expert tiering: cumulative wall-clock microseconds spent in MOE_COLD ops
+    // (measured at op dispatch + barrier, ith==0 only)
+    GGML_API uint64_t ggml_moe_cold_timer_us(void);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
