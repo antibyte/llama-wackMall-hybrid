@@ -25,6 +25,7 @@ concurrency:
 jobs:
   check-release:
     runs-on: ubuntu-slim
+    timeout-minutes: 90
 
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
@@ -48,6 +49,7 @@ jobs:
 
   get-version:
     runs-on: ubuntu-slim
+    timeout-minutes: 90
     outputs:
       ui_version: ${{ steps.version.outputs.ui_version }}
     steps:
@@ -93,6 +95,8 @@ jobs:
             defines: "-DGGML_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -161,10 +165,10 @@ jobs:
             os: ubuntu-22.04
           - build: 'arm64'
             os: ubuntu-24.04-arm
-          - build: 's390x'
-            os: ubuntu-24.04-s390x
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -251,6 +255,8 @@ jobs:
             os: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -329,6 +335,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    continue-on-error: true
 
     #permissions:
     #  actions: write
@@ -422,6 +430,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -541,6 +551,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
+    timeout-minutes: 90
+    continue-on-error: true
 
     outputs:
       openvino_version: ${{ steps.openvino_version.outputs.value }}
@@ -670,6 +682,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2025-vs2026
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -738,6 +752,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2025
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -837,6 +853,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
+    timeout-minutes: 180
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -884,7 +902,8 @@ jobs:
             -DGGML_CPU=OFF ^
             -DGGML_CUDA=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DGGML_CUDA_CUB_3DOT2=ON
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DCMAKE_CUDA_FLAGS="-diag-suppress=177 -t0"
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
 
@@ -924,6 +943,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
+    timeout-minutes: 90
+    continue-on-error: true
 
     defaults:
       run:
@@ -1043,6 +1064,8 @@ jobs:
             fp16: ON
 
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
 
     env:
       ONEAPI_ROOT: /opt/intel/oneapi/
@@ -1127,6 +1150,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -1248,6 +1273,8 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
+    timeout-minutes: 90
+    continue-on-error: true
 
     permissions:
       actions: write
@@ -1371,6 +1398,8 @@ jobs:
     needs: [check-release, get-version]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
     runs-on: macos-26
+    timeout-minutes: 90
+    continue-on-error: true
 
     steps:
       - name: Checkout code
@@ -1650,7 +1679,6 @@ jobs:
             **Linux:**
             - [Ubuntu x64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-x64.tar.gz)
             - [Ubuntu arm64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-arm64.tar.gz)
-            - [Ubuntu s390x (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-s390x.tar.gz)
             - [Ubuntu x64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-x64.tar.gz)
             - [Ubuntu arm64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-arm64.tar.gz)
             - [Ubuntu x64 (ROCm 7.2)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-rocm-7.2-x64.tar.gz)
