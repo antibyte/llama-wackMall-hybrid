@@ -36,6 +36,50 @@
 #include <windows.h>
 #endif
 
+// expert tiering hooks live in the CPU backend (ggml-cpu.c). Under
+// GGML_BACKEND_DL the backend is a runtime-loaded .so, so libllama cannot
+// link the setters directly; resolve them once from the backend registry
+// (same pattern as llama-context.cpp for ggml_backend_cpu_set_threadpool).
+typedef void (*moe_predict_hook_fn)(const ggml_tensor *, const ggml_tensor *);
+typedef const char * (*moe_addr_hook_fn)(const void *, int64_t, const char *);
+
+typedef void (*moe_set_predict_fn)(moe_predict_hook_fn);
+typedef void (*moe_set_addr_fn)(moe_addr_hook_fn);
+typedef void (*moe_set_route_fn)(FILE *, int);
+typedef uint64_t (*moe_timer_fn)(void);
+
+static moe_set_predict_fn g_fn_predict = NULL;
+static moe_set_addr_fn    g_fn_probe   = NULL;
+static moe_set_addr_fn    g_fn_fetch   = NULL;
+static moe_set_route_fn   g_fn_route   = NULL;
+static moe_timer_fn       g_fn_timer   = NULL;
+
+static void tier_resolve_moe_hooks(void) {
+    if (g_fn_predict) {
+        return;
+    }
+    ggml_backend_t backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!backend_cpu) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend_cpu);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return;
+    }
+    g_fn_predict = (moe_set_predict_fn) ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_predict_hook");
+    g_fn_probe   = (moe_set_addr_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_probe_hook");
+    g_fn_fetch   = (moe_set_addr_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_fetch_hook");
+    g_fn_route   = (moe_set_route_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_set_route_trace");
+    g_fn_timer   = (moe_timer_fn)       ggml_backend_reg_get_proc_address(reg, "ggml_moe_cold_timer_us");
+}
+
+#define MOE_PREDICT_HOOK(fn)   do { if (g_fn_predict) g_fn_predict((fn)); } while (0)
+#define MOE_PROBE_HOOK(fn)     do { if (g_fn_probe)   g_fn_probe((fn));   } while (0)
+#define MOE_FETCH_HOOK(fn)     do { if (g_fn_fetch)   g_fn_fetch((fn));   } while (0)
+#define MOE_ROUTE_HOOK(f, n)   do { if (g_fn_route)   g_fn_route((f), (n)); } while (0)
+#define MOE_TIMER_HOOK()       (g_fn_timer ? g_fn_timer() : 0)
+
 // portable atomic access to single i32s inside plain buffers (lut_host must
 // stay a plain i32 vector: it is uploaded wholesale into the GPU lut tensor)
 static inline int32_t tier_atomic_load_i32(const int32_t * p) {
@@ -741,7 +785,8 @@ static void pred_init(const llama_model & model) {
     }
     const bool want_worker = g_predict && g_poolB_bytes > 0 && g_pred.size() >= 2;
     if (g_pred.size() >= 2 && (g_pred_log || want_worker)) {
-        ggml_set_moe_predict_hook(pregate_hook);
+        tier_resolve_moe_hooks();
+        MOE_PREDICT_HOOK(pregate_hook);
     }
     if (want_worker) {
         for (auto & kv : g_stores) {
@@ -757,7 +802,8 @@ static void pred_init(const llama_model & model) {
                          L.poolB, (int64_t) L.pool_slot_bytes, (int64_t) st.pool_off };
             g_probe_ix[st.ptrs->data] = c;
         }
-        ggml_set_moe_probe_hook(pregate_probe);
+        tier_resolve_moe_hooks();
+        MOE_PROBE_HOOK(pregate_probe);
         for (int i = 0; i < g_n_workers; i++) {
             g_workers.emplace_back(prefetch_worker);
         }
@@ -1107,7 +1153,7 @@ static void dump_stats() {
                         (unsigned long long) g_stage_fails.load());
             }
             {
-                const uint64_t cold_us = ggml_moe_cold_timer_us();
+                const uint64_t cold_us = MOE_TIMER_HOOK();
                 fprintf(f, "expert_timers: steps %llu fetch %llu us (%.2f ms/step) cold_compute %llu us (%.2f ms/step)\n",
                         (unsigned long long) g_steps,
                         (unsigned long long) g_fetch_us,
@@ -1290,7 +1336,8 @@ void init(const llama_model & model) {
     const int n_expert = model.hparams.n_expert;
 
     if (g_route_log) {
-        ggml_set_route_trace(g_route_log, n_layer);
+        tier_resolve_moe_hooks();
+        MOE_ROUTE_HOOK(g_route_log, n_layer);
     }
 
     std::vector<std::vector<std::pair<int64_t, int32_t>>> heat;
@@ -1768,7 +1815,8 @@ void init(const llama_model & model) {
                                     (const char *) kv.first->data, (int64_t) (ggml_nbytes(kv.first)/L.n_expert) };
                         }
                     }
-                    ggml_set_moe_fetch_hook(stage_fetch);
+                    tier_resolve_moe_hooks();
+                    MOE_FETCH_HOOK(stage_fetch);
                     TIER_LOG("%s: pread ring: %d slots x %.2f MiB%s\n", __func__,
                             g_stage_n, (double) g_stage_stride/(1024.0*1024.0),
                             g_stage_fail_test ? " (FAIL-TEST)" : "");

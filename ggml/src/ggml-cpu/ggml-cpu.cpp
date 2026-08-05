@@ -679,6 +679,24 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_backend_cpu_set_threadpool;
     }
 
+    // expert tiering: setter hooks defined in ggml-cpu.c, resolved at runtime
+    // so libllama can call them under GGML_BACKEND_DL without linking ggml-cpu
+    if (strcmp(name, "ggml_set_moe_predict_hook") == 0) {
+        return (void *)ggml_set_moe_predict_hook;
+    }
+    if (strcmp(name, "ggml_set_moe_probe_hook") == 0) {
+        return (void *)ggml_set_moe_probe_hook;
+    }
+    if (strcmp(name, "ggml_set_moe_fetch_hook") == 0) {
+        return (void *)ggml_set_moe_fetch_hook;
+    }
+    if (strcmp(name, "ggml_set_route_trace") == 0) {
+        return (void *)ggml_set_route_trace;
+    }
+    if (strcmp(name, "ggml_moe_cold_timer_us") == 0) {
+        return (void *)ggml_moe_cold_timer_us;
+    }
+
     return NULL;
 
     GGML_UNUSED(reg);
