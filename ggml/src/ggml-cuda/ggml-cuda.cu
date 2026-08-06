@@ -2970,7 +2970,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool allow_multi_token_moe = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2987,12 +2987,16 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
+    static const bool multi_token_moe = getenv("GGML_CUDA_MOE_MULTI_FUSION") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_MOE_MULTI_FUSION"));
+    const bool use_multi_token_moe = allow_multi_token_moe && multi_token_moe &&
+            tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] >= 2 && dst->ne[2] <= 4;
+
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1 && !use_multi_token_moe) {
         return false;
     }
 
@@ -4330,6 +4334,86 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+struct ggml_cuda_moe_combine_args {
+    const ggml_tensor * experts = nullptr;
+    const ggml_tensor * weights = nullptr;
+    ggml_tensor * dst = nullptr;
+};
+
+static int ggml_cuda_moe_combine_fusion(
+        ggml_cgraph * cgraph, int node_idx, ggml_cuda_moe_combine_args & args) {
+    static const bool enabled = getenv("GGML_CUDA_MOE_COMBINE_FUSION") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_MOE_COMBINE_FUSION"));
+    if (!enabled || node_idx >= cgraph->n_nodes) {
+        return 0;
+    }
+
+    ggml_tensor * weighted = cgraph->nodes[node_idx];
+    static constexpr char prefix[] = "ffn_moe_weighted-";
+    if (weighted->op != GGML_OP_MUL || strncmp(weighted->name, prefix, sizeof(prefix) - 1) != 0 ||
+            weighted->type != GGML_TYPE_F32 || weighted->ne[1] < 2 || weighted->ne[1] > 32 ||
+            weighted->ne[2] < 1 || weighted->ne[3] != 1) {
+        return 0;
+    }
+
+    const int n_experts = weighted->ne[1];
+    const int n_ops = 2*n_experts;
+    if (node_idx + n_ops > cgraph->n_nodes) {
+        return 0;
+    }
+
+    const ggml_tensor * experts = weighted->src[0];
+    const ggml_tensor * weights = weighted->src[1];
+    if (!experts || !weights || experts->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(experts, weighted) || experts->nb[0] != sizeof(float) ||
+            weights->ne[0] != 1 || weights->ne[1] != n_experts ||
+            weights->ne[2] != weighted->ne[2] || weights->ne[3] != 1 ||
+            weights->nb[0] != sizeof(float)) {
+        return 0;
+    }
+
+    std::vector<ggml_op> ops;
+    ops.reserve(n_ops);
+    ops.push_back(GGML_OP_MUL);
+    std::vector<ggml_tensor *> views;
+    views.reserve(n_experts);
+    for (int expert = 0; expert < n_experts; ++expert) {
+        ggml_tensor * view = cgraph->nodes[node_idx + 1 + expert];
+        if (view->op != GGML_OP_VIEW || view->src[0] != weighted || view->type != GGML_TYPE_F32 ||
+                view->ne[0] != weighted->ne[0] || view->ne[1] != weighted->ne[2] ||
+                view->ne[2] != 1 || view->ne[3] != 1 || view->nb[0] != sizeof(float)) {
+            return 0;
+        }
+        views.push_back(view);
+        ops.push_back(GGML_OP_VIEW);
+    }
+
+    ggml_tensor * previous = views[0];
+    for (int expert = 1; expert < n_experts; ++expert) {
+        ggml_tensor * add = cgraph->nodes[node_idx + n_experts + expert];
+        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+                !((add->src[0] == previous && add->src[1] == views[expert]) ||
+                  (add->src[1] == previous && add->src[0] == views[expert])) ||
+                add->ne[0] != weighted->ne[0] || add->ne[1] != weighted->ne[2] ||
+                add->ne[2] != 1 || add->ne[3] != 1 || add->nb[0] != sizeof(float)) {
+            return 0;
+        }
+        previous = add;
+        ops.push_back(GGML_OP_ADD);
+    }
+
+    const int output_node = node_idx + n_ops - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, n_ops, ops.data(), &output_node, 1) ||
+            !ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, n_ops, &output_node, 1)) {
+        return 0;
+    }
+
+    args.experts = experts;
+    args.weights = weights;
+    args.dst = previous;
+    return n_ops - 1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4339,6 +4423,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    ggml_cuda_moe_combine_args moe_combine;
+    const int moe_combine_skip = ggml_cuda_moe_combine_fusion(cgraph, i, moe_combine);
+    if (moe_combine_skip > 0) {
+        static std::atomic<bool> logged{false};
+        if (getenv("GGML_CUDA_MOE_COMBINE_TRACE") && !logged.exchange(true)) {
+            fprintf(stderr, "ggml_cuda: MoE weighted combine fusion active: experts=%lld tokens=%lld skipped_nodes=%d\n",
+                    (long long) moe_combine.experts->ne[1],
+                    (long long) moe_combine.experts->ne[2], moe_combine_skip);
+        }
+        ggml_cuda_op_moe_combine(*cuda_ctx, moe_combine.experts, moe_combine.weights, moe_combine.dst);
+        return moe_combine_skip;
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -4847,7 +4944,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);

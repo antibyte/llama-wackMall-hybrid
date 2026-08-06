@@ -37,6 +37,9 @@ struct llama_model;
 //   LLAMA_EXPERT_CPU_ASYNC - 1: experimental CPU-cold/GPU-hot layer overlap
 //   LLAMA_EXPERT_CPU_DOWN_PREFETCH - down-weight row prefetch distance, 0..8
 //   LLAMA_EXPERT_CPU_REUSE_ROWS - 1: reuse weight rows across repeated MTP experts
+//   LLAMA_EXPERT_CPU_MULTI_ROW - 1: AVX2 Q4_K/Q5_K dots share decoded weight
+//                                blocks across repeated MTP expert selections
+//   LLAMA_EXPERT_SHARED_HOT_IDS - 1: reuse one per-layer hot-slot ID mapping
 //   LLAMA_EXPERT_WARM_SLOTS - extra bounded warm slots/layer (default 0)
 //   LLAMA_EXPERT_WARM_AUTO_MAX - cap for W=auto (default 4; tune on larger GPUs)
 //   LLAMA_EXPERT_WARM_POLICY - warm replacement policy (currently lru)
@@ -87,7 +90,14 @@ void init(const llama_model & model);
 // hot part on the GPU via the pinned store, cold part on the CPU via
 // ggml_mul_mat_id_cold; falls back to plain ggml_mul_mat_id when the weight
 // has no store or the batch is larger than LLAMA_EXPERT_TMAX
-ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids);
+ggml_tensor * build_hot_ids(ggml_context * ctx, ggml_tensor * w, ggml_tensor * ids);
+
+ggml_tensor * build_mul_mat_id(
+        ggml_context * ctx,
+        ggml_tensor * w,
+        ggml_tensor * x,
+        ggml_tensor * ids,
+        ggml_tensor * hot_ids = nullptr);
 
 // consume accumulated expert selection counts, update scores and
 // (LLAMA_EXPERT_ADAPT) repin hot slots; call after each ubatch compute

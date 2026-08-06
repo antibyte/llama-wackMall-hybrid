@@ -291,6 +291,13 @@ target_include_directories(test-expert-lookahead PRIVATE ../src)
 target_compile_features(test-expert-lookahead PRIVATE cxx_std_17)
 llama_test(test-expert-lookahead)
 
+add_executable(test-moe-multi-row
+    test-moe-multi-row.cpp
+)
+target_link_libraries(test-moe-multi-row PRIVATE ggml)
+target_compile_features(test-moe-multi-row PRIVATE cxx_std_17)
+llama_test(test-moe-multi-row)
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)

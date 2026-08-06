@@ -72,6 +72,7 @@ static atomic_int g_moe_single_row_chunk = 64;
 static atomic_bool g_moe_parallel_activation;
 static atomic_int g_moe_down_prefetch;
 static atomic_bool g_moe_reuse_rows;
+static atomic_bool g_moe_multi_row;
 static _Atomic(ggml_cpu_moe_transient_gate_up_claim_fn) g_moe_transient_gate_up_claim;
 static _Atomic(ggml_cpu_moe_transient_gate_up_fetch_fn) g_moe_transient_gate_up_fetch;
 static atomic_bool g_moe_transient_gate_up_verify;
@@ -144,6 +145,14 @@ void ggml_cpu_moe_set_reuse_rows(bool enabled) {
 
 bool ggml_cpu_moe_get_reuse_rows(void) {
     return atomic_load_explicit(&g_moe_reuse_rows, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_multi_row(bool enabled) {
+    atomic_store_explicit(&g_moe_multi_row, enabled, memory_order_relaxed);
+}
+
+bool ggml_cpu_moe_get_multi_row(void) {
+    return atomic_load_explicit(&g_moe_multi_row, memory_order_relaxed);
 }
 
 void ggml_cpu_moe_set_transient_gate_up(
@@ -2187,7 +2196,10 @@ static void ggml_compute_forward_moe_cold(
 
     const bool profile_phases = ggml_cpu_moe_profile_is_enabled();
     const int profile_layer = profile_phases ? dst->op_params[0] : -1;
-    const bool reuse_rows = ggml_cpu_moe_get_reuse_rows();
+    const bool multi_row = ggml_cpu_moe_get_multi_row() && ggml_cpu_has_avx2();
+    const bool reuse_rows = ggml_cpu_moe_get_reuse_rows() || multi_row;
+    const bool multi_gate_up = multi_row && type_g == GGML_TYPE_Q4_K;
+    const bool multi_down = multi_row && type_d == GGML_TYPE_Q5_K;
     const bool verify_transient = atomic_load_explicit(&g_moe_transient_gate_up_verify, memory_order_acquire);
 
     // quantize x once, shared by all experts
@@ -2292,16 +2304,45 @@ static void ggml_compute_forward_moe_cold(
                 for (int64_t i = ir0_start; i < ir0_end; i++) {
                     __builtin_prefetch(wg + (i + 1)*w_gate->nb[1], 0, 3);
                     __builtin_prefetch(wu + (i + 1)*w_up->nb[1], 0, 3);
-                    for (int64_t c = ir1_start; c < ir1_end; c++) {
+                    for (int64_t c = ir1_start; c < ir1_end;) {
                         if (transient_gate_up[col0[cur_a] + c] && !verify_transient) {
+                            c++;
                             continue;
                         }
                         const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
                         const char * xcol = xq + (int64_t) rm.i2*q_embd;
-                        float * gout = gate_out + (col0[cur_a] + c)*n_ff;
-                        float * uout = up_out   + (col0[cur_a] + c)*n_ff;
-                        vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
-                        vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                        int run = 1;
+                        if (multi_gate_up) {
+                            while (run < 4 && c + run < ir1_end) {
+                                if (transient_gate_up[col0[cur_a] + c + run] && !verify_transient) {
+                                    break;
+                                }
+                                const struct mmid_row_mapping next =
+                                    matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c + run];
+                                if (next.i2 != rm.i2 + run) {
+                                    break;
+                                }
+                                run++;
+                            }
+                        }
+                        if (run > 1) {
+                            float gres[4];
+                            float ures[4];
+                            vec_dot_g(ne_embd, gres, sizeof(float),
+                                    wg + i*w_gate->nb[1], 0, xcol, q_embd, run);
+                            vec_dot_g(ne_embd, ures, sizeof(float),
+                                    wu + i*w_up->nb[1], 0, xcol, q_embd, run);
+                            for (int r = 0; r < run; ++r) {
+                                gate_out[(col0[cur_a] + c + r)*n_ff + i] = gres[r];
+                                up_out[(col0[cur_a] + c + r)*n_ff + i] = ures[r];
+                            }
+                        } else {
+                            float * gout = gate_out + (col0[cur_a] + c)*n_ff;
+                            float * uout = up_out   + (col0[cur_a] + c)*n_ff;
+                            vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
+                            vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                        }
+                        c += run;
                     }
                 }
             } else {
@@ -2477,13 +2518,20 @@ static void ggml_compute_forward_moe_cold(
                     if (down_prefetch > 0 && j + down_prefetch < ir0_end) {
                         __builtin_prefetch(wd + (j + down_prefetch)*w_down->nb[1], 0, 3);
                     }
-                    for (int64_t c = ir1_start; c < ir1_end; c++) {
-                        const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
+                    for (int64_t c = ir1_start; c < ir1_end;) {
+                        const int run = multi_down ? MIN(4, ir1_end - c) : 1;
                         const char * acol = act_q + (col0[cur_a] + c)*q_ff;
-                        float * dst_col = (float *) ((char *) dst->data + rm.i1*dst->nb[1] + (int64_t) rm.i2*dst->nb[2]);
-                        float res = 0.0f;
-                        vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
-                        dst_col[j] += res;
+                        float results[4];
+                        vec_dot_d(n_ff, results, sizeof(float),
+                                wd + j*w_down->nb[1], 0, acol, run > 1 ? q_ff : 0, run);
+                        for (int r = 0; r < run; ++r) {
+                            const struct mmid_row_mapping rm =
+                                matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c + r];
+                            float * dst_col = (float *) ((char *) dst->data +
+                                    rm.i1*dst->nb[1] + (int64_t) rm.i2*dst->nb[2]);
+                            dst_col[j] += results[r];
+                        }
+                        c += run;
                     }
                 }
             } else {

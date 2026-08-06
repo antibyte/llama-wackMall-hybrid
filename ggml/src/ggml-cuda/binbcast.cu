@@ -450,6 +450,90 @@ void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_div>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
+template <int n_experts_fixed>
+static __global__ void moe_combine_f32_kernel(
+        const float * experts,
+        const float * weights,
+        float * dst,
+        int64_t n_embd,
+        int n_experts,
+        int n_tokens,
+        size_t expert_stride,
+        size_t expert_token_stride,
+        size_t weight_expert_stride,
+        size_t weight_token_stride,
+        size_t dst_token_stride) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int token = blockIdx.y;
+    if (token >= n_tokens) {
+        return;
+    }
+
+    const char * expert_token = (const char *) experts + (size_t) token*expert_token_stride;
+    const char * weight_token = (const char *) weights + (size_t) token*weight_token_stride;
+    const int expert_count = n_experts_fixed > 0 ? n_experts_fixed : n_experts;
+    __shared__ float block_weights[32];
+    if (threadIdx.x < expert_count) {
+        block_weights[threadIdx.x] = *(const float *)
+            (weight_token + (size_t) threadIdx.x*weight_expert_stride);
+    }
+    __syncthreads();
+
+    if (i >= n_embd) {
+        return;
+    }
+
+    float sum = __fmul_rn(
+            *(const float *) (expert_token + i*sizeof(float)),
+            block_weights[0]);
+#pragma unroll
+    for (int expert = 1; expert < expert_count; ++expert) {
+        const float value = *(const float *)
+            (expert_token + (size_t) expert*expert_stride + i*sizeof(float));
+        sum = __fadd_rn(sum, __fmul_rn(value, block_weights[expert]));
+    }
+    *(float *) ((char *) dst + (size_t) token*dst_token_stride + i*sizeof(float)) = sum;
+}
+
+void ggml_cuda_op_moe_combine(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * experts,
+        const ggml_tensor * weights,
+        ggml_tensor * dst) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(experts->ne[0] == dst->ne[0]);
+    GGML_ASSERT(experts->ne[1] == weights->ne[1]);
+    GGML_ASSERT(experts->ne[2] == weights->ne[2]);
+    GGML_ASSERT(experts->ne[2] == dst->ne[1]);
+    GGML_ASSERT(experts->nb[0] == sizeof(float));
+    GGML_ASSERT(weights->ne[0] == 1 && weights->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    constexpr int threads = 256;
+    const dim3 blocks((experts->ne[0] + threads - 1)/threads, experts->ne[2], 1);
+    auto launch = [&](auto experts_fixed) {
+        moe_combine_f32_kernel<decltype(experts_fixed)::value><<<blocks, threads, 0, ctx.stream()>>>(
+            (const float *) experts->data,
+            (const float *) weights->data,
+            (float *) dst->data,
+            experts->ne[0],
+            experts->ne[1],
+            experts->ne[2],
+            experts->nb[1],
+            experts->nb[2],
+            weights->nb[1],
+            weights->nb[2],
+            dst->nb[1]);
+    };
+    if (experts->ne[1] == 8) {
+        launch(std::integral_constant<int, 8>{});
+    } else {
+        launch(std::integral_constant<int, 0>{});
+    }
+}
+
 template <float (*op)(const float, const float), int n_fuse>
 static void ggml_cuda_op_fused_binbcast_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();

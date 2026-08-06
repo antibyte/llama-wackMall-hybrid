@@ -206,6 +206,65 @@ upstream 2048/512 logical/physical defaults in that sweep.
 
 Change `--spec-draft-n-max` to 1 or 3 for MTP-1/MTP-3, or remove all `--spec-*` options for a no-MTP control. Always compare token/output hashes and MTP acceptance, not throughput alone.
 
+### Experimental hot-ID and MoE kernel fusion
+
+Two default-off controls remove repeated hot-slot lookups and fuse quantized Gate+Up+GLU work for multi-token MoE verification graphs:
+
+```bash
+LLAMA_EXPERT_SHARED_HOT_IDS=1 \
+GGML_CUDA_MOE_MULTI_FUSION=1 \
+GGML_CUDA_MOE_COMBINE_FUSION=1 \
+./build-kernel-sm75/bin/llama-server ...
+```
+
+`LLAMA_EXPERT_SHARED_HOT_IDS=1` reuses one mapped hot-ID tensor for Gate, Up, and Down within a layer. `GGML_CUDA_MOE_MULTI_FUSION=1` extends the existing quantized CUDA fusion to bias- and scale-free `MUL_MAT_ID` graphs with two to four target tokens. The multi-token kernel is guarded off on Pascal and older GPUs until separate architecture-specific measurements are available. Keep both controls disabled for an unmodified baseline.
+
+`GGML_CUDA_MOE_COMBINE_FUSION=1` is a separate default-off experiment. It
+replaces the post-Down F32 weighting plus the ordered Top-k reduction with one
+CUDA kernel while retaining the exact router weights and addition order. It is
+model-dimension independent (2--32 routed experts) and has an optimized Top-8
+dispatch. The GTX 1660 Ti 3x256 screen was neutral (+0.07%), so it is not a
+production default and needs an independent sm_61 screen before use on the GTX
+1080.
+
+### Experimental Q8_0 three-column MMVQ geometry
+
+Node-level Nsight Systems profiling of the MTP-2 decode window identified the
+dense Q8_0 three-column matrix-vector kernel as the largest GPU-kernel category
+(25.1% of measured decode GPU time). The optional setting below changes only
+how many output rows one CUDA block evaluates; it does not alter the dot-product
+or reduction order:
+
+```bash
+GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=4 \
+./build-kernel-sm75/bin/llama-server ...
+```
+
+Accepted values are `1`, `2`, and `4`; unset or `0` keeps the upstream-selected
+geometry (`2` on the tested path). On the GTX 1660 Ti, three 2,000-token MTP-2
+runs improved from a 46.831 tok/s median to 47.436 tok/s (+1.29%). All runs had
+identical output/token hashes, MTP acceptance (0.780269), and mean accepted
+length (2.56). One row per block regressed by about 4.1% in the short screen.
+The override remains default-off and must be benchmarked independently on
+Pascal; successful sm_61 compilation is not a GTX 1080 performance result.
+
+The same profiler showed that the Q6_K output projection consumed another
+18.3% of decode GPU-kernel time across one- and three-column launches. These
+paths can be tuned independently:
+
+```bash
+GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS=2 \
+GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS=4 \
+./build-kernel-sm75/bin/llama-server ...
+```
+
+With the Q8_0 four-row winner already enabled, the Q6_K pair improved the
+GTX 1660 Ti three-run, 2,000-token MTP-2 median from 47.293 to 47.794 tok/s
+(+1.06%). All output/token hashes, acceptance (0.780269), and mean accepted
+length (2.56) remained identical. Short no-MTP, MTP-1, MTP-2, and MTP-3
+off/on checks were also hash-identical. Both settings remain default-off and
+architecture-specific; test `1`, `2`, and `4` independently on each GPU.
+
 ### Experimental target backend sampling
 
 This tree contains a semantic port of llama.cpp PR #25532.  Add `-bs` to keep
@@ -522,6 +581,13 @@ Key portable controls:
 | `LLAMA_EXPERT_WARM_PREFETCH` | 0 | Experimental asynchronous H2D population of warm slots |
 | `LLAMA_EXPERT_STATIC_NO_SYNC` | 0 | Skip only the expert-tier update barrier under strict immutable-tier conditions |
 | `LLAMA_EXPERT_CPU_REUSE_ROWS` | 0 | Reuse quantized cold rows across repeated MTP expert selections |
+| `LLAMA_EXPERT_CPU_MULTI_ROW` | 0 | AVX2 Q4_K/Q5_K multi-row dots for repeated MTP expert selections; implies row-oriented traversal |
+| `LLAMA_EXPERT_SHARED_HOT_IDS` | 0 | Reuse one hot-slot ID mapping for Gate, Up, and Down in a layer |
+| `GGML_CUDA_MOE_MULTI_FUSION` | 0 | Fuse quantized Gate+Up+GLU for two to four MoE target tokens on Turing or newer GPUs |
+| `GGML_CUDA_MOE_COMBINE_FUSION` | 0 | Fuse exact F32 post-Down expert weighting and ordered Top-k reduction; experimental |
+| `GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS` | 0 | Override rows/block for non-ID Q8_0 three-column MMVQ (`1`, `2`, or `4`); `0` preserves automatic selection |
+| `GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS` | 0 | Override rows/block for plain non-ID Q6_K one-column MMVQ (`1`, `2`, or `4`) |
+| `GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS` | 0 | Override rows/block for plain non-ID Q6_K three-column MMVQ (`1`, `2`, or `4`) |
 | `LLAMA_EXPERT_CPU_ASYNC` | 0 | Experimental CPU-cold/GPU-hot overlap; benchmark before use |
 
 The benchmark runner also accepts `CONTEXT`, `TARGET_TYPE_K`, and `TARGET_TYPE_V`. Their defaults remain `32768`, `q4_0`, and `q4_0` so existing benchmark commands retain their behavior.
@@ -540,11 +606,12 @@ python3 -m unittest \
 Build and run the targeted C++ tests:
 
 ```bash
-cmake --build build-hybrid -j 8 --target test-expert-adaptation test-expert-warm-cache test-expert-placement test-arg-parser test-backend-ops
+cmake --build build-hybrid -j 8 --target test-expert-adaptation test-expert-warm-cache test-expert-placement test-moe-multi-row test-arg-parser test-backend-ops
 
 ./build-hybrid/bin/test-expert-adaptation
 ./build-hybrid/bin/test-expert-warm-cache
 ./build-hybrid/bin/test-expert-placement
+./build-hybrid/bin/test-moe-multi-row
 ./build-hybrid/bin/test-arg-parser
 ./build-hybrid/bin/test-backend-ops
 ```

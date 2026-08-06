@@ -1041,3 +1041,261 @@ default-off and is enabled explicitly with `-bs` or
 
 Artifacts are under
 `benchmark-results/backend-sampling-mtp{2,3}-{off,on}-3x2000-20260804`.
+
+## Shared hot IDs and multi-token MoE fusion
+
+The hot tier originally mapped the same router IDs through separate Gate, Up,
+and Down LUT tensors.  Besides launching redundant `CONT` and `GET_ROWS`
+work, distinct mapped-ID tensor addresses prevented the existing CUDA
+Gate+Up+GLU fusion predicate from matching.  The default-off
+`LLAMA_EXPERT_SHARED_HOT_IDS=1` path builds the mapping once from the layer's
+Gate store and passes it to all three expert matmuls.  Router IDs, masks,
+sentinel handling, cold compute, and router weights are unchanged.
+
+The first sm_75 screen used S=33, W=0, static no-sync, backend target sampling,
+q4_0/q4_0 target KV, 128/128 physical batches, and a fresh server per run.
+All compared output and token hashes were identical.
+
+| Mode | Shared IDs off | Shared IDs on | Difference |
+|---|---:|---:|---:|
+| no MTP, 3x256 median | 35.647 tok/s | 36.544 tok/s | +2.52% |
+| MTP-2, 3x256 median | 39.504 tok/s | 39.712 tok/s | +0.53% |
+
+No-MTP benefits from both the removed LUT work and the existing single-token
+Gate+Up+GLU fusion.  MTP-2 initially benefits only from the LUT change because
+the dedicated multi-token MoE MMVQ kernel did not support fusion.
+
+`GGML_CUDA_MOE_MULTI_FUSION=1` therefore adds a second default-off experiment.
+For bias- and scale-free `MUL_MAT_ID` graphs on Turing or newer GPUs, the
+dedicated kernel computes Gate and Up dot products together and applies GLU
+before writing.  It accepts two through four target tokens so MTP-1/2/3 verify
+graphs are covered.  Pascal remains guarded off pending an sm_61-specific
+benchmark.
+
+With shared IDs already enabled, the MTP-2 3x256 median increased from 39.712
+to 39.905 tok/s, another +0.49%.  Relative to the original shared-ID-off
+baseline, the combined short-screen increase was +1.02%.  A 128-token MTP-3
+smoke increased from 36.763 to 37.159 tok/s after four-token graphs were added.
+The MTP-3 value is an individual smoke, not a sustained result.  MTP-1, MTP-2,
+and MTP-3 retained identical hashes, acceptance, and mean accepted length in
+their correctness comparisons.
+
+Artifacts are under `/tmp/hot-id-*` and `/tmp/moe-multi-fusion*` on the GTX
+1660 Ti host.  Both controls remain default-off until counterbalanced 2,000
+token runs and the GTX 1080 architecture screen are complete.
+
+The subsequent sustained MTP-2 comparison used 32K context, 376/376 physical
+batches, S=33, W=0, target backend sampling, three fresh servers per side, and
+2,000 output tokens.  The baseline median was 38.427 tok/s and the combined
+shared-ID plus multi-token-fusion median was 38.693 tok/s, a measured +0.69%.
+All six outputs and token streams were hash-identical; acceptance was 0.752978
+and mean accepted length was 2.51 in every run.  One optimized run was below
+the baseline median, and the two three-run series were sequential rather than
+counterbalanced.  The controls therefore remain default-off pending a paired
+screen and the sm_61 result.  Artifacts are under
+`/tmp/kernel-mtp2-{baseline,optimized}-3x2000-20260806`.
+
+## AVX2 CPU cold-expert multi-row dots
+
+The row-reuse experiment improved cache locality but still decoded each
+quantized weight block separately for every repeated MTP expert selection.
+`LLAMA_EXPERT_CPU_MULTI_ROW=1` adds a default-off x86 AVX2 path which decodes
+one weight block and evaluates two through four Q8_K activation rows against
+it. The first implementation intentionally covers only the model's dominant
+expert types:
+
+- all 41 Gate and Up stacks are Q4_K;
+- 38 of 41 Down stacks are Q5_K;
+- the three Q6_K Down stacks retain the existing single-row implementation.
+
+The optimization is used only by the fused CPU cold-expert node. It implies
+row-oriented traversal, groups Gate/Up only when quantized token rows are
+physically consecutive, and otherwise falls back to the original call. The
+feature is inert without AVX2. Other architectures and quant types preserve
+their old paths.
+
+A dedicated C++ test quantizes deterministic Q4_K/Q5_K weights and four Q8_K
+input rows, then compares four ordinary dot products with one multi-row call.
+Both types were bit-identical. Model-level No-MTP, MTP-1, MTP-2, and MTP-3
+checks also retained output hashes, token hashes, acceptance, and mean accepted
+length. The targeted expert tests passed 5/5.
+
+One MTP-2 phase-timing pair at 256 output tokens showed that the kernel does
+reduce the intended work:
+
+| Measurement | Existing row reuse | Multi-row | Difference |
+|---|---:|---:|---:|
+| CPU cold total | 2132.898 ms | 2008.598 ms | -5.83% |
+| Gate + Up | 1182.300 ms | 1137.849 ms | -3.76% |
+| Activation | 43.923 ms | 42.069 ms | -4.22% |
+| Down | 797.356 ms | 727.093 ms | -8.81% |
+
+Without timing instrumentation, three 256-token MTP-2 runs moved from a
+39.948 tok/s median to 40.102 tok/s (+0.39%). MTP-3, which offers more rows
+per verify graph, moved from 37.755 to 38.075 tok/s (+0.85%). Hashes were
+identical across each comparison, but MTP-3 remained slower than MTP-2.
+
+The sustained test used the historical prompt-specific placement profile
+with SHA-256 `351cf93b8776de0001f5b7a05d7a187c4a53e37ad4e1386fc678c0fdf6995b5c`,
+32K context, S=33, W=0, 376/376 maximum batch sizes, q4_0/q4_0 target and draft
+KV, MTP-2, eight CPU workers, target backend sampling, shared hot IDs,
+multi-token CUDA MoE fusion, and the System76 performance profile. Three
+fresh-server 2,000-token runs per side produced:
+
+| CPU multi-row | Median decode | Acceptance | Mean accepted length | Hashes |
+|---|---:|---:|---:|---|
+| off | 46.734 tok/s | 0.780269 | 2.56 | identical |
+| on | 46.688 tok/s | 0.780269 | 2.56 | identical |
+
+The sustained result is -0.10%, so the CPU savings are not on the critical
+path of this GTX 1660 Ti configuration. The feature remains default-off and
+Q6_K specialization is deferred. It should be screened on the GTX 1080 host:
+that machine's older quad-core i7 may expose more CPU cold time even though
+the CUDA device is stronger and has more fixed slots. Enable it there only
+for an A/B test with `LLAMA_EXPERT_CPU_MULTI_ROW=1`; do not change the stable
+default based on the short-run gains.
+
+Local artifacts are under `/tmp/cpu-multi-*20260806`. The power profile was
+restored to `balanced` after the sustained comparison.
+
+## Exact CUDA post-Down MoE combine fusion
+
+The next kernel probe targeted the graph tail which previously materialized
+the weighted expert tensor and then reduced its Top-8 dimension through seven
+ordered F32 additions. `GGML_CUDA_MOE_COMBINE_FUSION=1` recognizes only the
+closed named MoE subgraph
+
+```text
+MUL -> N VIEW nodes -> N-1 ordered ADD nodes
+```
+
+and replaces it with one CUDA kernel. The matcher validates tensor types,
+shapes, sources, output ownership, and memory ranges. It accepts 2--32 routed
+experts and any positive token count; the common Top-8 path is compile-time
+unrolled. Router weights are broadcast through block-local shared memory.
+Explicit round-to-nearest multiplication and addition preserve the separate
+kernel's multiplication boundary and original left-to-right sum order.
+
+Short model-level controls with no MTP and MTP-1/2/3 generated 32 tokens each.
+Fusion off/on retained identical output hashes, token hashes, MTP acceptance,
+and mean accepted length in all four pairs. The MTP-2 performance screen used
+the historical prompt-specific profile (`351cf93...`), 32K context, S=33,
+W=0, 376/376 batches, q4_0/q4_0 target and draft KV, eight CPU workers, target
+backend sampling, shared hot IDs, the multi-token CUDA MoE fusion, and the
+System76 performance profile:
+
+| Variant | 3x256 median | Difference | Hashes |
+|---|---:|---:|---|
+| existing graph | 44.747 tok/s | baseline | identical |
+| initial generic combine kernel | 44.640 tok/s | -0.24% | identical |
+| shared-weight, unrolled Top-8 kernel | 44.777 tok/s | +0.07% | identical |
+
+The optimized result is measurement noise rather than a practical gain, so a
+3x2,000 run is not justified. The code remains default-off as a portable
+experiment for architectures where launch overhead or F32 bandwidth balance
+differs. It should be screened independently on sm_61; no GTX 1080 result is
+claimed here. Local artifacts are under `/tmp/moe-combine-*20260806`.
+
+## Q8_0 three-column MMVQ launch geometry
+
+A node-level Nsight Systems trace was captured with MTP-2, the historical
+prompt-specific placement profile, shared hot IDs, multi-token MoE fusion, and
+target backend sampling. Within the decode interval, the dominant GPU kernel
+categories were:
+
+| Kernel category | Total GPU time | Calls | Share of decode GPU-kernel time |
+|---|---:|---:|---:|
+| Q8_0 MMVQ, three output columns | 79.478 ms | 2,838 | 25.10% |
+| Q4_K fused multi-token MoE Gate+Up | 34.802 ms | 440 | 10.99% |
+| Q6_K one-token output projection | 34.526 ms | 22 | 10.90% |
+| Q5_K multi-token MoE Down | 24.753 ms | 407 | 7.82% |
+| Q6_K three-token output projection | 23.287 ms | 11 | 7.35% |
+
+The post-Down combine accounted for only a small fraction, explaining the
+neutral combine-fusion result. The Q8_0 three-column path was therefore used
+for a strictly launch-geometric experiment. `GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS`
+accepts `1`, `2`, or `4`; unset/zero retains the existing automatic geometry.
+Only the number of output rows assigned to a CUDA block changes. The quantized
+dot products, warp reduction order, tensor shapes, and output stores remain the
+same. The override applies only to non-ID Q8_0 calls with exactly three output
+columns.
+
+Short MTP-2 correctness runs at rows/block 1, 2, and 4 produced identical
+output hashes, token hashes, acceptance, and mean accepted length. A 3x256
+screen then produced:
+
+| Rows/block | Median decode | Difference from automatic | Hashes |
+|---:|---:|---:|---|
+| automatic (2) | 44.758 tok/s | baseline | identical |
+| 1 | 42.934 tok/s | -4.07% | identical |
+| 4 | 45.255 tok/s | +1.11% | identical |
+
+Because four rows/block cleared the short-screen threshold, it was compared
+against automatic selection in three fresh-server 2,000-token runs. Conditions
+were 32K context, S=33, W=0, 376/376 maximum batches, q4_0/q4_0 target and draft
+KV, MTP-2, eight CPU workers, target backend sampling, shared hot IDs,
+multi-token MoE fusion, static no-sync, the historical profile
+`351cf93b8776de0001f5b7a05d7a187c4a53e37ad4e1386fc678c0fdf6995b5c`, and
+the System76 performance profile.
+
+| Rows/block | Three decode results | Median | Difference |
+|---:|---|---:|---:|
+| automatic (2) | 46.873, 46.831, 46.693 | 46.831 tok/s | baseline |
+| 4 | 47.442, 47.436, 47.193 | 47.436 tok/s | +1.29% |
+
+All six 2,000-token runs were hash-identical. Acceptance was 0.780269 and mean
+accepted length was 2.56 throughout. The sm_75 result is therefore positive,
+but the control remains default-off because launch geometry is
+architecture-specific. The tree compiles for sm_61 with the override present;
+the GTX 1080 still requires its own `0/1/4` A/B screen. Local artifacts are
+under `/tmp/mmvq-q8-n3-*20260806`. The host power profile was restored to
+`balanced` after the measurements.
+
+## Q6_K output-projection MMVQ launch geometry
+
+The same node-level decode trace attributed 34.526 ms (10.90%) to the Q6_K
+one-column output projection and 23.287 ms (7.35%) to its three-column MTP-2
+counterpart. Two independent default-off controls were added:
+
+```text
+GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS
+GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS
+```
+
+Both accept `1`, `2`, or `4`; zero/unset retains automatic selection. The
+override is restricted to plain non-ID Q6_K operations without fused bias,
+scale, or gate inputs. Small-K one-column calls retain their specialized
+dispatch. As with the Q8_0 experiment, only output-row grouping changes; dot
+products and reductions keep the existing order.
+
+MTP-2 correctness probes covered the baseline and `(ncols1,ncols3)` settings
+`(2,0)`, `(4,0)`, `(0,1)`, and `(0,4)`. All generated identical output and
+token hashes. The one-row three-column variant was visibly slower and was
+discarded. Additional off/on checks for no-MTP, MTP-1, and MTP-3 were also
+hash-identical, including unchanged acceptance and mean accepted lengths.
+
+The 3x256 screen used the same historical profile and 32K MTP-2 conditions as
+the Q8_0 experiment, with `GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=4` already active:
+
+| Q6_K rows `(ncols1,ncols3)` | Median decode | Difference | Hashes |
+|---|---:|---:|---|
+| automatic `(0,0)` | 45.275 tok/s | baseline | identical |
+| `(2,0)` | 45.425 tok/s | +0.33% | identical |
+| `(0,4)` | 45.678 tok/s | +0.89% | identical |
+| `(2,4)` | 45.861 tok/s | +1.29% | identical |
+
+The combined `(2,4)` setting therefore advanced to three fresh-server
+2,000-token runs:
+
+| Q6_K rows | Three decode results | Median | Difference |
+|---|---|---:|---:|
+| automatic | 47.293, 47.438, 47.045 | 47.293 tok/s | baseline |
+| `(2,4)` | 48.027, 47.794, 47.737 | 47.794 tok/s | +1.06% |
+
+All six long outputs and token streams were identical. MTP acceptance was
+0.780269 and mean accepted length was 2.56 throughout. This is a reproducible
+sm_75 gain, but not yet a cross-architecture default. The modified source
+builds successfully for sm_61 with MMQ disabled; the GTX 1080 must still run
+its own geometry sweep. Local artifacts are under
+`/tmp/mmvq-q6-k-*20260806`. The host power profile was restored to `balanced`
+after the benchmark series.

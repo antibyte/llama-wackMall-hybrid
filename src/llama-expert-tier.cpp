@@ -111,6 +111,8 @@ static bool g_cpu_parallel_activation = false;
 static bool g_cpu_async = false;
 static int  g_cpu_down_prefetch = 0;
 static bool g_cpu_reuse_rows = false;
+static bool g_cpu_multi_row = false;
+static bool g_shared_hot_ids = false;
 static bool g_static_no_sync_requested = false;
 static bool g_static_no_sync_active = false;
 static int  g_prefetch_streams = 1;
@@ -1271,6 +1273,7 @@ static void dump_stats() {
                 "  \"cpu_parallel_activation\": %s,\n"
                 "  \"cpu_down_prefetch\": %d,\n"
                 "  \"cpu_reuse_rows\": %s,\n"
+                "  \"cpu_multi_row\": %s,\n"
                 "  \"cpu_async\": %s,\n"
                 "  \"cpu_async_jobs\": %llu,\n"
                 "  \"cpu_async_wait_ms\": %.3f,\n"
@@ -1297,6 +1300,7 @@ static void dump_stats() {
                 g_variable_placement ? -1 : g_S, hot_slots_total, hot_slots_min, hot_slots_max,
                 g_W, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "true" : "false",
                 g_cpu_down_prefetch, g_cpu_reuse_rows ? "true" : "false",
+                g_cpu_multi_row ? "true" : "false",
                 g_cpu_async ? "true" : "false", (unsigned long long) cpu_async_jobs,
                 (double) cpu_async_wait_us/1000.0,
                 (unsigned long long) selected_total, (unsigned long long) fixed_hits,
@@ -1487,6 +1491,8 @@ static bool explicitly_requested_by_env() {
         "LLAMA_EXPERT_CPU_ASYNC",
         "LLAMA_EXPERT_CPU_DOWN_PREFETCH",
         "LLAMA_EXPERT_CPU_REUSE_ROWS",
+        "LLAMA_EXPERT_CPU_MULTI_ROW",
+        "LLAMA_EXPERT_SHARED_HOT_IDS",
         "LLAMA_EXPERT_WARM_SLOTS",
         "LLAMA_EXPERT_STATIC_NO_SYNC",
         "LLAMA_EXPERT_LOOKAHEAD_TRACE",
@@ -1795,10 +1801,29 @@ void init(const llama_model & model) {
         }
         g_cpu_reuse_rows = value == 1;
     }
+    if (const char * multi = getenv("LLAMA_EXPERT_CPU_MULTI_ROW")) {
+        int value = 0;
+        if (!parse_nonnegative_int(multi, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_MULTI_ROW='%s'; expected 0 or 1\n",
+                    __func__, multi);
+            return;
+        }
+        g_cpu_multi_row = value == 1;
+    }
+    if (const char * shared = getenv("LLAMA_EXPERT_SHARED_HOT_IDS")) {
+        int value = 0;
+        if (!parse_nonnegative_int(shared, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_SHARED_HOT_IDS='%s'; expected 0 or 1\n",
+                    __func__, shared);
+            return;
+        }
+        g_shared_hot_ids = value == 1;
+    }
     ggml_cpu_moe_set_single_row_chunk(g_cpu_single_row_chunk);
     ggml_cpu_moe_set_parallel_activation(g_cpu_parallel_activation);
     ggml_cpu_moe_set_down_prefetch(g_cpu_down_prefetch);
     ggml_cpu_moe_set_reuse_rows(g_cpu_reuse_rows);
+    ggml_cpu_moe_set_multi_row(g_cpu_multi_row);
     ggml_cpu_moe_set_async(g_cpu_async);
     ggml_cpu_moe_async_stats_reset();
     ggml_cpu_moe_profile_reset();
@@ -2294,9 +2319,10 @@ void init(const llama_model & model) {
         TIER_LOG("%s: CUDA graph caching during adaptation: %s\n", __func__,
                 g_mutable_disabled_cuda_graphs ? "disabled" : "enabled (experimental)");
     }
-    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s; down prefetch: %d; row reuse: %s; async overlap: %s\n",
+    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s; down prefetch: %d; row reuse: %s; multi-row AVX2: %s; shared hot IDs: %s; async overlap: %s\n",
             __func__, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "on" : "off",
-            g_cpu_down_prefetch, g_cpu_reuse_rows ? "on" : "off", g_cpu_async ? "on" : "off");
+            g_cpu_down_prefetch, g_cpu_reuse_rows ? "on" : "off", g_cpu_multi_row ? "on" : "off",
+            g_shared_hot_ids ? "on" : "off", g_cpu_async ? "on" : "off");
     if (g_W > 0) {
         if (g_warm_admission == warm_admission_mode::frequency) {
             TIER_LOG("%s: warm admission frequency window=%d graphs\n", __func__, g_warm_admission_window);
@@ -2372,7 +2398,27 @@ void init(const llama_model & model) {
     }
 }
 
-ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids) {
+ggml_tensor * build_hot_ids(ggml_context * ctx, ggml_tensor * w, ggml_tensor * ids) {
+    if (!g_shared_hot_ids) {
+        return nullptr;
+    }
+    auto it = g_stores.find(w);
+    if (it == g_stores.end() || ids->ne[1] > (int64_t) g_tmax) {
+        return nullptr;
+    }
+
+    const store & s = it->second;
+    ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, ids), ids->ne[0]*ids->ne[1]);
+    ggml_tensor * hot_flat = ggml_get_rows(ctx, s.lut, ids_flat);
+    return ggml_reshape_2d(ctx, hot_flat, ids->ne[0], ids->ne[1]);
+}
+
+ggml_tensor * build_mul_mat_id(
+        ggml_context * ctx,
+        ggml_tensor * w,
+        ggml_tensor * x,
+        ggml_tensor * ids,
+        ggml_tensor * hot_ids) {
     auto it = g_stores.find(w);
     if (it == g_stores.end() || ids->ne[1] > (int64_t) g_tmax) {
         return ggml_mul_mat_id(ctx, w, x, ids);
@@ -2380,11 +2426,13 @@ ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
 
     const store & s = it->second;
 
-    // get_rows wants matching trailing dims, so flatten ids to 1d first
-    ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, ids), ids->ne[0]*ids->ne[1]);
-    ggml_tensor * hot_flat = ggml_get_rows(ctx, s.lut, ids_flat); // [1, n_used*n_tokens]
-    ggml_tensor * ids_hot  = ggml_reshape_2d(ctx, hot_flat, ids->ne[0], ids->ne[1]);
-    ggml_tensor * hot      = ggml_mul_mat_id(ctx, s.w_hot, x, ids_hot);    // GPU
+    if (!hot_ids) {
+        ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, ids), ids->ne[0]*ids->ne[1]);
+        ggml_tensor * hot_flat = ggml_get_rows(ctx, s.lut, ids_flat);
+        hot_ids = ggml_reshape_2d(ctx, hot_flat, ids->ne[0], ids->ne[1]);
+    }
+    GGML_ASSERT(hot_ids->ne[0] == ids->ne[0] && hot_ids->ne[1] == ids->ne[1]);
+    ggml_tensor * hot = ggml_mul_mat_id(ctx, s.w_hot, x, hot_ids); // GPU
 
     if (g_hot_only) {
         return hot;
