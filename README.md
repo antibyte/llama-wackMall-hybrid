@@ -1,3 +1,7 @@
+IMPORTANT: Current autofit is bugged to use max context. Set -c manually to see real benefit. Outside of that no other argument is needed
+
+
+
 I am throwing ideas one by one in an attempt to recreate colibri tier performance using llama.cpp base and model compatibility
 
 This version is behind master llama as my focus is on getting both my merge
