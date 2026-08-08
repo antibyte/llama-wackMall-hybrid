@@ -433,6 +433,16 @@ to that maximum. The same context can therefore process prompt chunks with a
 large physical ubatch and retain 1--3 token decode graphs without an explicit
 phase switch.
 
+The default-off cmoe phase-batching experiment adds separate prefill and decode
+logical/physical caps while keeping allocation at the maximum requested pair.
+It is limited to `-np 1`; the server changes the runtime memory-split cap before
+`pre_decode()`, at a point where no target graph from the next phase has been
+submitted. It does not mutate KV, SSM, MTP rollback state, expert placement, or
+the scheduler reserve. Repeated requests may switch phases repeatedly in the
+same process. Because actual MTP verify batches are already far below 32 tokens,
+the decode cap is mainly a correctness and measurement control rather than an
+assumed optimization.
+
 The maximum graph is reserved before expert-tier auto-fit, so physical ubatch
 and fixed hot slots compete for VRAM. This is intentionally a runtime tradeoff:
 the benchmark runner records requested batch/ubatch and the effective fixed

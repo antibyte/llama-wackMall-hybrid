@@ -460,6 +460,112 @@ GGML_CUDA_EXPERT_BRIDGE_JSON=/root/gtx1080-hybrid-results/bridge.json
 
 The bridge is explicit opt-in, produces per-layer v6 JSON metrics, and should remain disabled for ordinary runs. Verification can be enabled with `GGML_CUDA_EXPERT_BRIDGE_VERIFY=1` when validating math, at substantial diagnostic overhead. Fine timing can be enabled with `GGML_CUDA_EXPERT_BRIDGE_TELEMETRY=1`; timing results must not be mixed with ordinary throughput results. The persistent cache is intentionally omitted from the recommended configuration.
 
+## GTX 1660 Ti cross-host comparison
+
+The SM 61 phase was pulled at commit `56f4c4d0d928fad88fed90a354e45a39aa346bb7` and rebuilt natively for SM 75 on the GTX 1660 Ti host. The four expert C++ tests, 37 Python tests, deterministic bridge validation, and `git diff --check` passed. A 64-token bridge run with `GGML_CUDA_EXPERT_BRIDGE_VERIFY=1` reported no bit mismatch and reproduced the corresponding baseline token prefix.
+
+The inference comparison reused the exact held-out GTX 1080 replay prompt; its SHA-256 is `68f3700281816732839b9d18ad2a297c38d3b467dfc3e948388a0c0a13899565`. Each candidate used three fresh-server repetitions, 256 output tokens, temperature zero, MTP-2, CMOE batch/ubatch 32/32, target KV Q8_0/Q8_0, draft KV Q8_0/Q4_0, disabled backend sampling, static placement, no adaptation, and no warm cache.
+
+This is a phase-matched functional comparison, not a controlled GPU-only comparison. The GTX 1660 Ti host used the local Q4_K_M model, 32,768 context, eight Ryzen 7 4800H CPU workers, requested S=33 and effective S=31. The GTX 1080 host used the Q4_K_XL_MTP model, 65,536 context, four i7-4770 CPU workers, and effective S=64. Model quantization, CPU cost, PCIe width, context, and fixed residency therefore differ.
+
+All nine GTX 1660 Ti inference runs produced output SHA-256 `c03e78e013d1218e681f0ef13f393ab2f8c0102add0cb562bd065ca2615d3901`, token SHA-256 `09c54bd33a40281a60ffcd98f8b13df2560145f9c56cc4a66b9bd59f11d5eeaa`, MTP acceptance `0.814433`, and mean accepted length `2.63`.
+
+| Configuration | GTX 1080 median token/s | GTX 1080 delta | GTX 1660 Ti runs | GTX 1660 Ti median token/s | GTX 1660 Ti delta |
+| --- | ---: | ---: | --- | ---: | ---: |
+| bridge disabled | 27.934939 | reference | 39.279919, 39.268297, 39.267134 | 39.268297 | reference |
+| layer 1 lookahead K=2 | 27.976870 | +0.150102% | 39.150759, 39.030257, 39.097495 | 39.097495 | -0.434960% |
+| layer 1 lookahead K=2 plus layer 2 recurrence K=1 | 28.057460 | +0.438595% | 38.931957, 38.920639, 38.919574 | 38.920639 | -0.885338% |
+
+The GTX 1660 Ti bridge raised peak VRAM from 5,548 MiB to 5,554 MiB. It introduced no exposed wait and no late useful copies, but the representative final-run usefulness was poor:
+
+| Layer | Mode | Copies | Router-useful | Consumed | Copied bytes | Staging ms | Transfer ms | Compute ms |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | lookahead K=2 | 198 | 4 | 4 | 233,570,304 | 42.434 | 44.805 | 0.635 |
+| 2 | recurrence K=1 | 99 | 51 | 1 | 116,785,152 | 10.274 | 19.929 | 0.052 |
+
+Layer 1 consumed only 2.02 percent of copied candidates, compared with 68.14 percent in the representative GTX 1080 run. Layer 2 had comparable routing recurrence usefulness (51.52 percent on GTX 1660 Ti versus 52.94 percent on GTX 1080), but only one of those 51 useful candidates reached transient Gate+Up consumption. This local model/MTP row-mapping or claim-eligibility gap must be understood before tuning more layers. The CPU fallback preserved exact output, so it is a performance issue rather than a correctness failure in these runs.
+
+Transport also favors the GTX 1080. The isolated pinned 1,179,648-byte Gate+Up copy measured 0.179168 ms on the PCIe Gen3 x8 GTX 1660 Ti host and 0.111712 ms on the PCIe Gen3 x16 GTX 1080 host, making the SM 75 transfer 60.38 percent slower. In contrast, the deterministic custom Q4_K x Q8_K Gate+Up kernel measured 0.013718 ms on SM 75 versus 0.023721 ms on SM 61; device-input quantize plus compute measured 0.031130 ms versus 0.073042 ms. The SM 75 kernel is therefore not the limiting component. Copy selection, staging, and usable consumption are the next targets.
+
+The result supports the same production decision on both hosts: retain the bridge behind explicit flags and leave it disabled by default. On GTX 1660 Ti the exact GTX 1080 policy is rejected for current use because its repeatable median regression exceeds the measured GTX 1080 gain.
+
+### GTX 1660 Ti 2,319-token prompt check
+
+A separate long-input check repeated the exact held-out FFT replay text 40 times. The server reported 2,319 prompt tokens. This deliberately controls content against the short run but is a repetitive stress input rather than a representative natural 2K document. Baseline and the layer-1 K=2 plus layer-2 recurrence K=1 bridge each used three fresh-server runs and the same Q8_0/Q8_0, MTP-2, 32K, effective-S=31 configuration as the short comparison.
+
+| Configuration | Prompt token/s | TTFT ms | Decode runs token/s | Median decode token/s | Versus baseline |
+| --- | ---: | ---: | --- | ---: | ---: |
+| bridge disabled | 18.711437 | 123,972.14 | 38.339521, 38.188106, 38.156140 | 38.188106 | reference |
+| layer 1 K=2 plus layer 2 recurrence K=1 | 18.718031 | 123,918.63 | 37.070058, 37.176962, 38.052146 | 37.176962 | -2.647798% |
+
+All six runs produced output SHA-256 `6c04eedcf16ecbf147a6c3fe3a3cafa8cda8352890e2fe1f15f275bae9bd22d3`, token SHA-256 `32e1b33281b93107e895061499ade77eaf1134c5e16cb81097574537325767c5`, MTP acceptance `0.880435`, and mean accepted length `2.76`. Peak VRAM was 5,554 MiB for baseline and 5,560 MiB for the bridge. No OOM, CUDA error, Xid, late useful copy, exposed bridge wait, or output divergence occurred.
+
+The final bridge run copied 190 layer-1 candidates and consumed seven useful rows. Layer 2 copied 95 candidates and matched 48 actual cold selections, but consumed none. Long input therefore did not repair the local MTP row/claim eligibility gap. The bridge median regression grew from 0.885338 percent on the 57-token prompt to 2.647798 percent on this 2,319-token prompt, while the bridge run spread also grew to 0.982088 token/s. The policy remains rejected on GTX 1660 Ti.
+
+Prompt processing itself was the dominant latency: approximately 124 seconds at only 18.71 prompt token/s. The bridge is intentionally decode-only and did not change prompt throughput. This result strengthens the case for separately testing phase-specific larger prefill batch/ubatch values instead of treating the transient bridge as a prefill optimization.
+
+### GTX 1660 Ti long prompt with batch/ubatch 128/128
+
+The same 2,319-token input and 256-token generation were repeated with global CMOE batch and ubatch increased from 32/32 to 128/128. All other settings remained unchanged. Baseline and bridge again used three fresh-server runs.
+
+| Batch | Bridge | Prompt token/s | TTFT ms | Decode runs token/s | Median decode token/s | Effective S | Peak VRAM MiB |
+| --- | --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 32/32 | off | 18.711437 | 123,972.14 | 38.339521, 38.188106, 38.156140 | 38.188106 | 31 | 5,554 |
+| 32/32 | on | 18.718031 | 123,918.63 | 37.070058, 37.176962, 38.052146 | 37.176962 | 31 | 5,560 |
+| 128/128 | off | 30.552304 | 75,941.04 | 34.973681, 35.850230, 35.587149 | 35.587149 | 31 | 5,578 |
+| 128/128 | on | 30.549964 | 75,945.62 | 35.426485, 34.891255, 35.211500 | 35.211500 | 31 | 5,584 |
+
+For baseline, 128/128 increased prompt throughput by 63.281444 percent and reduced TTFT by 38.743462 percent. It reduced decode throughput by 6.810908 percent. Combining measured TTFT and the time for 256 output tokens, end-to-end time fell from approximately 130.676 seconds to 83.135 seconds, a 36.380990 percent improvement for this long-input workload. The larger compute buffers added 24 MiB but did not reduce effective S below 31 or cause OOM.
+
+The 128/128 baseline and bridge runs were internally deterministic and hash-identical to each other: output SHA-256 `c6a04edba8c90c6fc2ade8bcfb331e615e38da00545e68397c9eabec38675ed6`, token SHA-256 `d03a38397f13e989d348fcb827daef547d890d890cdc19310a28e3a1e86c17a1`, MTP acceptance `0.795918`, and mean accepted length `2.59`. They differ from the 32/32 token stream and MTP values, showing that batch size changes the numerical path. This test makes no quality claim about that different stream.
+
+At 128/128 the bridge remained a loss: its decode median was 1.055575 percent below the phase-matched baseline. In the representative final run, layer 1 consumed six of 202 copies; layer 2 matched 47 of 101 recurrence candidates but consumed only one. The bridge decision remains unchanged.
+
+The result justified implementing and measuring a phase-specific batching MVP. A global 128/128 value substantially improves long prefill, while a decode cap can be selected at the existing prompt-to-generation boundary without changing the context allocation maximum.
+
+### Experimental dynamic 128/128 to 32/32 phase switch
+
+The default-off MVP reserves target and MTP contexts for the maximum phase pair, limits server prompt chunks to the configured prefill pair, and changes a per-context runtime ubatch cap before `pre_decode()`. It is restricted to `-np 1`; mixed prefill and generation across multiple slots are deliberately not scheduled by this first version. The new controls are:
+
+```text
+LLAMA_CMOE_PREFILL_BATCH
+LLAMA_CMOE_PREFILL_UBATCH
+LLAMA_CMOE_DECODE_BATCH
+LLAMA_CMOE_DECODE_UBATCH
+```
+
+The same 2,319-token prompt, 256-token output, Q8_0/Q8_0 target KV, MTP-2, static S=31 configuration was measured three times with prefill 128/128 and decode 32/32:
+
+| Mode | Prompt token/s | TTFT ms | Decode runs token/s | Median decode token/s | End-to-end seconds |
+| --- | ---: | ---: | --- | ---: | ---: |
+| fixed 32/32 | 18.711437 | 123,972.14 | 38.339521, 38.188106, 38.156140 | 38.188106 | 130.676 |
+| fixed 128/128 | 30.552304 | 75,941.04 | 34.973681, 35.850230, 35.587149 | 35.587149 | 83.135 |
+| dynamic 128/128 to 32/32 | 30.589220 | 75,848.62 | 34.882512, 35.642533, 34.775573 | 34.882512 | 83.188 |
+
+Dynamic mode improved prompt throughput by 63.478738 percent and end-to-end time by 36.340512 percent relative to fixed 32/32. Those gains are the same prefill benefit as fixed 128/128. Dynamic mode was 1.980032 percent below the fixed-128 decode median and 0.063626 percent slower end to end, so it did not recover decode performance.
+
+All dynamic runs reproduced the fixed-128 output/token hashes and MTP values exactly: token SHA-256 `d03a38397f13e989d348fcb827daef547d890d890cdc19310a28e3a1e86c17a1`, acceptance `0.795918`, and mean accepted length `2.59`. This shows that the 128-token prefill path, rather than the later maximum cap, determines the changed KV/numerical trajectory and MTP acceptance. Each measured and warm-up log contained exactly one prefill and one decode transition. Two additional requests in one live server process each completed the same transition pair without failure. Default-off produced no phase log and reproduced the first 32 tokens of the earlier fixed-32 baseline.
+
+The implementation is retained as a parameterized experiment because it is correct, default-off, and may be useful for other schedulers or hardware. On GTX 1660 Ti it is not a throughput optimization over simply reserving and using global 128/128.
+
+Local evidence is stored under:
+
+```text
+benchmark-results/transient-transport-sm75-median3-20260803T2210Z/
+benchmark-results/sm75-pulled-bridge-compute-20260804.json
+benchmark-results/pulled-bridge-sm75-sb-verify-64-20260804/
+benchmark-results/gtx1660ti-sm75-gtx1080-replay-q8-baseline-3x256-20260804/
+benchmark-results/gtx1660ti-sm75-gtx1080-replay-q8-layer1-3x256-20260804/
+benchmark-results/gtx1660ti-sm75-gtx1080-replay-q8-bridge-3x256-20260804/
+benchmark-results/gtx1660ti-sm75-long-replay-q8-baseline-3x256-20260804/
+benchmark-results/gtx1660ti-sm75-long-replay-q8-bridge-3x256-20260804/
+benchmark-results/gtx1660ti-sm75-long-replay-q8-b128-baseline-3x256-20260804/
+benchmark-results/gtx1660ti-sm75-long-replay-q8-b128-bridge-3x256-20260804/
+benchmark-results/gtx1660ti-sm75-long-replay-q8-dynamic128to32-3x256-20260804/
+benchmark-results/gtx1660ti-dynamic-batch-smoke-20260804/
+benchmark-results/gtx1660ti-dynamic-batch-default-off-smoke-20260804/
+```
+
 ### Artifact index
 
 The main evidence directories and files are:

@@ -501,6 +501,27 @@ verify the logged effective fixed-slot count, peak VRAM, long decode throughput,
 and output stability. Larger-memory GPUs should include 512, 1024, and the
 upstream 2048/512 logical/physical defaults in that sweep.
 
+An experimental, default-off `-np 1` phase cap is available for controlled
+testing:
+
+```bash
+LLAMA_CMOE_BATCH=32 \
+LLAMA_CMOE_UBATCH=32 \
+LLAMA_CMOE_PREFILL_BATCH=128 \
+LLAMA_CMOE_PREFILL_UBATCH=128 \
+LLAMA_CMOE_DECODE_BATCH=32 \
+LLAMA_CMOE_DECODE_UBATCH=32 \
+./build-hybrid/bin/llama-server ...
+```
+
+The context still reserves the maximum pair, here 128/128. The server limits
+prompt submission to the prefill pair and switches the runtime ubatch cap at
+the existing prompt-to-generation boundary. This is not a production
+recommendation: MTP decode already uses its actual small token count, and the
+GTX 1660 Ti test did not recover decode throughput relative to global 128/128.
+The flags are rejected as an active optimization for `-np > 1` because mixed
+prefill/decode requests need an explicit scheduling policy.
+
 Change `--spec-draft-n-max` to 1 or 3 for MTP-1/MTP-3, or remove all `--spec-*` options for a no-MTP control. Always compare token/output hashes and MTP acceptance, not throughput alone.
 
 The benchmark runner can screen the already-supported self-speculative chain
@@ -730,6 +751,30 @@ MTP_N=2 \
 ./scripts/test_prompt_cache.sh
 ```
 
+### LAN/OpenWebUI launcher
+
+The project-root launcher [`start.sh`](start.sh) contains the complete
+environment configuration for the server, MTP, backend sampling, expert
+tiering, warmcache, and lookahead controls. It binds to `0.0.0.0:8080` and
+auto-detects the tested batch starting point (`376/376` on `sm_75`, `128/128`
+on `sm_61`). The expert slot count is left to VRAM auto-fit so the same file
+can be used on the GTX 1660 Ti, GTX 1080, and larger cards.
+
+```bash
+cd /path/to/llama-wackMall-hybrid
+# edit the CONFIGURATION block in start.sh first
+./start.sh
+```
+
+The complete list of parameters is in the editable block at the top of the
+script, including `MODEL`, `PROFILE`, `HOST`, `PORT`, `MTP_N`, global and
+phase-specific CMoE batches, `THREADS`, `EXPERT_S`,
+`TARGET_BACKEND_SAMPLING`, `REASONING_BUDGET`, every `LLAMA_EXPERT_*` control,
+and the lookahead/bridge flags. The launcher rejects command-line parameters
+so the running configuration always comes from the checked-in file. It keeps
+`WARM_SLOTS=0` and lookahead disabled by default. Without an API key, it prints
+a warning because the HTTP API is unauthenticated on the LAN.
+
 ## 7. Run a reproducible benchmark
 
 The runner keeps context, prompt, temperature, batch sizes, warm-up procedure, and process lifetime fixed. Case `SC` is a fixed static profile with no warm cache and guarded no-sync:
@@ -898,7 +943,8 @@ Key portable controls:
 | `GGML_CUDA_TURBO4_FAST_F16_CONVERT` | 0 | Experimental Turbo4-to-F16 converter schedule (`1` one warp/block, `2` two warps/block); both were slower on SM75 |
 | `GGML_CUDA_TURBO4_WHT_SHUFFLE` | 0 | Experimental shuffle-first Turbo4 WHT; neutral/slower on SM75 |
 | `LLAMA_TURBO4_DRAFT_EXPERIMENTAL` | 0 | Permit Turbo4 K/V in the MTP-only draft context; exact target verification remains authoritative |
-| `GGML_CUDA_ASYNC_HOST_COPY` | 0 | Queue pinned CPU-to-CUDA scheduler split copies on the destination compute stream; measured winner for local MTP-2 |
+| `GGML_CUDA_ASYNC_HOST_COPY` | 0 | Enqueue pinned CPU-to-CUDA scheduler split copies on the destination compute stream; measured GTX 1660 Ti MTP-2 winner |
+| `GGML_SCHED_ASYNC_D2H_COPY` | 0 | Queue CUDA-to-pinned-host split readback after source compute and synchronize once at the CPU consumer; experimental |
 | `GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE` | 0 | Non-contiguous CONCAT block override (`32`, `64`, `128`, `256`); zero keeps the CUDA default |
 | `GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0` | 0 | Use the flat dim-0 non-contiguous CONCAT kernel; measured winner for local MTP-2 |
 | `LLAMA_EXPERT_CPU_ASYNC` | 0 | Experimental CPU-cold/GPU-hot overlap; benchmark before use |

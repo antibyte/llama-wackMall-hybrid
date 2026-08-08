@@ -114,6 +114,9 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
+#ifdef GGML_CUDA_PASCAL_MMVQ_TUNING
+    MMVQ_PARAMETERS_PASCAL_DP4A,
+#endif
     MMVQ_PARAMETERS_TURING,
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
@@ -132,6 +135,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_GCN;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
+#elif defined(GGML_CUDA_PASCAL_MMVQ_TUNING) && defined(__CUDA_ARCH__) && \
+        __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+    return MMVQ_PARAMETERS_PASCAL_DP4A;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -150,9 +156,15 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
     }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
+    const int arch = ggml_cuda_highest_compiled_arch(cc);
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && arch >= GGML_CUDA_CC_TURING && arch < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
     }
+#ifdef GGML_CUDA_PASCAL_MMVQ_TUNING
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && arch >= GGML_CUDA_CC_DP4A && arch < GGML_CUDA_CC_VOLTA) {
+        return MMVQ_PARAMETERS_PASCAL_DP4A;
+    }
+#endif
     return MMVQ_PARAMETERS_GENERIC;
 }
 
@@ -401,7 +413,16 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC
+#ifdef GGML_CUDA_PASCAL_MMVQ_TUNING
+            || table_id == MMVQ_PARAMETERS_PASCAL_DP4A
+#endif
+            ) {
+#ifdef GGML_CUDA_PASCAL_MMVQ_TUNING
+        if (table_id == MMVQ_PARAMETERS_PASCAL_DP4A && ncols_dst == 1) {
+            return 2;
+        }
+#endif
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -507,7 +528,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC
+#ifdef GGML_CUDA_PASCAL_MMVQ_TUNING
+            || table_id == MMVQ_PARAMETERS_PASCAL_DP4A
+#endif
+            || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;

@@ -20,10 +20,21 @@ CPU_THREADS="${CPU_THREADS:-}"
 DRAFT_THREADS="${DRAFT_THREADS:-$CPU_THREADS}"
 CMOE_BATCH="${CMOE_BATCH:-32}"
 CMOE_UBATCH="${CMOE_UBATCH:-32}"
+CMOE_PREFILL_BATCH="${CMOE_PREFILL_BATCH:-}"
+CMOE_PREFILL_UBATCH="${CMOE_PREFILL_UBATCH:-}"
+CMOE_DECODE_BATCH="${CMOE_DECODE_BATCH:-}"
+CMOE_DECODE_UBATCH="${CMOE_DECODE_UBATCH:-}"
 CONTEXT="${CONTEXT:-32768}"
 TARGET_TYPE_K="${TARGET_TYPE_K:-q4_0}"
 TARGET_TYPE_V="${TARGET_TYPE_V:-q4_0}"
 KV_Q4_SCALE="${KV_Q4_SCALE:-${LLAMA_KV_Q4_SCALE:-legacy}}"
+# Optional heterogeneous-backend controls. Empty values preserve every
+# existing benchmark case byte-for-byte. Example:
+#   DEVICE_LIST=CUDA0,Vulkan0 SPLIT_MODE=layer TENSOR_SPLIT=39,2
+DEVICE_LIST="${DEVICE_LIST:-}"
+SPLIT_MODE="${SPLIT_MODE:-}"
+TENSOR_SPLIT="${TENSOR_SPLIT:-}"
+N_GPU_LAYERS="${N_GPU_LAYERS:-}"
 PROMPT_REPEAT="${PROMPT_REPEAT:-1}"
 WARMUP_PROMPT_REPEAT="${WARMUP_PROMPT_REPEAT:-1}"
 ADAPT_CUDA_GRAPHS="${ADAPT_CUDA_GRAPHS:-0}"
@@ -62,6 +73,7 @@ MMVQ_MOE_PLAIN_ROWS="${MMVQ_MOE_PLAIN_ROWS:-0}"
 TURBO4_FAST_F16_CONVERT="${TURBO4_FAST_F16_CONVERT:-0}"
 TURBO4_WHT_SHUFFLE="${TURBO4_WHT_SHUFFLE:-0}"
 CUDA_ASYNC_HOST_COPY="${CUDA_ASYNC_HOST_COPY:-0}"
+SCHED_ASYNC_D2H_COPY="${SCHED_ASYNC_D2H_COPY:-0}"
 CONCAT_NONCONT_BLOCK_SIZE="${CONCAT_NONCONT_BLOCK_SIZE:-0}"
 CONCAT_NONCONT_FLAT_DIM0="${CONCAT_NONCONT_FLAT_DIM0:-0}"
 CPU_MASK="${CPU_MASK:-}"
@@ -167,7 +179,7 @@ if command -v system76-power >/dev/null; then
 fi
 
 printf '%s\n' \
-  'config,rep,fixed_s,effective_fixed_s,warm_s,mtp_n,spec_types,ngram_mod_n_match,ngram_mod_n_min,ngram_mod_n_max,ngram_simple_size_n,ngram_simple_size_m,ngram_simple_min_hits,context,target_type_k,target_type_v,kv_q4_scale,mtp_requantize_output,turbo4_f16_prefill_min_batch,cpu_threads,draft_threads,draft_type_k,draft_type_v,draft_p_min,draft_backend_sampling,target_backend_sampling,reasoning_budget,cpu_chunk,cpu_act_parallel,cpu_async,cpu_down_prefetch,cpu_reuse_rows,cpu_multi_row,cpu_fused_gate_up,shared_hot_ids,moe_multi_fusion,moe_combine_fusion,mmvq_q8_ncols3_rows,mmvq_q6_k_ncols1_rows,mmvq_q6_k_ncols3_rows,mmvq_moe_fused_rows,mmvq_moe_plain_rows,turbo4_fast_f16_convert,turbo4_wht_shuffle,cuda_async_host_copy,concat_noncont_block_size,concat_noncont_flat_dim0,load_mode,cmoe_batch,cmoe_ubatch,prompt_repeat,profile_sha256,placement_sha256,power_profile,cpu_mask,cpu_poll,adapt,adapt_cuda_graphs,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,cpu_gate_up_ms,cpu_activation_ms,cpu_down_ms,cpu_async_jobs,cpu_async_wait_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
+  'config,rep,fixed_s,effective_fixed_s,warm_s,mtp_n,spec_types,ngram_mod_n_match,ngram_mod_n_min,ngram_mod_n_max,ngram_simple_size_n,ngram_simple_size_m,ngram_simple_min_hits,context,target_type_k,target_type_v,kv_q4_scale,mtp_requantize_output,turbo4_f16_prefill_min_batch,cpu_threads,draft_threads,draft_type_k,draft_type_v,draft_p_min,draft_backend_sampling,target_backend_sampling,reasoning_budget,cpu_chunk,cpu_act_parallel,cpu_async,cpu_down_prefetch,cpu_reuse_rows,cpu_multi_row,cpu_fused_gate_up,shared_hot_ids,moe_multi_fusion,moe_combine_fusion,mmvq_q8_ncols3_rows,mmvq_q6_k_ncols1_rows,mmvq_q6_k_ncols3_rows,mmvq_moe_fused_rows,mmvq_moe_plain_rows,turbo4_fast_f16_convert,turbo4_wht_shuffle,cuda_async_host_copy,sched_async_d2h_copy,concat_noncont_block_size,concat_noncont_flat_dim0,load_mode,cmoe_batch,cmoe_ubatch,prompt_repeat,profile_sha256,placement_sha256,power_profile,cpu_mask,cpu_poll,adapt,adapt_cuda_graphs,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,cpu_gate_up_ms,cpu_activation_ms,cpu_down_ms,cpu_async_jobs,cpu_async_wait_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
   > "$RUNS_CSV"
 
 PID=""
@@ -283,7 +295,7 @@ for config in "${CONFIGS[@]}"; do
         lookahead_file="$RESULTS_DIR/$stem.lookahead-%r.json"
 
         EFFECTIVE_SPEC_TYPES="${SPEC_TYPES_OVERRIDE:-draft-mtp}"
-        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N spec_types=$EFFECTIVE_SPEC_TYPES ngram_mod=$NGRAM_MOD_N_MATCH/$NGRAM_MOD_N_MIN/$NGRAM_MOD_N_MAX ngram_simple=$NGRAM_SIMPLE_SIZE_N/$NGRAM_SIMPLE_SIZE_M/$NGRAM_SIMPLE_MIN_HITS context=$CONTEXT target_kv=$TARGET_TYPE_K/$TARGET_TYPE_V q4_scale=$KV_Q4_SCALE mtp_output=$MTP_REQUANTIZE_OUTPUT turbo4_f16_min_batch=${TURBO4_F16_PREFILL_MIN_BATCH:-compile-default} batch=$CMOE_BATCH/$CMOE_UBATCH prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V turbo4_mtp=$TURBO4_MTP_EXPERIMENTAL turbo4_v=$TURBO4_V_EXPERIMENTAL turbo4_q8_layers=${TURBO4_Q8_FALLBACK_LAYERS:-none} pmin=${DRAFT_P_MIN:-default} draft_backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING target_backend_sampling=$TARGET_BACKEND_SAMPLING reasoning_budget=$REASONING_BUDGET cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS cpu_multi_row=$CPU_MULTI_ROW cpu_fused_gate_up=$CPU_FUSED_GATE_UP shared_hot_ids=$SHARED_HOT_IDS moe_multi_fusion=$MOE_MULTI_FUSION moe_combine_fusion=$MOE_COMBINE_FUSION mmvq_q8_ncols3_rows=$MMVQ_Q8_NCOLS3_ROWS mmvq_q6_k_ncols1_rows=$MMVQ_Q6_K_NCOLS1_ROWS mmvq_q6_k_ncols3_rows=$MMVQ_Q6_K_NCOLS3_ROWS mmvq_moe_rows=$MMVQ_MOE_FUSED_ROWS/$MMVQ_MOE_PLAIN_ROWS turbo4_convert=$TURBO4_FAST_F16_CONVERT turbo4_wht=$TURBO4_WHT_SHUFFLE async_h2d=$CUDA_ASYNC_HOST_COPY concat=$CONCAT_NONCONT_BLOCK_SIZE/$CONCAT_NONCONT_FLAT_DIM0 load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC lookahead_trace=$LOOKAHEAD_TRACE ==="
+        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N spec_types=$EFFECTIVE_SPEC_TYPES ngram_mod=$NGRAM_MOD_N_MATCH/$NGRAM_MOD_N_MIN/$NGRAM_MOD_N_MAX ngram_simple=$NGRAM_SIMPLE_SIZE_N/$NGRAM_SIMPLE_SIZE_M/$NGRAM_SIMPLE_MIN_HITS context=$CONTEXT target_kv=$TARGET_TYPE_K/$TARGET_TYPE_V q4_scale=$KV_Q4_SCALE mtp_output=$MTP_REQUANTIZE_OUTPUT turbo4_f16_min_batch=${TURBO4_F16_PREFILL_MIN_BATCH:-compile-default} batch=$CMOE_BATCH/$CMOE_UBATCH phase_prefill=${CMOE_PREFILL_BATCH:-off}/${CMOE_PREFILL_UBATCH:-off} phase_decode=${CMOE_DECODE_BATCH:-off}/${CMOE_DECODE_UBATCH:-off} prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V turbo4_mtp=$TURBO4_MTP_EXPERIMENTAL turbo4_v=$TURBO4_V_EXPERIMENTAL turbo4_q8_layers=${TURBO4_Q8_FALLBACK_LAYERS:-none} pmin=${DRAFT_P_MIN:-default} draft_backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING target_backend_sampling=$TARGET_BACKEND_SAMPLING reasoning_budget=$REASONING_BUDGET cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS cpu_multi_row=$CPU_MULTI_ROW cpu_fused_gate_up=$CPU_FUSED_GATE_UP shared_hot_ids=$SHARED_HOT_IDS moe_multi_fusion=$MOE_MULTI_FUSION moe_combine_fusion=$MOE_COMBINE_FUSION mmvq_q8_ncols3_rows=$MMVQ_Q8_NCOLS3_ROWS mmvq_q6_k_ncols1_rows=$MMVQ_Q6_K_NCOLS1_ROWS mmvq_q6_k_ncols3_rows=$MMVQ_Q6_K_NCOLS3_ROWS mmvq_moe_rows=$MMVQ_MOE_FUSED_ROWS/$MMVQ_MOE_PLAIN_ROWS turbo4_convert=$TURBO4_FAST_F16_CONVERT turbo4_wht=$TURBO4_WHT_SHUFFLE async_h2d=$CUDA_ASYNC_HOST_COPY async_d2h=$SCHED_ASYNC_D2H_COPY concat=$CONCAT_NONCONT_BLOCK_SIZE/$CONCAT_NONCONT_FLAT_DIM0 load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC lookahead_trace=$LOOKAHEAD_TRACE ==="
 
         env_args=(
             CUDA_VISIBLE_DEVICES=0
@@ -314,6 +326,7 @@ for config in "${CONFIGS[@]}"; do
             "GGML_CUDA_TURBO4_FAST_F16_CONVERT=$TURBO4_FAST_F16_CONVERT"
             "GGML_CUDA_TURBO4_WHT_SHUFFLE=$TURBO4_WHT_SHUFFLE"
             "GGML_CUDA_ASYNC_HOST_COPY=$CUDA_ASYNC_HOST_COPY"
+            "GGML_SCHED_ASYNC_D2H_COPY=$SCHED_ASYNC_D2H_COPY"
             "GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE=$CONCAT_NONCONT_BLOCK_SIZE"
             "GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=$CONCAT_NONCONT_FLAT_DIM0"
             "LLAMA_EXPERT_STATIC_NO_SYNC=$STATIC_NO_SYNC"
@@ -338,6 +351,15 @@ for config in "${CONFIGS[@]}"; do
         fi
         if [[ -n "$TURBO4_F16_PREFILL_MIN_BATCH" ]]; then
             env_args+=("GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=$TURBO4_F16_PREFILL_MIN_BATCH")
+        fi
+        if [[ -n "$CMOE_PREFILL_BATCH" || -n "$CMOE_PREFILL_UBATCH" ||
+              -n "$CMOE_DECODE_BATCH" || -n "$CMOE_DECODE_UBATCH" ]]; then
+            env_args+=(
+                "LLAMA_CMOE_PREFILL_BATCH=${CMOE_PREFILL_BATCH:-$CMOE_BATCH}"
+                "LLAMA_CMOE_PREFILL_UBATCH=${CMOE_PREFILL_UBATCH:-$CMOE_UBATCH}"
+                "LLAMA_CMOE_DECODE_BATCH=${CMOE_DECODE_BATCH:-$CMOE_BATCH}"
+                "LLAMA_CMOE_DECODE_UBATCH=${CMOE_DECODE_UBATCH:-$CMOE_UBATCH}"
+            )
         fi
         if [[ "$USE_PROFILE" == 1 ]]; then
             env_args+=("LLAMA_EXPERT_HOT=$PROFILE")
@@ -382,6 +404,18 @@ for config in "${CONFIGS[@]}"; do
             --port "$PORT"
             -a "hybrid-$config"
         )
+        if [[ -n "$DEVICE_LIST" ]]; then
+            server_args+=(--device "$DEVICE_LIST")
+        fi
+        if [[ -n "$SPLIT_MODE" ]]; then
+            server_args+=(--split-mode "$SPLIT_MODE")
+        fi
+        if [[ -n "$TENSOR_SPLIT" ]]; then
+            server_args+=(--tensor-split "$TENSOR_SPLIT")
+        fi
+        if [[ -n "$N_GPU_LAYERS" ]]; then
+            server_args+=(--gpu-layers "$N_GPU_LAYERS")
+        fi
         if [[ "$TARGET_BACKEND_SAMPLING" == 1 ]]; then
             server_args+=(-bs)
         elif [[ "$TARGET_BACKEND_SAMPLING" != 0 ]]; then
@@ -550,7 +584,7 @@ if not trace.get("records"):
 PY
         fi
 
-        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "$EFFECTIVE_SPEC_TYPES" "$NGRAM_MOD_N_MATCH" "$NGRAM_MOD_N_MIN" "$NGRAM_MOD_N_MAX" "$NGRAM_SIMPLE_SIZE_N" "$NGRAM_SIMPLE_SIZE_M" "$NGRAM_SIMPLE_MIN_HITS" "$CONTEXT" "$TARGET_TYPE_K" "$TARGET_TYPE_V" "$KV_Q4_SCALE" "$MTP_REQUANTIZE_OUTPUT" "${TURBO4_F16_PREFILL_MIN_BATCH:-compile-default}" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$TARGET_BACKEND_SAMPLING" "$REASONING_BUDGET" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$CPU_ASYNC" "$CPU_DOWN_PREFETCH" "$CPU_REUSE_ROWS" "$CPU_MULTI_ROW" "$CPU_FUSED_GATE_UP" "$SHARED_HOT_IDS" "$MOE_MULTI_FUSION" "$MOE_COMBINE_FUSION" "$MMVQ_Q8_NCOLS3_ROWS" "$MMVQ_Q6_K_NCOLS1_ROWS" "$MMVQ_Q6_K_NCOLS3_ROWS" "$MMVQ_MOE_FUSED_ROWS" "$MMVQ_MOE_PLAIN_ROWS" "$TURBO4_FAST_F16_CONVERT" "$TURBO4_WHT_SHUFFLE" "$CUDA_ASYNC_HOST_COPY" "$CONCAT_NONCONT_BLOCK_SIZE" "$CONCAT_NONCONT_FLAT_DIM0" "$LOAD_MODE" "$CMOE_BATCH" "$CMOE_UBATCH" "$PROMPT_REPEAT" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$ADAPT_CUDA_GRAPHS" "$STATIC_NO_SYNC" \
+        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "$EFFECTIVE_SPEC_TYPES" "$NGRAM_MOD_N_MATCH" "$NGRAM_MOD_N_MIN" "$NGRAM_MOD_N_MAX" "$NGRAM_SIMPLE_SIZE_N" "$NGRAM_SIMPLE_SIZE_M" "$NGRAM_SIMPLE_MIN_HITS" "$CONTEXT" "$TARGET_TYPE_K" "$TARGET_TYPE_V" "$KV_Q4_SCALE" "$MTP_REQUANTIZE_OUTPUT" "${TURBO4_F16_PREFILL_MIN_BATCH:-compile-default}" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$TARGET_BACKEND_SAMPLING" "$REASONING_BUDGET" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$CPU_ASYNC" "$CPU_DOWN_PREFETCH" "$CPU_REUSE_ROWS" "$CPU_MULTI_ROW" "$CPU_FUSED_GATE_UP" "$SHARED_HOT_IDS" "$MOE_MULTI_FUSION" "$MOE_COMBINE_FUSION" "$MMVQ_Q8_NCOLS3_ROWS" "$MMVQ_Q6_K_NCOLS1_ROWS" "$MMVQ_Q6_K_NCOLS3_ROWS" "$MMVQ_MOE_FUSED_ROWS" "$MMVQ_MOE_PLAIN_ROWS" "$TURBO4_FAST_F16_CONVERT" "$TURBO4_WHT_SHUFFLE" "$CUDA_ASYNC_HOST_COPY" "$SCHED_ASYNC_D2H_COPY" "$CONCAT_NONCONT_BLOCK_SIZE" "$CONCAT_NONCONT_FLAT_DIM0" "$LOAD_MODE" "$CMOE_BATCH" "$CMOE_UBATCH" "$PROMPT_REPEAT" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$ADAPT_CUDA_GRAPHS" "$STATIC_NO_SYNC" \
             "$response_file" "$stats_file" "$samples_file" "$log_file" >> "$RUNS_CSV" <<'PY'
 import csv
 import json
@@ -559,7 +593,7 @@ import statistics
 import sys
 from pathlib import Path
 
-config, rep, fixed_s, warm_s, mtp_n, spec_types, ngram_mod_n_match, ngram_mod_n_min, ngram_mod_n_max, ngram_simple_size_n, ngram_simple_size_m, ngram_simple_min_hits, context, target_type_k, target_type_v, kv_q4_scale, mtp_requantize_output, turbo4_f16_prefill_min_batch, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, cpu_fused_gate_up, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, turbo4_fast_f16_convert, turbo4_wht_shuffle, cuda_async_host_copy, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
+config, rep, fixed_s, warm_s, mtp_n, spec_types, ngram_mod_n_match, ngram_mod_n_min, ngram_mod_n_max, ngram_simple_size_n, ngram_simple_size_m, ngram_simple_min_hits, context, target_type_k, target_type_v, kv_q4_scale, mtp_requantize_output, turbo4_f16_prefill_min_batch, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, cpu_fused_gate_up, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, turbo4_fast_f16_convert, turbo4_wht_shuffle, cuda_async_host_copy, sched_async_d2h_copy, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
 response = json.loads(Path(response_path).read_text())
 stats_file = Path(stats_path)
 stats = json.loads(stats_file.read_text()) if stats_file.exists() else {}
@@ -594,7 +628,7 @@ total = float(stats.get("selected_total", 0) or 0)
 cold = float(stats.get("cold_hits", 0) or 0)
 
 row = [
-    config, rep, fixed_s, effective_fixed_s, warm_s, mtp_n, spec_types, ngram_mod_n_match, ngram_mod_n_min, ngram_mod_n_max, ngram_simple_size_n, ngram_simple_size_m, ngram_simple_min_hits, context, target_type_k, target_type_v, kv_q4_scale, mtp_requantize_output, turbo4_f16_prefill_min_batch, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, cpu_fused_gate_up, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, turbo4_fast_f16_convert, turbo4_wht_shuffle, cuda_async_host_copy, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, int(static_active),
+    config, rep, fixed_s, effective_fixed_s, warm_s, mtp_n, spec_types, ngram_mod_n_match, ngram_mod_n_min, ngram_mod_n_max, ngram_simple_size_n, ngram_simple_size_m, ngram_simple_min_hits, context, target_type_k, target_type_v, kv_q4_scale, mtp_requantize_output, turbo4_f16_prefill_min_batch, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, cpu_fused_gate_up, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, turbo4_fast_f16_convert, turbo4_wht_shuffle, cuda_async_host_copy, sched_async_d2h_copy, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, int(static_active),
     timings.get("prompt_per_second", 0),
     response.get("ttft_ms", 0),
     timings.get("predicted_per_second", 0),
@@ -647,7 +681,7 @@ numeric = [
     "predicted_tokens",
 ]
 with open(destination, "w", newline="") as handle:
-    fields = ["config", "repeats", "fixed_s", "effective_fixed_s", "warm_s", "mtp_n", "spec_types", "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max", "ngram_simple_size_n", "ngram_simple_size_m", "ngram_simple_min_hits", "context", "target_type_k", "target_type_v", "kv_q4_scale", "mtp_requantize_output", "turbo4_f16_prefill_min_batch", "cpu_threads", "draft_threads", "draft_type_k", "draft_type_v", "draft_p_min", "draft_backend_sampling", "target_backend_sampling", "reasoning_budget", "cpu_chunk", "cpu_act_parallel", "cpu_async", "cpu_down_prefetch", "cpu_reuse_rows", "cpu_multi_row", "cpu_fused_gate_up", "shared_hot_ids", "moe_multi_fusion", "moe_combine_fusion", "mmvq_q8_ncols3_rows", "mmvq_q6_k_ncols1_rows", "mmvq_q6_k_ncols3_rows", "mmvq_moe_fused_rows", "mmvq_moe_plain_rows", "turbo4_fast_f16_convert", "turbo4_wht_shuffle", "cuda_async_host_copy", "concat_noncont_block_size", "concat_noncont_flat_dim0", "load_mode", "cmoe_batch", "cmoe_ubatch", "prompt_repeat", "profile_sha256", "placement_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "adapt_cuda_graphs", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
+    fields = ["config", "repeats", "fixed_s", "effective_fixed_s", "warm_s", "mtp_n", "spec_types", "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max", "ngram_simple_size_n", "ngram_simple_size_m", "ngram_simple_min_hits", "context", "target_type_k", "target_type_v", "kv_q4_scale", "mtp_requantize_output", "turbo4_f16_prefill_min_batch", "cpu_threads", "draft_threads", "draft_type_k", "draft_type_v", "draft_p_min", "draft_backend_sampling", "target_backend_sampling", "reasoning_budget", "cpu_chunk", "cpu_act_parallel", "cpu_async", "cpu_down_prefetch", "cpu_reuse_rows", "cpu_multi_row", "cpu_fused_gate_up", "shared_hot_ids", "moe_multi_fusion", "moe_combine_fusion", "mmvq_q8_ncols3_rows", "mmvq_q6_k_ncols1_rows", "mmvq_q6_k_ncols3_rows", "mmvq_moe_fused_rows", "mmvq_moe_plain_rows", "turbo4_fast_f16_convert", "turbo4_wht_shuffle", "cuda_async_host_copy", "sched_async_d2h_copy", "concat_noncont_block_size", "concat_noncont_flat_dim0", "load_mode", "cmoe_batch", "cmoe_ubatch", "prompt_repeat", "profile_sha256", "placement_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "adapt_cuda_graphs", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
         "output_hashes_identical", "token_hashes_identical", "output_sha256", "token_sha256",
     ]
     writer = csv.DictWriter(handle, fieldnames=fields)
@@ -702,6 +736,7 @@ with open(destination, "w", newline="") as handle:
             "turbo4_fast_f16_convert": group[0]["turbo4_fast_f16_convert"],
             "turbo4_wht_shuffle": group[0]["turbo4_wht_shuffle"],
             "cuda_async_host_copy": group[0]["cuda_async_host_copy"],
+            "sched_async_d2h_copy": group[0]["sched_async_d2h_copy"],
             "concat_noncont_block_size": group[0]["concat_noncont_block_size"],
             "concat_noncont_flat_dim0": group[0]["concat_noncont_flat_dim0"],
             "load_mode": group[0]["load_mode"],

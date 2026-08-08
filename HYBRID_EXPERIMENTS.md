@@ -1299,3 +1299,191 @@ builds successfully for sm_61 with MMQ disabled; the GTX 1080 must still run
 its own geometry sweep. Local artifacts are under
 `/tmp/mmvq-q6-k-*20260806`. The host power profile was restored to `balanced`
 after the benchmark series.
+
+## AMD Renoir iGPU layer offload
+
+A CUDA+Vulkan build was used to test the Ryzen 7 4800H integrated Radeon as a
+secondary layer device and as a full-model device. The experiment found real
+NVIDIA VRAM savings but large throughput regressions: one leading layer on the
+iGPU reduced decode from 39.497 to 32.725 tok/s, and full iGPU execution with
+S=33 reached 10.015 tok/s. An aggressive full-GTT autofit selected S=181 and
+12.96 GiB, completed its warm-up, then stopped making progress on the measured
+request. It is therefore rejected on Renoir and remains default-off.
+
+The test also fixed fixed-hot-tensor allocation for a model whose layers all
+reside on one non-default GPU backend. Full setup, capability data, results,
+reproduction parameters, and the stronger-APU retest policy are documented in
+[`IGPU_LAYER_EXPERIMENTS.md`](IGPU_LAYER_EXPERIMENTS.md).
+
+## Compiler optimization feasibility
+
+The production build already uses O3, native CPU flags for ggml-cpu, native
+sm_75 SASS, and CUDA fast math. Separate LTO, LTO plus whole-host native, and
+LTO/native/no-semantic-interposition builds compile successfully. Six targeted
+component tests pass. The CUDA library is byte-identical between these builds,
+so any gain must come from CPU cold work or host/server overhead.
+
+After the server was stopped, a controlled 3x256 screen compared O3, LTO,
+O3+native, LTO+native, and LTO+native+no-semantic-interposition. O3 reached
+45.771 tok/s; the candidates reached 45.749, 45.760, 45.687, and 45.671 tok/s.
+All controlled outputs, token streams, MTP acceptance values, and mean accepted
+lengths were identical. None cleared the one-percent promotion gate, so O3
+remains the production compiler configuration and no 2,000-token compiler run
+was warranted. The earlier allocation failure is still not a result. Detailed
+flags, artifact paths, unsafe options, and remaining optimization priorities
+are documented in
+[`COMPILER_OPTIMIZATION_ANALYSIS.md`](COMPILER_OPTIMIZATION_ANALYSIS.md).
+
+## Asynchronous pinned scheduler split copies
+
+A target-decode-only Nsight Systems trace separated target verification,
+prefill, and MTP draft work with default-off NVTX ranges. In the target ranges,
+the dominant CUDA API wait was not the final scheduler barrier. Backtraces
+attributed the long repeated waits to synchronous H2D tensor copies at CPU to
+CUDA scheduler split boundaries. The trace contained 1,624 pinned H2D copies
+for 28 target verification steps. Of these, 1,066 copies were 196,608 bytes,
+the repeated per-layer cold contribution for the traced MTP shape.
+
+`GGML_CUDA_ASYNC_HOST_COPY=1` is a default-off CUDA backend experiment. It is
+restricted to source buffers allocated by the CUDA pinned-host buffer type and
+CPU source backends. The copy is enqueued on the destination CUDA backend
+stream, so the following graph remains ordered after the transfer without a
+host-side `cudaStreamSynchronize()`. Pageable inputs and all other backend
+pairs retain the original path.
+
+Controlled GTX 1660 Ti MTP-2 runs used the archived profile with SHA-256
+`351cf93b8776de0001f5b7a05d7a187c4a53e37ad4e1386fc678c0fdf6995b5c`,
+S=33, W=0, static no-sync, 376/376 batching, eight target and draft threads,
+Q4_0/Q4_0 target and draft KV, target and draft backend sampling, shared hot
+IDs, multi-token MoE fusion, Q8 ncols=3 rows=4, and Q6 rows=2/4.
+
+| Run length | synchronous median | asynchronous median | delta | correctness |
+| --- | ---: | ---: | ---: | --- |
+| 3 x 256 tokens | 45.458 tok/s | 46.196 tok/s | +1.62% | identical output/token hashes and MTP metrics |
+| 3 x 2,000 tokens | 47.435 tok/s | 48.335 tok/s | +1.90% | identical output/token hashes and MTP metrics |
+
+The 2K runs all produced output hash
+`69de5b7a21d279b29febdab85f4d44c0c3040804fa84f555a6bfeaf71b0b9a7a`
+and token hash
+`07abeb9a3951592b2247a6a272eacc897849b7e16029f2a4944a23afce575263`.
+MTP acceptance was 0.780269 and mean accepted length was 2.56 in both cases.
+No CUDA error, invariant failure, VRAM increase, or output divergence occurred.
+
+Artifacts:
+
+- `benchmark-results/async-host-copy-control-3x256-20260807`
+- `benchmark-results/async-host-copy-on-3x256-20260807`
+- `benchmark-results/async-host-copy-control-3x2000-20260807`
+- `benchmark-results/async-host-copy-on-3x2000-20260807`
+- `/tmp/wackmall-target-decode-20260807.nsys-rep`
+- `/tmp/wackmall-target-sync-backtrace-20260807.nsys-rep`
+
+The implementation remains opt-in globally. The local GTX 1660 Ti launcher
+enables it as a measured winner; the GTX 1080 launcher marks it as a candidate
+that still requires the same phase-matched sm_61 validation.
+
+The H2D winner was then combined with the already measured flat non-contiguous
+CONCAT kernel. Three 2,000-token runs reached 49.187, 49.129, and 49.134 tok/s,
+for a 49.134 tok/s median. This is 1.10% above the previous flat-CONCAT median
+of 48.599 tok/s and 3.58% above the phase-matched synchronous/non-flat median
+of 47.435 tok/s. Hashes and MTP metrics remained unchanged.
+
+`GGML_SCHED_ASYNC_D2H_COPY=1` tests the corresponding CUDA-to-host boundary.
+It queues the pinned readback on the source backend stream after source graph
+work and synchronizes once at the CPU consumer, replacing the old source sync
+followed by a separately synchronized copy stream. It is still exact and
+default-off. With the H2D and CONCAT winners, three Q4_0/Q4_0 2K runs reached
+49.656, 49.370, and 49.236 tok/s (49.370 median, +0.48%). Under the actual
+quality-oriented q8_0/q4_0 target KV and general production profile, the 3x256
+median changed only from 44.425 to 44.530 tok/s (+0.24%) and included one slow
+candidate outlier. It therefore did not clear the one-percent promotion gate
+and remains disabled in `start.sh` and `start1080.sh`.
+
+Additional stop decisions from this series:
+
+- S=34 was safely clamped to the effective S=33 by VRAM autofit.
+- `--poll 100` was neutral (47.176 versus 47.190 tok/s in the D2H screen).
+- Compiler LTO/native variants remain rejected; none improved on controlled O3.
+
+Additional artifacts:
+
+- `benchmark-results/async-host-copy-flat-concat-3x2000-20260807`
+- `benchmark-results/async-d2h-combined-3x2000-20260807`
+- `benchmark-results/q8q4-copy-control-3x256-20260807`
+- `benchmark-results/q8q4-copy-d2h-3x256-20260807`
+- `benchmark-results/s34-all-winners-smoke256-20260807`
+- `benchmark-results/poll100-all-winners-3x256-20260807`
+
+## Three-row Q4_K/Q5_K multi-token MoE geometry
+
+After the target-decode trace identified the fused Q4_K Gate+Up and plain
+Q5_K Down kernels as 25.22 percent of target CUDA-kernel time combined, a
+strictly launch-geometric MTP-2 probe assigned three output rows to each
+three-token block.  The experimental dispatch was limited to fused Q4_K
+Gate+Up and plain Q5_K Down.  Dot products, warp reductions, routing, and
+stores were unchanged.
+
+A one-pair 256-token smoke was hash-identical and changed decode from 47.126
+to 47.246 tok/s (+0.26 percent).  The subsequent fresh-server 3x512 screen
+produced:
+
+| Geometry | Three decode results | Median | Difference |
+| --- | --- | ---: | ---: |
+| existing two rows | 48.941, 48.942, 48.934 | 48.941 tok/s | baseline |
+| experimental three rows | 49.090, 48.979, 49.009 | 49.009 tok/s | +0.14 percent |
+
+All outputs and token streams were identical; MTP acceptance was 0.698824 and
+mean accepted length was 2.39 in every 512-token run.  The result is noise and
+does not meet the one-percent promotion gate.  No 2,000-token run was
+performed, and the experimental dispatch was removed rather than adding a
+non-winning production flag.  Artifacts are under
+`/tmp/mmvq-moe-n3-{baseline,candidate}-{1x256,3x512}-20260807*`.
+
+## Pascal DP4A single-token MMVQ tuning
+
+Official llama.cpp pull request #25479 introduces a Pascal-specific MMVQ
+parameter table and uses two rather than four warps for one-column quantized
+matrix-vector products on compute capabilities 6.1 and 6.2. This is directly
+relevant to the GTX 1080 decode path, but not to the local GTX 1660 Ti. The
+port is isolated behind the default-off CMake option:
+
+```text
+GGML_CUDA_PASCAL_MMVQ_TUNING=OFF
+```
+
+When enabled, only `DP4A <= arch < Volta` and `ncols_dst == 1` select the new
+two-warp table. Multi-column MTP verification and the existing type-specific
+row controls are unchanged. Volta, Turing, later NVIDIA GPUs, AMD, and generic
+dispatch retain their old configuration.
+
+The default-off port compiled successfully on 2026-08-08 for SM 61 with
+forced MMQ disabled. `llama-server`, `llama-cli`, and `test-backend-ops`
+linked, and `cuobjdump` confirmed SM 61 cubins. This is a build result only:
+the local SM 75 GPU cannot provide a GTX 1080 correctness or throughput
+result. The target gate is a paired OFF/ON run in separate build directories,
+followed by three fresh-server 512-token runs and only then 3x2,000 if the
+short median gains at least one percent without hash, MTP, quality, VRAM, or
+stability regression.
+
+Source reference: https://github.com/ggml-org/llama.cpp/pull/25479
+
+## CUDA block-reduce shared-memory race fix
+
+Official llama.cpp pull request #26385 fixes unsafe shared-memory reuse across
+multiple multi-warp reductions. The port adds the required synchronization in
+ordinary softmax and separate shared-memory regions for multi-stage single-row
+softmax and GroupNorm variance reduction. Expert matmul arithmetic, routing,
+MTP state, and KV formats are unchanged.
+
+The SM 75 release build passed all 255 supported targeted CUDA `SOFT_MAX`,
+`NORM`, `RMS_NORM`, and `GROUP_NORM` cases, including large softmax rows and
+CUDA-graph reuse. Eight Q4_0/Q4_0 MTP-2 screens produced identical output and
+token hashes with unchanged MTP metrics. Serial groups showed time-order
+drift; an immediately paired comparison measured 44.246 versus 44.187 tok/s
+(-0.13%). The change is retained as a correctness fix, not a throughput
+winner, and no 2,000-token performance claim is made.
+
+Artifacts remain outside the repository under
+`/tmp/block-reduce-{base,patch}-*20260808*`.
+
+Source reference: https://github.com/ggml-org/llama.cpp/pull/26385

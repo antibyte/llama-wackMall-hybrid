@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-ext.h"
 #include "src/llama-expert-tier.h"
 #include "log.h"
 #include "sampling.h"
@@ -29,6 +30,13 @@
 #include <utility>
 #include <fstream>
 
+#if defined(GGML_USE_CUDA) && __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define SERVER_CONTEXT_HAS_NVTX 1
+#else
+#define SERVER_CONTEXT_HAS_NVTX 0
+#endif
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -41,6 +49,37 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static bool server_nsys_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_NSYS_TRACE");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+struct server_nsys_range {
+    bool active;
+
+    explicit server_nsys_range(const char * name) : active(name != nullptr && server_nsys_trace_enabled()) {
+#if SERVER_CONTEXT_HAS_NVTX
+        if (active) {
+            nvtxRangePushA(name);
+        }
+#else
+        (void) name;
+        active = false;
+#endif
+    }
+
+    ~server_nsys_range() {
+#if SERVER_CONTEXT_HAS_NVTX
+        if (active) {
+            nvtxRangePop();
+        }
+#endif
+    }
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -910,6 +949,15 @@ private:
 
     int32_t n_ctx; // total context for all clients / slots
 
+    bool cmoe_phase_batching = false;
+    bool cmoe_phase_prefill  = false;
+    int32_t cmoe_prefill_batch  = 0;
+    int32_t cmoe_prefill_ubatch = 0;
+    int32_t cmoe_decode_batch   = 0;
+    int32_t cmoe_decode_ubatch  = 0;
+    int32_t cmoe_active_batch   = 0;
+    int32_t cmoe_active_ubatch  = 0;
+
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
@@ -937,6 +985,83 @@ private:
     bool sleeping = false;
 
     int64_t t_last_load_progress_ms = 0;
+
+    void configure_cmoe_phase_batching() {
+        cmoe_phase_batching = false;
+        cmoe_phase_prefill = false;
+        cmoe_active_batch = (int32_t) llama_n_batch(ctx_tgt);
+        cmoe_active_ubatch = (int32_t) llama_n_ubatch(ctx_tgt);
+
+        if (params_base.cmoe_n_batch_prefill == 0) {
+            return;
+        }
+
+        if (params_base.n_parallel != 1) {
+            SRV_WRN("%s", "cmoe phase batching disabled: only -np 1 is supported by the experimental MVP\n");
+            return;
+        }
+
+        cmoe_prefill_batch  = params_base.cmoe_n_batch_prefill;
+        cmoe_prefill_ubatch = params_base.cmoe_n_ubatch_prefill;
+        cmoe_decode_batch   = params_base.cmoe_n_batch_decode;
+        cmoe_decode_ubatch  = params_base.cmoe_n_ubatch_decode;
+
+        const int32_t max_batch  = (int32_t) llama_n_batch(ctx_tgt);
+        const int32_t max_ubatch = (int32_t) llama_n_ubatch(ctx_tgt);
+        if (cmoe_prefill_batch > max_batch || cmoe_decode_batch > max_batch ||
+                cmoe_prefill_ubatch > max_ubatch || cmoe_decode_ubatch > max_ubatch) {
+            SRV_WRN("cmoe phase batching disabled: requested phase limit exceeds context reserve %d/%d\n",
+                    max_batch, max_ubatch);
+            return;
+        }
+
+        cmoe_phase_batching = true;
+        SRV_INF("cmoe phase batching enabled: prefill=%d/%d decode=%d/%d reserve=%d/%d\n",
+                cmoe_prefill_batch, cmoe_prefill_ubatch,
+                cmoe_decode_batch, cmoe_decode_ubatch,
+                max_batch, max_ubatch);
+    }
+
+    void set_cmoe_batch_phase(bool prefill) {
+        if (!cmoe_phase_batching) {
+            cmoe_active_batch = (int32_t) llama_n_batch(ctx_tgt);
+            cmoe_active_ubatch = (int32_t) llama_n_ubatch(ctx_tgt);
+            return;
+        }
+
+        const int32_t batch = prefill ? cmoe_prefill_batch : cmoe_decode_batch;
+        const int32_t ubatch = prefill ? cmoe_prefill_ubatch : cmoe_decode_ubatch;
+        if (!llama_set_runtime_ubatch(ctx_tgt, (uint32_t) ubatch) ||
+                (ctx_dft && !llama_set_runtime_ubatch(ctx_dft, (uint32_t) ubatch))) {
+            throw std::runtime_error(string_format(
+                    "failed to activate cmoe %s batch %d/%d",
+                    prefill ? "prefill" : "decode", batch, ubatch));
+        }
+
+        if (prefill != cmoe_phase_prefill ||
+                batch != cmoe_active_batch || ubatch != cmoe_active_ubatch) {
+            SRV_INF("cmoe phase switch: %s batch=%d/%d\n",
+                    prefill ? "prefill" : "decode", batch, ubatch);
+        }
+
+        cmoe_phase_prefill = prefill;
+        cmoe_active_batch = batch;
+        cmoe_active_ubatch = ubatch;
+    }
+
+    bool cmoe_request_is_prefilling() const {
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            if (slot.state == SLOT_STATE_STARTED ||
+                    slot.state == SLOT_STATE_PROCESSING_PROMPT ||
+                    slot.state == SLOT_STATE_DONE_PROMPT) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     void destroy() {
         spec.reset();
@@ -1383,6 +1508,7 @@ private:
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
+            configure_cmoe_phase_batching();
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             batch.init(std::max(n_batch, params_base.n_parallel));
         }
@@ -2810,6 +2936,9 @@ private:
             }
         }
 
+        const bool request_is_prefilling = cmoe_request_is_prefilling();
+        set_cmoe_batch_phase(request_is_prefilling);
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -2842,9 +2971,10 @@ private:
 
         llama_batch batch_view;
         int32_t off_next = 0;
-        int32_t n_batch = llama_n_batch(ctx_tgt);
+        int32_t n_batch = cmoe_phase_batching ? cmoe_active_batch : (int32_t) llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            server_nsys_range nsys_range(request_is_prefilling ? "wackmall.target.prefill" : "wackmall.target.decode");
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -2860,7 +2990,7 @@ private:
                     off_next = off + n_tokens;
 
                     // on successful decode, restore the original batch size
-                    n_batch = llama_n_batch(ctx_tgt);
+                    n_batch = cmoe_phase_batching ? cmoe_active_batch : (int32_t) llama_n_batch(ctx_tgt);
                 } else {
                     // try again with the updated n_batch
                     continue;
@@ -3023,6 +3153,7 @@ private:
 
         // generate the actual drafts (if any)
         {
+            server_nsys_range nsys_range(spec ? "wackmall.draft" : nullptr);
             common_speculative_draft(spec.get());
         }
 
@@ -3078,8 +3209,8 @@ private:
         });
 
         // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx_tgt);
-        int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        int32_t n_batch  = cmoe_phase_batching ? cmoe_active_batch : (int32_t) llama_n_batch(ctx_tgt);
+        int32_t n_ubatch = cmoe_phase_batching ? cmoe_active_ubatch : (int32_t) llama_n_ubatch(ctx_tgt);
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;

@@ -100,6 +100,36 @@ cmake --build build-transient-sm61 -j 8 --target \
     test-expert-placement test-expert-lookahead
 ```
 
+### Optional Pascal MMVQ A/B build
+
+The port of upstream llama.cpp PR #25479 is default-off and changes only
+one-column MMVQ launch geometry on SM 61/62. Build it in a second directory;
+do not overwrite the control build:
+
+```bash
+cmake -S . -B build-pascal-tuned-sm61 -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=61 \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc-13 \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++-13 \
+    -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
+    -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13 \
+    -DGGML_CUDA_FORCE_MMQ=OFF \
+    -DGGML_CUDA_NCCL=OFF \
+    -DGGML_CUDA_PASCAL_MMVQ_TUNING=ON \
+    -DLLAMA_BUILD_TESTS=ON \
+    -DLLAMA_BUILD_UI=OFF
+
+cmake --build build-pascal-tuned-sm61 -j 8 --target \
+    llama-server llama-cli test-backend-ops
+```
+
+Run identical fresh-server OFF/ON cases. The tuned build is only a candidate:
+compile/link success was established locally, but no GTX 1080 performance
+claim exists until the target machine completes hash, MTP, quality, VRAM, and
+counterbalanced throughput checks.
+
 If CUDA 12.4 rejects GCC 13, save the complete configure error. Use another installed host compiler only after documenting the exact compiler and starting a new build directory. Never add `GGML_CUDA_FORCE_MMQ` as a workaround.
 
 Run the tests before benchmarks:
