@@ -151,6 +151,10 @@ flake.lock
 
 /benchmark-results/
 /local-profiles/
+/turboquant-samples/
+/turboquant-captures/
+/turboquant-results/
+*.kv.f32
 *.nsys-rep
 *.qdstrm
 /perf.data

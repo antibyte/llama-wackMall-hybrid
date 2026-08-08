@@ -2386,9 +2386,10 @@ struct test_set_rows : public test_case {
     const std::array<int, 2> nr23; // broadcast only dims 2 and 3
     const int r; // rows to set
     const bool v; // view (non-contiguous src1)
+    const bool weighted_q4;
 
     std::string vars() override {
-        return VARS_TO_STR7(type_src, type_dst, type_idx, ne, nr23, r, v);
+        return VARS_TO_STR8(type_src, type_dst, type_idx, ne, nr23, r, v, weighted_q4);
     }
 
     test_set_rows(ggml_type type_src,
@@ -2396,8 +2397,8 @@ struct test_set_rows : public test_case {
             ggml_type type_idx,
             std::array<int64_t, 4> ne,
             std::array<int, 2> nr23,
-            int r, bool v = false)
-        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v) {}
+            int r, bool v = false, bool weighted_q4 = false)
+        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v), weighted_q4(weighted_q4) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * dst = ggml_new_tensor_4d(ctx, type_dst, ne[0], ne[1], ne[2]*nr23[0], ne[3]*nr23[1]);
@@ -2415,7 +2416,8 @@ struct test_set_rows : public test_case {
             ggml_set_name(row_idxs, "view_of_rows");
         }
 
-        ggml_tensor * out = ggml_set_rows(ctx, dst, src, row_idxs);
+        const uint32_t flags = weighted_q4 ? GGML_SET_ROWS_FLAG_Q4_0_WEIGHTED_SCALE : GGML_SET_ROWS_FLAG_NONE;
+        ggml_tensor * out = ggml_set_rows_ext(ctx, dst, src, row_idxs, flags);
         ggml_set_name(out, "out");
 
         return out;
@@ -2437,7 +2439,8 @@ struct test_set_rows : public test_case {
     double max_nmse_err() override {
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
             type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_TURBO4_K) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-1,1], so it'll be
             // roughly (2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -8126,6 +8129,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_I32, { 256, 5, 2, 3 }, { 1, 1 }, 3, false, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_I64, { 256, 11, 1, 2 }, { 2, 3 }, 7, true, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO4_K, GGML_TYPE_I32, { 256, 5, 2, 3 }, { 1, 1 }, 3, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO4_K, GGML_TYPE_I64, { 256, 11, 1, 2 }, { 2, 3 }, 7, true));
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type : all_types) {
             for (int b : {1, 7}) {

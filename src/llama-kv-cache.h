@@ -263,6 +263,10 @@ private:
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
+    // env: LLAMA_KV_Q4_SCALE
+    bool q4_weighted_scale_k = false;
+    bool q4_weighted_scale_v = false;
+
     // set when a k_idx (indexer) cache exists and the stream layout supports MSA (single seq, or one stream per seq)
     bool msa_strict_slots = false;
 

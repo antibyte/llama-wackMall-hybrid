@@ -112,6 +112,7 @@ static bool g_cpu_async = false;
 static int  g_cpu_down_prefetch = 0;
 static bool g_cpu_reuse_rows = false;
 static bool g_cpu_multi_row = false;
+static bool g_cpu_fused_gate_up = false;
 static bool g_shared_hot_ids = false;
 static bool g_static_no_sync_requested = false;
 static bool g_static_no_sync_active = false;
@@ -1810,6 +1811,15 @@ void init(const llama_model & model) {
         }
         g_cpu_multi_row = value == 1;
     }
+    if (const char * fused = getenv("LLAMA_EXPERT_CPU_FUSED_GATE_UP")) {
+        int value = 0;
+        if (!parse_nonnegative_int(fused, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_FUSED_GATE_UP='%s'; expected 0 or 1\n",
+                    __func__, fused);
+            return;
+        }
+        g_cpu_fused_gate_up = value == 1;
+    }
     if (const char * shared = getenv("LLAMA_EXPERT_SHARED_HOT_IDS")) {
         int value = 0;
         if (!parse_nonnegative_int(shared, value) || value > 1) {
@@ -1824,6 +1834,7 @@ void init(const llama_model & model) {
     ggml_cpu_moe_set_down_prefetch(g_cpu_down_prefetch);
     ggml_cpu_moe_set_reuse_rows(g_cpu_reuse_rows);
     ggml_cpu_moe_set_multi_row(g_cpu_multi_row);
+    ggml_cpu_moe_set_fused_gate_up(g_cpu_fused_gate_up);
     ggml_cpu_moe_set_async(g_cpu_async);
     ggml_cpu_moe_async_stats_reset();
     ggml_cpu_moe_profile_reset();
@@ -2319,10 +2330,10 @@ void init(const llama_model & model) {
         TIER_LOG("%s: CUDA graph caching during adaptation: %s\n", __func__,
                 g_mutable_disabled_cuda_graphs ? "disabled" : "enabled (experimental)");
     }
-    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s; down prefetch: %d; row reuse: %s; multi-row AVX2: %s; shared hot IDs: %s; async overlap: %s\n",
+    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s; down prefetch: %d; row reuse: %s; multi-row AVX2: %s; fused Gate/Up AVX2: %s; shared hot IDs: %s; async overlap: %s\n",
             __func__, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "on" : "off",
             g_cpu_down_prefetch, g_cpu_reuse_rows ? "on" : "off", g_cpu_multi_row ? "on" : "off",
-            g_shared_hot_ids ? "on" : "off", g_cpu_async ? "on" : "off");
+            g_cpu_fused_gate_up ? "on" : "off", g_shared_hot_ids ? "on" : "off", g_cpu_async ? "on" : "off");
     if (g_W > 0) {
         if (g_warm_admission == warm_admission_mode::frequency) {
             TIER_LOG("%s: warm admission frequency window=%d graphs\n", __func__, g_warm_admission_window);

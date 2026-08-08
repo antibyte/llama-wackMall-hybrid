@@ -143,6 +143,8 @@ extern "C" {
     GGML_BACKEND_API bool ggml_cpu_moe_get_reuse_rows(void);
     GGML_BACKEND_API void ggml_cpu_moe_set_multi_row(bool enabled);
     GGML_BACKEND_API bool ggml_cpu_moe_get_multi_row(void);
+    GGML_BACKEND_API void ggml_cpu_moe_set_fused_gate_up(bool enabled);
+    GGML_BACKEND_API bool ggml_cpu_moe_get_fused_gate_up(void);
     typedef bool (*ggml_cpu_moe_transient_gate_up_claim_fn)(
             int layer, int expert, int token, int64_t n_ff);
     typedef bool (*ggml_cpu_moe_transient_gate_up_fetch_fn)(

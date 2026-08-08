@@ -1,7 +1,10 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "turbo4-k.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
@@ -80,6 +83,253 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
     NO_DEVICE_CODE;
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
 }
+
+#ifdef GGML_CUDA_TURBO4_F16_PREFILL
+static int ggml_cuda_turbo4_fast_f16_convert_mode() {
+    static const int mode = []() {
+        const char * value = std::getenv("GGML_CUDA_TURBO4_FAST_F16_CONVERT");
+        if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+            return 0;
+        }
+        if (std::strcmp(value, "1") == 0) {
+            return 1;
+        }
+        if (std::strcmp(value, "2") == 0) {
+            return 2;
+        }
+        {
+            GGML_LOG_WARN(
+                "invalid GGML_CUDA_TURBO4_FAST_F16_CONVERT='%s'; using 0\n", value);
+            return 0;
+        }
+    }();
+    return mode;
+}
+
+template <bool need_check>
+static __global__ void dequantize_block_turbo4_f16_fast(
+        const block_turbo4_k * __restrict__ x,
+        half * __restrict__ y,
+        const int64_t k) {
+    constexpr int warps_per_block = CUDA_DEQUANTIZE_BLOCK_SIZE / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int64_t ib = int64_t(blockIdx.x)*warps_per_block + warp;
+    const int64_t i0 = ib*QK_TURBO4_K;
+
+    if (need_check && i0 >= k) {
+        return;
+    }
+
+    const float norm = __shfl_sync(0xffffffff, lane == 0 ? __half2float(x[ib].norm) : 0.0f, 0);
+    const uint16_t packed = *reinterpret_cast<const uint16_t *>(x[ib].qs + 2*lane);
+    const uint8_t packed0 = packed & 0xff;
+    const uint8_t packed1 = packed >> 8;
+
+    half2 * y2 = reinterpret_cast<half2 *>(y + i0);
+    y2[2*lane + 0] = __float22half2_rn(make_float2(
+        norm*turbo4_k_centroids_cuda[ packed0       & 0x0f],
+        norm*turbo4_k_centroids_cuda[(packed0 >> 4) & 0x0f]));
+    y2[2*lane + 1] = __float22half2_rn(make_float2(
+        norm*turbo4_k_centroids_cuda[ packed1       & 0x0f],
+        norm*turbo4_k_centroids_cuda[(packed1 >> 4) & 0x0f]));
+}
+
+static void dequantize_block_turbo4_f16_fast_cuda(
+        const void * __restrict__ vx,
+        half * __restrict__ y,
+        const int64_t k,
+        cudaStream_t stream) {
+    GGML_ASSERT(k % QK_TURBO4_K == 0);
+    constexpr int warps_per_block = CUDA_DEQUANTIZE_BLOCK_SIZE / WARP_SIZE;
+    const int64_t n_quant_blocks = k / QK_TURBO4_K;
+    const int num_blocks = (n_quant_blocks + warps_per_block - 1) / warps_per_block;
+
+    if (n_quant_blocks % warps_per_block == 0) {
+        dequantize_block_turbo4_f16_fast<false><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+            static_cast<const block_turbo4_k *>(vx), y, k);
+    } else {
+        dequantize_block_turbo4_f16_fast<true><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+            static_cast<const block_turbo4_k *>(vx), y, k);
+    }
+}
+
+static __global__ void dequantize_block_turbo4_f16_fast_nc(
+        const block_turbo4_k * __restrict__ x,
+        half * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne0203,
+        const uint3 ne02,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03) {
+    constexpr int warps_per_block = 2;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int64_t blocks_per_row = ne00 / QK_TURBO4_K;
+    const int64_t ib_row = int64_t(blockIdx.x)*warps_per_block + warp;
+
+    if (ib_row >= blocks_per_row) {
+        return;
+    }
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t) i0203, ne02);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+            const int64_t ib = i03*s03 + i02*s02 + i01*s01 + ib_row;
+            const int64_t i0 = ((i0203*ne01 + i01)*ne00) + ib_row*QK_TURBO4_K;
+
+            const float norm = __shfl_sync(0xffffffff, lane == 0 ? __half2float(x[ib].norm) : 0.0f, 0);
+            const uint16_t packed = *reinterpret_cast<const uint16_t *>(x[ib].qs + 2*lane);
+            const uint8_t packed0 = packed & 0xff;
+            const uint8_t packed1 = packed >> 8;
+            half2 * y2 = reinterpret_cast<half2 *>(y + i0);
+
+            y2[2*lane + 0] = __float22half2_rn(make_float2(
+                norm*turbo4_k_centroids_cuda[ packed0       & 0x0f],
+                norm*turbo4_k_centroids_cuda[(packed0 >> 4) & 0x0f]));
+            y2[2*lane + 1] = __float22half2_rn(make_float2(
+                norm*turbo4_k_centroids_cuda[ packed1       & 0x0f],
+                norm*turbo4_k_centroids_cuda[(packed1 >> 4) & 0x0f]));
+        }
+    }
+}
+
+static void dequantize_block_turbo4_f16_fast_nc_cuda(
+        const void * x,
+        half * y,
+        int64_t ne00,
+        int64_t ne01,
+        int64_t ne02,
+        int64_t ne03,
+        int64_t s01,
+        int64_t s02,
+        int64_t s03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_TURBO4_K == 0);
+    constexpr int warps_per_block = 2;
+    const int64_t blocks_per_row = ne00 / QK_TURBO4_K;
+    const int64_t ne0203 = ne02*ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks(
+        (blocks_per_row + warps_per_block - 1) / warps_per_block,
+        (int) std::min(ne01, (int64_t) 65535),
+        (int) std::min(ne0203, (int64_t) 65535));
+    dequantize_block_turbo4_f16_fast_nc<<<num_blocks, warps_per_block*WARP_SIZE, 0, stream>>>(
+        static_cast<const block_turbo4_k *>(x), y,
+        ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
+template <bool need_check>
+static __global__ void dequantize_block_turbo4_f16_2warp(
+        const block_turbo4_k * __restrict__ x,
+        half * __restrict__ y,
+        const int64_t k) {
+    constexpr int threads_per_quant_block = 2*WARP_SIZE;
+    constexpr int quant_blocks_per_cuda_block = CUDA_DEQUANTIZE_BLOCK_SIZE / threads_per_quant_block;
+    const int local_quant_block = threadIdx.x / threads_per_quant_block;
+    const int byte = threadIdx.x % threads_per_quant_block;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int64_t ib = int64_t(blockIdx.x)*quant_blocks_per_cuda_block + local_quant_block;
+    const int64_t i0 = ib*QK_TURBO4_K;
+
+    if (need_check && i0 >= k) {
+        return;
+    }
+
+    const float norm = __shfl_sync(0xffffffff, lane == 0 ? __half2float(x[ib].norm) : 0.0f, 0);
+    const uint8_t packed = x[ib].qs[byte];
+    reinterpret_cast<half2 *>(y + i0)[byte] = __float22half2_rn(make_float2(
+        norm*turbo4_k_centroids_cuda[ packed       & 0x0f],
+        norm*turbo4_k_centroids_cuda[(packed >> 4) & 0x0f]));
+}
+
+static void dequantize_block_turbo4_f16_2warp_cuda(
+        const void * __restrict__ vx,
+        half * __restrict__ y,
+        const int64_t k,
+        cudaStream_t stream) {
+    GGML_ASSERT(k % QK_TURBO4_K == 0);
+    constexpr int quant_blocks_per_cuda_block = CUDA_DEQUANTIZE_BLOCK_SIZE / (2*WARP_SIZE);
+    const int64_t n_quant_blocks = k / QK_TURBO4_K;
+    const int num_blocks = (n_quant_blocks + quant_blocks_per_cuda_block - 1) / quant_blocks_per_cuda_block;
+
+    if (n_quant_blocks % quant_blocks_per_cuda_block == 0) {
+        dequantize_block_turbo4_f16_2warp<false><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+            static_cast<const block_turbo4_k *>(vx), y, k);
+    } else {
+        dequantize_block_turbo4_f16_2warp<true><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+            static_cast<const block_turbo4_k *>(vx), y, k);
+    }
+}
+
+static __global__ void dequantize_block_turbo4_f16_2warp_nc(
+        const block_turbo4_k * __restrict__ x,
+        half * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne0203,
+        const uint3 ne02,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03) {
+    constexpr int threads_per_quant_block = 2*WARP_SIZE;
+    constexpr int quant_blocks_per_cuda_block = 2;
+    const int local_quant_block = threadIdx.x / threads_per_quant_block;
+    const int byte = threadIdx.x % threads_per_quant_block;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int64_t blocks_per_row = ne00 / QK_TURBO4_K;
+    const int64_t ib_row = int64_t(blockIdx.x)*quant_blocks_per_cuda_block + local_quant_block;
+
+    if (ib_row >= blocks_per_row) {
+        return;
+    }
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t) i0203, ne02);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+            const int64_t ib = i03*s03 + i02*s02 + i01*s01 + ib_row;
+            const int64_t i0 = ((i0203*ne01 + i01)*ne00) + ib_row*QK_TURBO4_K;
+
+            const float norm = __shfl_sync(0xffffffff, lane == 0 ? __half2float(x[ib].norm) : 0.0f, 0);
+            const uint8_t packed = x[ib].qs[byte];
+            reinterpret_cast<half2 *>(y + i0)[byte] = __float22half2_rn(make_float2(
+                norm*turbo4_k_centroids_cuda[ packed       & 0x0f],
+                norm*turbo4_k_centroids_cuda[(packed >> 4) & 0x0f]));
+        }
+    }
+}
+
+static void dequantize_block_turbo4_f16_2warp_nc_cuda(
+        const void * x,
+        half * y,
+        int64_t ne00,
+        int64_t ne01,
+        int64_t ne02,
+        int64_t ne03,
+        int64_t s01,
+        int64_t s02,
+        int64_t s03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_TURBO4_K == 0);
+    constexpr int quant_blocks_per_cuda_block = 2;
+    const int64_t blocks_per_row = ne00 / QK_TURBO4_K;
+    const int64_t ne0203 = ne02*ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks(
+        (blocks_per_row + quant_blocks_per_cuda_block - 1) / quant_blocks_per_cuda_block,
+        (int) std::min(ne01, (int64_t) 65535),
+        (int) std::min(ne0203, (int64_t) 65535));
+    dequantize_block_turbo4_f16_2warp_nc<<<num_blocks, quant_blocks_per_cuda_block*2*WARP_SIZE, 0, stream>>>(
+        static_cast<const block_turbo4_k *>(x), y,
+        ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+#endif
 
 template<typename dst_t>
 static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
@@ -527,6 +777,14 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
                 return dequantize_block_q8_0_f16_cuda;
             }
             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+#ifdef GGML_CUDA_TURBO4_F16_PREFILL
+        case GGML_TYPE_TURBO4_K:
+            switch (ggml_cuda_turbo4_fast_f16_convert_mode()) {
+                case 1: return dequantize_block_turbo4_f16_fast_cuda;
+                case 2: return dequantize_block_turbo4_f16_2warp_cuda;
+                default: return dequantize_block_cont_cuda<QK_TURBO4_K, 1, dequantize_turbo4_k_rotated, half>;
+            }
+#endif
         case GGML_TYPE_Q2_K:
             return dequantize_row_q2_K_cuda;
         case GGML_TYPE_Q3_K:
@@ -639,6 +897,14 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+#ifdef GGML_CUDA_TURBO4_F16_PREFILL
+        case GGML_TYPE_TURBO4_K:
+            switch (ggml_cuda_turbo4_fast_f16_convert_mode()) {
+                case 1: return dequantize_block_turbo4_f16_fast_nc_cuda;
+                case 2: return dequantize_block_turbo4_f16_2warp_nc_cuda;
+                default: return dequantize_block_cuda<QK_TURBO4_K, 1, dequantize_turbo4_k_rotated, half>;
+            }
+#endif
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:

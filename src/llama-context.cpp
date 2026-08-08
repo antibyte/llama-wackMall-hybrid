@@ -17,6 +17,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -3562,6 +3563,36 @@ llama_context * llama_init_from_model(
         }
         if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
             LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
+            return nullptr;
+        }
+    }
+
+    const bool turbo4_k = params.type_k == GGML_TYPE_TURBO4_K;
+    const bool turbo4_v = params.type_v == GGML_TYPE_TURBO4_K;
+    if (turbo4_k || turbo4_v) {
+        const char * turbo4_v_env = std::getenv("LLAMA_TURBO4_V_EXPERIMENTAL");
+        if (turbo4_v && !(turbo4_v_env != nullptr && std::strcmp(turbo4_v_env, "1") == 0)) {
+            LLAMA_LOG_ERROR("%s: experimental turbo4_k V requires LLAMA_TURBO4_V_EXPERIMENTAL=1\n", __func__);
+            return nullptr;
+        }
+        if (turbo4_k && params.type_v != GGML_TYPE_Q8_0 && !turbo4_v) {
+            LLAMA_LOG_ERROR("%s: experimental turbo4_k K requires q8_0 or turbo4_k V cache\n", __func__);
+            return nullptr;
+        }
+        if (turbo4_v && params.type_k != GGML_TYPE_Q8_0 && !turbo4_k) {
+            LLAMA_LOG_ERROR("%s: experimental turbo4_k V requires q8_0 or turbo4_k K cache\n", __func__);
+            return nullptr;
+        }
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            LLAMA_LOG_ERROR("%s: experimental turbo4_k requires flash_attn enabled\n", __func__);
+            return nullptr;
+        }
+        if (!params.offload_kqv) {
+            LLAMA_LOG_ERROR("%s: experimental turbo4_k requires KQV offload\n", __func__);
+            return nullptr;
+        }
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            LLAMA_LOG_ERROR("%s: experimental turbo4_k is disabled for MTP contexts\n", __func__);
             return nullptr;
         }
     }

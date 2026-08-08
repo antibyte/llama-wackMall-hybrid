@@ -24,6 +24,10 @@ See [HYBRID_EXPERIMENTS.md](HYBRID_EXPERIMENTS.md) for measured runs and rejecte
 | `tools/simulate_expert_streaming.py` | Routing-trace Oracle and predictor replay under measured costs |
 | `tools/expert-transport-bench/` | CUDA transport, staging, mapped-read, and overlap microbenchmark |
 | `tools/expert-compute-bench/` | Resident per-expert GPU compute microbenchmark |
+| `tools/turboquant-ref/` | Offline Turbo3/Turbo4 codec and raw float32 row quality analyzer |
+| `tools/turboquant-capture/` | Deterministic post-RoPE Q/K capture for offline codec evaluation |
+| `tools/turboquant-ref/simulate-triattention.py` | Non-mutating KV eviction and causal heavy-hitter simulator |
+| `IK_LLAMA_EXPERIMENTS.md` | ik_llama concept audit, measured gates, and rejected imports |
 | `GTX1080_HANDOFF.md` | Native SM 61 build, measurement, replay, and gate procedure |
 | `scripts/collect_expert_profiles.sh` | Reproducible profile collection over the included JSONL corpus |
 | `scripts/bench_hybrid.sh` | Fresh-process warm-up and repeated 2,000-token benchmark runner |
@@ -31,6 +35,289 @@ See [HYBRID_EXPERIMENTS.md](HYBRID_EXPERIMENTS.md) for measured runs and rejecte
 | `tests/test-expert-placement.cpp` | Placement manifest validation tests |
 
 Generated builds, local profiles, model files, traces, and `benchmark-results/` are intentionally excluded by `.gitignore`.
+
+TurboQuant Phase 1 is the offline reference and capture suite. Later phases
+add experimental, default-off SM75 target Turbo4 K and target Turbo4 V paths.
+Neither is enabled by the stable start scripts; MTP requires an additional
+explicit guard. See
+[`TURBOQUANT_ANALYSIS.md`](TURBOQUANT_ANALYSIS.md),
+[`TURBOQUANT_DESIGN.md`](TURBOQUANT_DESIGN.md), and
+[`TURBOQUANT_EXPERIMENTS.md`](TURBOQUANT_EXPERIMENTS.md) before attempting a
+runtime use.
+
+Build the phase-1 tools without changing the inference runtime:
+
+```bash
+cmake -S . -B build-turbo-ref -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=OFF \
+    -DLLAMA_BUILD_TESTS=ON \
+    -DLLAMA_BUILD_TOOLS=ON \
+    -DLLAMA_BUILD_SERVER=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_UI=OFF
+
+cmake --build build-turbo-ref -j 8 \
+    --target llama-turboquant-ref test-turboquant-ref
+```
+
+The capture executable needs the ordinary native CUDA build. Always run an
+identical no-capture control first. The capture directory must not exist:
+
+```bash
+CAPTURE=/tmp/turboquant-qk-capture-01
+
+./build-hybrid/bin/llama-turboquant-capture \
+    -m "$MODEL" -f "$PROMPT" -c 4096 -b 128 -ub 128 \
+    -ctk q8_0 -ctv q8_0 -n 8 --seed 1234 --temp 0 \
+    --capture-dir "$CAPTURE" --capture-max-tokens 256
+
+python3 tools/turboquant-ref/analyze-capture.py \
+    --capture-dir "$CAPTURE" \
+    --analyzer build-hybrid/bin/llama-turboquant-ref \
+    --output /tmp/turboquant-qk-metrics.json
+```
+
+Compare the generated token IDs and FNV-1a hash printed by control and capture.
+The analyzer validates every manifest dimension and file size, measures K-only
+reconstruction, and evaluates each captured query against all causally visible
+keys. Raw captures and metric JSON files are local artifacts and must not be
+committed.
+
+For attention-output diagnostics, add `--capture-values`. This enables a
+capture-only materialized pre-attention V tensor; the ordinary graph remains
+unchanged when the option is absent. Always compare its token hash with both
+the no-capture and Q/K-only controls.
+
+Long captures can also be evaluated without modifying the KV cache. The
+Qwen3.6 model used here rotates only 64 of its 256 head dimensions, so
+`--rope-dims 64` is required. NumPy is the only additional dependency.
+
+```bash
+python3 tools/turboquant-ref/simulate-triattention.py \
+    --capture-dir /tmp/turboquant-qk-long \
+    --output /tmp/kv-eviction-simulation.json \
+    --train-tokens 4096 --eval-tokens 128 \
+    --history-tokens 128 --recent-window 128 \
+    --budgets 1024,2048,3072 \
+    --rope-theta 10000000 --rope-dims 64 \
+    --attention-output
+```
+
+The output compares recency, norm-only selection, Atomic-style
+TriAttention scoring, a causal past-attention heavy-hitter score, and a
+future-looking oracle. The oracle is an unattainable upper bound. With
+`--attention-output`, a capture containing V tensors also reports normalized
+RMSE, relative L2 error, and cosine similarity for the reconstructed attention
+output after renormalizing the retained positions. This remains an offline
+F32 proxy, not a downstream-logit or quality result. No physical KV eviction
+is enabled by this tool.
+
+Recursive JSON also includes per-layer metrics plus
+`squared_error_sum`/`squared_reference_sum`. These allow selective-layer error
+to be combined without incorrectly averaging layer RMSE values.
+
+For the replay-only logit gate, first create a capture with an exact prompt
+prefix and raw final logits:
+
+```bash
+./build-hybrid/bin/llama-turboquant-capture \
+    -m "$MODEL" -f "$PROMPT" -c 2560 -b 256 -ub 256 \
+    -ctk q8_0 -ctv q8_0 -fa on -cmoe --offline -n 1 \
+    --prompt-max-tokens 2304 --capture-max-tokens 2304 --capture-values \
+    --capture-dir /tmp/qkv-prefix --dump-final-logits /tmp/baseline.f32
+
+python3 tools/turboquant-ref/simulate-triattention.py \
+    --capture-dir /tmp/qkv-prefix --output /tmp/replay-simulation.json \
+    --train-tokens 2176 --eval-tokens 128 --history-tokens 128 \
+    --recent-window 128 --budgets 2048 --rope-dims 64 \
+    --attention-output --export-replay-dir /tmp/replay-layer39 \
+    --export-replay-layer 39 --export-replay-policy history_attention_global
+```
+
+Run the same prefix with `--attention-replay /tmp/replay-layer39` and a new
+`--dump-final-logits` path, then compare it with:
+
+```bash
+python3 tools/turboquant-ref/compare-logits.py \
+    --reference /tmp/baseline.f32 --candidate /tmp/replay.f32 \
+    --output /tmp/logit-comparison.json
+```
+
+For a multi-position gate without changing the 256-token batch geometry, dump
+the final 128 prompt rows in both runs:
+
+```bash
+--dump-logits-window /tmp/baseline-window.f32 --logits-window-start 2176
+```
+
+The tool writes a guarded JSON sidecar with row count, vocabulary width,
+prompt hash, and token offset. `compare-logits.py` detects the sidecars and
+reports per-row plus aggregate L2, KL, Top-1, and Top-10 metrics. The simulator
+also exports `attention-keep.u8`. It can be tested against actual Q8/Q8
+FlashAttention with the diagnostic-only option:
+
+```bash
+--attention-live-mask /tmp/replay-layer39 \
+--dump-logits-window /tmp/live-window.f32 --logits-window-start 2176
+```
+
+Add `--attention-live-mask-continue` only for a no-MTP, single-sequence
+autoregressive diagnostic. It reapplies the same fixed old-prefix mask to each
+later decode graph and verifies the number of callback applications. This
+synchronous mode is for quality comparison, not throughput measurement.
+
+Replay and live-mask modes are mutually exclusive and confined to this
+diagnostic executable. The live mask duplicates the selected layer's causal
+mask and only adds `-inf` for exported evictions; it does not delete or compact
+KV entries and is not available in `llama-server`. The manifest binds model
+path and size, prompt-token hash, context, batch, ubatch, and cache types.
+Mismatches abort before prompt evaluation. A zero-delta replay must be
+byte-identical to its baseline.
+
+Add `--recursive` to model repeated pruning where an evicted position cannot
+return. In recursive mode the first prune occurs at `budget + recent-window`
+and evaluation continues in `recent-window` increments. `--recursive-max-events`
+provides a bounded smoke test.
+
+```bash
+python3 tools/turboquant-ref/simulate-triattention.py \
+    --capture-dir /tmp/turboquant-qk-long \
+    --output /tmp/heavy-hitter-recursive.json \
+    --recursive --budgets 2048 \
+    --history-tokens 128 --recent-window 128
+```
+
+The Phase 2 runtime is an explicit diagnostic only:
+
+```bash
+./build-hybrid/bin/llama-turboquant-capture \
+    -m "$MODEL" -p "fft in c" -c 4096 -b 128 -ub 128 \
+    -ctk turbo4_k -ctv q8_0 -fa on -cmoe \
+    --offline --seed 1234 --temp 0 -n 128
+```
+
+Do not use `turbo4_k` for draft KV, FlashAttention-off operation, or CPU KQV.
+Target V is a separate experiment and requires
+`LLAMA_TURBO4_V_EXPERIMENTAL=1`. Target Turbo4 with the existing draft-mtp
+path additionally requires `LLAMA_TURBO4_MTP_EXPERIMENTAL=1`; other
+speculative methods stay rejected. Use a fresh Q8/Q8 control process with
+identical inputs and compare hashes, quality, acceptance, and median timing.
+An optional faster prompt/verify path can be built with:
+
+```bash
+cmake -S . -B build-turbo-sm75 -G Ninja \
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=75 \
+    -DGGML_CUDA_TURBO4_F16_PREFILL=ON \
+    -DGGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=32
+```
+
+This option uses existing FP16 tile/MMA attention for larger prompt batches,
+while stored K remains Turbo4 and decode remains on the float-centroid vector
+path. The configurable minimum batch defaults to 32 so small prompt fragments
+stay on the native Turbo4 path. A build with this option can override the
+crossover per process with `GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH`; values
+must be measured per GPU and MTP width. It improved
+the local 2,747-token Prompt-TPS median by 0.40% over Q8/Q8. Target-only MTP-2
+has completed repeatable 32K and 64K tests plus 2,000-token long runs, but this
+is still not a production recommendation: broader quality data, rollback/state
+tests, and SM61 validation remain outstanding. Do not enable
+`GGML_CUDA_TURBO4_KQ_DP4A`; it did not improve SM75 throughput.
+
+Run the no-MTP perplexity and KL quality matrix on an external representative
+corpus with:
+
+```bash
+QUALITY_PROMPT_SOURCE=/absolute/path/to/corpus.txt \
+PPL="$PWD/build-turbo-sm75/bin/llama-perplexity" \
+MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" \
+PROFILE="$HOME/models/qwen3.6-35b-a3b-mtp/luce-warmstart.csv" \
+TURBO4_Q8_FALLBACK_LAYERS="23,35,27" \
+scripts/bench_turboquant_quality.sh
+```
+
+The runner refuses to overwrite results and compares Q8/Q8, Q8/Q4, Q4/Q8,
+Q4/Q4, Turbo4/Q8, Q8/Turbo4, and Turbo4/Turbo4 against one saved Q8/Q8 logit
+reference. Its default 1,024-token context requires a corpus that tokenizes to
+at least 2,048 tokens. If `TURBO4_Q8_FALLBACK_LAYERS` is non-empty, it also
+evaluates that mixed Turbo4/Q8-layer policy. The example IDs are local
+measurements, not defaults.
+
+An experimental per-layer Q8 K fallback can be selected only with Turbo4 K:
+
+```bash
+LLAMA_TURBO4_Q8_FALLBACK_LAYERS="23,35" \
+    ./build-turbo-sm75/bin/llama-cli ... -ctk turbo4_k -ctv q8_0
+```
+
+The value accepts comma-separated layer IDs and inclusive ranges such as
+`3,7,11-15`. It is empty by default, validates every ID against the loaded
+model, and currently rejects cache sharing or layer reuse. Layer choices must
+come from measured quality data; the example IDs are not a built-in policy.
+
+For the first guarded MTP smoke test, compress only the target K cache. The
+draft context retains its separately configured Q8/Q4 cache:
+
+```bash
+LLAMA_TURBO4_MTP_EXPERIMENTAL=1 \
+LLAMA_TURBO4_Q8_FALLBACK_LAYERS="23,35,27" \
+GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=2 \
+    ./build-turbo-sm75/bin/llama-server \
+    ... -ctk turbo4_k -ctv q8_0 \
+    --spec-type draft-mtp --spec-draft-n-max 2 \
+    --spec-draft-type-k q8_0 --spec-draft-type-v q4_0
+```
+
+The flag does not enable Turbo4 in the MTP draft context. The runtime crossover
+of 2 made MTP-2 and MTP-3 hash-identical in the local short geometry screen;
+MTP-1 remained numerically distinct. MTP-2 was fastest. At 64K, three
+512-token runs reached a 39.077 token/s median versus 38.416 for Q8/Q8 while
+retaining S=27 instead of S=25, and a single 2,000-token pair favored Turbo4
+38.241 versus 37.425 token/s. Keep the flag absent from production scripts
+until rollback/state and broader long-context quality tests pass.
+
+For the symmetric target-cache experiment:
+
+```bash
+LLAMA_TURBO4_V_EXPERIMENTAL=1 \
+LLAMA_TURBO4_MTP_EXPERIMENTAL=1 \
+GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=2 \
+    ./build-turbo-sm75/bin/llama-server \
+    ... -ctk turbo4_k -ctv turbo4_k \
+    --spec-type draft-mtp --spec-draft-n-max 2 \
+    --spec-draft-type-k q8_0 --spec-draft-type-v q4_0
+```
+
+On the local GTX 1660 Ti, Turbo4/Turbo4 retained S=33 instead of Q8/Q8 S=30
+at 32K, but the 2,000-token rates were effectively tied (39.634 versus
+39.541 token/s). At 64K it retained S=30 instead of S=25; the three-run
+512-token median was 39.956 versus 38.416 token/s, and one 2,000-token run was
+38.852 versus 37.425. The small quality corpus measured +1.58% PPL, mean KLD
+0.02801, and 91.585% same-top-token agreement relative to Q8/Q8. This is a
+capacity/performance option with a measurable quality cost, not a new default.
+The 32K/64K figures reserve those context sizes but do not fill them with an
+active long prompt. Native SM61 and active-long-context validation remain.
+
+Two additional ik_llama-inspired experiments are available but remain
+default-off:
+
+```bash
+# Low-perplexity Q4_0 block-scale experiment. Values: legacy, weighted,
+# weighted-k, weighted-v. Production-compatible default: legacy.
+LLAMA_KV_Q4_SCALE=weighted-k
+
+# Create a smaller additional output matrix for MTP only. Values: none, q4_K,
+# q5_K. The original output remains authoritative for the target graph.
+LLAMA_MTP_REQUANTIZE_OUTPUT=q4_K
+```
+
+The MTP-only tensor consumes additional VRAM; lower fixed expert slots if
+allocation fails. On the GTX 1660 Ti its isolated gain was below one percent
+and the lost expert residency made it unattractive. See
+[`IK_LLAMA_EXPERIMENTS.md`](IK_LLAMA_EXPERIMENTS.md) for quality metrics,
+three-run medians, and the native-SM61 test gate. Neither variable is enabled
+by the stable start scripts.
 
 ## 1. Requirements
 
@@ -205,6 +492,13 @@ and output stability. Larger-memory GPUs should include 512, 1024, and the
 upstream 2048/512 logical/physical defaults in that sweep.
 
 Change `--spec-draft-n-max` to 1 or 3 for MTP-1/MTP-3, or remove all `--spec-*` options for a no-MTP control. Always compare token/output hashes and MTP acceptance, not throughput alone.
+
+The benchmark runner can screen the already-supported self-speculative chain
+without changing the production launcher. For example,
+`SPEC_TYPES_OVERRIDE=ngram-mod,draft-mtp` enables N-gram fallback ahead of
+MTP; `NGRAM_MOD_N_MATCH`, `NGRAM_MOD_N_MIN`, and `NGRAM_MOD_N_MAX` bound it.
+The GTX 1660 Ti screens did not find a winner, so `start.sh` intentionally
+keeps MTP-2 alone.
 
 ### Experimental hot-ID and MoE kernel fusion
 
@@ -582,12 +876,20 @@ Key portable controls:
 | `LLAMA_EXPERT_STATIC_NO_SYNC` | 0 | Skip only the expert-tier update barrier under strict immutable-tier conditions |
 | `LLAMA_EXPERT_CPU_REUSE_ROWS` | 0 | Reuse quantized cold rows across repeated MTP expert selections |
 | `LLAMA_EXPERT_CPU_MULTI_ROW` | 0 | AVX2 Q4_K/Q5_K multi-row dots for repeated MTP expert selections; implies row-oriented traversal |
+| `LLAMA_EXPERT_CPU_FUSED_GATE_UP` | 0 | Experimental AVX2 Q4_K dual-dot sharing Q8_K activation loads between CPU-Cold Gate and Up; neutral on GTX 1660 Ti, retest on CPU-bound hosts |
 | `LLAMA_EXPERT_SHARED_HOT_IDS` | 0 | Reuse one hot-slot ID mapping for Gate, Up, and Down in a layer |
 | `GGML_CUDA_MOE_MULTI_FUSION` | 0 | Fuse quantized Gate+Up+GLU for two to four MoE target tokens on Turing or newer GPUs |
 | `GGML_CUDA_MOE_COMBINE_FUSION` | 0 | Fuse exact F32 post-Down expert weighting and ordered Top-k reduction; experimental |
 | `GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS` | 0 | Override rows/block for non-ID Q8_0 three-column MMVQ (`1`, `2`, or `4`); `0` preserves automatic selection |
 | `GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS` | 0 | Override rows/block for plain non-ID Q6_K one-column MMVQ (`1`, `2`, or `4`) |
 | `GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS` | 0 | Override rows/block for plain non-ID Q6_K three-column MMVQ (`1`, `2`, or `4`) |
+| `GGML_CUDA_MMVQ_MOE_FUSED_ROWS` | 0 | Tune rows/block (`1`, `2`, or `4`) for fused multi-token MoE Gate+Up; zero retains the current two-row default |
+| `GGML_CUDA_MMVQ_MOE_PLAIN_ROWS` | 0 | Tune rows/block (`1`, `2`, or `4`) for plain multi-token MoE Down; zero retains the current two-row default |
+| `GGML_CUDA_TURBO4_FAST_F16_CONVERT` | 0 | Experimental Turbo4-to-F16 converter schedule (`1` one warp/block, `2` two warps/block); both were slower on SM75 |
+| `GGML_CUDA_TURBO4_WHT_SHUFFLE` | 0 | Experimental shuffle-first Turbo4 WHT; neutral/slower on SM75 |
+| `GGML_CUDA_ASYNC_HOST_COPY` | 0 | Queue pinned CPU-to-CUDA scheduler split copies on the destination compute stream; measured winner for local MTP-2 |
+| `GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE` | 0 | Non-contiguous CONCAT block override (`32`, `64`, `128`, `256`); zero keeps the CUDA default |
+| `GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0` | 0 | Use the flat dim-0 non-contiguous CONCAT kernel; measured winner for local MTP-2 |
 | `LLAMA_EXPERT_CPU_ASYNC` | 0 | Experimental CPU-cold/GPU-hot overlap; benchmark before use |
 
 The benchmark runner also accepts `CONTEXT`, `TARGET_TYPE_K`, and `TARGET_TYPE_V`. Their defaults remain `32768`, `q4_0`, and `q4_0` so existing benchmark commands retain their behavior.

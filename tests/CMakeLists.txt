@@ -291,9 +291,34 @@ target_include_directories(test-expert-lookahead PRIVATE ../src)
 target_compile_features(test-expert-lookahead PRIVATE cxx_std_17)
 llama_test(test-expert-lookahead)
 
+add_executable(test-turboquant-ref
+    test-turboquant-ref.cpp
+    ../tools/turboquant-ref/turboquant-ref.cpp
+)
+target_include_directories(test-turboquant-ref PRIVATE ../tools/turboquant-ref ../ggml/include ../ggml/src)
+target_link_libraries(test-turboquant-ref PRIVATE ggml-base)
+target_compile_features(test-turboquant-ref PRIVATE cxx_std_17)
+llama_test(test-turboquant-ref)
+
+add_executable(test-turboquant-layer-policy
+    test-turboquant-layer-policy.cpp
+)
+target_include_directories(test-turboquant-layer-policy PRIVATE ../src)
+target_compile_features(test-turboquant-layer-policy PRIVATE cxx_std_17)
+llama_test(test-turboquant-layer-policy)
+
+add_executable(test-kv-q4-scale
+    test-kv-q4-scale.cpp
+)
+target_include_directories(test-kv-q4-scale PRIVATE ../ggml/src)
+target_link_libraries(test-kv-q4-scale PRIVATE ggml-base)
+target_compile_features(test-kv-q4-scale PRIVATE cxx_std_17)
+llama_test(test-kv-q4-scale)
+
 add_executable(test-moe-multi-row
     test-moe-multi-row.cpp
 )
+target_include_directories(test-moe-multi-row PRIVATE ../ggml/src ../ggml/src/ggml-cpu)
 target_link_libraries(test-moe-multi-row PRIVATE ggml)
 target_compile_features(test-moe-multi-row PRIVATE cxx_std_17)
 llama_test(test-moe-multi-row)

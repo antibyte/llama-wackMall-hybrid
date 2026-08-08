@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -40,6 +41,11 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
 };
+
+static bool turbo4_mtp_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_MTP_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
     std::string result;
@@ -2269,6 +2275,18 @@ common_speculative_init_result::common_speculative_init_result(
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     GGML_ASSERT(has_draft || spec_mtp);
+
+    if (params.cache_type_k == GGML_TYPE_TURBO4_K || params.cache_type_v == GGML_TYPE_TURBO4_K) {
+        const bool mtp_only = spec_mtp &&
+            std::all_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type type) {
+                return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
+            });
+        if (!turbo4_mtp_experimental_enabled() || !mtp_only) {
+            LOG_ERR("%s: target turbo4_k speculative decoding requires draft-mtp only and "
+                    "LLAMA_TURBO4_MTP_EXPERIMENTAL=1\n", __func__);
+            return;
+        }
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);

@@ -2,12 +2,14 @@
 
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-kv-layer-policy.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -98,6 +100,41 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;
+
+    if (const char * value = std::getenv("LLAMA_KV_Q4_SCALE")) {
+        const bool weighted   = std::strcmp(value, "weighted") == 0;
+        const bool weighted_k = std::strcmp(value, "weighted-k") == 0;
+        const bool weighted_v = std::strcmp(value, "weighted-v") == 0;
+        if (value[0] != '\0' && std::strcmp(value, "legacy") != 0 && !weighted && !weighted_k && !weighted_v) {
+            throw std::invalid_argument(
+                "LLAMA_KV_Q4_SCALE must be legacy, weighted, weighted-k, or weighted-v");
+        }
+        q4_weighted_scale_k = (weighted || weighted_k) && type_k == GGML_TYPE_Q4_0;
+        q4_weighted_scale_v = (weighted || weighted_v) && type_v == GGML_TYPE_Q4_0;
+    }
+    if (q4_weighted_scale_k || q4_weighted_scale_v) {
+        LLAMA_LOG_WARN("%s: experimental weighted Q4_0 scale enabled for %s%s\n", __func__,
+            q4_weighted_scale_k ? "K" : "", q4_weighted_scale_v ? "V" : "");
+    }
+
+    std::vector<uint8_t> turbo4_q8_fallback(n_layer, 0);
+    size_t n_turbo4_q8_fallback = 0;
+    if (const char * value = std::getenv("LLAMA_TURBO4_Q8_FALLBACK_LAYERS")) {
+        // A process can own a Turbo4 target context and a Q8/Q4 MTP draft
+        // context. The process-wide fallback policy applies only to Turbo4 K;
+        // the common CLI validates that the target configuration is Turbo4.
+        if (value[0] != '\0' && type_k == GGML_TYPE_TURBO4_K) {
+            if (other || reuse || share) {
+                throw std::invalid_argument(
+                    "Turbo4 per-layer Q8 fallback does not support cache sharing or layer reuse yet");
+            }
+            turbo4_q8_fallback = llama_kv_layer_policy::parse_layer_set(value, n_layer);
+            n_turbo4_q8_fallback = std::count(turbo4_q8_fallback.begin(), turbo4_q8_fallback.end(), uint8_t(1));
+            LLAMA_LOG_WARN(
+                "%s: experimental Turbo4 Q8 fallback enabled for %zu layer(s): %s\n",
+                __func__, n_turbo4_q8_fallback, value);
+        }
+    }
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -228,7 +265,8 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        const ggml_type type_k_layer = turbo4_q8_fallback[il] ? GGML_TYPE_Q8_0 : type_k;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k_layer, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
@@ -316,7 +354,8 @@ llama_kv_cache::llama_kv_cache(
 
         constexpr float mib = 1024.0f * 1024.0f;
 
-        const std::string k_log = format(", K (%s): %7.2f MiB", ggml_type_name(type_k), (float) memory_size_k / mib);
+        const char * k_type_log = n_turbo4_q8_fallback ? "mixed turbo4_k/q8_0" : ggml_type_name(type_k);
+        const std::string k_log = format(", K (%s): %7.2f MiB", k_type_log, (float) memory_size_k / mib);
         const std::string v_log = format(", V (%s): %7.2f MiB", ggml_type_name(type_v), (float) memory_size_v / mib);
 
         std::string k_idx_log;
@@ -1454,7 +1493,10 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    const uint32_t flags = q4_weighted_scale_k && k->type == GGML_TYPE_Q4_0
+        ? GGML_SET_ROWS_FLAG_Q4_0_WEIGHTED_SCALE
+        : GGML_SET_ROWS_FLAG_NONE;
+    return ggml_set_rows_ext(ctx, k, k_cur, k_idxs, flags);
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1489,7 +1531,10 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
+        const uint32_t flags = q4_weighted_scale_v && v->type == GGML_TYPE_Q4_0
+            ? GGML_SET_ROWS_FLAG_Q4_0_WEIGHTED_SCALE
+            : GGML_SET_ROWS_FLAG_NONE;
+        return ggml_set_rows_ext(ctx, v, v_cur, v_idxs, flags);
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {

@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "turbo4-k.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -217,6 +218,153 @@ static void set_rows_cuda(
     }
 }
 
+template <typename idx_t>
+__launch_bounds__(QK_TURBO4_K)
+static __global__ void k_set_rows_turbo4_k(
+        const float * __restrict__ src0,
+        const idx_t * __restrict__ src1,
+        block_turbo4_k * __restrict__ dst,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne02,
+        const int64_t ne10,
+        const int64_t ne11,
+        const int64_t ne12,
+        const int64_t ne13,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const int64_t s10,
+        const int64_t s11,
+        const int64_t s12,
+        const int64_t s1,
+        const int64_t s2,
+        const int64_t s3) {
+    const int j = threadIdx.x;
+    const int64_t n_blocks_per_row = ne00 / QK_TURBO4_K;
+    const int64_t flat_block = blockIdx.x;
+    const int64_t i_block = flat_block % n_blocks_per_row;
+    int64_t tmp = flat_block / n_blocks_per_row;
+    const int64_t i01 = tmp % ne01;
+    tmp /= ne01;
+    const int64_t i02 = tmp % ne02;
+    const int64_t i03 = tmp / ne02;
+
+    const int64_t i12 = i03 % ne12;
+    const int64_t i11 = i02 % ne11;
+    const int64_t i10 = i01;
+
+    ggml_cuda_pdl_sync();
+    const int64_t dst_row = src1[i10*s10 + i11*s11 + i12*s12];
+    ggml_cuda_pdl_lc();
+
+    const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
+    block_turbo4_k * dst_row_ptr = (block_turbo4_k *) ((char *) dst + dst_row*s1 + i02*s2 + i03*s3);
+    block_turbo4_k * block = dst_row_ptr + i_block;
+
+    __shared__ float values[QK_TURBO4_K];
+    __shared__ float warp_sums[QK_TURBO4_K / WARP_SIZE];
+    values[j] = src_row[i_block*QK_TURBO4_K + j];
+    __syncthreads();
+
+    float sum = values[j] * values[j];
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    }
+    if (j % WARP_SIZE == 0) {
+        warp_sums[j / WARP_SIZE] = sum;
+    }
+    __syncthreads();
+
+    __shared__ float source_norm;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int warp = 0; warp < QK_TURBO4_K / WARP_SIZE; ++warp) {
+            total += warp_sums[warp];
+        }
+        source_norm = sqrtf(total);
+    }
+    __syncthreads();
+
+    const float inv_norm = source_norm > 1e-10f ? 1.0f / source_norm : 0.0f;
+    values[j] *= inv_norm * (float) turbo4_k_signs_first_cuda[j];
+    __syncthreads();
+
+#define TURBO4_K_WHT_STAGE(width)                                                                                 \
+    if (j % (2*(width)) < (width)) {                                                                              \
+        const float a = values[j];                                                                                 \
+        const float b = values[j + (width)];                                                                       \
+        values[j] = a + b;                                                                                         \
+        values[j + (width)] = a - b;                                                                               \
+    }                                                                                                              \
+    __syncthreads()
+
+    TURBO4_K_WHT_STAGE(1);
+    TURBO4_K_WHT_STAGE(2);
+    TURBO4_K_WHT_STAGE(4);
+    TURBO4_K_WHT_STAGE(8);
+    TURBO4_K_WHT_STAGE(16);
+    TURBO4_K_WHT_STAGE(32);
+    TURBO4_K_WHT_STAGE(64);
+#undef TURBO4_K_WHT_STAGE
+
+    values[j] *= 0.08838834764831845f * (float) turbo4_k_signs_second_cuda[j];
+    const uint8_t index = turbo4_k_nearest_cuda(values[j]);
+    const uint8_t partner = (uint8_t) __shfl_xor_sync(0xffffffff, (int) index, 1);
+    if (j % 2 == 0) {
+        block->qs[j / 2] = (uint8_t) (index | (partner << 4));
+    }
+
+    sum = turbo4_k_centroids_cuda[index] * turbo4_k_centroids_cuda[index];
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    }
+    if (j % WARP_SIZE == 0) {
+        warp_sums[j / WARP_SIZE] = sum;
+    }
+    __syncthreads();
+
+    if (j == 0) {
+        float total = 0.0f;
+        for (int warp = 0; warp < QK_TURBO4_K / WARP_SIZE; ++warp) {
+            total += warp_sums[warp];
+        }
+        const float reconstructed_norm = sqrtf(total);
+        const float corrected_norm = reconstructed_norm > 1e-10f ? source_norm / reconstructed_norm : source_norm;
+        block->norm = __float2half(corrected_norm);
+        block->reserved = __float2half(0.0f);
+    }
+
+    GGML_UNUSED(ne10);
+    GGML_UNUSED(ne13);
+}
+
+template <typename idx_t>
+static void set_rows_cuda_turbo4_k(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ne00 % QK_TURBO4_K == 0);
+
+    const int64_t n_blocks = ne00 / QK_TURBO4_K;
+    const int64_t n_total = n_blocks * ne01 * ne02 * ne03;
+    if (n_total == 0) {
+        return;
+    }
+
+    k_set_rows_turbo4_k<idx_t><<<(int) n_total, QK_TURBO4_K, 0, ctx.stream()>>>(
+        (const float *) src0->data,
+        (const idx_t *) src1->data,
+        (block_turbo4_k *) dst->data,
+        ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+        nb01 / sizeof(float), nb02 / sizeof(float), nb03 / sizeof(float),
+        nb10 / sizeof(idx_t), nb11 / sizeof(idx_t), nb12 / sizeof(idx_t),
+        nb1, nb2, nb3);
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
@@ -225,9 +373,12 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     GGML_TENSOR_BINARY_OP_LOCALS
 
     cudaStream_t stream = ctx.stream();
+    const uint32_t flags = (uint32_t) dst->op_params[0];
 
 
-    if (dst->type == GGML_TYPE_F32) {
+    if (dst->type == GGML_TYPE_TURBO4_K) {
+        set_rows_cuda_turbo4_k<idx_t>(ctx, src0, src1, dst);
+    } else if (dst->type == GGML_TYPE_F32) {
         set_rows_cuda(
             src0_d, src1_d, (float*)dst->data,
             ne00, ne01, ne02, ne03,
@@ -258,15 +409,27 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q4_0) {
-        set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
-            src0_d, src1_d, (block_q4_0*)dst->data,
-            ne00, ne01, ne02, ne03,
-            ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03,
-            nb10, nb11, nb12,
-            nb1, nb2, nb3,
-            stream
-        );
+        if (flags & GGML_SET_ROWS_FLAG_Q4_0_WEIGHTED_SCALE) {
+            set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_weighted_block>(
+                src0_d, src1_d, (block_q4_0*)dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        } else {
+            set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
+                src0_d, src1_d, (block_q4_0*)dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        }
     } else if (dst->type == GGML_TYPE_Q4_1) {
         set_rows_cuda_quant<idx_t, block_q4_1, QK4_1, quantize_f32_q4_1_block>(
             src0_d, src1_d, (block_q4_1*)dst->data,

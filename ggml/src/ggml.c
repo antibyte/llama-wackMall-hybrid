@@ -689,6 +689,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
     },
+    [GGML_TYPE_TURBO4_K] = {
+        .type_name                = "turbo4_k",
+        .blck_size                = QK_TURBO4_K,
+        .type_size                = sizeof(block_turbo4_k),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_k,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_k_ref,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -1086,6 +1094,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "TURBO4_WHT",
 
     "UNARY",
 
@@ -1103,7 +1112,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1202,6 +1211,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "turbo4_wht(x)",
 
     "unary(x)",
 
@@ -1219,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
 static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
@@ -4032,11 +4042,12 @@ struct ggml_tensor * ggml_get_rows_back(
 
 // ggml_set_rows
 
-struct ggml_tensor * ggml_set_rows(
+struct ggml_tensor * ggml_set_rows_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
-        struct ggml_tensor  * c) {
+        struct ggml_tensor  * c,
+                 uint32_t     flags) {
     GGML_ASSERT(a->ne[0] == b->ne[0]);
     GGML_ASSERT(a->ne[2] == b->ne[2]);
     GGML_ASSERT(a->ne[3] == b->ne[3]);
@@ -4056,8 +4067,17 @@ struct ggml_tensor * ggml_set_rows(
     result->src[0] = b;
     result->src[1] = c;
     result->src[2] = a; // note: order is weird due to legacy reasons (https://github.com/ggml-org/llama.cpp/pull/16063#discussion_r2385795931)
+    ggml_set_op_params_i32(result, 0, (int32_t) flags);
 
     return result;
+}
+
+struct ggml_tensor * ggml_set_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    return ggml_set_rows_ext(ctx, a, b, c, GGML_SET_ROWS_FLAG_NONE);
 }
 
 // ggml_diag
@@ -5492,6 +5512,22 @@ struct ggml_tensor * ggml_arange(
 
     result->op = GGML_OP_ARANGE;
 
+    return result;
+}
+
+// ggml_turbo4_wht
+
+struct ggml_tensor * ggml_turbo4_wht(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->ne[0] % QK_TURBO4_K == 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    ggml_set_op_params_i32(result, 0, 0);
+    result->op = GGML_OP_TURBO4_WHT;
+    result->src[0] = a;
     return result;
 }
 
@@ -8035,6 +8071,7 @@ size_t ggml_quantize_chunk(
     switch (type) {
         case GGML_TYPE_Q1_0:    result = quantize_q1_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO4_K: result = quantize_turbo4_k(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

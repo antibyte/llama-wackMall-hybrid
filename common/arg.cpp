@@ -311,7 +311,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_1,
 };
 
-static ggml_type kv_cache_type_from_str(const std::string & s) {
+static ggml_type kv_cache_type_from_str(const std::string & s, bool allow_experimental_turbo4_k = false) {
+    if (allow_experimental_turbo4_k && s == ggml_type_name(GGML_TYPE_TURBO4_K)) {
+        return GGML_TYPE_TURBO4_K;
+    }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
@@ -320,10 +323,13 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     throw std::runtime_error("Unsupported cache type: " + s);
 }
 
-static std::string get_all_kv_cache_types() {
+static std::string get_all_kv_cache_types(bool allow_experimental_turbo4_k = false) {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
         msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+    }
+    if (allow_experimental_turbo4_k) {
+        msg << ", " << ggml_type_name(GGML_TYPE_TURBO4_K);
     }
     return msg.str();
 }
@@ -356,6 +362,24 @@ static bool spec_types_is_default(const common_params & params) {
     return params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE};
 }
 
+static bool turbo4_mtp_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_MTP_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static bool turbo4_v_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_V_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static bool spec_types_is_mtp_only(const common_params & params) {
+    const auto & types = params.speculative.types;
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() &&
+        std::all_of(types.begin(), types.end(), [](common_speculative_type type) {
+            return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
+        });
+}
+
 common_models_handler common_models_handler_init(const common_params & params, llama_example curr_ex) {
     common_download_hf_plan plan;
     common_download_hf_plan plan_spec;
@@ -373,6 +397,35 @@ common_models_handler common_models_handler_init(const common_params & params, l
     const bool spec_type_draft_eagle3 = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params.speculative.types.end();
+
+    const bool turbo4_k = params.cache_type_k == GGML_TYPE_TURBO4_K;
+    const bool turbo4_v = params.cache_type_v == GGML_TYPE_TURBO4_K;
+    if (turbo4_k || turbo4_v) {
+        if (turbo4_v && !turbo4_v_experimental_enabled()) {
+            throw std::invalid_argument(
+                "experimental turbo4_k target V requires LLAMA_TURBO4_V_EXPERIMENTAL=1");
+        }
+        if (turbo4_k && params.cache_type_v != GGML_TYPE_Q8_0 && !turbo4_v) {
+            throw std::invalid_argument("experimental turbo4_k target K requires q8_0 or turbo4_k target V");
+        }
+        if (turbo4_v && params.cache_type_k != GGML_TYPE_Q8_0 && !turbo4_k) {
+            throw std::invalid_argument("experimental turbo4_k target V requires q8_0 or turbo4_k target K");
+        }
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            throw std::invalid_argument("experimental turbo4_k requires --flash-attn on");
+        }
+        if (!spec_types_is_default(params) &&
+            !(turbo4_mtp_experimental_enabled() && spec_types_is_mtp_only(params))) {
+            throw std::invalid_argument(
+                "experimental turbo4_k with MTP requires draft-mtp only and "
+                "LLAMA_TURBO4_MTP_EXPERIMENTAL=1");
+        }
+    } else if (const char * value = std::getenv("LLAMA_TURBO4_Q8_FALLBACK_LAYERS")) {
+        if (value[0] != '\0') {
+            throw std::invalid_argument(
+                "LLAMA_TURBO4_Q8_FALLBACK_LAYERS requires target K type turbo4_k");
+        }
+    }
 
     // only download mmproj if the current example is using it
     bool use_mmproj = false;
@@ -2395,11 +2448,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for K\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(true).c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            params.cache_type_k = kv_cache_type_from_str(value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -2408,11 +2461,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for V\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(true).c_str(),
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_v = kv_cache_type_from_str(value);
+            params.cache_type_v = kv_cache_type_from_str(value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(

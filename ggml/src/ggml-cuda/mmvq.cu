@@ -16,10 +16,10 @@ static int get_rows_override(const char * name) {
         return 0;
     }
     const int parsed = std::atoi(env);
-    if (parsed == 1 || parsed == 2 || parsed == 4) {
+    if (parsed == 0 || parsed == 1 || parsed == 2 || parsed == 4) {
         return parsed;
     }
-    std::fprintf(stderr, "ggml_cuda: ignoring invalid %s='%s' (expected 1, 2, or 4)\n", name, env);
+    std::fprintf(stderr, "ggml_cuda: ignoring invalid %s='%s' (expected 0, 1, 2, or 4)\n", name, env);
     return 0;
 }
 
@@ -40,6 +40,20 @@ static int get_q6_k_ncols1_rows_override() {
 static int get_q6_k_ncols3_rows_override() {
     static const int value = [] {
         return get_rows_override("GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS");
+    }();
+    return value;
+}
+
+static int get_moe_fused_rows_override() {
+    static const int value = [] {
+        return get_rows_override("GGML_CUDA_MMVQ_MOE_FUSED_ROWS");
+    }();
+    return value;
+}
+
+static int get_moe_plain_rows_override() {
+    static const int value = [] {
+        return get_rows_override("GGML_CUDA_MMVQ_MOE_PLAIN_ROWS");
     }();
     return value;
 }
@@ -876,8 +890,8 @@ static void mul_mat_vec_q_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
-template <ggml_type type, bool has_fusion>
-static void mul_mat_vec_q_moe_launch(
+template <ggml_type type, bool has_fusion, int rows_per_block>
+static void mul_mat_vec_q_moe_launch_rows(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
@@ -885,7 +899,6 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst);
     const dim3 block_dims(warp_size, ncols_dst);
@@ -896,6 +909,52 @@ static void mul_mat_vec_q_moe_launch(
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
         ncols_dst, ids_stride);
+}
+
+template <ggml_type type, bool has_fusion>
+static void mul_mat_vec_q_moe_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride,
+        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+
+    const int rows_override = has_fusion ? get_moe_fused_rows_override() : get_moe_plain_rows_override();
+    if (rows_override != 0 && rows_override != 2) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            std::fprintf(stderr,
+                    "ggml_cuda: %s multi-token MoE MMVQ rows/block override active: %d (default 2)\n",
+                    has_fusion ? "fused" : "plain", rows_override);
+        }
+    }
+
+    switch (rows_override) {
+        case 1:
+            mul_mat_vec_q_moe_launch_rows<type, has_fusion, 1>(
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            break;
+        case 4:
+            mul_mat_vec_q_moe_launch_rows<type, has_fusion, 4>(
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            break;
+        case 0:
+        case 2:
+        default:
+            mul_mat_vec_q_moe_launch_rows<type, has_fusion, 2>(
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            break;
+    }
 }
 
 template <ggml_type type>

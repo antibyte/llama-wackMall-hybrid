@@ -53,6 +53,7 @@
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/turbo4-wht.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -3225,6 +3226,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
             break;
+        case GGML_OP_TURBO4_WHT:
+            ggml_cuda_turbo4_wht(ctx, dst);
+            break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -3617,6 +3621,30 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    static const bool async_host_copy = getenv("GGML_CUDA_ASYNC_HOST_COPY") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_ASYNC_HOST_COPY")) != 0;
+
+    // Scheduler split inputs allocated in the CUDA host buffer are page-locked
+    // and remain alive until their copy slot is reused. Enqueue their H2D copy
+    // on the destination compute stream so the following graph is ordered after
+    // the copy without a host-side cudaStreamSynchronize().
+    if (async_host_copy &&
+        ggml_backend_dev_type(ggml_backend_get_device(backend_src)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+        ggml_backend_is_cuda(backend_dst) &&
+        ggml_backend_buft_is_cuda_host(buf_src->buft) &&
+        ggml_backend_buffer_is_cuda(buf_dst)) {
+        ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+        ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+
+        if (cuda_ctx_dst->device != buf_ctx_dst->device) {
+            return false;
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst),
+                cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+        return true;
+    }
 
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
@@ -6171,7 +6199,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                               (op->type == GGML_TYPE_TURBO4_K && op->ne[0] % QK_TURBO4_K == 0)) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
@@ -6179,6 +6208,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        ) &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
+        case GGML_OP_TURBO4_WHT:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) && op->src[0]->ne[0] % QK_TURBO4_K == 0;
         case GGML_OP_SET:
             {
                 const ggml_type t = op->type;

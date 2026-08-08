@@ -73,6 +73,7 @@ static atomic_bool g_moe_parallel_activation;
 static atomic_int g_moe_down_prefetch;
 static atomic_bool g_moe_reuse_rows;
 static atomic_bool g_moe_multi_row;
+static atomic_bool g_moe_fused_gate_up;
 static _Atomic(ggml_cpu_moe_transient_gate_up_claim_fn) g_moe_transient_gate_up_claim;
 static _Atomic(ggml_cpu_moe_transient_gate_up_fetch_fn) g_moe_transient_gate_up_fetch;
 static atomic_bool g_moe_transient_gate_up_verify;
@@ -153,6 +154,14 @@ void ggml_cpu_moe_set_multi_row(bool enabled) {
 
 bool ggml_cpu_moe_get_multi_row(void) {
     return atomic_load_explicit(&g_moe_multi_row, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_fused_gate_up(bool enabled) {
+    atomic_store_explicit(&g_moe_fused_gate_up, enabled, memory_order_relaxed);
+}
+
+bool ggml_cpu_moe_get_fused_gate_up(void) {
+    return atomic_load_explicit(&g_moe_fused_gate_up, memory_order_relaxed);
 }
 
 void ggml_cpu_moe_set_transient_gate_up(
@@ -364,6 +373,10 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q2_0,
         .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_K] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo4_k_ref,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q4_0] = {
@@ -2200,6 +2213,8 @@ static void ggml_compute_forward_moe_cold(
     const bool reuse_rows = ggml_cpu_moe_get_reuse_rows() || multi_row;
     const bool multi_gate_up = multi_row && type_g == GGML_TYPE_Q4_K;
     const bool multi_down = multi_row && type_d == GGML_TYPE_Q5_K;
+    const bool fused_gate_up = ggml_cpu_moe_get_fused_gate_up() &&
+            type_g == GGML_TYPE_Q4_K && ggml_cpu_has_avx2();
     const bool verify_transient = atomic_load_explicit(&g_moe_transient_gate_up_verify, memory_order_acquire);
 
     // quantize x once, shared by all experts
@@ -2339,8 +2354,13 @@ static void ggml_compute_forward_moe_cold(
                         } else {
                             float * gout = gate_out + (col0[cur_a] + c)*n_ff;
                             float * uout = up_out   + (col0[cur_a] + c)*n_ff;
-                            vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
-                            vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                            if (fused_gate_up) {
+                                ggml_vec_dot_q4_K_q8_K_pair(ne_embd, &gout[i], &uout[i],
+                                        wg + i*w_gate->nb[1], wu + i*w_up->nb[1], xcol);
+                            } else {
+                                vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
+                                vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                            }
                         }
                         c += run;
                     }
@@ -2357,8 +2377,13 @@ static void ggml_compute_forward_moe_cold(
                     for (int64_t i = ir0_start; i < ir0_end; i++) {
                         __builtin_prefetch(wg + (i + 1)*w_gate->nb[1], 0, 3);
                         __builtin_prefetch(wu + (i + 1)*w_up->nb[1], 0, 3);
-                        vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
-                        vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                        if (fused_gate_up) {
+                            ggml_vec_dot_q4_K_q8_K_pair(ne_embd, &gout[i], &uout[i],
+                                    wg + i*w_gate->nb[1], wu + i*w_up->nb[1], xcol);
+                        } else {
+                            vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
+                            vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                        }
                     }
                 }
             }
@@ -3020,6 +3045,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_TURBO4_WHT:
+            {
+                GGML_ABORT("GGML_OP_TURBO4_WHT requires the CUDA backend");
+            }
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");

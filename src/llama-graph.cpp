@@ -2494,6 +2494,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 
+    if (k->type == GGML_TYPE_TURBO4_K) {
+        if (!ggml_is_contiguous(q)) {
+            q = ggml_cont(ctx0, q);
+        }
+        q = ggml_turbo4_wht(ctx0, q);
+        cb(q, "Qcur_turbo4_wht", il);
+    }
+
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
@@ -2525,6 +2533,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+        // Turbo4 V is stored and accumulated in the randomized WHT domain.
+        // Restore the normal value-head basis exactly once after attention.
+        if (v->type == GGML_TYPE_TURBO4_K) {
+            if (!ggml_is_contiguous(cur)) {
+                cur = ggml_cont(ctx0, cur);
+            }
+            cur = ggml_turbo4_wht(ctx0, cur);
+            const int32_t inverse = 1;
+            std::memcpy(cur->op_params, &inverse, sizeof(inverse));
+            cb(cur, "kqv_turbo4_wht_inverse", il);
+        }
 
         if (v_mla) {
 #if 0
@@ -2736,7 +2756,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * kq_mask_override) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
@@ -2766,7 +2787,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = kq_mask_override ? kq_mask_override : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);

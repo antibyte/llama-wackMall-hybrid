@@ -43,6 +43,28 @@ static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, blo
     }
 }
 
+static __device__ void quantize_f32_q4_0_weighted_block(const float * __restrict__ x, block_q4_0 * __restrict__ y) {
+    quantize_f32_q4_0_block(x, y);
+
+    float sumqx = 0.0f;
+    float sumq2 = 0.0f;
+    for (int j = 0; j < QK4_0/2; ++j) {
+        const float x0 = x[j];
+        const float x1 = x[QK4_0/2 + j];
+        const int q0 = (y->qs[j] & 0x0f) - 8;
+        const int q1 = (y->qs[j] >> 4) - 8;
+        const float w0 = x0*x0;
+        const float w1 = x1*x1;
+
+        sumqx += w0*q0*x0 + w1*q1*x1;
+        sumq2 += w0*q0*q0 + w1*q1*q1;
+    }
+
+    if (sumq2 > 0.0f) {
+        y->d = sumqx/sumq2;
+    }
+}
+
 static __device__ void quantize_f32_q4_1_block(const float * __restrict__ x, block_q4_1 * __restrict__ y) {
     float vmin = FLT_MAX;
     float vmax = -FLT_MAX;

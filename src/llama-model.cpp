@@ -24,8 +24,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -35,6 +37,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1651,6 +1654,117 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    const char * mtp_requant = std::getenv("LLAMA_MTP_REQUANTIZE_OUTPUT");
+    if (mtp_requant && mtp_requant[0] != '\0' && std::strcmp(mtp_requant, "none") != 0) {
+        if (arch != LLM_ARCH_QWEN35MOE || hparams.n_layer_nextn == 0) {
+            throw std::invalid_argument(
+                "LLAMA_MTP_REQUANTIZE_OUTPUT currently supports only Qwen3.5/3.6 MoE models with MTP");
+        }
+
+        ggml_type dst_type = GGML_TYPE_COUNT;
+        if (std::strcmp(mtp_requant, "q4_K") == 0 || std::strcmp(mtp_requant, "q4_k") == 0) {
+            dst_type = GGML_TYPE_Q4_K;
+        } else if (std::strcmp(mtp_requant, "q5_K") == 0 || std::strcmp(mtp_requant, "q5_k") == 0) {
+            dst_type = GGML_TYPE_Q5_K;
+        } else {
+            throw std::invalid_argument("LLAMA_MTP_REQUANTIZE_OUTPUT must be none, q4_K, or q5_K");
+        }
+
+        const int32_t il_mtp = hparams.n_layer();
+        if (il_mtp >= (int32_t) layers.size()) {
+            throw std::runtime_error("MTP output requantization could not locate the MTP layer");
+        }
+        if (layers[il_mtp].nextn.shared_head_head) {
+            LLAMA_LOG_WARN("%s: model already has a dedicated MTP output head; runtime requantization skipped\n", __func__);
+        } else if (!output) {
+            throw std::runtime_error("MTP output requantization requires model.output");
+        } else {
+            const auto * src_traits = ggml_get_type_traits(output->type);
+            const auto * dst_traits = ggml_get_type_traits(dst_type);
+            if (!src_traits->to_float || !dst_traits->from_float_ref) {
+                throw std::runtime_error(format("cannot requantize MTP output from %s to %s",
+                    ggml_type_name(output->type), ggml_type_name(dst_type)));
+            }
+            if (output->ne[0] % ggml_blck_size(dst_type) != 0) {
+                throw std::runtime_error(format("MTP output width %lld is not divisible by %lld for %s",
+                    (long long) output->ne[0], (long long) ggml_blck_size(dst_type), ggml_type_name(dst_type)));
+            }
+
+            const size_t src_bytes = ggml_nbytes(output);
+            const size_t dst_row_bytes = ggml_row_size(dst_type, output->ne[0]);
+            const size_t dst_bytes = dst_row_bytes*ggml_nrows(output);
+            if (dst_bytes >= src_bytes) {
+                throw std::runtime_error(format("MTP output %s would not be smaller than source %s",
+                    ggml_type_name(dst_type), ggml_type_name(output->type)));
+            }
+
+            ggml_init_params ctx_params = {
+                /* .mem_size   = */ ggml_tensor_overhead(),
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+            ggml_context_ptr mtp_ctx { ggml_init(ctx_params) };
+            if (!mtp_ctx) {
+                throw std::runtime_error("failed to create MTP output metadata context");
+            }
+
+            ggml_tensor * derived = ggml_new_tensor_2d(mtp_ctx.get(), dst_type, output->ne[0], output->ne[1]);
+            ggml_set_name(derived, "output_mtp.runtime.weight");
+
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+            ggml_backend_buffer_ptr mtp_buf { ggml_backend_alloc_ctx_tensors_from_buft(mtp_ctx.get(), buft) };
+            if (!mtp_buf) {
+                throw std::runtime_error(format(
+                    "failed to allocate %.2f MiB for the %s MTP output; lower fixed expert slots or disable LLAMA_MTP_REQUANTIZE_OUTPUT",
+                    dst_bytes/(1024.0*1024.0), ggml_type_name(dst_type)));
+            }
+            ggml_backend_buffer_set_usage(mtp_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            LLAMA_LOG_WARN("%s: creating MTP-only %s output from %s: %.2f MiB -> %.2f MiB\n", __func__,
+                ggml_type_name(dst_type), ggml_type_name(output->type),
+                src_bytes/(1024.0*1024.0), dst_bytes/(1024.0*1024.0));
+
+            const auto time_start = std::chrono::steady_clock::now();
+            std::vector<uint8_t> src_data(src_bytes);
+            std::vector<uint8_t> dst_data(dst_bytes);
+            ggml_backend_tensor_get(output, src_data.data(), 0, src_bytes);
+
+            const int64_t n_rows = ggml_nrows(output);
+            const int n_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
+                std::max(1u, std::thread::hardware_concurrency()/2), n_rows));
+            auto quantize_rows = [&](int ith) {
+                const int64_t row_begin = n_rows*ith/n_threads;
+                const int64_t row_end   = n_rows*(ith + 1)/n_threads;
+                std::vector<float> row(output->ne[0]);
+                for (int64_t ir = row_begin; ir < row_end; ++ir) {
+                    src_traits->to_float(src_data.data() + ir*output->nb[1], row.data(), output->ne[0]);
+                    dst_traits->from_float_ref(row.data(), dst_data.data() + ir*dst_row_bytes, output->ne[0]);
+                }
+            };
+
+            std::vector<std::thread> workers;
+            workers.reserve(n_threads - 1);
+            for (int ith = 0; ith < n_threads - 1; ++ith) {
+                workers.emplace_back(quantize_rows, ith);
+            }
+            quantize_rows(n_threads - 1);
+            for (auto & worker : workers) {
+                worker.join();
+            }
+
+            ggml_backend_tensor_set(derived, dst_data.data(), 0, dst_bytes);
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - time_start).count();
+            LLAMA_LOG_WARN("%s: MTP-only output ready in %.1f ms using %d host threads\n",
+                __func__, elapsed_ms, n_threads);
+
+            output_mtp = derived;
+            std::vector<ggml_backend_buffer_ptr> bufs;
+            bufs.emplace_back(std::move(mtp_buf));
+            pimpl->ctxs_bufs.emplace_back(std::move(mtp_ctx), std::move(bufs));
         }
     }
 

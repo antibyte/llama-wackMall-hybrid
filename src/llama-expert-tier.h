@@ -39,6 +39,8 @@ struct llama_model;
 //   LLAMA_EXPERT_CPU_REUSE_ROWS - 1: reuse weight rows across repeated MTP experts
 //   LLAMA_EXPERT_CPU_MULTI_ROW - 1: AVX2 Q4_K/Q5_K dots share decoded weight
 //                                blocks across repeated MTP expert selections
+//   LLAMA_EXPERT_CPU_FUSED_GATE_UP - 1: AVX2 Q4_K Gate/Up dots share Q8_K
+//                                    activation loads (default 0)
 //   LLAMA_EXPERT_SHARED_HOT_IDS - 1: reuse one per-layer hot-slot ID mapping
 //   LLAMA_EXPERT_WARM_SLOTS - extra bounded warm slots/layer (default 0)
 //   LLAMA_EXPERT_WARM_AUTO_MAX - cap for W=auto (default 4; tune on larger GPUs)

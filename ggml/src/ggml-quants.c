@@ -147,6 +147,33 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
     }
 }
 
+void quantize_row_q4_0_weighted_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_0_ref(x, y, k);
+
+    const int nb = k / QK4_0;
+    for (int i = 0; i < nb; ++i) {
+        const float * xb = x + i*QK4_0;
+        float sumqx = 0.0f;
+        float sumq2 = 0.0f;
+
+        for (int j = 0; j < QK4_0/2; ++j) {
+            const float x0 = xb[j];
+            const float x1 = xb[QK4_0/2 + j];
+            const int q0 = (y[i].qs[j] & 0x0f) - 8;
+            const int q1 = (y[i].qs[j] >> 4) - 8;
+            const float w0 = x0*x0;
+            const float w1 = x1*x1;
+
+            sumqx += w0*q0*x0 + w1*q1*x1;
+            sumq2 += w0*q0*q0 + w1*q1*q1;
+        }
+
+        if (sumq2 > 0.0f) {
+            y[i].d = GGML_FP32_TO_FP16(sumqx/sumq2);
+        }
+    }
+}
+
 void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k) {
     const int qk = QK4_1;
 
@@ -5536,6 +5563,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
+            } break;
+        case GGML_TYPE_TURBO4_K:
+            {
+                const block_turbo4_k * q = (const block_turbo4_k *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i) || !validate_fp16(q[i].reserved, i)) {
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {

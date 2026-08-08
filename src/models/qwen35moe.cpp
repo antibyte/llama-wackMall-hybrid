@@ -2,6 +2,9 @@
 #include "llama-expert-lookahead.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
+#include <cstdlib>
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -147,6 +150,20 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     }
     for (int i = n_layer; i < n_layer_all; ++i) {
         load_block_mtp(i);
+    }
+
+    const char * mtp_head_trace = std::getenv("LLAMA_MTP_HEAD_TRACE");
+    if (mtp_head_trace && std::atoi(mtp_head_trace) != 0 && n_layer_all > n_layer) {
+        const auto & mtp_layer = layers[n_layer];
+        const ggml_tensor * head_w = mtp_layer.nextn.shared_head_head
+            ? mtp_layer.nextn.shared_head_head
+            : output;
+        if (head_w) {
+            LLAMA_LOG_WARN("QWEN35MOE MTP head metadata: source=%s type=%s size=%.2f MiB shape=%lldx%lld\n",
+                mtp_layer.nextn.shared_head_head ? "nextn.shared_head_head" : "output",
+                ggml_type_name(head_w->type), ggml_nbytes(head_w)/(1024.0*1024.0),
+                (long long) head_w->ne[0], (long long) head_w->ne[1]);
+        }
     }
 }
 
@@ -388,6 +405,17 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
+    // The evaluation callback cannot safely stop on the aliasing Vcur reshape.
+    // The capture tool opts into a materialized diagnostic tensor instead.  It
+    // is also the tensor consumed by attention, so it remains connected to the
+    // graph.  The default graph is unchanged when the environment variable is
+    // absent.
+    const char * capture_values = std::getenv("LLAMA_TURBOQUANT_CAPTURE_VALUES");
+    const bool capture_values_active = capture_values && std::atoi(capture_values) != 0;
+    if (capture_values_active) {
+        Vcur = ggml_dup(ctx0, Vcur);
+    }
+
     // Apply IMRoPE
     Qcur = ggml_rope_multi(
             ctx0, Qcur, inp_pos, nullptr,
@@ -403,14 +431,28 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
 
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
-    cb(Vcur, "Vcur", il);
+    cb(Vcur, capture_values_active ? "Vcapture" : "Vcur", il);
 
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
+    // Diagnostic-only layer-local attention mask.  The capture tool sets this
+    // environment variable before graph construction.  The duplicate prevents
+    // the callback from modifying the shared causal mask used by other layers.
+    ggml_tensor * kq_mask_override = nullptr;
+    const char * live_mask_layer = std::getenv("LLAMA_TURBOQUANT_LIVE_MASK_LAYER");
+    if (live_mask_layer != nullptr) {
+        char * end = nullptr;
+        const long requested_layer = std::strtol(live_mask_layer, &end, 10);
+        if (end != live_mask_layer && *end == '\0' && requested_layer == il) {
+            kq_mask_override = ggml_dup(ctx0, inp->get_kq_mask());
+            cb(kq_mask_override, "triattention_live_mask", il);
+        }
+    }
+
     cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il, kq_mask_override);
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
@@ -805,9 +847,23 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     cb(cur, "mtp_shared_head_norm", -1);
 
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    ggml_tensor * head_w = layer.nextn.shared_head_head
+        ? layer.nextn.shared_head_head
+        : (model.output_mtp ? model.output_mtp : model.output);
+    ggml_tensor * head_s = layer.nextn.shared_head_head
+        ? layer.nextn.shared_head_head_s
+        : (model.output_mtp ? nullptr : model.output_s);
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+    const char * mtp_head_trace = std::getenv("LLAMA_MTP_HEAD_TRACE");
+    if (mtp_head_trace && std::atoi(mtp_head_trace) != 0) {
+        static std::atomic<bool> logged { false };
+        if (!logged.exchange(true)) {
+            LLAMA_LOG_WARN("QWEN35MOE MTP head: source=%s type=%s size=%.2f MiB shape=%lldx%lld\n",
+                layer.nextn.shared_head_head ? "nextn.shared_head_head" : (model.output_mtp ? "output_mtp" : "output"),
+                ggml_type_name(head_w->type), ggml_nbytes(head_w)/(1024.0*1024.0),
+                (long long) head_w->ne[0], (long long) head_w->ne[1]);
+        }
+    }
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
 

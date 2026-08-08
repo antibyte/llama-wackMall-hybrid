@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -1022,6 +1024,24 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+        const bool has_any_spec = std::any_of(
+            params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type type) {
+                return type != COMMON_SPECULATIVE_TYPE_NONE;
+            });
+
+        if ((params_base.cache_type_k == GGML_TYPE_TURBO4_K || params_base.cache_type_v == GGML_TYPE_TURBO4_K) && has_any_spec) {
+            const char * value = std::getenv("LLAMA_TURBO4_MTP_EXPERIMENTAL");
+            const bool enabled = value != nullptr && std::strcmp(value, "1") == 0;
+            const bool mtp_only = spec_mtp &&
+                std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type type) {
+                    return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
+                });
+            if (!enabled || !mtp_only) {
+                SRV_ERR("%s", "target turbo4_k speculative decoding requires draft-mtp only and "
+                        "LLAMA_TURBO4_MTP_EXPERIMENTAL=1\n");
+                return false;
+            }
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};

@@ -89,3 +89,22 @@ concept motivated the ordering; no LuceBox scheduler, worker, graph, or
 synchronization code was copied.
 
 If later work copies or closely adapts LuceBox code, this file must be updated with the exact source path, function/range, copyright notice, nature of modifications, and corresponding `NOTICE` entry before distribution.
+
+## TurboQuant phase 1
+
+TurboQuant reference-codec provenance is recorded separately in
+`TURBOQUANT_ATTRIBUTION.md`. The reference implementation retains the ggml MIT
+notice. The standalone capture and manifest analyzer are original Apache-2.0
+work for this fork. None of these files modifies or imports LuceBox code.
+
+The Phase 2 Turbo4-K CUDA adaptation is documented in the same attribution
+file. It is derived from the MIT-licensed Atomic reference, not LuceBox, and
+remains an experimental default-off path.
+
+The later ik_llama-inspired Q4 KV scale and MTP-only output-head work is also
+recorded in `TURBOQUANT_ATTRIBUTION.md` and `IK_LLAMA_EXPERIMENTS.md`. It is
+MIT-derived/reimplemented work, not LuceBox code.
+
+The offline KV-retention simulator is original Apache-2.0 work. It references
+the documented Atomic TriAttention equations but contains no Atomic or LuceBox
+runtime source and never mutates a model or KV cache.
