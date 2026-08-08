@@ -29,7 +29,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"  # directo
 # ============================================================================
 
 # Paths
-SERVER="$PROJECT_ROOT/build-turbo-fastconvert-sm75/bin/llama-server"  # current Turbo4-enabled native sm_75 Release executable
+SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"  # current Turbo4-enabled native sm_75 Release executable
 MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"  # target GGUF
 PROFILE="$HOME/src/llama-wackMall-hybrid/benchmark-results/profile-corpus-train8-512-20260802T124500Z/general-profile.csv"  # measured general heat/ranking CSV; edit after cloning elsewhere
 PLACEMENT=""  # optional validated per-layer placement manifest; empty = uniform S/auto-fit
