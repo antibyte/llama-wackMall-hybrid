@@ -1043,6 +1043,22 @@ private:
             }
         }
 
+        if (has_any_spec &&
+            (params_base.speculative.draft.cache_type_k == GGML_TYPE_TURBO4_K ||
+             params_base.speculative.draft.cache_type_v == GGML_TYPE_TURBO4_K)) {
+            const char * value = std::getenv("LLAMA_TURBO4_DRAFT_EXPERIMENTAL");
+            const bool enabled = value != nullptr && std::strcmp(value, "1") == 0;
+            const bool mtp_only = spec_mtp &&
+                std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type type) {
+                    return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
+                });
+            if (!enabled || !mtp_only) {
+                SRV_ERR("%s", "turbo4_k draft KV requires draft-mtp only and "
+                        "LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1\n");
+                return false;
+            }
+        }
+
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {

@@ -47,6 +47,11 @@ static bool turbo4_mtp_experimental_enabled() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+static bool turbo4_draft_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_DRAFT_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
     std::string result;
     for (size_t i = 0; i < devices.size(); i++) {
@@ -2282,8 +2287,14 @@ common_speculative_init_result::common_speculative_init_result(
                 return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
             });
         if (!turbo4_mtp_experimental_enabled() || !mtp_only) {
-            LOG_ERR("%s: target turbo4_k speculative decoding requires draft-mtp only and "
+            LOG_ERR("%s: turbo4_k speculative decoding requires draft-mtp only and "
                     "LLAMA_TURBO4_MTP_EXPERIMENTAL=1\n", __func__);
+            return;
+        }
+        if ((params.speculative.draft.cache_type_k == GGML_TYPE_TURBO4_K ||
+             params.speculative.draft.cache_type_v == GGML_TYPE_TURBO4_K) &&
+            !turbo4_draft_experimental_enabled()) {
+            LOG_ERR("%s: turbo4_k draft KV requires LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1\n", __func__);
             return;
         }
     }

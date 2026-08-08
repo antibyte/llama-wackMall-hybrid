@@ -662,3 +662,24 @@ because their benefit is graph- and architecture-dependent. They are measured
 winners for both 32K and 64K Turbo4/Turbo4 MTP-2 on SM75. SM61 needs its own
 phase-matched screen. The remaining local quality/performance gate is an
 actively populated long prompt rather than only reserved 64K capacity.
+
+## Turbo4 in the MTP draft KV cache
+
+Date: 2026-08-08. The draft parser and MTP context now accept Turbo4 K/V only
+with `LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1`, Flash Attention, KQV offload, and an
+MTP-only speculative chain. MTP-1, MTP-2, and MTP-3 deterministic smoke tests
+completed correctly on SM75 and released all VRAM after shutdown.
+
+The phase-matched 32K, S=33, MTP-2, 376/376, 3x512 comparison was:
+
+| Draft KV | Three results | Median | Acceptance | Mean accepted | VRAM |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Q4_0/Q4_0 | 44.533, 44.463, 44.507 | 44.507 | 62.20% | 2.24 | 5614 MiB |
+| Turbo4/Turbo4 | 40.555, 40.442, 40.476 | 40.476 | 52.72% | 2.05 | 5608 MiB |
+
+All three runs per side had identical output and token hashes, including
+across the two draft formats. Draft Turbo4 therefore preserves routing-exact
+target results in this test, but loses 9.06% throughput because its lower
+draft acceptance outweighs the 6 MiB memory saving. It remains available
+behind its guard, but is not enabled by `start.sh`; Q4_0/Q4_0 is the measured
+SM75 performance winner and Q8_0/Q8_0 is the active quality-oriented setting.

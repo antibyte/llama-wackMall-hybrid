@@ -269,8 +269,8 @@ GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=2 \
     --spec-draft-type-k q8_0 --spec-draft-type-v q4_0
 ```
 
-The flag does not enable Turbo4 in the MTP draft context. The runtime crossover
-of 2 made MTP-2 and MTP-3 hash-identical in the local short geometry screen;
+Draft Turbo4 is separately guarded by `LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1`.
+The runtime crossover of 2 made MTP-2 and MTP-3 hash-identical in the local short geometry screen;
 MTP-1 remained numerically distinct. MTP-2 was fastest. At 64K, three
 512-token runs reached a 39.077 token/s median versus 38.416 for Q8/Q8 while
 retaining S=27 instead of S=25, and a single 2,000-token pair favored Turbo4
@@ -282,12 +282,22 @@ For the symmetric target-cache experiment:
 ```bash
 LLAMA_TURBO4_V_EXPERIMENTAL=1 \
 LLAMA_TURBO4_MTP_EXPERIMENTAL=1 \
+LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1 \
 GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=2 \
     ./build-turbo-sm75/bin/llama-server \
     ... -ctk turbo4_k -ctv turbo4_k \
     --spec-type draft-mtp --spec-draft-n-max 2 \
-    --spec-draft-type-k q8_0 --spec-draft-type-v q4_0
+    --spec-draft-type-k turbo4_k --spec-draft-type-v turbo4_k
 ```
+
+Draft Turbo4 uses the same exact-writing and Flash-Attention implementation as
+the target cache, but the draft context contains only the single NextN layer.
+On the GTX 1660 Ti it saved only 6 MiB at 32K. In a phase-matched 3x512 MTP-2
+screen, Q4/Q4 draft KV reached a 44.507 token/s median with 62.20% acceptance,
+while Turbo4/Turbo4 reached 40.476 token/s with 52.72% acceptance. All output
+and token hashes remained identical. It is therefore a guarded capacity
+experiment and not the SM75 throughput winner; Q4/Q4 remains the recommended
+draft cache when speed matters.
 
 On the local GTX 1660 Ti, Turbo4/Turbo4 retained S=33 instead of Q8/Q8 S=30
 at 32K, but the 2,000-token rates were effectively tied (39.634 versus
@@ -887,6 +897,7 @@ Key portable controls:
 | `GGML_CUDA_MMVQ_MOE_PLAIN_ROWS` | 0 | Tune rows/block (`1`, `2`, or `4`) for plain multi-token MoE Down; zero retains the current two-row default |
 | `GGML_CUDA_TURBO4_FAST_F16_CONVERT` | 0 | Experimental Turbo4-to-F16 converter schedule (`1` one warp/block, `2` two warps/block); both were slower on SM75 |
 | `GGML_CUDA_TURBO4_WHT_SHUFFLE` | 0 | Experimental shuffle-first Turbo4 WHT; neutral/slower on SM75 |
+| `LLAMA_TURBO4_DRAFT_EXPERIMENTAL` | 0 | Permit Turbo4 K/V in the MTP-only draft context; exact target verification remains authoritative |
 | `GGML_CUDA_ASYNC_HOST_COPY` | 0 | Queue pinned CPU-to-CUDA scheduler split copies on the destination compute stream; measured winner for local MTP-2 |
 | `GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE` | 0 | Non-contiguous CONCAT block override (`32`, `64`, `128`, `256`); zero keeps the CUDA default |
 | `GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0` | 0 | Use the flat dim-0 non-contiguous CONCAT kernel; measured winner for local MTP-2 |

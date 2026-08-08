@@ -10,7 +10,9 @@
 # (CMOE 376/376, MTP-2, S=33) mit dem experimentellen Turbo4/Turbo4-Target-KV.
 # Turbo4/Turbo4 spart deutlich KV-Speicher, kostet gegenueber Q8/Q8 aber
 # messbar Qualitaet. Fuer maximale Qualitaet TARGET_TYPE_K/V auf q8_0 setzen.
-# Der MTP-Draft-Cache bleibt q4_0/q4_0; Turbo4 wird dort nicht unterstuetzt.
+# Das Target verwendet Turbo4; der MTP-Draft nutzt den genaueren Q8_0-Cache.
+# Draft-Turbo4 bleibt über DRAFT_TYPE_K/V und den Guard verfügbar, war aber
+# im 3x512-Test wegen geringerer Akzeptanz 9,1 % langsamer.
 # Bekannter weiterer Referenzpunkt:
 #   GTX 1080    (sm_61): siehe start1080.sh; eigene Kernel-Sweeps erforderlich
 #
@@ -54,11 +56,12 @@ N_PREDICT="4096"  # CLI/server generation limit; API requests may impose a lower
 # Nur die beiden folgenden Zeilen aendern; die passenden Turbo4-Guards duerfen auf 1 bleiben.
 TARGET_TYPE_K="turbo4_k"  # experimental 4-bit randomized-WHT target K cache
 TARGET_TYPE_V="turbo4_k"  # experimental symmetric Turbo4 V cache; saves the most target KV memory
-DRAFT_TYPE_K="q4_0"  # tested Turbo4+MTP draft K cache; draft Turbo4 is unsupported
-DRAFT_TYPE_V="q4_0"  # tested Turbo4+MTP draft V cache
+DRAFT_TYPE_K="q8_0"  # quality-oriented 8-bit MTP-draft K cache
+DRAFT_TYPE_V="q8_0"  # quality-oriented 8-bit MTP-draft V cache; requires Flash Attention
 LLAMA_KV_Q4_SCALE="legacy"  # Q4-only scale policy: legacy winner for speed; weighted-k is the quality A/B candidate
 LLAMA_TURBO4_V_EXPERIMENTAL="1"  # required guard for Turbo4 target V; 0 rejects this configuration
 LLAMA_TURBO4_MTP_EXPERIMENTAL="1"  # required guard for target Turbo4 with draft-mtp
+LLAMA_TURBO4_DRAFT_EXPERIMENTAL="1"  # required guard for Turbo4 in the MTP draft context
 LLAMA_TURBO4_Q8_FALLBACK_LAYERS=""  # optional comma/range list of target K layers kept at Q8, e.g. 23,35,27
 GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH="2"  # tested MTP-2 crossover: multi-token verify/prefill uses the FP16 FA path
 GGML_CUDA_TURBO4_FAST_F16_CONVERT="0"  # generic converter is the SM75 winner; 1/2 were slower experiments
@@ -229,6 +232,7 @@ case "$DRAFT_BACKEND_SAMPLING" in 0|1) ;; *) die "DRAFT_BACKEND_SAMPLING muss 0 
 case "$REASONING_PRESERVE" in 0|1) ;; *) die "REASONING_PRESERVE muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_V_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_V_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_MTP_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_MTP_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
+case "$LLAMA_TURBO4_DRAFT_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_DRAFT_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_KV_Q4_SCALE" in legacy|weighted|weighted-k|weighted-v) ;; *) die "LLAMA_KV_Q4_SCALE muss legacy, weighted, weighted-k oder weighted-v sein." ;; esac
 case "$LLAMA_MTP_REQUANTIZE_OUTPUT" in none|q4_K|q4_k|q5_K|q5_k) ;; *) die "LLAMA_MTP_REQUANTIZE_OUTPUT muss none, q4_K oder q5_K sein." ;; esac
 case "$LLAMA_MTP_HEAD_TRACE" in 0|1) ;; *) die "LLAMA_MTP_HEAD_TRACE muss 0 oder 1 sein." ;; esac
@@ -272,8 +276,8 @@ fi
 if [[ "$MTP_N" != 0 && ( "$TARGET_TYPE_K" == turbo4_k || "$TARGET_TYPE_V" == turbo4_k ) && "$LLAMA_TURBO4_MTP_EXPERIMENTAL" != 1 ]]; then
     die "Target-Turbo4 mit MTP benötigt LLAMA_TURBO4_MTP_EXPERIMENTAL=1."
 fi
-if [[ "$DRAFT_TYPE_K" == turbo4_k || "$DRAFT_TYPE_V" == turbo4_k ]]; then
-    die "Turbo4 wird im MTP-Draft-Cache nicht unterstuetzt."
+if [[ ( "$DRAFT_TYPE_K" == turbo4_k || "$DRAFT_TYPE_V" == turbo4_k ) && "$LLAMA_TURBO4_DRAFT_EXPERIMENTAL" != 1 ]]; then
+    die "Draft-Turbo4 benötigt LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1."
 fi
 if [[ -n "$LLAMA_TURBO4_Q8_FALLBACK_LAYERS" && "$TARGET_TYPE_K" != turbo4_k ]]; then
     die "LLAMA_TURBO4_Q8_FALLBACK_LAYERS benötigt TARGET_TYPE_K=turbo4_k."
@@ -333,6 +337,7 @@ env_args=(
     "LLAMA_KV_Q4_SCALE=$LLAMA_KV_Q4_SCALE"
     "LLAMA_TURBO4_V_EXPERIMENTAL=$LLAMA_TURBO4_V_EXPERIMENTAL"
     "LLAMA_TURBO4_MTP_EXPERIMENTAL=$LLAMA_TURBO4_MTP_EXPERIMENTAL"
+    "LLAMA_TURBO4_DRAFT_EXPERIMENTAL=$LLAMA_TURBO4_DRAFT_EXPERIMENTAL"
     "GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=$GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH"
     "GGML_CUDA_TURBO4_FAST_F16_CONVERT=$GGML_CUDA_TURBO4_FAST_F16_CONVERT"
     "GGML_CUDA_TURBO4_WHT_SHUFFLE=$GGML_CUDA_TURBO4_WHT_SHUFFLE"
@@ -489,7 +494,7 @@ llama-wackMall-hybrid start
   KV target:    $TARGET_TYPE_K/$TARGET_TYPE_V
   KV draft:     $DRAFT_TYPE_K/$DRAFT_TYPE_V
   Q4 scale:     $LLAMA_KV_Q4_SCALE
-  Turbo4:       V-guard=$LLAMA_TURBO4_V_EXPERIMENTAL MTP-guard=$LLAMA_TURBO4_MTP_EXPERIMENTAL FP16-threshold=$GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH convert=$GGML_CUDA_TURBO4_FAST_F16_CONVERT wht-shuffle=$GGML_CUDA_TURBO4_WHT_SHUFFLE Q8-layers=${LLAMA_TURBO4_Q8_FALLBACK_LAYERS:-none}
+  Turbo4:       V-guard=$LLAMA_TURBO4_V_EXPERIMENTAL MTP-guard=$LLAMA_TURBO4_MTP_EXPERIMENTAL draft-guard=$LLAMA_TURBO4_DRAFT_EXPERIMENTAL FP16-threshold=$GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH convert=$GGML_CUDA_TURBO4_FAST_F16_CONVERT wht-shuffle=$GGML_CUDA_TURBO4_WHT_SHUFFLE Q8-layers=${LLAMA_TURBO4_Q8_FALLBACK_LAYERS:-none}
   MTP head:     $LLAMA_MTP_REQUANTIZE_OUTPUT (trace=$LLAMA_MTP_HEAD_TRACE)
   CMoE batch:   $CMOE_BATCH/$CMOE_UBATCH
   phase batch:  prefill=${CMOE_PREFILL_BATCH:-base}/${CMOE_PREFILL_UBATCH:-base} decode=${CMOE_DECODE_BATCH:-base}/${CMOE_DECODE_UBATCH:-base}

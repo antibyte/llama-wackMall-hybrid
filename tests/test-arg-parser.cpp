@@ -142,6 +142,15 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
 
+    {
+        common_params turbo4_draft_params;
+        argv = {"binary_name", "--spec-draft-type-k", "turbo4_k", "--spec-draft-type-v", "turbo4_k"};
+        assert(true == common_params_parse(
+            argv.size(), list_str_to_char(argv).data(), turbo4_draft_params, LLAMA_EXAMPLE_SERVER));
+        assert(turbo4_draft_params.speculative.draft.cache_type_k == GGML_TYPE_TURBO4_K);
+        assert(turbo4_draft_params.speculative.draft.cache_type_v == GGML_TYPE_TURBO4_K);
+    }
+
     argv = {"binary_name", "-t", "1234"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.cpuparams.n_threads == 1234);

@@ -3571,6 +3571,7 @@ llama_context * llama_init_from_model(
     const bool turbo4_v = params.type_v == GGML_TYPE_TURBO4_K;
     if (turbo4_k || turbo4_v) {
         const char * turbo4_v_env = std::getenv("LLAMA_TURBO4_V_EXPERIMENTAL");
+        const char * turbo4_draft_env = std::getenv("LLAMA_TURBO4_DRAFT_EXPERIMENTAL");
         if (turbo4_v && !(turbo4_v_env != nullptr && std::strcmp(turbo4_v_env, "1") == 0)) {
             LLAMA_LOG_ERROR("%s: experimental turbo4_k V requires LLAMA_TURBO4_V_EXPERIMENTAL=1\n", __func__);
             return nullptr;
@@ -3591,8 +3592,10 @@ llama_context * llama_init_from_model(
             LLAMA_LOG_ERROR("%s: experimental turbo4_k requires KQV offload\n", __func__);
             return nullptr;
         }
-        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
-            LLAMA_LOG_ERROR("%s: experimental turbo4_k is disabled for MTP contexts\n", __func__);
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT &&
+            !(params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+              turbo4_draft_env != nullptr && std::strcmp(turbo4_draft_env, "1") == 0)) {
+            LLAMA_LOG_ERROR("%s: experimental turbo4_k MTP context requires LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1\n", __func__);
             return nullptr;
         }
     }
