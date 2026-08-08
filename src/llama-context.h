@@ -66,6 +66,7 @@ struct llama_context {
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
+    uint32_t runtime_ubatch() const;
     uint32_t n_seq_max() const;
 
     uint32_t n_threads()       const;
@@ -109,6 +110,7 @@ struct llama_context {
     void detach_threadpool();
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
+    bool set_runtime_ubatch(uint32_t n_ubatch);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
@@ -280,6 +282,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    uint32_t runtime_n_ubatch = 0;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

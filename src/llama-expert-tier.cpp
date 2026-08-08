@@ -1892,11 +1892,42 @@ void init(const llama_model & model) {
         atexit(dump_stats);
     }
 
-    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    // Prefer the device that actually owns every base layer.  A binary may
+    // contain several GPU backends (for example CUDA + Vulkan), in which case
+    // ggml_backend_dev_by_type() returns the first registered GPU rather than
+    // necessarily the device selected with --device.  Allocating the .hot
+    // tensors on that unrelated device makes a single-device Vulkan model
+    // fail graph allocation.  Mixed-device models still use the historical
+    // first-GPU behavior until hot storage is made per-layer/per-device.
+    ggml_backend_dev_t dev = nullptr;
+    bool uniform_layer_device = n_layer > 0;
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_backend_dev_t layer_dev = model.dev_layer(il);
+        const auto layer_dev_type = layer_dev ? ggml_backend_dev_type(layer_dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (!layer_dev || (layer_dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                           layer_dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+            uniform_layer_device = false;
+            break;
+        }
+        if (!dev) {
+            dev = layer_dev;
+        } else if (dev != layer_dev) {
+            uniform_layer_device = false;
+            break;
+        }
+    }
+    if (!uniform_layer_device) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev) {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+        }
+    }
     if (!dev) {
         TIER_LOG("%s: expert tiering disabled (no GPU device found)\n", __func__);
         return;
     }
+    TIER_LOG("%s: expert hot storage device: %s%s\n", __func__,
+            ggml_backend_dev_name(dev), uniform_layer_device ? " (uniform layer device)" : " (mixed-device fallback)");
 
     // Calculate per-expert slot memory size across all layers for Auto-Fit
     size_t bytes_per_slot_all_layers = 0;

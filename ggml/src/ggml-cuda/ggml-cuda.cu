@@ -3618,6 +3618,30 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
+    static const bool async_host_copy = getenv("GGML_CUDA_ASYNC_HOST_COPY") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_ASYNC_HOST_COPY")) != 0;
+
+    // Scheduler split inputs allocated in the CUDA host buffer are page-locked
+    // and remain alive until their copy slot is reused. Enqueue their H2D copy
+    // on the destination compute stream so the following graph is ordered after
+    // the copy without a host-side cudaStreamSynchronize().
+    if (async_host_copy &&
+        ggml_backend_dev_type(ggml_backend_get_device(backend_src)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+        ggml_backend_is_cuda(backend_dst) &&
+        ggml_backend_buft_is_cuda_host(buf_src->buft) &&
+        ggml_backend_buffer_is_cuda(buf_dst)) {
+        ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+        ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+
+        if (cuda_ctx_dst->device != buf_ctx_dst->device) {
+            return false;
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst),
+                cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+        return true;
+    }
+
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
     }

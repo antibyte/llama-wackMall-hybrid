@@ -246,6 +246,7 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    runtime_n_ubatch = cparams.n_ubatch;
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_sampling_outputs_per_seq_max = params.n_sampling_outputs_per_seq_max == 0 ?
@@ -762,6 +763,10 @@ uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+uint32_t llama_context::runtime_ubatch() const {
+    return runtime_n_ubatch;
+}
+
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
@@ -772,6 +777,15 @@ uint32_t llama_context::n_threads() const {
 
 uint32_t llama_context::n_threads_batch() const {
     return cparams.n_threads_batch;
+}
+
+bool llama_context::set_runtime_ubatch(uint32_t n_ubatch) {
+    if (n_ubatch == 0 || n_ubatch > cparams.n_ubatch) {
+        return false;
+    }
+
+    runtime_n_ubatch = n_ubatch;
+    return true;
 }
 
 llama_memory_t llama_context::get_memory() const {
@@ -1741,7 +1755,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, runtime_n_ubatch, output_all);
         if (!mctx) {
             return -2;
         }
@@ -4114,6 +4128,14 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+bool llama_set_runtime_ubatch(llama_context * ctx, uint32_t n_ubatch) {
+    return ctx != nullptr && ctx->set_runtime_ubatch(n_ubatch);
+}
+
+uint32_t llama_get_runtime_ubatch(const llama_context * ctx) {
+    return ctx != nullptr ? ctx->runtime_ubatch() : 0;
 }
 
 //

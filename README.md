@@ -204,6 +204,27 @@ verify the logged effective fixed-slot count, peak VRAM, long decode throughput,
 and output stability. Larger-memory GPUs should include 512, 1024, and the
 upstream 2048/512 logical/physical defaults in that sweep.
 
+An experimental, default-off `-np 1` phase cap is available for controlled
+testing:
+
+```bash
+LLAMA_CMOE_BATCH=32 \
+LLAMA_CMOE_UBATCH=32 \
+LLAMA_CMOE_PREFILL_BATCH=128 \
+LLAMA_CMOE_PREFILL_UBATCH=128 \
+LLAMA_CMOE_DECODE_BATCH=32 \
+LLAMA_CMOE_DECODE_UBATCH=32 \
+./build-hybrid/bin/llama-server ...
+```
+
+The context still reserves the maximum pair, here 128/128. The server limits
+prompt submission to the prefill pair and switches the runtime ubatch cap at
+the existing prompt-to-generation boundary. This is not a production
+recommendation: MTP decode already uses its actual small token count, and the
+GTX 1660 Ti test did not recover decode throughput relative to global 128/128.
+The flags are rejected as an active optimization for `-np > 1` because mixed
+prefill/decode requests need an explicit scheduling policy.
+
 Change `--spec-draft-n-max` to 1 or 3 for MTP-1/MTP-3, or remove all `--spec-*` options for a no-MTP control. Always compare token/output hashes and MTP acceptance, not throughput alone.
 
 ### Experimental hot-ID and MoE kernel fusion
@@ -426,6 +447,30 @@ MTP_N=2 \
 ./scripts/test_prompt_cache.sh
 ```
 
+### LAN/OpenWebUI launcher
+
+The project-root launcher [`start.sh`](start.sh) contains the complete
+environment configuration for the server, MTP, backend sampling, expert
+tiering, warmcache, and lookahead controls. It binds to `0.0.0.0:8080` and
+auto-detects the tested batch starting point (`376/376` on `sm_75`, `128/128`
+on `sm_61`). The expert slot count is left to VRAM auto-fit so the same file
+can be used on the GTX 1660 Ti, GTX 1080, and larger cards.
+
+```bash
+cd /path/to/llama-wackMall-hybrid
+# edit the CONFIGURATION block in start.sh first
+./start.sh
+```
+
+The complete list of parameters is in the editable block at the top of the
+script, including `MODEL`, `PROFILE`, `HOST`, `PORT`, `MTP_N`, global and
+phase-specific CMoE batches, `THREADS`, `EXPERT_S`,
+`TARGET_BACKEND_SAMPLING`, `REASONING_BUDGET`, every `LLAMA_EXPERT_*` control,
+and the lookahead/bridge flags. The launcher rejects command-line parameters
+so the running configuration always comes from the checked-in file. It keeps
+`WARM_SLOTS=0` and lookahead disabled by default. Without an API key, it prints
+a warning because the HTTP API is unauthenticated on the LAN.
+
 ## 7. Run a reproducible benchmark
 
 The runner keeps context, prompt, temperature, batch sizes, warm-up procedure, and process lifetime fixed. Case `SC` is a fixed static profile with no warm cache and guarded no-sync:
@@ -588,6 +633,8 @@ Key portable controls:
 | `GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS` | 0 | Override rows/block for non-ID Q8_0 three-column MMVQ (`1`, `2`, or `4`); `0` preserves automatic selection |
 | `GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS` | 0 | Override rows/block for plain non-ID Q6_K one-column MMVQ (`1`, `2`, or `4`) |
 | `GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS` | 0 | Override rows/block for plain non-ID Q6_K three-column MMVQ (`1`, `2`, or `4`) |
+| `GGML_CUDA_ASYNC_HOST_COPY` | 0 | Enqueue pinned CPU-to-CUDA scheduler split copies on the destination stream; `start.sh` enables the measured GTX 1660 Ti winner |
+| `GGML_SCHED_ASYNC_D2H_COPY` | 0 | Queue CUDA-to-pinned-host split readback after source compute and synchronize once at the CPU consumer; experimental |
 | `LLAMA_EXPERT_CPU_ASYNC` | 0 | Experimental CPU-cold/GPU-hot overlap; benchmark before use |
 
 The benchmark runner also accepts `CONTEXT`, `TARGET_TYPE_K`, and `TARGET_TYPE_V`. Their defaults remain `32768`, `q4_0`, and `q4_0` so existing benchmark commands retain their behavior.

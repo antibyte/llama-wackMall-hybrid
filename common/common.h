@@ -453,6 +453,13 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    // Experimental cmoe server-only phase limits. Zero keeps the ordinary
+    // fixed n_batch/n_ubatch behavior. The context is allocated for the
+    // maximum while the server chooses one pair per decode call.
+    int32_t cmoe_n_batch_prefill  =     0;
+    int32_t cmoe_n_ubatch_prefill =     0;
+    int32_t cmoe_n_batch_decode   =     0;
+    int32_t cmoe_n_ubatch_decode  =     0;
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
