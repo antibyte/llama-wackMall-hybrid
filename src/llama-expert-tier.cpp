@@ -59,8 +59,9 @@ struct store {
     ggml_tensor * lut    = nullptr; // i32 [n_expert] on GPU: expert -> hot slot | sentinel
     ggml_tensor * mask   = nullptr; // i32 [n_expert] on CPU: 1 = cold
     ggml_tensor * counts = nullptr; // i32 [n_expert+1] on CPU: selection stats
-    int  il      = -1;
-    bool is_down = false;
+    int  il       = -1;
+    int  sentinel = 0; // last w_hot channel; cold experts map here
+    bool is_down  = false;
 };
 
 // per-layer grouping for stats and online repin
@@ -114,6 +115,10 @@ static bool g_cpu_reuse_rows = false;
 static bool g_cpu_multi_row = false;
 static bool g_cpu_fused_gate_up = false;
 static bool g_shared_hot_ids = false;
+// When true, MUL_MAT_ID results for the hot store carry op_params that tell the
+// CUDA MMVQ kernels to skip the zeroed sentinel slot (cold experts) instead of
+// loading and computing against zero weights. Default off until measured.
+static bool g_skip_sentinel = false;
 static bool g_static_no_sync_requested = false;
 static bool g_static_no_sync_active = false;
 static int  g_prefetch_streams = 1;
@@ -1829,6 +1834,15 @@ void init(const llama_model & model) {
         }
         g_shared_hot_ids = value == 1;
     }
+    if (const char * skip = getenv("LLAMA_EXPERT_SKIP_SENTINEL")) {
+        int value = 0;
+        if (!parse_nonnegative_int(skip, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_SKIP_SENTINEL='%s'; expected 0 or 1\n",
+                    __func__, skip);
+            return;
+        }
+        g_skip_sentinel = value == 1;
+    }
     ggml_cpu_moe_set_single_row_chunk(g_cpu_single_row_chunk);
     ggml_cpu_moe_set_parallel_activation(g_cpu_parallel_activation);
     ggml_cpu_moe_set_down_prefetch(g_cpu_down_prefetch);
@@ -2158,6 +2172,7 @@ void init(const llama_model & model) {
             s.mask   = ggml_new_tensor_1d(g_ctx_cpu, GGML_TYPE_I32, n_expert);
             s.counts = ggml_new_tensor_1d(g_ctx_cpu, GGML_TYPE_I32, n_expert + 1);
             s.il      = il;
+            s.sentinel = sentinel;
             s.is_down = (w == l.ffn_down_exps);
 
             ggml_set_name(s.w_hot, (std::string(w->name) + ".hot").c_str());
@@ -2231,6 +2246,7 @@ void init(const llama_model & model) {
             }
             store & s = it->second;
             const size_t slice = ggml_nbytes(w)/n_expert;
+            s.sentinel = sentinel;
 
             ggml_backend_tensor_set(s.lut,  lut_host.data(),  0, n_expert*sizeof(int32_t));
             ggml_backend_tensor_set(s.mask, mask_host.data(), 0, n_expert*sizeof(int32_t));
@@ -2361,10 +2377,11 @@ void init(const llama_model & model) {
         TIER_LOG("%s: CUDA graph caching during adaptation: %s\n", __func__,
                 g_mutable_disabled_cuda_graphs ? "disabled" : "enabled (experimental)");
     }
-    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s; down prefetch: %d; row reuse: %s; multi-row AVX2: %s; fused Gate/Up AVX2: %s; shared hot IDs: %s; async overlap: %s\n",
+    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s; down prefetch: %d; row reuse: %s; multi-row AVX2: %s; fused Gate/Up AVX2: %s; shared hot IDs: %s; skip-sentinel MMVQ: %s; async overlap: %s\n",
             __func__, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "on" : "off",
             g_cpu_down_prefetch, g_cpu_reuse_rows ? "on" : "off", g_cpu_multi_row ? "on" : "off",
-            g_cpu_fused_gate_up ? "on" : "off", g_shared_hot_ids ? "on" : "off", g_cpu_async ? "on" : "off");
+            g_cpu_fused_gate_up ? "on" : "off", g_shared_hot_ids ? "on" : "off",
+            g_skip_sentinel ? "on" : "off", g_cpu_async ? "on" : "off");
     if (g_W > 0) {
         if (g_warm_admission == warm_admission_mode::frequency) {
             TIER_LOG("%s: warm admission frequency window=%d graphs\n", __func__, g_warm_admission_window);
@@ -2440,6 +2457,24 @@ void init(const llama_model & model) {
     }
 }
 
+static ggml_tensor * map_hot_ids(ggml_context * ctx, const store & s, ggml_tensor * ids) {
+    ggml_tensor * ids_src = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids);
+    ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ids_src, ids->ne[0]*ids->ne[1]);
+    ggml_tensor * hot_flat = ggml_get_rows(ctx, s.lut, ids_flat);
+    return ggml_reshape_2d(ctx, hot_flat, ids->ne[0], ids->ne[1]);
+}
+
+static void mark_skip_sentinel(ggml_tensor * hot, const store & s) {
+    if (!g_skip_sentinel || !hot) {
+        return;
+    }
+    // op_params[0]=1 enables CUDA MMVQ skip; op_params[1]=sentinel slot index.
+    // The sentinel weight channel is zeroed at tier init, so the math result is
+    // exact zero whether the kernel loads the zeros or takes the early exit.
+    hot->op_params[0] = 1;
+    hot->op_params[1] = s.sentinel;
+}
+
 ggml_tensor * build_hot_ids(ggml_context * ctx, ggml_tensor * w, ggml_tensor * ids) {
     if (!g_shared_hot_ids) {
         return nullptr;
@@ -2449,10 +2484,7 @@ ggml_tensor * build_hot_ids(ggml_context * ctx, ggml_tensor * w, ggml_tensor * i
         return nullptr;
     }
 
-    const store & s = it->second;
-    ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, ids), ids->ne[0]*ids->ne[1]);
-    ggml_tensor * hot_flat = ggml_get_rows(ctx, s.lut, ids_flat);
-    return ggml_reshape_2d(ctx, hot_flat, ids->ne[0], ids->ne[1]);
+    return map_hot_ids(ctx, it->second, ids);
 }
 
 ggml_tensor * build_mul_mat_id(
@@ -2469,12 +2501,11 @@ ggml_tensor * build_mul_mat_id(
     const store & s = it->second;
 
     if (!hot_ids) {
-        ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, ids), ids->ne[0]*ids->ne[1]);
-        ggml_tensor * hot_flat = ggml_get_rows(ctx, s.lut, ids_flat);
-        hot_ids = ggml_reshape_2d(ctx, hot_flat, ids->ne[0], ids->ne[1]);
+        hot_ids = map_hot_ids(ctx, s, ids);
     }
     GGML_ASSERT(hot_ids->ne[0] == ids->ne[0] && hot_ids->ne[1] == ids->ne[1]);
     ggml_tensor * hot = ggml_mul_mat_id(ctx, s.w_hot, x, hot_ids); // GPU
+    mark_skip_sentinel(hot, s);
 
     if (g_hot_only) {
         return hot;

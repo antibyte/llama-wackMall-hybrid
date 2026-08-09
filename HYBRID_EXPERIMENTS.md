@@ -1467,6 +1467,96 @@ stability regression.
 
 Source reference: https://github.com/ggml-org/llama.cpp/pull/25479
 
+## Skip-sentinel MMVQ for cold expert slots
+
+Date: 2026-08-08. Cold experts map through the hot-tier LUT to a zeroed
+sentinel weight channel. The GPU previously still executed full Q4_K/Q5_K
+matvecs against those zeros. `LLAMA_EXPERT_SKIP_SENTINEL=1` marks each
+`MUL_MAT_ID` with `op_params[0]=1` and `op_params[1]=sentinel`, and the CUDA
+MMVQ path (`mul_mat_vec_q` and `mul_mat_vec_q_moe`) early-exits those slots and
+writes exact zeros. The mathematical result is identical to loading the zeroed
+weights; cold work remains on the CPU fused path.
+
+Controls:
+
+- `LLAMA_EXPERT_SKIP_SENTINEL=0|1` (default off in the runtime until measured;
+  `start.sh` / `start1080.sh` enable it for the first A/B)
+- Fused Gate+Up multi-token launches pass the skip slot via
+  `ggml_cuda_mm_fusion_args_{host,device}.skip_slot`
+
+Side fix: shared hot-ID mapping no longer forces `ggml_cont` when the router
+IDs are already contiguous.
+
+Promoted on 2026-08-08 for the GTX 1660 Ti winner stack (SC, S=33, MTP-2,
+q4_0/q4_0 target and draft KV, Q8/Q6 row overrides, async H2D, flat CONCAT,
+shared hot IDs, multi-token MoE fusion, 376/376, 8/8 threads, profile
+`cbb5aef7…`).
+
+3×256 short gate (fresh server each run, 32-token warm-up):
+
+| Skip | Three decode results | Median | Δ |
+|---|---|---:|---:|
+| 0 | 43.146, 42.107, 42.839 | 42.839 | baseline |
+| 1 | 44.761, 44.760, 44.703 | 44.760 | **+4.48%** |
+
+All six runs reproduced output hash
+`87b87f1d8c52a0d64c48682675b01d3e458cc8c835098cab2ec98caca4ec577c`,
+token hash
+`f2739bc4de244337140dda6da246dcb436b05f3ca331e085506e722aa61b4ae5`,
+acceptance 0.597403, mean accepted length 2.19, peak VRAM 5,624 MiB.
+
+3×2,000 sustained gate (64-token warm-up):
+
+| Skip | Three decode results | Median | Δ |
+|---|---|---:|---:|
+| 0 | 44.486, 44.820, 44.744 | 44.744 | baseline |
+| 1 | 46.657, 46.350, 46.487 | **46.487** | **+3.90%** |
+
+All six long runs reproduced output hash
+`6d552602fadede320c5b4bfacec186158f5dccec650fdcb23d8a05412def2332`,
+token hash
+`9b315ca546d63c9f5b258415eb6e0b45445adf3943d8e56c06e5d6797919ef12`,
+acceptance 0.766160, mean accepted length 2.53, peak VRAM 5,624 MiB.
+
+`LLAMA_EXPERT_SKIP_SENTINEL=1` is therefore a measured sm_75 winner and is
+enabled in `start.sh`. The GTX 1080 launcher keeps it as a candidate that still
+needs its own phase-matched sm_61 A/B. Artifacts:
+`/tmp/skip-sentinel-{off,on}-{3x256,3x2000}-20260808`.
+
+### Rejected follow-up: multi-token MoE shared-weight K reassignment
+
+A device-side fast path detected when every MTP token mapped to the same expert
+channel and reassigned warps from "one per token" to "all on K with shared
+weight loads". It compiled after shrinking the scratch to four tokens, but the
+K-reduction reordering changed float accumulation order. Against the skip-
+sentinel baseline the 3×256 screen produced different output/token hashes
+(`5fc5623b…` / `038099e9…` vs `87b87f1d…` / `f2739bc4…`) and different MTP
+metrics (0.6167 / 2.23 vs 0.5974 / 2.19). That path was removed.
+
+### Bit-identical MoE weight staging (kept off)
+
+`GGML_CUDA_MMVQ_MOE_SHARE_WEIGHTS=1` keeps the original per-token `kbx` schedule
+and warp reduction. When all tokens map to the same expert, warp 0 copies each
+thread's weight block into shared memory and every token warp reuses it. Against
+the skip-sentinel winner stack on 2026-08-08:
+
+| Share weights | 3×256 decode | Median | Δ | Hashes / MTP |
+|---|---|---:|---:|---|
+| 0 (baseline) | 44.761 / 44.760 / 44.703 | 44.760 | — | `87b87f1d…` / `f2739bc4…`, 0.5974 / 2.19 |
+| 1 | 37.375 / 37.300 / 37.314 | **37.314** | **−16.6%** | identical |
+
+Correctness passes; throughput fails. Staging plus per-`kbx` `__syncthreads`
+costs more than letting concurrent warps hit L1 on the same global weight
+addresses. The flag remains default-off (`start.sh` does not enable it). Artifact:
+`/tmp/moe-share-bitident-3x256-20260808`.
+
+### Re-screen: async D2H with skip-sentinel stack
+
+With skip-sentinel and the full sm_75 winner stack, `GGML_SCHED_ASYNC_D2H_COPY=1`
+was hash-identical at 3×256 (hashes `87b87f1d…` / `f2739bc4…`, acceptance
+0.5974) but the median was 44.762 vs 44.760 tok/s (+0.004%). Still below the
+one-percent gate; remains disabled in `start.sh`.
+
 ## CUDA block-reduce shared-memory race fix
 
 Official llama.cpp pull request #26385 fixes unsafe shared-memory reuse across
@@ -1487,3 +1577,154 @@ Artifacts remain outside the repository under
 `/tmp/block-reduce-{base,patch}-*20260808*`.
 
 Source reference: https://github.com/ggml-org/llama.cpp/pull/26385
+
+## Compact hot-only MMVQ launches (skip-sentinel follow-up)
+
+Date: 2026-08-09. Skip-sentinel still launches a full Top-k channel grid and
+early-exits cold sentinel slots. With ~50% seed coverage that wastes launch
+slots on zero work. `GGML_CUDA_MMVQ_COMPACT_SKIP=1` (default off) builds a
+device-side packed list of non-sentinel channels (single-token) or
+`(channel, token)` pairs (multi-token MoE), `cudaMemset`s the destination,
+reads the active count (one int D2H + stream sync), and launches only those
+work items. Outputs scatter back to the original Top-k layout so the existing
+weighted combine and CPU cold ADD stay unchanged and bit-identical.
+
+Controls:
+
+- `GGML_CUDA_MMVQ_COMPACT_SKIP=0|1` (default 0)
+- Requires `LLAMA_EXPERT_SKIP_SENTINEL=1` so `skip_slot` is set on MUL_MAT_ID
+- While a CUDA graph is capturing, the path falls back to the full-grid
+  skip-sentinel behavior (variable grid is not capture-safe)
+
+Implementation: `ggml/src/ggml-cuda/mmvq.cu` (`mmvq_compact_*_kernel`,
+`mmvq_compact_args`, entry in `ggml_cuda_mul_mat_vec_q`). Wired in `start.sh`
+and `scripts/bench_hybrid.sh` as an A/B flag.
+
+### 3×256 gate (2026-08-09) — rejected
+
+Phase-matched against skip-sentinel alone on the sm_75 winner stack (SC,
+S=33, MTP-2, 376/376, q4_0/q4_0 target+draft, shared hot IDs, multi-token MoE
+fusion, Q8 rows=4, Q6 rows=2/4, async H2D, flat CONCAT, static no-sync,
+profile `cbb5aef7…`). Fresh server each run, 32-token warm-up.
+
+| Compact skip | Three decode results | Median | Δ |
+|---|---|---:|---:|
+| 0 (baseline) | 39.979, 40.058, 39.830 | **39.979** | — |
+| 1 | 39.928, 39.857, 39.871 | **39.871** | **−0.27%** |
+
+All six runs reproduced output hash
+`87b87f1d8c52a0d64c48682675b01d3e458cc8c835098cab2ec98caca4ec577c`,
+token hash
+`f2739bc4de244337140dda6da246dcb436b05f3ca331e085506e722aa61b4ae5`,
+acceptance 0.597403, mean accepted length 2.19, peak VRAM 5,624 MiB.
+
+Correctness passes; throughput fails the ≥1% promotion gate. The per-op
+device compact plus one-int D2H stream sync costs more than the reduced
+channel grid saves on this Top-8 / ~50% cold mix. No 3×2,000 follow-up.
+`GGML_CUDA_MMVQ_COMPACT_SKIP` remains default-off (`start.sh` stays at 0).
+
+Note: a first ON attempt aborted with
+`GGML_ASSERT(ptr == pool_addr + pool_used)` because compact pool buffers were
+freed out of VMM LIFO order; fixed by constructing/allocating
+`n_active → ch → tok` after `src1_q8_1`.
+
+Artifacts: `/tmp/compact-skip-off-3x256-20260809`,
+`/tmp/compact-skip-on-3x256b-20260809`.
+
+## Q8_0 ncols=1 and ncols=2 MMVQ geometry
+
+Date: 2026-08-09. Nsight previously showed Q8_0 three-column MMVQ as ~25% of
+decode GPU time; rows=4 is already the measured ncols=3 winner. `start.sh`
+exported `GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS` but the CUDA path ignored it. The
+kernel now honors:
+
+- `GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS` = `0|2|4` (default auto = 1 row/block)
+- `GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS` = `0|1|4` (default auto = 2 rows/block)
+- existing `GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS` = `0|1|4`
+
+Overrides apply only to non-ID Q8_0 launches (same restriction as ncols=3).
+
+### 3×256 screen against the skip-sentinel winner stack
+
+Fixed: SC, S=33, MTP-2, 376/376, q4_0/q4_0, shared hot IDs, multi-token MoE
+fusion, Q8 n3=4, Q6 n1=2/n3=4, async H2D, flat CONCAT, static no-sync,
+`SKIP_SENTINEL=1`, profile `cbb5aef7…`. Fresh server each run.
+
+| Config | n1 | n2 | n3 | Three decode | Median | Δ vs base |
+|---|---:|---:|---:|---|---:|---:|
+| base | 0 | 0 | 4 | 40.072, 39.879, 39.484 | **39.879** | — |
+| n1r2 | 2 | 0 | 4 | 39.905, 39.872, 39.888 | 39.888 | +0.02% |
+| n1r4 | 4 | 0 | 4 | 39.885, 39.885, 39.849 | 39.885 | +0.02% |
+| n2r1 | 0 | 1 | 4 | 39.806, 39.920, 39.847 | 39.847 | −0.08% |
+| n2r4 | 0 | 4 | 4 | 39.913, 39.854, 39.847 | 39.854 | −0.06% |
+
+All 15 runs shared output hash `87b87f1d…`, token hash `f2739bc4…`, acceptance
+0.597403, mean length 2.19. Overrides appeared in server logs when set.
+
+No candidate cleared the 1% gate. MTP-2 spends almost all Q8 work on
+three-column verify graphs; ncols=1/2 geometry is not on the critical path.
+Defaults remain auto (`0`) in `start.sh`. No 3×2,000 follow-up.
+
+Artifacts: `/tmp/q8-geom-{base,n1r2,n1r4,n2r1,n2r4}-3x256-20260809`,
+`/tmp/q8-geom-3x256-summary.txt`.
+
+## Prompt-matched specialist profile and variable placement
+
+Date: 2026-08-09. Seed coverage of the production general corpus profile is
+only **51.6%** top-33 mass. A session-local usage capture on the standard
+phase-1 bench prompt (512 decode tokens, `SAVE_EXPERT_USAGE=1`) was aggregated
+into a specialist CSV and optional variable placements at a uniform S=33 byte
+budget.
+
+| Source | Mean top-33 mass | Notes |
+|---|---:|---|
+| general corpus profile | 51.64% | `profile-corpus-train8-512-…/general-profile.csv` |
+| specialist (bench prompt) | **72.87%** | from `SC-run1.usage.csv` |
+| variable placement @ S=33 budget (general) | 52.00% offline | slots 16–43 |
+| variable placement @ S=33 budget (specialist) | 73.22% offline | slots 23–43 |
+
+### 3×256 screen (same winner stack, skip-sentinel, q4_0/q4_0, MTP-2)
+
+| Config | Seed cov | Median | Δ | Acc | Hash relation |
+|---|---:|---:|---:|---:|---|
+| gen-s33 (baseline) | 51.6% | 39.880 | — | 0.5974 | reference `87b87f1d…` |
+| **spec-s33** | **72.9%** | **44.522** | **+11.64%** | 0.6545 | different (expected) |
+| gen-var | validated | 41.962 | +5.22% | 0.6591 | different |
+| spec-var | validated | 42.768 | +7.24% | 0.6087 | different |
+
+### 3×2,000 sustained
+
+| Config | Median | Δ | Acc | Mean len | Within-config hashes |
+|---|---:|---:|---:|---:|---|
+| gen-s33 | **42.375** | — | 0.7662 | 2.53 | identical |
+| **spec-s33** | **43.222** | **+2.00%** | 0.7395 | 2.48 | identical |
+| gen-var | 41.839 | **−1.27%** | 0.7488 | 2.50 | identical |
+
+Peak VRAM stayed 5,624 MiB for every run.
+
+### Decisions
+
+- **spec-s33** clears the 1% sustained gate on this prompt (+2.00%) and improves
+  short-run throughput strongly. Token streams diverge (different hot set →
+  different float path and MTP acceptances). The specialist is **prompt-matched
+  / overfit** to the phase-1 bench prompt and is **not** a drop-in replacement
+  for multi-domain OpenWebUI traffic.
+- **gen-var** wins the short screen but **loses sustained** (−1.27%); keep
+  variable placement default-off for the portable general profile.
+- Production `start.sh` keeps the general corpus profile and uniform S unless
+  the operator deliberately installs a workload-matched specialist CSV.
+
+How to rebuild a specialist for a real workload:
+
+```bash
+SAVE_EXPERT_USAGE=1  # one collection run
+python3 tools/aggregate_expert_profiles.py \
+  --input path/to/run.usage.csv --weight 1 \
+  --model "$MODEL" --output specialist-profile.csv \
+  --normalization per-layer --scale 10000 --top-k 33
+# then set LLAMA_EXPERT_HOT=specialist-profile.csv and re-bench
+```
+
+Artifacts: `/tmp/profile-cov-artifacts-20260809`,
+`/tmp/profile-cov-{gen-s33,spec-s33,gen-var,spec-var}-3x{256,2000}-20260809`,
+`/tmp/profile-cov-3x{256,2000}-summary.txt`.

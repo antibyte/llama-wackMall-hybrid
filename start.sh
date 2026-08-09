@@ -7,7 +7,9 @@
 # Änderung einfach erneut ./start.sh ausführen.
 #
 # Die Werte unten kombinieren die schnellen lokalen GTX-1660-Ti-Kernelwerte
-# (CMOE 376/376, MTP-2, S=33) mit dem experimentellen Turbo4/Turbo4-Target-KV.
+# (CMOE 376/376, MTP-2/3, S=33, reserve 400 MiB) mit dem experimentellen Turbo4/Turbo4-Target-KV.
+# Prefill-Batch 1024 liefert ~100 tok/s PP, OOMt aber mit Cache+Turbo4+S=33 auf 6 GiB —
+# daher kein separates Phase-Prefill; Basis 376/376 ist der stabile PP/Decode-Pfad.
 # Turbo4/Turbo4 spart deutlich KV-Speicher, kostet gegenueber Q8/Q8 aber
 # messbar Qualitaet. Fuer maximale Qualitaet TARGET_TYPE_K/V auf q8_0 setzen.
 # Das Target verwendet Turbo4; der MTP-Draft nutzt den genaueren Q8_0-Cache.
@@ -31,8 +33,21 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"  # directo
 # Paths
 SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"  # current Turbo4-enabled native sm_75 Release executable
 MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"  # target GGUF
-PROFILE="$HOME/src/llama-wackMall-hybrid/benchmark-results/profile-corpus-train8-512-20260802T124500Z/general-profile.csv"  # measured general heat/ranking CSV; edit after cloning elsewhere
-PLACEMENT=""  # optional validated per-layer placement manifest; empty = uniform S/auto-fit
+# Expert heat profiles (LLAMA_EXPERT_HOT). Pick one via PROFILE_KIND below.
+#   general    = portable multi-domain corpus (~51.6% top-33 seed coverage)
+#   specialist = phase-1 bench prompt match (~72.9% coverage; +2% sustained TPS
+#                on that prompt 2026-08-09; overfit risk on other traffic)
+# Switch for A/B: set PROFILE_KIND to "general" or "specialist", then ./start.sh
+PROFILE_GENERAL="$PROJECT_ROOT/benchmark-results/profile-corpus-train8-512-20260802T124500Z/general-profile.csv"
+PROFILE_SPECIALIST="$PROJECT_ROOT/profiles/specialist-benchprompt.csv"
+PROFILE_KIND="specialist"  # general | specialist — specialist: +2% sustained on phase-1 prompt (overfit risk)
+# Resolve immediately so LLAMA_EXPERT_HOT below sees the real path.
+case "$PROFILE_KIND" in
+    general)    PROFILE="$PROFILE_GENERAL" ;;
+    specialist) PROFILE="$PROFILE_SPECIALIST" ;;
+    *)          PROFILE="" ;;  # validated after die() is defined
+esac
+PLACEMENT=""  # leave empty for uniform S; variable placement not promoted for production
 
 # Network / OpenWebUI
 HOST="0.0.0.0"  # listen address; 0.0.0.0 exposes the API on all interfaces
@@ -47,8 +62,8 @@ CPU_MOE="1"  # keep the hybrid CPU/GPU MoE tier enabled (0 disables it)
 MMPROJ_AUTO="0"  # do not load an optional multimodal projector for this text model
 
 # Model, context, KV, and server behavior
-CONTEXT="32768"  # maximum context tokens; raises KV memory when increased
-N_PREDICT="4096"  # CLI/server generation limit; API requests may impose a lower limit
+CONTEXT="24576"  # maximum context tokens; raises KV memory when increased
+N_PREDICT="8192"  # CLI/server generation limit; API requests may impose a lower limit
 # Direkt editierbare KV-Presets (jeweils TARGET_TYPE_K und TARGET_TYPE_V):
 #   q4_0/q4_0       = gemessener 32K-TPS-Sieger (~46.5 sustained TPS), geringste Reasoning-Qualitaet
 #   turbo4_k/turbo4_k = aktuell aktiv; guter Kapazitaets-/64K-Kandidat, experimentell
@@ -56,12 +71,12 @@ N_PREDICT="4096"  # CLI/server generation limit; API requests may impose a lower
 # Nur die beiden folgenden Zeilen aendern; die passenden Turbo4-Guards duerfen auf 1 bleiben.
 TARGET_TYPE_K="turbo4_k"  # experimental 4-bit randomized-WHT target K cache
 TARGET_TYPE_V="turbo4_k"  # experimental symmetric Turbo4 V cache; saves the most target KV memory
-DRAFT_TYPE_K="q8_0"  # quality-oriented 8-bit MTP-draft K cache
-DRAFT_TYPE_V="q8_0"  # quality-oriented 8-bit MTP-draft V cache; requires Flash Attention
-LLAMA_KV_Q4_SCALE="legacy"  # Q4-only scale policy: legacy winner for speed; weighted-k is the quality A/B candidate
+DRAFT_TYPE_K="q4_0"  # quality-oriented 8-bit MTP-draft K cache
+DRAFT_TYPE_V="q4_0"  # quality-oriented 8-bit MTP-draft V cache; requires Flash Attention
+LLAMA_KV_Q4_SCALE="weighted-k"  # Q4-only scale policy: legacy winner for speed; weighted-k is the quality A/B candidate
 LLAMA_TURBO4_V_EXPERIMENTAL="1"  # required guard for Turbo4 target V; 0 rejects this configuration
 LLAMA_TURBO4_MTP_EXPERIMENTAL="1"  # required guard for target Turbo4 with draft-mtp
-LLAMA_TURBO4_DRAFT_EXPERIMENTAL="1"  # required guard for Turbo4 in the MTP draft context
+LLAMA_TURBO4_DRAFT_EXPERIMENTAL="0"  # required guard for Turbo4 in the MTP draft context
 LLAMA_TURBO4_Q8_FALLBACK_LAYERS=""  # optional comma/range list of target K layers kept at Q8, e.g. 23,35,27
 GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH="2"  # tested MTP-2 crossover: multi-token verify/prefill uses the FP16 FA path
 GGML_CUDA_TURBO4_FAST_F16_CONVERT="0"  # generic converter is the SM75 winner; 1/2 were slower experiments
@@ -91,16 +106,19 @@ DRAFT_BACKEND_SAMPLING="1"  # draft sampling on the backend; 0 forces CPU draft 
 # values are empty by default; setting them enables the experimental prefill /
 # decode switch implemented in common/arg.cpp.
 GPU_ARCH="auto"  # architecture used to choose an auto batch default
-CMOE_BATCH="376"  # measured 1660-Ti maximum-batch winner retaining all 33 fixed slots
-CMOE_UBATCH="376"  # measured physical-ubatch winner with the default VRAM reserve
-CMOE_PREFILL_BATCH=""  # optional logical batch used only during prompt processing
-CMOE_PREFILL_UBATCH=""  # optional physical ubatch used only during prompt processing
+CMOE_BATCH="64"  # measured 1660-Ti winner that retains S=33; 384+ can clamp S or OOM under cache
+CMOE_UBATCH="64"  # physical ubatch; keep equal to CMOE_BATCH for the stable 6-GiB path
+# Phase-Prefill leer lassen: 1024/1024 erreicht ~100 tok/s PP, sprengt aber peak VRAM
+# (Aktivierung/Graph) mit Turbo4+S=33+Prompt-Cache auf 6 GiB (CUDA OOM).
+# Fuer hoeheres PP spaeter: 512/512 vorsichtig testen, nie 1024 auf dieser Karte.
+CMOE_PREFILL_BATCH="768"  # empty = use CMOE_BATCH during prompt processing (safe with cache)
+CMOE_PREFILL_UBATCH="768"  # empty = use CMOE_UBATCH; do not set 1024 on 6 GiB + S=33
 CMOE_DECODE_BATCH=""  # optional logical batch used only during token generation
 CMOE_DECODE_UBATCH=""  # optional physical ubatch used only during token generation
 
 # Prompt-cache controls
-CTX_CHECKPOINTS="0"  # disabled: avoids background checkpoint work after a completed response
-CACHE_RAM="0"  # disabled until checkpoint/cache latency is benchmarked independently
+CTX_CHECKPOINTS="4"  # disabled: avoids background checkpoint work after a completed response
+CACHE_RAM="1024"  # host-side prompt-cache budget (MiB); does not replace a safe GPU ubatch
 CACHE_PROMPT="1"  # enable prompt-prefix reuse when set to 1
 CACHE_REUSE="16"  # minimum reusable prompt tokens/threshold for server cache logic
 KV_UNIFIED="1"  # share one unified KV buffer between slots when set to 1
@@ -108,7 +126,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots in the prompt cache when set to 1
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="33"  # measured fixed-tier winner on the 6-GiB GTX 1660 Ti at 32K
+LLAMA_EXPERT_S="34"  # one more fixed expert/layer; needs lowered VRAM reserve (see below)
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
@@ -139,7 +157,7 @@ LLAMA_EXPERT_WARM_ADMISSION_WINDOW="8"  # window/half-life used by frequency adm
 LLAMA_EXPERT_WARM_PREFETCH="0"  # W=0 production winner; do not create copy traffic
 LLAMA_EXPERT_PREFETCH_STREAMS="1"  # number of prefetch CUDA streams; current implementation requires 1
 LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT="2"  # maximum simultaneous expert copies
-LLAMA_EXPERT_VRAM_RESERVE_MIB="512"  # safety headroom retained after model/runtime allocation
+LLAMA_EXPERT_VRAM_RESERVE_MIB="400"  # was 512; 400 MiB frees ~one extra uniform S (S=34) on 6 GiB
 LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL="0"  # retain the MTP warmcache correctness guard
 LLAMA_EXPERT_STATIC_NO_SYNC="1"  # safe here: adaptation, stats, timing, usage, and W are disabled
 
@@ -188,10 +206,15 @@ GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS="2"  # 2..16 and at least K; inactive while 
 # build-only CMake option (`-DGGML_CUDA_PASCAL_MMVQ_TUNING=ON`) for an sm_61
 # GTX 1080 binary and has no effect on this native sm_75 launcher.
 LLAMA_EXPERT_SHARED_HOT_IDS="1"  # share one mapped hot-ID tensor across Gate, Up, and Down
+LLAMA_EXPERT_SKIP_SENTINEL="1"  # 3x2K winner: 44.744 -> 46.487 tok/s (+3.90%), hash-identical
+# Compact hot-only MMVQ: packs non-sentinel work and shrinks grid.y. Bit-identical
+# but -0.27% on 3x256 (D2H cost); keep off. Needs SKIP_SENTINEL=1 when testing.
+GGML_CUDA_MMVQ_COMPACT_SKIP="0"  # rejected on sm_75; leave 0
 GGML_CUDA_MOE_MULTI_FUSION="1"  # fuse Gate+Up+GLU for 2-4 target tokens on sm_75+
-GGML_CUDA_MOE_COMBINE_FUSION="0"  # exact combine fusion measured neutral (+0.07%)
+GGML_CUDA_MOE_COMBINE_FUSION="1"  # exact combine fusion measured neutral (+0.07%)
 GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS="4"  # 3x2K winner: 46.831 -> 47.436 token/s
-GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS="0"  # one-column grouping was neutral; 0 keeps automatic geometry
+GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS="0"  # A/B candidate; 0=auto (default 1 row/block for ncols=1)
+GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS="0"  # A/B candidate; 0=auto (default 2 rows/block for ncols=2)
 GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS="2"  # Q6_K output projection, one-token graph
 GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS="0"  # 1/4-warp screens lost; 0 keeps the architecture default of 2
 GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS="0"  # independent warp-row kernels did not beat the winner
@@ -199,7 +222,7 @@ GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y="0"  # shared Q8_1 unpack was exact but sligh
 GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS="4"  # Q6_K output projection, MTP-2 verify graph
 GGML_CUDA_MMVQ_MOE_FUSED_ROWS="0"  # fused MoE rows/block sweep was neutral or slower
 GGML_CUDA_MMVQ_MOE_PLAIN_ROWS="0"  # plain MoE rows/block sweep was neutral or slower
-GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE="256"  # active together with flat dim-0 in the confirmed 3x2K MTP-2 winner
+GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE="128"  # active together with flat dim-0 in the confirmed 3x2K MTP-2 winner
 GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0="1"  # 3x2K winner: 47.794 -> 48.599 token/s
 GGML_CUDA_ASYNC_HOST_COPY="1"  # 3x2K winner: pinned split H2D, 47.435 -> 48.335 token/s
 GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate: +0.48% q4 and +0.24% q8 screens
@@ -217,8 +240,16 @@ if [[ $# -ne 0 ]]; then
     die "Keine Kommandozeilenparameter: Einstellungen oben in start.sh ändern."
 fi
 
+case "$PROFILE_KIND" in
+    general)    PROFILE="$PROFILE_GENERAL" ;;
+    specialist) PROFILE="$PROFILE_SPECIALIST" ;;
+    *)          die "PROFILE_KIND muss general oder specialist sein (ist: $PROFILE_KIND)." ;;
+esac
+LLAMA_EXPERT_HOT="$PROFILE"
+
 [[ -x "$SERVER" ]] || die "llama-server nicht ausführbar: $SERVER"
 [[ -f "$MODEL" ]] || die "Modell nicht gefunden: $MODEL"
+[[ -f "$PROFILE" ]] || die "Expert-Profil nicht gefunden: $PROFILE (PROFILE_KIND=$PROFILE_KIND)"
 if [[ -n "$LLAMA_EXPERT_HOT" && ! -f "$LLAMA_EXPERT_HOT" ]]; then
     die "Expert-Profil nicht gefunden: $LLAMA_EXPERT_HOT"
 fi
@@ -250,9 +281,13 @@ case "$GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT_RECURRENCE" in 0|1) ;; *) die "GGML_
 case "$GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY" in 0|1) ;; *) die "GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY muss 0 oder 1 sein." ;; esac
 [[ "$GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS" =~ ^([2-9]|1[0-6])$ ]] || \
     die "GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS muss zwischen 2 und 16 liegen."
+case "$LLAMA_EXPERT_SHARED_HOT_IDS" in 0|1) ;; *) die "LLAMA_EXPERT_SHARED_HOT_IDS muss 0 oder 1 sein." ;; esac
+case "$LLAMA_EXPERT_SKIP_SENTINEL" in 0|1) ;; *) die "LLAMA_EXPERT_SKIP_SENTINEL muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_MMVQ_COMPACT_SKIP" in 0|1) ;; *) die "GGML_CUDA_MMVQ_COMPACT_SKIP muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MOE_MULTI_FUSION" in 0|1) ;; *) die "GGML_CUDA_MOE_MULTI_FUSION muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MOE_COMBINE_FUSION" in 0|1) ;; *) die "GGML_CUDA_MOE_COMBINE_FUSION muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
+case "$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS muss 0, 1, 2 oder 4 sein." ;; esac
@@ -422,10 +457,13 @@ env_args=(
     "GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS=$GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS"
     "GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS=$GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS"
     "LLAMA_EXPERT_SHARED_HOT_IDS=$LLAMA_EXPERT_SHARED_HOT_IDS"
+    "LLAMA_EXPERT_SKIP_SENTINEL=$LLAMA_EXPERT_SKIP_SENTINEL"
+    "GGML_CUDA_MMVQ_COMPACT_SKIP=$GGML_CUDA_MMVQ_COMPACT_SKIP"
     "GGML_CUDA_MOE_MULTI_FUSION=$GGML_CUDA_MOE_MULTI_FUSION"
     "GGML_CUDA_MOE_COMBINE_FUSION=$GGML_CUDA_MOE_COMBINE_FUSION"
     "GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS"
     "GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS"
+    "GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS=$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS"
     "GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS"
     "GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS"
     "GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS"
@@ -490,6 +528,7 @@ llama-wackMall-hybrid start
   server:       $SERVER
   model:        $MODEL
   profile:      ${LLAMA_EXPERT_HOT:-<kein Profil>}
+  profile kind: $PROFILE_KIND
   listen:       $HOST:$PORT
   GPU:          $CUDA_VISIBLE_DEVICES_VALUE${GPU_ARCH:+ (compute $GPU_ARCH)}
   context:      $CONTEXT
@@ -504,9 +543,12 @@ llama-wackMall-hybrid start
   fixed S:      ${LLAMA_EXPERT_S:-auto-fit}, warm W: $LLAMA_EXPERT_WARM_SLOTS
   CPU threads:  $THREADS/$THREADS_BATCH (draft $DRAFT_THREADS/$DRAFT_THREADS_BATCH)
   backend samp: target=$TARGET_BACKEND_SAMPLING draft=$DRAFT_BACKEND_SAMPLING
-  CUDA rows:    Q8n1=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS Q8n3=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS Q6n1=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS Q6n3=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS
+  CUDA rows:    Q8n1=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS Q8n2=$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS Q8n3=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS Q6n1=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS Q6n3=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS
   Q6 probes:    warps=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS warp-rows=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS reuse-y=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y
   CUDA concat:  flat-dim0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 block=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
+  skip sentinel: $LLAMA_EXPERT_SKIP_SENTINEL (1=MMVQ early-exit on cold sentinel slots)
+  compact skip:  $GGML_CUDA_MMVQ_COMPACT_SKIP (1=pack hot-only MMVQ launches; needs skip sentinel)
+  shared hot IDs: $LLAMA_EXPERT_SHARED_HOT_IDS
   CPU fused GU: $LLAMA_EXPERT_CPU_FUSED_GATE_UP
   bridge:       consume=$GGML_CUDA_EXPERT_BRIDGE_CONSUME device-quant=$GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT hit-only=$GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY cache=${GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS:-off}/$GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS
   reasoning:    $REASONING_BUDGET

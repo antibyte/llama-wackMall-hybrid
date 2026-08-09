@@ -165,6 +165,7 @@ GGML_CUDA_EXPERT_BRIDGE_JSON="0"  # 0 keeps bridge off; set an absolute JSON pat
 # this launcher. Compare this binary against build-transient-sm61 before
 # promoting it, because only compile/link correctness has been established.
 LLAMA_EXPERT_SHARED_HOT_IDS="1"  # first GTX1080 A/B candidate; set 0 for the exact old baseline
+LLAMA_EXPERT_SKIP_SENTINEL="1"  # sm_75 3x2K winner (+3.90%); still needs phase-matched sm_61 A/B
 GGML_CUDA_MOE_MULTI_FUSION="0"  # sm_75+ path; disabled on Pascal
 GGML_CUDA_MOE_COMBINE_FUSION="0"  # exact combine fusion measured neutral (+0.07%)
 GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS="0"  # automatic baseline; test 1,2,4 independently on sm_61
@@ -323,6 +324,7 @@ env_args=(
     "GGML_CUDA_EXPERT_BRIDGE_CONSUME=$GGML_CUDA_EXPERT_BRIDGE_CONSUME"
     "GGML_CUDA_EXPERT_BRIDGE_VERIFY=$GGML_CUDA_EXPERT_BRIDGE_VERIFY"
     "LLAMA_EXPERT_SHARED_HOT_IDS=$LLAMA_EXPERT_SHARED_HOT_IDS"
+    "LLAMA_EXPERT_SKIP_SENTINEL=$LLAMA_EXPERT_SKIP_SENTINEL"
     "GGML_CUDA_MOE_MULTI_FUSION=$GGML_CUDA_MOE_MULTI_FUSION"
     "GGML_CUDA_MOE_COMBINE_FUSION=$GGML_CUDA_MOE_COMBINE_FUSION"
     "GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS"

@@ -1526,7 +1526,11 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
-    ggml_glu_op glu_op;
+    ggml_glu_op glu_op = GGML_GLU_OP_SWIGLU;
+    // Expert-tier sentinel skip for MUL_MAT_ID: when >= 0, ids that map to this
+    // weight-channel (hot store slot) produce a zero output without loading the
+    // zeroed sentinel weights. -1 disables the path (default).
+    int32_t skip_slot = -1;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1535,7 +1539,20 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    int32_t skip_slot;
 };
+
+// MUL_MAT_ID op_params: [0]=1 enables skip, [1]=slot index of the zero sentinel.
+static inline int32_t ggml_cuda_mul_mat_id_skip_slot(const ggml_tensor * t) {
+    if (!t || t->op != GGML_OP_MUL_MAT_ID) {
+        return -1;
+    }
+    if (ggml_get_op_params_i32(t, 0) != 1) {
+        return -1;
+    }
+    const int32_t slot = ggml_get_op_params_i32(t, 1);
+    return slot >= 0 ? slot : -1;
+}
 
 struct ggml_cuda_kernel_launch_params {
     dim3 block_nums;
