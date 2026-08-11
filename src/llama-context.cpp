@@ -954,9 +954,15 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
+    // Prefill graphs rarely need multi-token logits. When DFlash is attached to the
+    // target, n_outputs_max tracks draft n_max for verify - do not size the large
+    // prefill reserve (often 512-1024 tokens) to that many outputs or higher n_max
+    // burns VRAM without helping prefill.
     const uint32_t n_outputs_pp = model.arch == LLM_ARCH_DFLASH ?
             std::max<uint64_t>(1, std::min<uint64_t>(n_tokens, (uint64_t) n_seqs * cparams.n_sampling_outputs_per_seq_max)) :
-            std::min(n_tokens, cparams.n_outputs_max);
+            (dflash != nullptr ?
+                    n_seqs :
+                    std::min(n_tokens, cparams.n_outputs_max));
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -989,11 +995,21 @@ void llama_context::sched_reserve() {
         n_nodes_tg  = ggml_graph_n_nodes(gf);
     }
 
-    if (dflash != nullptr && dflash->enabled) {
-        const uint32_t n_tokens_dflash = dflash->max_combined_tokens();
-        auto * gf = graph_reserve(n_tokens_dflash, n_seqs, n_tokens_dflash, mctx.get(), model.hparams.no_alloc);
+    if (dflash != nullptr) {
+        if (dflash->enabled) {
+            const uint32_t n_tokens_dflash = dflash->max_combined_tokens();
+            auto * gf = graph_reserve(n_tokens_dflash, n_seqs, n_tokens_dflash, mctx.get(), model.hparams.no_alloc);
+            if (!gf) {
+                throw std::runtime_error("failed to allocate combined DFlash compute buffers");
+            }
+        }
+        // Standalone or fallback verify: target may decode up to n_max+1 tokens with n_max
+        // logits without going through the large prefill graph's output count.
+        const uint32_t n_verify = std::min(n_tokens, std::max(n_seqs, cparams.n_outputs_max + 1));
+        const uint32_t n_out_v  = std::min(n_verify, std::max(n_seqs, cparams.n_outputs_max));
+        auto * gf = graph_reserve(n_verify, n_seqs, n_out_v, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
-            throw std::runtime_error("failed to allocate combined DFlash compute buffers");
+            throw std::runtime_error("failed to allocate DFlash verify compute buffers");
         }
     }
 

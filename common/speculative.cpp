@@ -2379,22 +2379,27 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_dflash = std::find(params.speculative.types.begin(),
+                                       params.speculative.types.end(),
+                                       COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
     GGML_ASSERT(has_draft || spec_mtp);
 
+    // params here is already the speculative/draft param view: cache_type_* is draft KV.
     if (params.cache_type_k == GGML_TYPE_TURBO4_K || params.cache_type_v == GGML_TYPE_TURBO4_K) {
         const bool mtp_only = spec_mtp &&
             std::all_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type type) {
                 return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
             });
-        if (!turbo4_mtp_experimental_enabled() || !mtp_only) {
-            LOG_ERR("%s: turbo4_k draft KV requires draft-mtp only and "
-                    "LLAMA_TURBO4_MTP_EXPERIMENTAL=1\n", __func__);
+        const bool dflash_only = spec_dflash &&
+            std::all_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type type) {
+                return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_NONE;
+            });
+        if (!turbo4_draft_experimental_enabled()) {
+            LOG_ERR("%s: turbo4_k draft KV requires LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1\n", __func__);
             return;
         }
-        if ((params.speculative.draft.cache_type_k == GGML_TYPE_TURBO4_K ||
-             params.speculative.draft.cache_type_v == GGML_TYPE_TURBO4_K) &&
-            !turbo4_draft_experimental_enabled()) {
-            LOG_ERR("%s: turbo4_k draft KV requires LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1\n", __func__);
+        if (!mtp_only && !dflash_only) {
+            LOG_ERR("%s: turbo4_k draft KV requires draft-mtp only or draft-dflash only\n", __func__);
             return;
         }
     }

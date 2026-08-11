@@ -79,6 +79,36 @@ static _Atomic(ggml_cpu_moe_transient_gate_up_fetch_fn) g_moe_transient_gate_up_
 static atomic_bool g_moe_transient_gate_up_verify;
 static atomic_bool g_moe_transient_gate_up_verify_seen;
 
+// expert tiering hooks: restored after DFlash merge dropped the definitions.
+// exposed via ggml_backend_cpu_get_proc_address for GGML_BACKEND_DL builds.
+static const char * (*g_moe_probe_hook)(const void *, int64_t, const char *) = NULL;
+static const char * (*g_moe_fetch_hook)(const void *, int64_t, const char *) = NULL;
+static void (*g_moe_predict_hook)(const struct ggml_tensor *, const struct ggml_tensor *) = NULL;
+static FILE * g_route_trace = NULL;
+static int g_route_nlayers = 0;
+static uint64_t g_moe_cold_us = 0;
+
+void ggml_set_moe_probe_hook(const char * (*fn)(const void * key, int64_t expert, const char * fallback)) {
+    g_moe_probe_hook = fn;
+}
+
+void ggml_set_moe_fetch_hook(const char * (*fn)(const void * key, int64_t expert, const char * fallback)) {
+    g_moe_fetch_hook = fn;
+}
+
+void ggml_set_moe_predict_hook(void (*fn)(const struct ggml_tensor * counts, const struct ggml_tensor * x)) {
+    g_moe_predict_hook = fn;
+}
+
+void ggml_set_route_trace(FILE * f, int n_layers) {
+    g_route_trace = f;
+    g_route_nlayers = n_layers;
+}
+
+uint64_t ggml_moe_cold_timer_us(void) {
+    return g_moe_cold_us;
+}
+
 void ggml_cpu_moe_profile_enable(bool enabled) {
     atomic_store_explicit(&g_moe_profile_enabled, enabled, memory_order_relaxed);
 }
@@ -2144,6 +2174,28 @@ static void ggml_compute_forward_moe_cold(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    // optional pre-gate predict + route trace (tier module may set these)
+    if (ith == 0) {
+        if (g_moe_predict_hook && counts) {
+            g_moe_predict_hook(counts, x);
+        }
+        // probe/fetch hooks are for weight-address override paths (warm prefetch / pread).
+        // the current fused cold kernel uses resident weight tensors; keep hooks linked.
+        (void) g_moe_probe_hook;
+        (void) g_moe_fetch_hook;
+        if (g_route_trace && ids) {
+            const int layer = g_route_nlayers > 0 ? (int) (g_moe_cold_us % (uint64_t) g_route_nlayers) : -1;
+            for (int64_t t = 0; t < ids->ne[1]; t++) {
+                fprintf(g_route_trace, "%llu,%d", (unsigned long long) t, layer);
+                for (int id = 0; id < ids->ne[0]; id++) {
+                    const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+                    fprintf(g_route_trace, ",%d", e);
+                }
+                fprintf(g_route_trace, "\n");
+            }
+        }
+    }
 
     // gate/up share a type; down may use a different quant
     const enum ggml_type type_g = w_gate->type;

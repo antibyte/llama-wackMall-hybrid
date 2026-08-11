@@ -190,11 +190,12 @@ graph uses the next-token layer, which is not in the base-layer tier store.
 
 Warmcache remains opt-in. Deterministic 64-token MTP-2 controls failed for both
 synchronous and asynchronous warm residency even though no-MTP hashes matched.
-The guard is therefore automatic: when `draft-mtp` is parsed, warm slots are
-disabled before target-context creation while the fixed tier remains active.
-`LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL=1` bypasses this only for controlled
-diagnostics. The benchmark evidence and first divergent token are recorded in
-`HYBRID_EXPERIMENTS.md`.
+MTP-2 warm residency is now allowed for controlled testing so that the guard
+can be re-evaluated with the current backend-sampling and reasoning-budget
+path. MTP-1 and MTP-3 remain guarded by default. The fixed tier remains active
+in all cases. `LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL=1` continues to bypass the
+guard for MTP-1 and MTP-3 diagnostics. The historical failure and first
+divergent token are recorded in `HYBRID_EXPERIMENTS.md`.
 
 ## VRAM auto-fit
 

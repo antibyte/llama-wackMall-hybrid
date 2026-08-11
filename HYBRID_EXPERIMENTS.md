@@ -1797,3 +1797,18 @@ Two related candidates were rejected and removed:
 Artifacts: `/tmp/mmvq-cleanup-ab-20260810`,
 `/tmp/sched-dedup-ab-20260810`, `/tmp/sched-dedup-ab-3x2000-20260810`,
 `/tmp/sched-dedup-safety-20260810`.
+
+## MTP-2 warm-cache guard removal
+
+On 2026-08-05 the automatic warm-cache guard was removed for MTP-2. The
+historical guard remains documented above because its 64-token synchronous and
+asynchronous tests diverged at output token 46. The current code now allows
+MTP-2 warm slots to be allocated so that the path can be re-tested with the
+new target backend sampler and reasoning-budget bridge. MTP-1 and MTP-3 retain
+the automatic guard, and `LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL=1` remains the
+explicit diagnostic override for those modes.
+
+No throughput or correctness claim is made by this source change alone. Any
+MTP-2 warm-cache run must compare output and token hashes, MTP acceptance,
+mean accepted length, first divergent token, CUDA errors, and VRAM before its
+throughput is considered.

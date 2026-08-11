@@ -1193,8 +1193,12 @@ private:
                 std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type type) {
                     return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
                 });
-            if (!enabled || !mtp_only) {
-                SRV_ERR("%s", "turbo4_k draft KV requires draft-mtp only and "
+            const bool dflash_only = spec_dflash &&
+                std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type type) {
+                    return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_NONE;
+                });
+            if (!enabled || !(mtp_only || dflash_only)) {
+                SRV_ERR("%s", "turbo4_k draft KV requires draft-mtp only or draft-dflash only and "
                         "LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1\n");
                 return false;
             }

@@ -555,6 +555,11 @@ void configure_mtp(int mtp_n) {
     if (already_configured) {
         return;
     }
+    if (g_mtp_n == 2) {
+        g_warm_mtp_guarded = false;
+        TIER_LOG("expert_tier: warm cache guard disabled for MTP-2; numerical equivalence remains experimental\n");
+        return;
+    }
     if (warm_mtp_experimental()) {
         TIER_LOG("expert_tier: WARNING experimental warm cache with MTP-%d explicitly enabled; deterministic equivalence is not established\n",
                 g_mtp_n);

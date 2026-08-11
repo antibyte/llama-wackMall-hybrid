@@ -291,21 +291,25 @@ GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=2 \
     --spec-draft-type-k turbo4_k --spec-draft-type-v turbo4_k
 ```
 
-The DFlash target-cache experiment keeps the sidecar KV at Q4_0:
+The DFlash path supports Turbo4 on the target and, with an extra guard, on the
+draft sidecar as well. Q4_0 draft KV remains the measured SM75 throughput
+default; draft Turbo4 is a capacity experiment:
 
 ```bash
 LLAMA_TURBO4_V_EXPERIMENTAL=1 \
 LLAMA_TURBO4_DFLASH_EXPERIMENTAL=1 \
+LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1 \
 GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=2 \
     ./build-main-sm75/bin/llama-server \
     ... -ctk turbo4_k -ctv turbo4_k \
     --spec-type draft-dflash --spec-draft-model "$DFLASH_MODEL" \
     --spec-draft-n-max 2 \
-    --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
+    --spec-draft-type-k turbo4_k --spec-draft-type-v turbo4_k
 ```
 
-This guard enables Turbo4 only for the target context. DFlash draft Turbo4
-remains rejected because it has a separate performance and acceptance tradeoff.
+`LLAMA_TURBO4_DFLASH_EXPERIMENTAL=1` enables Turbo4 for the target with
+draft-dflash. Draft Turbo4 additionally needs `LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1`
+(same flag as MTP draft Turbo4).
 
 Draft Turbo4 uses the same exact-writing and Flash-Attention implementation as
 the target cache, but the draft context contains only the single NextN layer.
@@ -770,6 +774,23 @@ MTP_N=2 \
 
 ### LAN/OpenWebUI launcher
 
+Fixed GPU references:
+
+- [`start1660.sh`](start1660.sh) — measured GTX 1660 Ti (sm_75, 6 GiB) production stack
+- [`start1080.sh`](start1080.sh) — measured GTX 1080 (sm_61, 8 GiB) production stack
+- [`start.sh`](start.sh) — auto-generated baseline for the current machine
+
+Generate/refine `start.sh` with hardware detect + optional timed search:
+
+```bash
+python3 tools/hybrid_autotune/autotune.py detect
+python3 tools/hybrid_autotune/autotune.py generate -y
+python3 tools/hybrid_autotune/autotune.py optimize --mode quick   # ~10 min
+# or: ./autotune
+```
+
+See [`tools/hybrid_autotune/README.md`](tools/hybrid_autotune/README.md).
+
 The project-root launcher [`start.sh`](start.sh) contains the complete
 environment configuration for the server, MTP, backend sampling, expert
 tiering, warmcache, and lookahead controls. It binds to `0.0.0.0:8080` and
@@ -815,7 +836,7 @@ CMOE_UBATCH=376 \
 ./scripts/bench_hybrid.sh
 ```
 
-Use `MTP_OVERRIDE=0`, `1`, `2`, or `3` for comparable MTP screens. Case `SD` enables expert statistics and the required synchronization for diagnostics. Cases `SV` and `SVC` use a layer-variable placement manifest through `PLACEMENT=...`. Warm-cache cases are available in the script but remain experimental, and MTP warm residency is guarded off by default.
+Use `MTP_OVERRIDE=0`, `1`, `2`, or `3` for comparable MTP screens. Case `SD` enables expert statistics and the required synchronization for diagnostics. Cases `SV` and `SVC` use a layer-variable placement manifest through `PLACEMENT=...`. Warm-cache cases remain experimental: MTP-2 warm residency is now allowed for controlled testing, while MTP-1 and MTP-3 retain the automatic guard.
 
 The primary metric is median sustained decode token/s over 2,000 tokens. Reject a candidate if hashes unexpectedly diverge, output quality fails, CUDA hangs, NVIDIA Xid appears, VRAM OOM occurs, or throughput regresses more than the experiment's declared threshold.
 

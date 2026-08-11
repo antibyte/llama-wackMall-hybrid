@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper for hybrid autotune
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+exec python3 "$ROOT/tools/hybrid_autotune/autotune.py" "$@"

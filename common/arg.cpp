@@ -455,8 +455,10 @@ common_models_handler common_models_handler_init(const common_params & params, l
             throw std::invalid_argument(
                 "experimental turbo4_k draft KV requires LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1");
         }
-        if (!spec_types_is_mtp_only(params)) {
-            throw std::invalid_argument("experimental turbo4_k draft KV requires draft-mtp only");
+        // draft Turbo4 is allowed for MTP and DFlash (each as sole non-none type)
+        if (!spec_types_is_mtp_only(params) && !spec_types_is_dflash_only(params)) {
+            throw std::invalid_argument(
+                "experimental turbo4_k draft KV requires draft-mtp only or draft-dflash only");
         }
         if (draft_turbo4_v && !turbo4_v_experimental_enabled()) {
             throw std::invalid_argument(
