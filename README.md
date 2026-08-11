@@ -200,9 +200,10 @@ The Phase 2 runtime is an explicit diagnostic only:
 Do not use `turbo4_k` for draft KV, FlashAttention-off operation, or CPU KQV.
 Target V is a separate experiment and requires
 `LLAMA_TURBO4_V_EXPERIMENTAL=1`. Target Turbo4 with the existing draft-mtp
-path additionally requires `LLAMA_TURBO4_MTP_EXPERIMENTAL=1`; other
-speculative methods stay rejected. Use a fresh Q8/Q8 control process with
-identical inputs and compare hashes, quality, acceptance, and median timing.
+path additionally requires `LLAMA_TURBO4_MTP_EXPERIMENTAL=1`. Target Turbo4
+with draft-dflash instead requires `LLAMA_TURBO4_DFLASH_EXPERIMENTAL=1`;
+other speculative methods stay rejected. Use a fresh Q8/Q8 control process
+with identical inputs and compare hashes, quality, acceptance, and median timing.
 An optional faster prompt/verify path can be built with:
 
 ```bash
@@ -289,6 +290,22 @@ GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=2 \
     --spec-type draft-mtp --spec-draft-n-max 2 \
     --spec-draft-type-k turbo4_k --spec-draft-type-v turbo4_k
 ```
+
+The DFlash target-cache experiment keeps the sidecar KV at Q4_0:
+
+```bash
+LLAMA_TURBO4_V_EXPERIMENTAL=1 \
+LLAMA_TURBO4_DFLASH_EXPERIMENTAL=1 \
+GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=2 \
+    ./build-main-sm75/bin/llama-server \
+    ... -ctk turbo4_k -ctv turbo4_k \
+    --spec-type draft-dflash --spec-draft-model "$DFLASH_MODEL" \
+    --spec-draft-n-max 2 \
+    --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
+```
+
+This guard enables Turbo4 only for the target context. DFlash draft Turbo4
+remains rejected because it has a separate performance and acceptance tradeoff.
 
 Draft Turbo4 uses the same exact-writing and Flash-Attention implementation as
 the target cache, but the draft context contains only the single NextN layer.

@@ -45,9 +45,6 @@ struct llama_model;
 //   LLAMA_EXPERT_SKIP_SENTINEL - 1: CUDA MMVQ early-exits cold expert slots that
 //                                map to the zeroed sentinel (default 0 until
 //                                measured on the target GPU)
-//   GGML_CUDA_MMVQ_COMPACT_SKIP - 1: pack non-sentinel (channel[,token]) work and
-//                                shrink the MMVQ grid (needs SKIP_SENTINEL=1;
-//                                bit-identical; default 0 until measured)
 //   LLAMA_EXPERT_WARM_SLOTS - extra bounded warm slots/layer (default 0)
 //   LLAMA_EXPERT_WARM_AUTO_MAX - cap for W=auto (default 4; tune on larger GPUs)
 //   LLAMA_EXPERT_WARM_POLICY - warm replacement policy (currently lru)

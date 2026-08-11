@@ -486,7 +486,12 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    const auto * mctx = static_cast<const llama_kv_cache_context *>(
+            use_mctx_draft ? params.mctx_draft : params.mctx);
+
+    if (mctx == nullptr) {
+        return false;
+    }
 
     this->mctx = mctx;
 
@@ -495,7 +500,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    if (self_kq_mask != nullptr) {
+        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, cparams);
+    }
 
     return res;
 }
@@ -592,7 +599,12 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
+    const auto * mctx = static_cast<const llama_kv_cache_iswa_context *>(
+            use_mctx_draft ? params.mctx_draft : params.mctx);
+
+    if (mctx == nullptr) {
+        return false;
+    }
 
     this->mctx = mctx;
 
@@ -605,7 +617,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     if (self_kq_mask && self_kq_mask->buffer) {
-        res &= can_reuse_kq_mask(self_kq_mask, mctx->get_base(), params.ubatch, params.cparams);
+        res &= can_reuse_kq_mask(self_kq_mask, mctx->get_base(), params.ubatch, cparams);
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -615,7 +627,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
-        res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+        res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, cparams);
     }
 
     return res;

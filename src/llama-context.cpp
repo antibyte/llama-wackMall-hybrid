@@ -15,6 +15,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -34,6 +35,256 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     }
     throw std::runtime_error("Unsupported ctx type");
 }
+
+struct llama_context::dflash_bridge : public llm_graph_dflash_i {
+    llama_context & target;
+    llama_context & draft;
+
+    llama_memory_context_ptr mctx_batch;
+    llama_memory_context_ptr mctx_reserve;
+
+    std::vector<llama_token> dummy_tokens;
+    std::map<llama_seq_id, llama_pos> rollback_pos;
+
+    bool enabled = true;
+    bool batch_active = false;
+    bool graph_supported = false;
+    bool current_injected = false;
+    bool any_injected = false;
+    bool applied = false;
+    bool last_injected = false;
+
+    dflash_bridge(llama_context & target, llama_context & draft) : target(target), draft(draft) {
+    }
+
+    uint32_t max_combined_tokens() const {
+        // Larger prompt batches use the standalone chunked injection path.
+        return std::min({
+            target.cparams.n_ubatch,
+            draft.cparams.n_ubatch,
+            draft.cparams.n_sampling_outputs_per_seq_max + 1,
+        });
+    }
+
+    const llama_memory_context_i * current_mctx() const {
+        if (mctx_batch != nullptr) {
+            return mctx_batch.get();
+        }
+        return mctx_reserve.get();
+    }
+
+    bool devices_compatible() const {
+        for (ggml_backend_t backend_draft : draft.backend_ptrs) {
+            const auto dev_draft = ggml_backend_get_device(backend_draft);
+            bool found = false;
+            for (ggml_backend_t backend_target : target.backend_ptrs) {
+                if (ggml_backend_get_device(backend_target) == dev_draft) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool begin_reserve() {
+        mctx_reserve.reset();
+        if (!enabled || draft.memory == nullptr) {
+            return false;
+        }
+        mctx_reserve = draft.memory->init_full();
+        return mctx_reserve != nullptr;
+    }
+
+    void end_reserve() {
+        mctx_reserve.reset();
+    }
+
+    bool begin_batch(const llama_batch & batch) {
+        last_injected = false;
+        batch_active = false;
+        current_injected = false;
+        any_injected = false;
+        applied = false;
+        rollback_pos.clear();
+        mctx_batch.reset();
+
+        if (!enabled || draft.memory == nullptr || batch.n_tokens <= 0 ||
+                batch.n_tokens > (int32_t) target.runtime_n_ubatch ||
+                batch.n_tokens > (int32_t) max_combined_tokens() ||
+                target.cparams.n_seq_max != 1 || draft.cparams.n_seq_max != 1) {
+            return false;
+        }
+
+        draft.synchronize();
+        draft.memory_update(false);
+
+        dummy_tokens.assign(batch.n_tokens, 0);
+        llama_batch layout = batch;
+        layout.token = dummy_tokens.data();
+        layout.embd = nullptr;
+        layout.logits = nullptr;
+
+        if (!draft.balloc->init(
+                    layout,
+                    draft.model.vocab,
+                    draft.memory.get(),
+                    draft.model.hparams.n_embd_inp(),
+                    draft.cparams.kv_unified ? LLAMA_MAX_SEQ : draft.cparams.n_seq_max,
+                    false)) {
+            return false;
+        }
+
+        mctx_batch = draft.memory->init_batch(*draft.balloc, target.runtime_n_ubatch, false);
+        if (mctx_batch == nullptr || mctx_batch->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+            mctx_batch.reset();
+            return false;
+        }
+
+        const llama_batch & sanitized = draft.balloc->get_batch();
+        for (int32_t i = 0; i < sanitized.n_tokens; ++i) {
+            const llama_seq_id seq_id = sanitized.n_seq_id ? sanitized.seq_id[i][0] : 0;
+            const llama_pos pos = sanitized.pos[i];
+            auto it = rollback_pos.find(seq_id);
+            if (it == rollback_pos.end()) {
+                rollback_pos.emplace(seq_id, pos);
+            } else {
+                it->second = std::min(it->second, pos);
+            }
+        }
+
+        batch_active = true;
+        return true;
+    }
+
+    static bool same_ubatch(const llama_ubatch & target_batch, const llama_ubatch & draft_batch) {
+        if (target_batch.n_tokens != draft_batch.n_tokens ||
+                target_batch.n_seqs_unq != draft_batch.n_seqs_unq) {
+            return false;
+        }
+
+        for (uint32_t i = 0; i < target_batch.n_tokens; ++i) {
+            if (target_batch.pos[i] != draft_batch.pos[i] ||
+                    target_batch.n_seq_id[i] != draft_batch.n_seq_id[i]) {
+                return false;
+            }
+            for (int32_t s = 0; s < target_batch.n_seq_id[i]; ++s) {
+                if (target_batch.seq_id[i][s] != draft_batch.seq_id[i][s]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool apply(const llama_ubatch & ubatch) {
+        current_injected = false;
+        if (!batch_active) {
+            return true;
+        }
+
+        if (!same_ubatch(ubatch, mctx_batch->get_ubatch())) {
+            if (any_injected) {
+                return false;
+            }
+            batch_active = false;
+            mctx_batch.reset();
+            return true;
+        }
+
+        if (!mctx_batch->apply()) {
+            return false;
+        }
+        applied = true;
+        return true;
+    }
+
+    void rollback() {
+        if (!applied) {
+            return;
+        }
+        target.synchronize();
+        for (const auto & entry : rollback_pos) {
+            draft.memory->seq_rm(entry.first, entry.second, -1);
+        }
+        applied = false;
+    }
+
+    void mark_computed() {
+        if (!batch_active) {
+            return;
+        }
+        if (!graph_supported) {
+            rollback();
+            batch_active = false;
+            mctx_batch.reset();
+            return;
+        }
+        current_injected = true;
+        any_injected = true;
+    }
+
+    bool advance(bool target_has_next) {
+        if (!batch_active) {
+            return true;
+        }
+        const bool draft_has_next = mctx_batch->next();
+        return draft_has_next == target_has_next;
+    }
+
+    void end_batch(bool success) {
+        if (!success) {
+            rollback();
+        }
+        last_injected = success && batch_active && any_injected;
+        batch_active = false;
+        current_injected = false;
+        applied = false;
+        mctx_batch.reset();
+        rollback_pos.clear();
+    }
+
+    bool skip_host_layer(uint32_t il) const {
+        if (!current_injected) {
+            return false;
+        }
+        return std::find(
+                draft.model.target_layer_ids.begin(),
+                draft.model.target_layer_ids.end(),
+                (int32_t) il) != draft.model.target_layer_ids.end();
+    }
+
+    bool build(llm_graph_context & graph) override {
+        graph_supported = false;
+        const auto * mctx = current_mctx();
+        if (mctx == nullptr || draft.model.arch != LLM_ARCH_DFLASH ||
+                draft.model.target_layer_ids.empty() ||
+                graph.ubatch.n_tokens > max_combined_tokens()) {
+            return false;
+        }
+
+        ggml_tensor * features = nullptr;
+        for (int32_t il : draft.model.target_layer_ids) {
+            if (il < 0 || (size_t) il >= graph.res->t_layer_inp.size()) {
+                return false;
+            }
+            ggml_tensor * layer = graph.res->get_layer_inp(il);
+            if (layer == nullptr || layer->type != GGML_TYPE_F32 ||
+                    layer->ne[1] != (int64_t) graph.ubatch.n_tokens) {
+                return false;
+            }
+            features = features == nullptr ? layer : ggml_concat(graph.ctx0, features, layer, 0);
+        }
+
+        graph.cb(features, "dflash_features", -1);
+        graph_supported = draft.model.build_dflash_injection(
+                graph, features, draft.cparams, mctx);
+        return graph_supported;
+    }
+};
 
 struct llm_fused_op_probe {
     llm_fused_op op;
@@ -482,6 +733,13 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (dflash_target != nullptr) {
+        dflash_target->detach_dflash(this);
+    }
+    if (dflash != nullptr) {
+        detach_dflash(&dflash->draft);
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -499,6 +757,62 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+bool llama_context::attach_dflash(llama_context * ctx_draft) {
+    if (ctx_draft == nullptr || ctx_draft == this || ctx_draft->model.arch != LLM_ARCH_DFLASH) {
+        return false;
+    }
+    if (dflash != nullptr) {
+        return &dflash->draft == ctx_draft;
+    }
+    if (ctx_draft->dflash_target != nullptr) {
+        return false;
+    }
+
+    const char * value = std::getenv("LLAMA_DFLASH_COMBINED");
+    if (value == nullptr || std::strcmp(value, "1") != 0) {
+        LLAMA_LOG_INFO("%s: combined DFlash graph disabled\n", __func__);
+        return false;
+    }
+
+    auto bridge = std::make_unique<dflash_bridge>(*this, *ctx_draft);
+    if (cparams.n_seq_max != 1 || ctx_draft->cparams.n_seq_max != 1) {
+        LLAMA_LOG_INFO("%s: combined DFlash graph requires n_seq_max = 1\n", __func__);
+        return false;
+    }
+    if (!bridge->devices_compatible()) {
+        LLAMA_LOG_INFO("%s: target and draft backends are not compatible\n", __func__);
+        return false;
+    }
+
+    dflash = std::move(bridge);
+    ctx_draft->dflash_target = this;
+    sched_need_reserve = true;
+    LLAMA_LOG_INFO("%s: combined DFlash graph enabled\n", __func__);
+    return true;
+}
+
+void llama_context::detach_dflash(llama_context * ctx_draft) {
+    if (dflash == nullptr || &dflash->draft != ctx_draft) {
+        return;
+    }
+    synchronize();
+    ctx_draft->dflash_target = nullptr;
+    dflash.reset();
+    sched_need_reserve = true;
+}
+
+bool llama_context::take_dflash_injected() {
+    if (dflash == nullptr) {
+        return false;
+    }
+    const bool result = dflash->last_injected;
+    dflash->last_injected = false;
+    if (result) {
+        synchronize();
+    }
+    return result;
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -589,6 +903,20 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    struct dflash_reserve_scope {
+        dflash_bridge * bridge;
+        ~dflash_reserve_scope() {
+            if (bridge != nullptr) {
+                bridge->end_reserve();
+            }
+        }
+    } dflash_scope { dflash.get() };
+
+    if (dflash != nullptr && !dflash->begin_reserve()) {
+        dflash->enabled = false;
+        LLAMA_LOG_WARN("%s: failed to reserve the combined DFlash graph; using standalone injection\n", __func__);
+    }
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
@@ -626,7 +954,9 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const uint32_t n_outputs_pp = model.arch == LLM_ARCH_DFLASH ?
+            std::max<uint64_t>(1, std::min<uint64_t>(n_tokens, (uint64_t) n_seqs * cparams.n_sampling_outputs_per_seq_max)) :
+            std::min(n_tokens, cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -657,6 +987,14 @@ void llama_context::sched_reserve() {
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
+    }
+
+    if (dflash != nullptr && dflash->enabled) {
+        const uint32_t n_tokens_dflash = dflash->max_combined_tokens();
+        auto * gf = graph_reserve(n_tokens_dflash, n_seqs, n_tokens_dflash, mctx.get(), model.hparams.no_alloc);
+        if (!gf) {
+            throw std::runtime_error("failed to allocate combined DFlash compute buffers");
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -1343,6 +1681,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    if (dflash != nullptr && !dflash->apply(ubatch)) {
+        LLAMA_LOG_ERROR("%s: failed to apply DFlash memory context\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1407,6 +1750,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (dflash != nullptr) {
+        dflash->mark_computed();
+    }
+
     // Phase 1 lookahead tracing only submits small asynchronous D2H reads.
     // Completion is consumed after the tier's existing scheduler barrier; the
     // trace path never introduces a barrier of its own.
@@ -1467,7 +1814,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens;
 
     // reserve output buffer
-    if (output_reserve(n_tokens) < n_tokens) {
+    if (output_reserve(n_tokens, model.arch == LLM_ARCH_DFLASH) < n_tokens) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
         return -2;
     };
@@ -1753,6 +2100,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
+    struct dflash_batch_scope {
+        dflash_bridge * bridge;
+        bool success = false;
+        ~dflash_batch_scope() {
+            if (bridge != nullptr) {
+                bridge->end_batch(success);
+            }
+        }
+    } dflash_scope { dflash.get() };
+
+    if (dflash != nullptr) {
+        dflash->begin_batch(batch_inp);
+    }
+
     llama_memory_context_ptr mctx;
 
     while (true) {
@@ -1812,7 +2173,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
-    do {
+    while (true) {
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
@@ -1987,7 +2348,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
-    } while (mctx->next());
+
+        const bool has_next = mctx->next();
+        if (dflash != nullptr && !dflash->advance(has_next)) {
+            LLAMA_LOG_ERROR("%s: target and DFlash ubatch layouts diverged\n", __func__);
+            return -3;
+        }
+        if (!has_next) {
+            break;
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2042,6 +2412,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    dflash_scope.success = true;
     return 0;
 }
 
@@ -2049,7 +2420,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, bool encoder_only) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -2060,7 +2431,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
+    bool has_logits     = !encoder_only;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -2091,7 +2462,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
-    const bool has_sampling = !sampling.samplers.empty();
+    const bool has_sampling = !encoder_only && !sampling.samplers.empty();
     if (has_sampling) {
         backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
@@ -2214,6 +2585,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
+            continue;
+        }
+        if (dflash != nullptr && dflash->skip_host_layer(il)) {
             continue;
         }
         if (!embd_layer_inp[il].has_data()) {
@@ -2343,6 +2717,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+    if (dflash != nullptr && dflash->enabled) {
+        res += 8u*dflash->draft.model.n_tensors();
+    }
     return res;
 }
 
@@ -2469,7 +2846,9 @@ llm_graph_params llama_context::graph_params(
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
+        /*.mctx_draft  =*/ dflash != nullptr ? dflash->current_mctx() : nullptr,
         /*.cross       =*/ &cross,
+        /*.dflash      =*/ dflash != nullptr && dflash->current_mctx() != nullptr ? dflash.get() : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4247,4 +4626,18 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+bool llama_attach_dflash(struct llama_context * ctx, struct llama_context * ctx_draft) {
+    return ctx != nullptr && ctx->attach_dflash(ctx_draft);
+}
+
+void llama_detach_dflash(struct llama_context * ctx, struct llama_context * ctx_draft) {
+    if (ctx != nullptr) {
+        ctx->detach_dflash(ctx_draft);
+    }
+}
+
+bool llama_take_dflash_injected(struct llama_context * ctx) {
+    return ctx != nullptr && ctx->take_dflash_injected();
 }

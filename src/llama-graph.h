@@ -20,6 +20,7 @@ struct llama_cparams;
 struct llama_layer;
 
 struct llama_memory_context_i;
+struct llm_graph_context;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
@@ -319,10 +320,12 @@ public:
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_context * mctx) :
+            const llama_kv_cache_context * mctx,
+            bool use_mctx_draft = false) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        use_mctx_draft(use_mctx_draft) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -352,6 +355,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    const bool use_mctx_draft;
 };
 
 // V-less input for the KV cache
@@ -430,10 +434,12 @@ public:
     llm_graph_input_attn_kv_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_iswa_context * mctx) :
+            const llama_kv_cache_iswa_context * mctx,
+            bool use_mctx_draft = false) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        use_mctx_draft(use_mctx_draft) {
     }
     ~llm_graph_input_attn_kv_iswa() = default;
 
@@ -469,6 +475,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    const bool use_mctx_draft;
 };
 
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
@@ -670,6 +677,12 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+struct llm_graph_dflash_i {
+    virtual ~llm_graph_dflash_i() = default;
+
+    virtual bool build(llm_graph_context & graph) = 0;
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -686,7 +699,10 @@ struct llm_graph_params {
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
+    const llama_memory_context_i * mctx_draft;
     const llama_cross            * cross;
+
+    llm_graph_dflash_i * dflash;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -777,6 +793,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            dflash == other.dflash &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

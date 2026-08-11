@@ -225,7 +225,7 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    uint32_t output_reserve(int32_t n_outputs, bool encoder_only = false);
 
     void output_reorder();
 
@@ -254,6 +254,10 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+
+    bool attach_dflash(llama_context * ctx_draft);
+    void detach_dflash(llama_context * ctx_draft);
+    bool take_dflash_injected();
 
 private:
     llm_graph_params graph_params(
@@ -380,6 +384,10 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    struct dflash_bridge;
+    std::unique_ptr<dflash_bridge> dflash;
+    llama_context * dflash_target = nullptr;
 
     // perf
     mutable int64_t t_start_us  = 0;

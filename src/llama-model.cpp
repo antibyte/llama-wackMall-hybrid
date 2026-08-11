@@ -2410,8 +2410,24 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     return res;
 }
 
+bool llama_model::build_dflash_injection(
+        llm_graph_context              & graph,
+        ggml_tensor                    * features,
+        const llama_cparams            & cparams_draft,
+        const llama_memory_context_i * mctx_draft) const {
+    GGML_UNUSED(graph);
+    GGML_UNUSED(features);
+    GGML_UNUSED(cparams_draft);
+    GGML_UNUSED(mctx_draft);
+    return false;
+}
+
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+
+    if (params.dflash != nullptr) {
+        params.dflash->build(*llm);
+    }
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);

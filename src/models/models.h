@@ -1269,6 +1269,12 @@ struct llama_model_dflash : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    bool build_dflash_injection(
+            llm_graph_context              & graph,
+            ggml_tensor                    * features,
+            const llama_cparams            & cparams_draft,
+            const llama_memory_context_i * mctx_draft) const override;
 };
 
 

@@ -1533,11 +1533,12 @@ sentinel baseline the 3×256 screen produced different output/token hashes
 (`5fc5623b…` / `038099e9…` vs `87b87f1d…` / `f2739bc4…`) and different MTP
 metrics (0.6167 / 2.23 vs 0.5974 / 2.19). That path was removed.
 
-### Bit-identical MoE weight staging (kept off)
+### Bit-identical MoE weight staging (removed)
 
-`GGML_CUDA_MMVQ_MOE_SHARE_WEIGHTS=1` keeps the original per-token `kbx` schedule
-and warp reduction. When all tokens map to the same expert, warp 0 copies each
-thread's weight block into shared memory and every token warp reuses it. Against
+The former `GGML_CUDA_MMVQ_MOE_SHARE_WEIGHTS=1` path kept the original per-token
+`kbx` schedule and warp reduction. When all tokens mapped to the same expert,
+warp 0 copied each thread's weight block into shared memory and every token warp
+reused it. Against
 the skip-sentinel winner stack on 2026-08-08:
 
 | Share weights | 3×256 decode | Median | Δ | Hashes / MTP |
@@ -1547,7 +1548,7 @@ the skip-sentinel winner stack on 2026-08-08:
 
 Correctness passes; throughput fails. Staging plus per-`kbx` `__syncthreads`
 costs more than letting concurrent warps hit L1 on the same global weight
-addresses. The flag remains default-off (`start.sh` does not enable it). Artifact:
+addresses. The implementation and runtime control were removed. Artifact:
 `/tmp/moe-share-bitident-3x256-20260808`.
 
 ### Re-screen: async D2H with skip-sentinel stack
@@ -1580,25 +1581,26 @@ Source reference: https://github.com/ggml-org/llama.cpp/pull/26385
 
 ## Compact hot-only MMVQ launches (skip-sentinel follow-up)
 
-Date: 2026-08-09. Skip-sentinel still launches a full Top-k channel grid and
-early-exits cold sentinel slots. With ~50% seed coverage that wastes launch
-slots on zero work. `GGML_CUDA_MMVQ_COMPACT_SKIP=1` (default off) builds a
+Date: 2026-08-09. Skip-sentinel still launched a full Top-k channel grid and
+early-exited cold sentinel slots. With ~50% seed coverage that wasted launch
+slots on zero work. The former `GGML_CUDA_MMVQ_COMPACT_SKIP=1` path built a
 device-side packed list of non-sentinel channels (single-token) or
-`(channel, token)` pairs (multi-token MoE), `cudaMemset`s the destination,
-reads the active count (one int D2H + stream sync), and launches only those
-work items. Outputs scatter back to the original Top-k layout so the existing
-weighted combine and CPU cold ADD stay unchanged and bit-identical.
+`(channel, token)` pairs (multi-token MoE), cleared the destination, read the
+active count (one int D2H + stream sync), and launched only those work items.
+Outputs scattered back to the original Top-k layout so the existing weighted
+combine and CPU cold ADD stayed unchanged and bit-identical.
 
-Controls:
+Historical controls:
 
 - `GGML_CUDA_MMVQ_COMPACT_SKIP=0|1` (default 0)
 - Requires `LLAMA_EXPERT_SKIP_SENTINEL=1` so `skip_slot` is set on MUL_MAT_ID
 - While a CUDA graph is capturing, the path falls back to the full-grid
   skip-sentinel behavior (variable grid is not capture-safe)
 
-Implementation: `ggml/src/ggml-cuda/mmvq.cu` (`mmvq_compact_*_kernel`,
-`mmvq_compact_args`, entry in `ggml_cuda_mul_mat_vec_q`). Wired in `start.sh`
-and `scripts/bench_hybrid.sh` as an A/B flag.
+Former implementation: `ggml/src/ggml-cuda/mmvq.cu`
+(`mmvq_compact_*_kernel`, `mmvq_compact_args`, entry in
+`ggml_cuda_mul_mat_vec_q`). It was wired in `start.sh` and
+`scripts/bench_hybrid.sh` as an A/B flag.
 
 ### 3×256 gate (2026-08-09) — rejected
 
@@ -1621,7 +1623,7 @@ acceptance 0.597403, mean accepted length 2.19, peak VRAM 5,624 MiB.
 Correctness passes; throughput fails the ≥1% promotion gate. The per-op
 device compact plus one-int D2H stream sync costs more than the reduced
 channel grid saves on this Top-8 / ~50% cold mix. No 3×2,000 follow-up.
-`GGML_CUDA_MMVQ_COMPACT_SKIP` remains default-off (`start.sh` stays at 0).
+The implementation and runtime control were removed.
 
 Note: a first ON attempt aborted with
 `GGML_ASSERT(ptr == pool_addr + pool_used)` because compact pool buffers were
@@ -1728,3 +1730,70 @@ python3 tools/aggregate_expert_profiles.py \
 Artifacts: `/tmp/profile-cov-artifacts-20260809`,
 `/tmp/profile-cov-{gen-s33,spec-s33,gen-var,spec-var}-3x{256,2000}-20260809`,
 `/tmp/profile-cov-3x{256,2000}-summary.txt`.
+
+## MMVQ cleanup and scheduler destination-sync deduplication
+
+Date: 2026-08-10. Two rejected MMVQ experiments were still compiled into the
+normal Q4_K/Q5_K/Q6_K MoE kernels even when their runtime switches were off:
+shared weight staging and compact skip packing. Their static shared arrays and
+live ranges inflated the off-path kernel resources. The experiments, launch
+plumbing, environment controls, and benchmark controls were removed while the
+skip-sentinel fast path and all measured row overrides were retained.
+
+| sm_75 rows=2 kernel | Before registers/shared | After registers/shared |
+|---|---:|---:|
+| Q4_K fused | 238 / 18,468 B | 64 / 0 B |
+| Q5_K plain | 254 / 11,300 B | 57 / 0 B |
+| Q6_K plain | 242 / 13,476 B | 64 / 0 B |
+
+`MUL_MAT_ID` passed 790/790 backend cases and `MUL_MAT_ID_FUSION` passed
+13/13. An exact old-binary versus cleaned-binary 3x256 A/B was neutral:
+36.060 versus 36.031 token/s (-0.08%). Output hashes, token hashes, and MTP
+acceptance were identical. The cleanup remains because it removes dead code and
+restores kernel occupancy without making a throughput claim.
+
+The same audit found a redundant destination synchronization at single-copy
+CUDA scheduler split boundaries. A backend that was fully synchronized earlier
+in the current `compute_splits` call does not need another full synchronization
+before a later split input overwrites its copy slot, provided no graph has run
+on that backend since. `GGML_SCHED_DEDUP_DST_SYNC=1` tracks this fact locally,
+is active only for `n_copies == 1`, and invalidates it before every asynchronous
+graph launch. Event-backed multi-copy scheduling is unchanged.
+
+### Counterbalanced A/B
+
+Fixed: specialist S=34, MTP-2, 64/64, q4_0/q4_0, skip sentinel, multi-token
+MoE fusion, async pinned H2D, flat CONCAT, static no-sync, fresh server per run.
+
+| Length | Off runs | On runs | Median off | Median on | Change |
+|---|---|---|---:|---:|---:|
+| 256 | 36.148, 36.008, 35.968 | 36.345, 36.175, 36.157 | 36.008 | 36.175 | +0.46% |
+| 2,000 | 47.340, 47.664, 47.111 | 47.713, 47.878, 47.572 | 47.340 | 47.713 | +0.79% |
+
+All paired deltas were positive. The 2,000-token output hash
+`4bcf3885...`, token hash `1634df0a...`, acceptance 0.703614, and mean accepted
+length 2.41 were identical. The synchronous-H2D fallback, no-MTP path, and two
+consecutive requests in one server process also retained identical hashes. A
+pre-change Nsight trace contained 7,622 sync-before-H2D pairs over 121 target
+verifications; those synchronizations accounted for 89.603 ms, or about
+0.736 ms per verification.
+
+This is below the usual 1% promotion gate, but it is enabled in the private
+max-TPS `start.sh` stack because both test lengths and every paired run agreed,
+the removed wait is directly visible in the trace, and the implementation is a
+small single-copy-only scheduling optimization. The benchmark harness keeps its
+default off so controls remain explicit.
+
+Two related candidates were rejected and removed:
+
+- Packing 2/4/8 independent Q4_0-to-F16 converter warps per CUDA block was
+  bit-identical and passed 336/336 Q4_0 flash-attention cases. At the observed
+  1,441,792/1,572,864-value shapes, the best two-warp variant saved only
+  0.25%/0.69% of a roughly 22-24 us kernel, with no useful end-to-end lever.
+- Batching the two pinned CUDA-to-host inputs of a cold MoE split reduced
+  synchronization calls but dropped a matched smoke run from 48.066 to
+  30.256 token/s (-37.0%). The prototype was fully removed.
+
+Artifacts: `/tmp/mmvq-cleanup-ab-20260810`,
+`/tmp/sched-dedup-ab-20260810`, `/tmp/sched-dedup-ab-3x2000-20260810`,
+`/tmp/sched-dedup-safety-20260810`.

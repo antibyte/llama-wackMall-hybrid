@@ -34,6 +34,23 @@ static void test(void) {
             std::numeric_limits<int32_t>::max(),
             std::numeric_limits<int32_t>::max());
 
+    auto assert_draft_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
+                                         int32_t total, int32_t per_seq) {
+        const auto limits = common_speculative_get_draft_output_limits(n_batch, n_parallel, n_draft);
+        assert(limits.total == total);
+        assert(limits.per_seq == per_seq);
+    };
+
+    assert_draft_output_limits(16, 2,  3, 6, 3);
+    assert_draft_output_limits( 5, 2,  3, 5, 3);
+    assert_draft_output_limits(16, 2, -1, 0, 0);
+    assert_draft_output_limits(
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max());
+
     {
         common_params base;
         base.n_parallel = 4;
@@ -42,6 +59,57 @@ static void test(void) {
         const auto draft = common_base_params_to_speculative(base);
         assert(draft.n_outputs_max == 4);
         assert(draft.n_sampling_outputs_per_seq_max == 1);
+    }
+
+    {
+        common_params base;
+        base.n_batch = 16;
+        base.n_ubatch = 16;
+        base.n_parallel = 4;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        base.speculative.draft.n_max = 3;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_outputs_max == 12);
+        assert(draft.n_sampling_outputs_per_seq_max == 3);
+    }
+
+    {
+        common_params base;
+        base.n_batch = 768;
+        base.n_ubatch = 768;
+        base.n_parallel = 1;
+        base.cmoe_n_batch_prefill = 768;
+        base.cmoe_n_ubatch_prefill = 768;
+        base.cmoe_n_batch_decode = 64;
+        base.cmoe_n_ubatch_decode = 64;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        base.speculative.draft.n_max = 2;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_batch == 64);
+        assert(draft.n_ubatch == 64);
+        assert(draft.n_outputs_max == 2);
+        assert(draft.n_sampling_outputs_per_seq_max == 2);
+    }
+
+    {
+        common_params base;
+        base.n_batch = 16;
+        base.n_ubatch = 16;
+        base.n_parallel = 2;
+        base.cmoe_n_batch_prefill = 16;
+        base.cmoe_n_ubatch_prefill = 16;
+        base.cmoe_n_batch_decode = 2;
+        base.cmoe_n_ubatch_decode = 2;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        base.speculative.draft.n_max = 3;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_batch == 8);
+        assert(draft.n_ubatch == 8);
+        assert(draft.n_outputs_max == 6);
+        assert(draft.n_sampling_outputs_per_seq_max == 3);
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");

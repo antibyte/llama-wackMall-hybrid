@@ -367,6 +367,11 @@ static bool turbo4_mtp_experimental_enabled() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+static bool turbo4_dflash_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_DFLASH_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 static bool turbo4_draft_experimental_enabled() {
     const char * value = std::getenv("LLAMA_TURBO4_DRAFT_EXPERIMENTAL");
     return value != nullptr && std::strcmp(value, "1") == 0;
@@ -382,6 +387,14 @@ static bool spec_types_is_mtp_only(const common_params & params) {
     return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() &&
         std::all_of(types.begin(), types.end(), [](common_speculative_type type) {
             return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
+        });
+}
+
+static bool spec_types_is_dflash_only(const common_params & params) {
+    const auto & types = params.speculative.types;
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end() &&
+        std::all_of(types.begin(), types.end(), [](common_speculative_type type) {
+            return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_NONE;
         });
 }
 
@@ -419,11 +432,14 @@ common_models_handler common_models_handler_init(const common_params & params, l
         if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
             throw std::invalid_argument("experimental turbo4_k requires --flash-attn on");
         }
-        if (!spec_types_is_default(params) &&
-            !(turbo4_mtp_experimental_enabled() && spec_types_is_mtp_only(params))) {
+        const bool turbo4_spec_enabled =
+            (turbo4_mtp_experimental_enabled() && spec_types_is_mtp_only(params)) ||
+            (turbo4_dflash_experimental_enabled() && spec_types_is_dflash_only(params));
+        if (!spec_types_is_default(params) && !turbo4_spec_enabled) {
             throw std::invalid_argument(
-                "experimental turbo4_k with MTP requires draft-mtp only and "
-                "LLAMA_TURBO4_MTP_EXPERIMENTAL=1");
+                "experimental turbo4_k speculative decoding requires either draft-mtp only with "
+                "LLAMA_TURBO4_MTP_EXPERIMENTAL=1 or draft-dflash only with "
+                "LLAMA_TURBO4_DFLASH_EXPERIMENTAL=1");
         }
     } else if (const char * value = std::getenv("LLAMA_TURBO4_Q8_FALLBACK_LAYERS")) {
         if (value[0] != '\0') {

@@ -122,6 +122,13 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// Attach a DFlash draft context to the target graph. Context destruction detaches the bridge; neither context owns the other.
+LLAMA_API bool llama_attach_dflash(struct llama_context * ctx, struct llama_context * ctx_draft);
+LLAMA_API void llama_detach_dflash(struct llama_context * ctx, struct llama_context * ctx_draft);
+
+// Consume the result of the most recent target decode.
+LLAMA_API bool llama_take_dflash_injected(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //

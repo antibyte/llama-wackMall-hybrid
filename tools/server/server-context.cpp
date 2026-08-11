@@ -1031,8 +1031,13 @@ private:
 
         const int32_t batch = prefill ? cmoe_prefill_batch : cmoe_decode_batch;
         const int32_t ubatch = prefill ? cmoe_prefill_ubatch : cmoe_decode_ubatch;
+        const bool spec_dflash = std::find(params_base.speculative.types.begin(),
+                                           params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
+        const uint32_t draft_ubatch = ctx_dft && spec_dflash ?
+                std::min<uint32_t>(ubatch, llama_n_ubatch(ctx_dft)) : (uint32_t) ubatch;
         if (!llama_set_runtime_ubatch(ctx_tgt, (uint32_t) ubatch) ||
-                (ctx_dft && !llama_set_runtime_ubatch(ctx_dft, (uint32_t) ubatch))) {
+                (ctx_dft && !llama_set_runtime_ubatch(ctx_dft, draft_ubatch))) {
             throw std::runtime_error(string_format(
                     "failed to activate cmoe %s batch %d/%d",
                     prefill ? "prefill" : "decode", batch, ubatch));
@@ -1148,6 +1153,9 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool spec_dflash = std::find(params_base.speculative.types.begin(),
+                                           params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
         const bool has_any_spec = std::any_of(
             params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type type) {
@@ -1155,15 +1163,23 @@ private:
             });
 
         if ((params_base.cache_type_k == GGML_TYPE_TURBO4_K || params_base.cache_type_v == GGML_TYPE_TURBO4_K) && has_any_spec) {
-            const char * value = std::getenv("LLAMA_TURBO4_MTP_EXPERIMENTAL");
-            const bool enabled = value != nullptr && std::strcmp(value, "1") == 0;
+            const char * mtp_value = std::getenv("LLAMA_TURBO4_MTP_EXPERIMENTAL");
+            const char * dflash_value = std::getenv("LLAMA_TURBO4_DFLASH_EXPERIMENTAL");
             const bool mtp_only = spec_mtp &&
                 std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type type) {
                     return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
                 });
-            if (!enabled || !mtp_only) {
-                SRV_ERR("%s", "target turbo4_k speculative decoding requires draft-mtp only and "
-                        "LLAMA_TURBO4_MTP_EXPERIMENTAL=1\n");
+            const bool dflash_only = spec_dflash &&
+                std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type type) {
+                    return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_NONE;
+                });
+            const bool turbo4_spec_enabled =
+                (mtp_value != nullptr && std::strcmp(mtp_value, "1") == 0 && mtp_only) ||
+                (dflash_value != nullptr && std::strcmp(dflash_value, "1") == 0 && dflash_only);
+            if (!turbo4_spec_enabled) {
+                SRV_ERR("%s", "target turbo4_k speculative decoding requires either draft-mtp only with "
+                        "LLAMA_TURBO4_MTP_EXPERIMENTAL=1 or draft-dflash only with "
+                        "LLAMA_TURBO4_DFLASH_EXPERIMENTAL=1\n");
                 return false;
             }
         }

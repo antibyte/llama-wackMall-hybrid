@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-SERVER="${SERVER:-$ROOT/build-hybrid/bin/llama-server}"
+SERVER="${SERVER:-$ROOT/build-main-sm75/bin/llama-server}"
 CLIENT="${CLIENT:-$ROOT/tools/bench_hybrid_client.py}"
 MODEL="${MODEL:-$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 PROFILE="${PROFILE:-${7:-$HOME/models/qwen3.6-35b-a3b-mtp/luce-warmstart.csv}}"
@@ -40,11 +40,17 @@ WARMUP_PROMPT_REPEAT="${WARMUP_PROMPT_REPEAT:-1}"
 ADAPT_CUDA_GRAPHS="${ADAPT_CUDA_GRAPHS:-0}"
 DRAFT_P_MIN="${DRAFT_P_MIN:-}"
 DRAFT_BACKEND_SAMPLING="${DRAFT_BACKEND_SAMPLING:-}"
-EFFECTIVE_DRAFT_BACKEND_SAMPLING="${DRAFT_BACKEND_SAMPLING:-1}"
 TARGET_BACKEND_SAMPLING="${TARGET_BACKEND_SAMPLING:-0}"
 REASONING_BUDGET="${REASONING_BUDGET:-16384}"
 DRAFT_TYPE_K="${DRAFT_TYPE_K:-q8_0}"
 DRAFT_TYPE_V="${DRAFT_TYPE_V:-q4_0}"
+SPEC_MODE="${SPEC_MODE:-mtp}"
+SPEC_DRAFT_MODEL="${SPEC_DRAFT_MODEL:-$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-DFlash-Q4_K_M.gguf}"
+SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-2}"
+SPEC_DRAFT_N_MIN="${SPEC_DRAFT_N_MIN:-0}"
+SPEC_DRAFT_P_MIN="${SPEC_DRAFT_P_MIN:-0.75}"
+SPEC_DRAFT_BACKEND_SAMPLING="${SPEC_DRAFT_BACKEND_SAMPLING:-1}"
+DFLASH_COMBINED="${DFLASH_COMBINED:-1}"
 SPEC_TYPES_OVERRIDE="${SPEC_TYPES_OVERRIDE:-}"
 NGRAM_MOD_N_MATCH="${NGRAM_MOD_N_MATCH:-8}"
 NGRAM_MOD_N_MIN="${NGRAM_MOD_N_MIN:-2}"
@@ -71,12 +77,11 @@ MMVQ_Q6_K_NCOLS1_ROWS="${MMVQ_Q6_K_NCOLS1_ROWS:-0}"
 MMVQ_Q6_K_NCOLS3_ROWS="${MMVQ_Q6_K_NCOLS3_ROWS:-0}"
 MMVQ_MOE_FUSED_ROWS="${MMVQ_MOE_FUSED_ROWS:-0}"
 MMVQ_MOE_PLAIN_ROWS="${MMVQ_MOE_PLAIN_ROWS:-0}"
-MMVQ_MOE_SHARE_WEIGHTS="${MMVQ_MOE_SHARE_WEIGHTS:-0}"
-MMVQ_COMPACT_SKIP="${MMVQ_COMPACT_SKIP:-0}"
 TURBO4_FAST_F16_CONVERT="${TURBO4_FAST_F16_CONVERT:-0}"
 TURBO4_WHT_SHUFFLE="${TURBO4_WHT_SHUFFLE:-0}"
 CUDA_ASYNC_HOST_COPY="${CUDA_ASYNC_HOST_COPY:-0}"
 SCHED_ASYNC_D2H_COPY="${SCHED_ASYNC_D2H_COPY:-0}"
+SCHED_DEDUP_DST_SYNC="${SCHED_DEDUP_DST_SYNC:-0}"
 CONCAT_NONCONT_BLOCK_SIZE="${CONCAT_NONCONT_BLOCK_SIZE:-0}"
 CONCAT_NONCONT_FLAT_DIM0="${CONCAT_NONCONT_FLAT_DIM0:-0}"
 CPU_MASK="${CPU_MASK:-}"
@@ -95,6 +100,7 @@ PREFETCH_OVERRIDE="${PREFETCH_OVERRIDE:-}"
 SIGSEGV_PRELOAD="${SIGSEGV_PRELOAD:-}"
 WARM_MTP_EXPERIMENTAL="${WARM_MTP_EXPERIMENTAL:-0}"
 TURBO4_MTP_EXPERIMENTAL="${TURBO4_MTP_EXPERIMENTAL:-0}"
+TURBO4_DFLASH_EXPERIMENTAL="${TURBO4_DFLASH_EXPERIMENTAL:-0}"
 TURBO4_V_EXPERIMENTAL="${TURBO4_V_EXPERIMENTAL:-0}"
 TURBO4_DRAFT_EXPERIMENTAL="${TURBO4_DRAFT_EXPERIMENTAL:-0}"
 TURBO4_Q8_FALLBACK_LAYERS="${TURBO4_Q8_FALLBACK_LAYERS:-}"
@@ -110,6 +116,31 @@ CASES="${CASES:-${1:-A}}"
 PROMPT_FILE="$RESULTS_DIR/prompt.txt"
 RUNS_CSV="$RESULTS_DIR/runs.csv"
 MEDIANS_CSV="$RESULTS_DIR/medians.csv"
+
+case "$SPEC_MODE" in
+    none|mtp|dflash) ;;
+    *) echo "SPEC_MODE muss none, mtp oder dflash sein" >&2; exit 1 ;;
+esac
+[[ "$SPEC_DRAFT_N_MAX" =~ ^[1-9][0-9]*$ ]] || { echo "SPEC_DRAFT_N_MAX muss eine positive Ganzzahl sein" >&2; exit 1; }
+[[ "$SPEC_DRAFT_N_MIN" =~ ^[0-9]+$ ]] || { echo "SPEC_DRAFT_N_MIN muss eine nichtnegative Ganzzahl sein" >&2; exit 1; }
+(( SPEC_DRAFT_N_MIN <= SPEC_DRAFT_N_MAX )) || { echo "SPEC_DRAFT_N_MIN darf SPEC_DRAFT_N_MAX nicht ueberschreiten" >&2; exit 1; }
+[[ "$SPEC_DRAFT_P_MIN" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] || { echo "SPEC_DRAFT_P_MIN muss zwischen 0 und 1 liegen" >&2; exit 1; }
+case "$SPEC_DRAFT_BACKEND_SAMPLING" in
+    0|1) ;;
+    *) echo "SPEC_DRAFT_BACKEND_SAMPLING muss 0 oder 1 sein" >&2; exit 1 ;;
+esac
+case "$DFLASH_COMBINED" in
+    0|1) ;;
+    *) echo "DFLASH_COMBINED muss 0 oder 1 sein" >&2; exit 1 ;;
+esac
+case "$TURBO4_DFLASH_EXPERIMENTAL" in
+    0|1) ;;
+    *) echo "TURBO4_DFLASH_EXPERIMENTAL muss 0 oder 1 sein" >&2; exit 1 ;;
+esac
+if [[ "$SPEC_MODE" == dflash ]]; then
+    [[ -n "$SPEC_DRAFT_MODEL" ]] || { echo "SPEC_DRAFT_MODEL darf fuer SPEC_MODE=dflash nicht leer sein" >&2; exit 1; }
+    [[ -f "$SPEC_DRAFT_MODEL" ]] || { echo "DFlash-Modell nicht gefunden: $SPEC_DRAFT_MODEL" >&2; exit 1; }
+fi
 
 if [[ -e "$RESULTS_DIR" ]]; then
     echo "Ergebnisverzeichnis existiert bereits; nichts wird ueberschrieben: $RESULTS_DIR" >&2
@@ -182,7 +213,7 @@ if command -v system76-power >/dev/null; then
 fi
 
 printf '%s\n' \
-  'config,rep,fixed_s,effective_fixed_s,warm_s,mtp_n,spec_types,ngram_mod_n_match,ngram_mod_n_min,ngram_mod_n_max,ngram_simple_size_n,ngram_simple_size_m,ngram_simple_min_hits,context,target_type_k,target_type_v,kv_q4_scale,mtp_requantize_output,turbo4_f16_prefill_min_batch,cpu_threads,draft_threads,draft_type_k,draft_type_v,draft_p_min,draft_backend_sampling,target_backend_sampling,reasoning_budget,cpu_chunk,cpu_act_parallel,cpu_async,cpu_down_prefetch,cpu_reuse_rows,cpu_multi_row,cpu_fused_gate_up,shared_hot_ids,moe_multi_fusion,moe_combine_fusion,mmvq_q8_ncols3_rows,mmvq_q6_k_ncols1_rows,mmvq_q6_k_ncols3_rows,mmvq_moe_fused_rows,mmvq_moe_plain_rows,turbo4_fast_f16_convert,turbo4_wht_shuffle,cuda_async_host_copy,sched_async_d2h_copy,concat_noncont_block_size,concat_noncont_flat_dim0,load_mode,cmoe_batch,cmoe_ubatch,prompt_repeat,profile_sha256,placement_sha256,power_profile,cpu_mask,cpu_poll,adapt,adapt_cuda_graphs,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,cpu_gate_up_ms,cpu_activation_ms,cpu_down_ms,cpu_async_jobs,cpu_async_wait_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
+  'config,rep,fixed_s,effective_fixed_s,warm_s,mtp_n,spec_mode,spec_draft_model,spec_draft_n_max,spec_draft_n_min,spec_draft_p_min,spec_draft_backend_sampling,dflash_combined,spec_types,ngram_mod_n_match,ngram_mod_n_min,ngram_mod_n_max,ngram_simple_size_n,ngram_simple_size_m,ngram_simple_min_hits,context,target_type_k,target_type_v,kv_q4_scale,mtp_requantize_output,turbo4_f16_prefill_min_batch,cpu_threads,draft_threads,draft_type_k,draft_type_v,draft_p_min,draft_backend_sampling,target_backend_sampling,reasoning_budget,cpu_chunk,cpu_act_parallel,cpu_async,cpu_down_prefetch,cpu_reuse_rows,cpu_multi_row,cpu_fused_gate_up,shared_hot_ids,moe_multi_fusion,moe_combine_fusion,mmvq_q8_ncols3_rows,mmvq_q6_k_ncols1_rows,mmvq_q6_k_ncols3_rows,mmvq_moe_fused_rows,mmvq_moe_plain_rows,turbo4_fast_f16_convert,turbo4_wht_shuffle,cuda_async_host_copy,sched_async_d2h_copy,sched_dedup_dst_sync,concat_noncont_block_size,concat_noncont_flat_dim0,load_mode,cmoe_batch,cmoe_ubatch,prompt_repeat,profile_sha256,placement_sha256,power_profile,cpu_mask,cpu_poll,adapt,adapt_cuda_graphs,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,spec_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,cpu_gate_up_ms,cpu_activation_ms,cpu_down_ms,cpu_async_jobs,cpu_async_wait_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
   > "$RUNS_CSV"
 
 PID=""
@@ -241,6 +272,39 @@ case_settings() {
     fi
 }
 
+resolve_spec_settings() {
+    case "$SPEC_MODE" in
+        none)
+            EFFECTIVE_SPEC_TYPES="none"
+            EFFECTIVE_SPEC_DRAFT_MODEL=""
+            EFFECTIVE_SPEC_DRAFT_N_MAX="0"
+            EFFECTIVE_SPEC_DRAFT_N_MIN=""
+            EFFECTIVE_SPEC_DRAFT_P_MIN=""
+            EFFECTIVE_DRAFT_BACKEND_SAMPLING="${DRAFT_BACKEND_SAMPLING:-1}"
+            ;;
+        mtp)
+            if [[ "$MTP_N" -gt 0 ]]; then
+                EFFECTIVE_SPEC_TYPES="${SPEC_TYPES_OVERRIDE:-draft-mtp}"
+            else
+                EFFECTIVE_SPEC_TYPES="none"
+            fi
+            EFFECTIVE_SPEC_DRAFT_MODEL=""
+            EFFECTIVE_SPEC_DRAFT_N_MAX="$MTP_N"
+            EFFECTIVE_SPEC_DRAFT_N_MIN=""
+            EFFECTIVE_SPEC_DRAFT_P_MIN="$DRAFT_P_MIN"
+            EFFECTIVE_DRAFT_BACKEND_SAMPLING="${DRAFT_BACKEND_SAMPLING:-1}"
+            ;;
+        dflash)
+            EFFECTIVE_SPEC_TYPES="${SPEC_TYPES_OVERRIDE:-draft-dflash}"
+            EFFECTIVE_SPEC_DRAFT_MODEL="$SPEC_DRAFT_MODEL"
+            EFFECTIVE_SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"
+            EFFECTIVE_SPEC_DRAFT_N_MIN="$SPEC_DRAFT_N_MIN"
+            EFFECTIVE_SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"
+            EFFECTIVE_DRAFT_BACKEND_SAMPLING="$SPEC_DRAFT_BACKEND_SAMPLING"
+            ;;
+    esac
+}
+
 start_monitor() {
     local sample_file="$1"
     (
@@ -283,6 +347,7 @@ for config in "${CONFIGS[@]}"; do
         fi
         exit "$status"
     fi
+    resolve_spec_settings
 
     for rep in $(seq 1 "$REPEATS"); do
         stem="${config}-run${rep}"
@@ -297,8 +362,7 @@ for config in "${CONFIGS[@]}"; do
         warmup_lookahead_file="$RESULTS_DIR/$stem.warmup.lookahead-%r.json"
         lookahead_file="$RESULTS_DIR/$stem.lookahead-%r.json"
 
-        EFFECTIVE_SPEC_TYPES="${SPEC_TYPES_OVERRIDE:-draft-mtp}"
-        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N spec_types=$EFFECTIVE_SPEC_TYPES ngram_mod=$NGRAM_MOD_N_MATCH/$NGRAM_MOD_N_MIN/$NGRAM_MOD_N_MAX ngram_simple=$NGRAM_SIMPLE_SIZE_N/$NGRAM_SIMPLE_SIZE_M/$NGRAM_SIMPLE_MIN_HITS context=$CONTEXT target_kv=$TARGET_TYPE_K/$TARGET_TYPE_V q4_scale=$KV_Q4_SCALE mtp_output=$MTP_REQUANTIZE_OUTPUT turbo4_f16_min_batch=${TURBO4_F16_PREFILL_MIN_BATCH:-compile-default} batch=$CMOE_BATCH/$CMOE_UBATCH phase_prefill=${CMOE_PREFILL_BATCH:-off}/${CMOE_PREFILL_UBATCH:-off} phase_decode=${CMOE_DECODE_BATCH:-off}/${CMOE_DECODE_UBATCH:-off} prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V turbo4_mtp=$TURBO4_MTP_EXPERIMENTAL turbo4_v=$TURBO4_V_EXPERIMENTAL turbo4_q8_layers=${TURBO4_Q8_FALLBACK_LAYERS:-none} pmin=${DRAFT_P_MIN:-default} draft_backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING target_backend_sampling=$TARGET_BACKEND_SAMPLING reasoning_budget=$REASONING_BUDGET cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS cpu_multi_row=$CPU_MULTI_ROW cpu_fused_gate_up=$CPU_FUSED_GATE_UP shared_hot_ids=$SHARED_HOT_IDS moe_multi_fusion=$MOE_MULTI_FUSION moe_combine_fusion=$MOE_COMBINE_FUSION mmvq_q8_ncols3_rows=$MMVQ_Q8_NCOLS3_ROWS mmvq_q6_k_ncols1_rows=$MMVQ_Q6_K_NCOLS1_ROWS mmvq_q6_k_ncols3_rows=$MMVQ_Q6_K_NCOLS3_ROWS mmvq_moe_rows=$MMVQ_MOE_FUSED_ROWS/$MMVQ_MOE_PLAIN_ROWS turbo4_convert=$TURBO4_FAST_F16_CONVERT turbo4_wht=$TURBO4_WHT_SHUFFLE async_h2d=$CUDA_ASYNC_HOST_COPY async_d2h=$SCHED_ASYNC_D2H_COPY concat=$CONCAT_NONCONT_BLOCK_SIZE/$CONCAT_NONCONT_FLAT_DIM0 load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC lookahead_trace=$LOOKAHEAD_TRACE ==="
+        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S spec_mode=$SPEC_MODE mtp=$MTP_N spec_types=$EFFECTIVE_SPEC_TYPES spec_draft_model=${EFFECTIVE_SPEC_DRAFT_MODEL:-none} spec_draft_n=$EFFECTIVE_SPEC_DRAFT_N_MIN..$EFFECTIVE_SPEC_DRAFT_N_MAX dflash_combined=$DFLASH_COMBINED ngram_mod=$NGRAM_MOD_N_MATCH/$NGRAM_MOD_N_MIN/$NGRAM_MOD_N_MAX ngram_simple=$NGRAM_SIMPLE_SIZE_N/$NGRAM_SIMPLE_SIZE_M/$NGRAM_SIMPLE_MIN_HITS context=$CONTEXT target_kv=$TARGET_TYPE_K/$TARGET_TYPE_V q4_scale=$KV_Q4_SCALE mtp_output=$MTP_REQUANTIZE_OUTPUT turbo4_f16_min_batch=${TURBO4_F16_PREFILL_MIN_BATCH:-compile-default} batch=$CMOE_BATCH/$CMOE_UBATCH phase_prefill=${CMOE_PREFILL_BATCH:-off}/${CMOE_PREFILL_UBATCH:-off} phase_decode=${CMOE_DECODE_BATCH:-off}/${CMOE_DECODE_UBATCH:-off} prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V turbo4_mtp=$TURBO4_MTP_EXPERIMENTAL turbo4_v=$TURBO4_V_EXPERIMENTAL turbo4_q8_layers=${TURBO4_Q8_FALLBACK_LAYERS:-none} pmin=${EFFECTIVE_SPEC_DRAFT_P_MIN:-default} draft_backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING target_backend_sampling=$TARGET_BACKEND_SAMPLING reasoning_budget=$REASONING_BUDGET cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS cpu_multi_row=$CPU_MULTI_ROW cpu_fused_gate_up=$CPU_FUSED_GATE_UP shared_hot_ids=$SHARED_HOT_IDS moe_multi_fusion=$MOE_MULTI_FUSION moe_combine_fusion=$MOE_COMBINE_FUSION mmvq_q8_ncols3_rows=$MMVQ_Q8_NCOLS3_ROWS mmvq_q6_k_ncols1_rows=$MMVQ_Q6_K_NCOLS1_ROWS mmvq_q6_k_ncols3_rows=$MMVQ_Q6_K_NCOLS3_ROWS mmvq_moe_rows=$MMVQ_MOE_FUSED_ROWS/$MMVQ_MOE_PLAIN_ROWS turbo4_convert=$TURBO4_FAST_F16_CONVERT turbo4_wht=$TURBO4_WHT_SHUFFLE async_h2d=$CUDA_ASYNC_HOST_COPY async_d2h=$SCHED_ASYNC_D2H_COPY dedup_dst_sync=$SCHED_DEDUP_DST_SYNC concat=$CONCAT_NONCONT_BLOCK_SIZE/$CONCAT_NONCONT_FLAT_DIM0 load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC lookahead_trace=$LOOKAHEAD_TRACE ==="
 
         env_args=(
             CUDA_VISIBLE_DEVICES=0
@@ -327,12 +391,11 @@ for config in "${CONFIGS[@]}"; do
             "GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS=$MMVQ_Q6_K_NCOLS3_ROWS"
             "GGML_CUDA_MMVQ_MOE_FUSED_ROWS=$MMVQ_MOE_FUSED_ROWS"
             "GGML_CUDA_MMVQ_MOE_PLAIN_ROWS=$MMVQ_MOE_PLAIN_ROWS"
-            "GGML_CUDA_MMVQ_MOE_SHARE_WEIGHTS=$MMVQ_MOE_SHARE_WEIGHTS"
-            "GGML_CUDA_MMVQ_COMPACT_SKIP=$MMVQ_COMPACT_SKIP"
             "GGML_CUDA_TURBO4_FAST_F16_CONVERT=$TURBO4_FAST_F16_CONVERT"
             "GGML_CUDA_TURBO4_WHT_SHUFFLE=$TURBO4_WHT_SHUFFLE"
             "GGML_CUDA_ASYNC_HOST_COPY=$CUDA_ASYNC_HOST_COPY"
             "GGML_SCHED_ASYNC_D2H_COPY=$SCHED_ASYNC_D2H_COPY"
+            "GGML_SCHED_DEDUP_DST_SYNC=$SCHED_DEDUP_DST_SYNC"
             "GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE=$CONCAT_NONCONT_BLOCK_SIZE"
             "GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=$CONCAT_NONCONT_FLAT_DIM0"
             "LLAMA_EXPERT_STATIC_NO_SYNC=$STATIC_NO_SYNC"
@@ -347,10 +410,12 @@ for config in "${CONFIGS[@]}"; do
             "LLAMA_EXPERT_WARM_PREFETCH=$PREFETCH"
             "LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL=$WARM_MTP_EXPERIMENTAL"
             "LLAMA_TURBO4_MTP_EXPERIMENTAL=$TURBO4_MTP_EXPERIMENTAL"
+            "LLAMA_TURBO4_DFLASH_EXPERIMENTAL=$TURBO4_DFLASH_EXPERIMENTAL"
             "LLAMA_TURBO4_V_EXPERIMENTAL=$TURBO4_V_EXPERIMENTAL"
             "LLAMA_TURBO4_DRAFT_EXPERIMENTAL=$TURBO4_DRAFT_EXPERIMENTAL"
             "LLAMA_MTP_HEAD_TRACE=$MTP_HEAD_TRACE"
             "LLAMA_MTP_REQUANTIZE_OUTPUT=$MTP_REQUANTIZE_OUTPUT"
+            "LLAMA_DFLASH_COMBINED=$DFLASH_COMBINED"
         )
         if [[ -n "$TURBO4_Q8_FALLBACK_LAYERS" ]]; then
             env_args+=("LLAMA_TURBO4_Q8_FALLBACK_LAYERS=$TURBO4_Q8_FALLBACK_LAYERS")
@@ -428,18 +493,28 @@ for config in "${CONFIGS[@]}"; do
             echo "TARGET_BACKEND_SAMPLING muss 0 oder 1 sein" >&2
             exit 1
         fi
-        if [[ "$MTP_N" -gt 0 ]]; then
-            if [[ ",$EFFECTIVE_SPEC_TYPES," != *,draft-mtp,* ]]; then
-                echo "MTP_N > 0 benoetigt draft-mtp in SPEC_TYPES_OVERRIDE" >&2
+        if [[ "$EFFECTIVE_SPEC_DRAFT_N_MAX" -gt 0 ]]; then
+            if [[ "$SPEC_MODE" == mtp && ",$EFFECTIVE_SPEC_TYPES," != *,draft-mtp,* ]]; then
+                echo "SPEC_MODE=mtp benoetigt draft-mtp in SPEC_TYPES_OVERRIDE" >&2
+                exit 1
+            fi
+            if [[ "$SPEC_MODE" == dflash && ",$EFFECTIVE_SPEC_TYPES," != *,draft-dflash,* ]]; then
+                echo "SPEC_MODE=dflash benoetigt draft-dflash in SPEC_TYPES_OVERRIDE" >&2
                 exit 1
             fi
             server_args+=(
                 --spec-type "$EFFECTIVE_SPEC_TYPES"
-                --spec-draft-n-max "$MTP_N"
+                --spec-draft-n-max "$EFFECTIVE_SPEC_DRAFT_N_MAX"
                 --spec-draft-ngl auto
                 --spec-draft-type-k "$DRAFT_TYPE_K"
                 --spec-draft-type-v "$DRAFT_TYPE_V"
             )
+            if [[ -n "$EFFECTIVE_SPEC_DRAFT_MODEL" ]]; then
+                server_args+=(--spec-draft-model "$EFFECTIVE_SPEC_DRAFT_MODEL")
+            fi
+            if [[ -n "$EFFECTIVE_SPEC_DRAFT_N_MIN" ]]; then
+                server_args+=(--spec-draft-n-min "$EFFECTIVE_SPEC_DRAFT_N_MIN")
+            fi
             if [[ ",$EFFECTIVE_SPEC_TYPES," == *,ngram-mod,* ]]; then
                 server_args+=(
                     --spec-ngram-mod-n-match "$NGRAM_MOD_N_MATCH"
@@ -454,13 +529,13 @@ for config in "${CONFIGS[@]}"; do
                     --spec-ngram-simple-min-hits "$NGRAM_SIMPLE_MIN_HITS"
                 )
             fi
-            if [[ -n "$DRAFT_P_MIN" ]]; then
-                server_args+=(--spec-draft-p-min "$DRAFT_P_MIN")
+            if [[ -n "$EFFECTIVE_SPEC_DRAFT_P_MIN" ]]; then
+                server_args+=(--spec-draft-p-min "$EFFECTIVE_SPEC_DRAFT_P_MIN")
             fi
-            if [[ "$DRAFT_BACKEND_SAMPLING" == 0 ]]; then
+            if [[ "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" == 0 ]]; then
                 server_args+=(--no-spec-draft-backend-sampling)
-            elif [[ -n "$DRAFT_BACKEND_SAMPLING" && "$DRAFT_BACKEND_SAMPLING" != 1 ]]; then
-                echo "DRAFT_BACKEND_SAMPLING muss 0, 1 oder leer sein" >&2
+            elif [[ "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" != 1 ]]; then
+                echo "Draft-Backend-Sampling muss 0 oder 1 sein" >&2
                 exit 1
             fi
         fi
@@ -590,7 +665,7 @@ if not trace.get("records"):
 PY
         fi
 
-        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "$EFFECTIVE_SPEC_TYPES" "$NGRAM_MOD_N_MATCH" "$NGRAM_MOD_N_MIN" "$NGRAM_MOD_N_MAX" "$NGRAM_SIMPLE_SIZE_N" "$NGRAM_SIMPLE_SIZE_M" "$NGRAM_SIMPLE_MIN_HITS" "$CONTEXT" "$TARGET_TYPE_K" "$TARGET_TYPE_V" "$KV_Q4_SCALE" "$MTP_REQUANTIZE_OUTPUT" "${TURBO4_F16_PREFILL_MIN_BATCH:-compile-default}" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$TARGET_BACKEND_SAMPLING" "$REASONING_BUDGET" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$CPU_ASYNC" "$CPU_DOWN_PREFETCH" "$CPU_REUSE_ROWS" "$CPU_MULTI_ROW" "$CPU_FUSED_GATE_UP" "$SHARED_HOT_IDS" "$MOE_MULTI_FUSION" "$MOE_COMBINE_FUSION" "$MMVQ_Q8_NCOLS3_ROWS" "$MMVQ_Q6_K_NCOLS1_ROWS" "$MMVQ_Q6_K_NCOLS3_ROWS" "$MMVQ_MOE_FUSED_ROWS" "$MMVQ_MOE_PLAIN_ROWS" "$TURBO4_FAST_F16_CONVERT" "$TURBO4_WHT_SHUFFLE" "$CUDA_ASYNC_HOST_COPY" "$SCHED_ASYNC_D2H_COPY" "$CONCAT_NONCONT_BLOCK_SIZE" "$CONCAT_NONCONT_FLAT_DIM0" "$LOAD_MODE" "$CMOE_BATCH" "$CMOE_UBATCH" "$PROMPT_REPEAT" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$ADAPT_CUDA_GRAPHS" "$STATIC_NO_SYNC" \
+        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "$SPEC_MODE" "$EFFECTIVE_SPEC_DRAFT_MODEL" "$EFFECTIVE_SPEC_DRAFT_N_MAX" "$EFFECTIVE_SPEC_DRAFT_N_MIN" "$EFFECTIVE_SPEC_DRAFT_P_MIN" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$DFLASH_COMBINED" "$EFFECTIVE_SPEC_TYPES" "$NGRAM_MOD_N_MATCH" "$NGRAM_MOD_N_MIN" "$NGRAM_MOD_N_MAX" "$NGRAM_SIMPLE_SIZE_N" "$NGRAM_SIMPLE_SIZE_M" "$NGRAM_SIMPLE_MIN_HITS" "$CONTEXT" "$TARGET_TYPE_K" "$TARGET_TYPE_V" "$KV_Q4_SCALE" "$MTP_REQUANTIZE_OUTPUT" "${TURBO4_F16_PREFILL_MIN_BATCH:-compile-default}" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$TARGET_BACKEND_SAMPLING" "$REASONING_BUDGET" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$CPU_ASYNC" "$CPU_DOWN_PREFETCH" "$CPU_REUSE_ROWS" "$CPU_MULTI_ROW" "$CPU_FUSED_GATE_UP" "$SHARED_HOT_IDS" "$MOE_MULTI_FUSION" "$MOE_COMBINE_FUSION" "$MMVQ_Q8_NCOLS3_ROWS" "$MMVQ_Q6_K_NCOLS1_ROWS" "$MMVQ_Q6_K_NCOLS3_ROWS" "$MMVQ_MOE_FUSED_ROWS" "$MMVQ_MOE_PLAIN_ROWS" "$TURBO4_FAST_F16_CONVERT" "$TURBO4_WHT_SHUFFLE" "$CUDA_ASYNC_HOST_COPY" "$SCHED_ASYNC_D2H_COPY" "$SCHED_DEDUP_DST_SYNC" "$CONCAT_NONCONT_BLOCK_SIZE" "$CONCAT_NONCONT_FLAT_DIM0" "$LOAD_MODE" "$CMOE_BATCH" "$CMOE_UBATCH" "$PROMPT_REPEAT" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$ADAPT_CUDA_GRAPHS" "$STATIC_NO_SYNC" \
             "$response_file" "$stats_file" "$samples_file" "$log_file" >> "$RUNS_CSV" <<'PY'
 import csv
 import json
@@ -599,7 +674,7 @@ import statistics
 import sys
 from pathlib import Path
 
-config, rep, fixed_s, warm_s, mtp_n, spec_types, ngram_mod_n_match, ngram_mod_n_min, ngram_mod_n_max, ngram_simple_size_n, ngram_simple_size_m, ngram_simple_min_hits, context, target_type_k, target_type_v, kv_q4_scale, mtp_requantize_output, turbo4_f16_prefill_min_batch, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, cpu_fused_gate_up, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, turbo4_fast_f16_convert, turbo4_wht_shuffle, cuda_async_host_copy, sched_async_d2h_copy, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
+config, rep, fixed_s, warm_s, mtp_n, spec_mode, spec_draft_model, spec_draft_n_max, spec_draft_n_min, spec_draft_p_min, spec_draft_backend_sampling, dflash_combined, spec_types, ngram_mod_n_match, ngram_mod_n_min, ngram_mod_n_max, ngram_simple_size_n, ngram_simple_size_m, ngram_simple_min_hits, context, target_type_k, target_type_v, kv_q4_scale, mtp_requantize_output, turbo4_f16_prefill_min_batch, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, cpu_fused_gate_up, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, turbo4_fast_f16_convert, turbo4_wht_shuffle, cuda_async_host_copy, sched_async_d2h_copy, sched_dedup_dst_sync, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
 response = json.loads(Path(response_path).read_text())
 stats_file = Path(stats_path)
 stats = json.loads(stats_file.read_text()) if stats_file.exists() else {}
@@ -633,13 +708,16 @@ draft_accepted = float(timings.get("draft_n_accepted", 0) or 0)
 total = float(stats.get("selected_total", 0) or 0)
 cold = float(stats.get("cold_hits", 0) or 0)
 
+spec_acceptance = draft_accepted / draft_n if draft_n else 0
+
 row = [
-    config, rep, fixed_s, effective_fixed_s, warm_s, mtp_n, spec_types, ngram_mod_n_match, ngram_mod_n_min, ngram_mod_n_max, ngram_simple_size_n, ngram_simple_size_m, ngram_simple_min_hits, context, target_type_k, target_type_v, kv_q4_scale, mtp_requantize_output, turbo4_f16_prefill_min_batch, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, cpu_fused_gate_up, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, turbo4_fast_f16_convert, turbo4_wht_shuffle, cuda_async_host_copy, sched_async_d2h_copy, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, int(static_active),
+    config, rep, fixed_s, effective_fixed_s, warm_s, mtp_n, spec_mode, spec_draft_model, spec_draft_n_max, spec_draft_n_min, spec_draft_p_min, spec_draft_backend_sampling, dflash_combined, spec_types, ngram_mod_n_match, ngram_mod_n_min, ngram_mod_n_max, ngram_simple_size_n, ngram_simple_size_m, ngram_simple_min_hits, context, target_type_k, target_type_v, kv_q4_scale, mtp_requantize_output, turbo4_f16_prefill_min_batch, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, cpu_fused_gate_up, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, turbo4_fast_f16_convert, turbo4_wht_shuffle, cuda_async_host_copy, sched_async_d2h_copy, sched_dedup_dst_sync, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, int(static_active),
     timings.get("prompt_per_second", 0),
     response.get("ttft_ms", 0),
     timings.get("predicted_per_second", 0),
     timings.get("predicted_per_second", 0),
-    draft_accepted / draft_n if draft_n else 0,
+    spec_acceptance if spec_mode == "mtp" else 0,
+    spec_acceptance,
     last(r"mean len\s*=\s*([0-9.]+)"),
     stats.get("hot_hits", 0), stats.get("warm_hits", 0), stats.get("cold_hits", 0),
     cold / total if total else 0,
@@ -677,7 +755,7 @@ for row in rows:
 
 numeric = [
     "prompt_tps", "ttft_ms", "decode_tps", "sustained_decode_tps",
-    "mtp_acceptance", "mean_accepted_length",
+    "mtp_acceptance", "spec_acceptance", "mean_accepted_length",
     "hot_hits", "warm_hits", "cold_hits", "cold_share", "repins",
     "warm_promotions", "warm_evictions", "h2d_copies", "h2d_bytes", "h2d_ms",
     "cpu_expert_ms", "cpu_gate_up_ms", "cpu_activation_ms", "cpu_down_ms",
@@ -687,7 +765,7 @@ numeric = [
     "predicted_tokens",
 ]
 with open(destination, "w", newline="") as handle:
-    fields = ["config", "repeats", "fixed_s", "effective_fixed_s", "warm_s", "mtp_n", "spec_types", "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max", "ngram_simple_size_n", "ngram_simple_size_m", "ngram_simple_min_hits", "context", "target_type_k", "target_type_v", "kv_q4_scale", "mtp_requantize_output", "turbo4_f16_prefill_min_batch", "cpu_threads", "draft_threads", "draft_type_k", "draft_type_v", "draft_p_min", "draft_backend_sampling", "target_backend_sampling", "reasoning_budget", "cpu_chunk", "cpu_act_parallel", "cpu_async", "cpu_down_prefetch", "cpu_reuse_rows", "cpu_multi_row", "cpu_fused_gate_up", "shared_hot_ids", "moe_multi_fusion", "moe_combine_fusion", "mmvq_q8_ncols3_rows", "mmvq_q6_k_ncols1_rows", "mmvq_q6_k_ncols3_rows", "mmvq_moe_fused_rows", "mmvq_moe_plain_rows", "turbo4_fast_f16_convert", "turbo4_wht_shuffle", "cuda_async_host_copy", "sched_async_d2h_copy", "concat_noncont_block_size", "concat_noncont_flat_dim0", "load_mode", "cmoe_batch", "cmoe_ubatch", "prompt_repeat", "profile_sha256", "placement_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "adapt_cuda_graphs", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
+    fields = ["config", "repeats", "fixed_s", "effective_fixed_s", "warm_s", "mtp_n", "spec_mode", "spec_draft_model", "spec_draft_n_max", "spec_draft_n_min", "spec_draft_p_min", "spec_draft_backend_sampling", "dflash_combined", "spec_types", "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max", "ngram_simple_size_n", "ngram_simple_size_m", "ngram_simple_min_hits", "context", "target_type_k", "target_type_v", "kv_q4_scale", "mtp_requantize_output", "turbo4_f16_prefill_min_batch", "cpu_threads", "draft_threads", "draft_type_k", "draft_type_v", "draft_p_min", "draft_backend_sampling", "target_backend_sampling", "reasoning_budget", "cpu_chunk", "cpu_act_parallel", "cpu_async", "cpu_down_prefetch", "cpu_reuse_rows", "cpu_multi_row", "cpu_fused_gate_up", "shared_hot_ids", "moe_multi_fusion", "moe_combine_fusion", "mmvq_q8_ncols3_rows", "mmvq_q6_k_ncols1_rows", "mmvq_q6_k_ncols3_rows", "mmvq_moe_fused_rows", "mmvq_moe_plain_rows", "turbo4_fast_f16_convert", "turbo4_wht_shuffle", "cuda_async_host_copy", "sched_async_d2h_copy", "sched_dedup_dst_sync", "concat_noncont_block_size", "concat_noncont_flat_dim0", "load_mode", "cmoe_batch", "cmoe_ubatch", "prompt_repeat", "profile_sha256", "placement_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "adapt_cuda_graphs", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
         "output_hashes_identical", "token_hashes_identical", "output_sha256", "token_sha256",
     ]
     writer = csv.DictWriter(handle, fieldnames=fields)
@@ -703,6 +781,13 @@ with open(destination, "w", newline="") as handle:
             "effective_fixed_s": group[0]["effective_fixed_s"],
             "warm_s": group[0]["warm_s"],
             "mtp_n": group[0]["mtp_n"],
+            "spec_mode": group[0]["spec_mode"],
+            "spec_draft_model": group[0]["spec_draft_model"],
+            "spec_draft_n_max": group[0]["spec_draft_n_max"],
+            "spec_draft_n_min": group[0]["spec_draft_n_min"],
+            "spec_draft_p_min": group[0]["spec_draft_p_min"],
+            "spec_draft_backend_sampling": group[0]["spec_draft_backend_sampling"],
+            "dflash_combined": group[0]["dflash_combined"],
             "spec_types": group[0]["spec_types"],
             "ngram_mod_n_match": group[0]["ngram_mod_n_match"],
             "ngram_mod_n_min": group[0]["ngram_mod_n_min"],
@@ -743,6 +828,7 @@ with open(destination, "w", newline="") as handle:
             "turbo4_wht_shuffle": group[0]["turbo4_wht_shuffle"],
             "cuda_async_host_copy": group[0]["cuda_async_host_copy"],
             "sched_async_d2h_copy": group[0]["sched_async_d2h_copy"],
+            "sched_dedup_dst_sync": group[0]["sched_dedup_dst_sync"],
             "concat_noncont_block_size": group[0]["concat_noncont_block_size"],
             "concat_noncont_flat_dim0": group[0]["concat_noncont_flat_dim0"],
             "load_mode": group[0]["load_mode"],

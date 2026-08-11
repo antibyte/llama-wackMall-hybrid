@@ -7,18 +7,16 @@
 # Änderung einfach erneut ./start.sh ausführen.
 #
 # Die Werte unten kombinieren die schnellen lokalen GTX-1660-Ti-Kernelwerte
-# (CMOE 376/376, MTP-2/3, S=33, reserve 400 MiB) mit dem experimentellen Turbo4/Turbo4-Target-KV.
-# Prefill-Batch 1024 liefert ~100 tok/s PP, OOMt aber mit Cache+Turbo4+S=33 auf 6 GiB —
-# daher kein separates Phase-Prefill; Basis 376/376 ist der stabile PP/Decode-Pfad.
-# Turbo4/Turbo4 spart deutlich KV-Speicher, kostet gegenueber Q8/Q8 aber
-# messbar Qualitaet. Fuer maximale Qualitaet TARGET_TYPE_K/V auf q8_0 setzen.
-# Das Target verwendet Turbo4; der MTP-Draft nutzt den genaueren Q8_0-Cache.
-# Draft-Turbo4 bleibt ueber DRAFT_TYPE_K/V und den Guard verfuegbar, war aber
-# im 3x512-Test wegen geringerer Akzeptanz 9,1 % langsamer.
+# mit dem gemessenen DFlash-Q4-Pfad (n_max=2, p_min=0.75, S=33).
+# Target-Prefill und DFlash-Reserve sind getrennt: Der Target-Pfad behaelt den
+# schnellen 768er Prefill, waehrend DFlash intern mit der 64er Decode-Geometrie
+# reserviert und groessere Prefills in 64er Chunks verarbeitet.
+# DFlash verwendet Turbo4 fuer den Target-KV und q4_0 fuer den Draft-KV.
+# Der separate DFlash-Guard haelt diese experimentelle Kombination explizit.
 # Bekannter weiterer Referenzpunkt:
 #   GTX 1080    (sm_61): siehe start1080.sh; eigene Kernel-Sweeps erforderlich
 #
-# Der Expert-S-Wert ist fuer den reproduzierbaren 1660-Ti-Pfad fest auf 33
+# Der Expert-S-Wert ist fuer den reproduzierbaren DFlash-Pfad fest auf 33
 # gesetzt. Fuer andere GPUs start1080.sh verwenden oder S nach einem VRAM-Sweep
 # anpassen; der Runtime-Autofit begrenzt einen zu hohen Wert weiterhin sicher.
 
@@ -33,6 +31,9 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"  # directo
 # Paths
 SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"  # current Turbo4-enabled native sm_75 Release executable
 MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"  # target GGUF
+SPEC_MODE="dflash"  # none | mtp | dflash; DFlash winner: n_max=2 and p_min=0.75
+SPEC_DRAFT_MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-DFlash-Q4_K_M.gguf"  # DFlash GGUF sidecar
+DFLASH_TARGET_TENSOR_OVERRIDE="^blk[.]40[.]=CPU"  # keep the unused embedded NextN block out of VRAM
 # Expert heat profiles (LLAMA_EXPERT_HOT). Pick one via PROFILE_KIND below.
 #   general    = portable multi-domain corpus (~51.6% top-33 seed coverage)
 #   specialist = phase-1 bench prompt match (~72.9% coverage; +2% sustained TPS
@@ -65,26 +66,32 @@ MMPROJ_AUTO="0"  # do not load an optional multimodal projector for this text mo
 CONTEXT="24576"  # maximum context tokens; raises KV memory when increased
 N_PREDICT="8192"  # CLI/server generation limit; API requests may impose a lower limit
 # Direkt editierbare KV-Presets (jeweils TARGET_TYPE_K und TARGET_TYPE_V):
-#   q4_0/q4_0       = gemessener 32K-TPS-Sieger (~46.5 sustained TPS), geringste Reasoning-Qualitaet
-#   turbo4_k/turbo4_k = aktuell aktiv; guter Kapazitaets-/64K-Kandidat, experimentell
+#   q4_0/q4_0       = gemessener DFlash- und 32K-TPS-Pfad
+#   turbo4_k/turbo4_k = aktuell aktiv; experimenteller DFlash-Kapazitaetspfad
 #   q8_0/q8_0       = Qualitaetskandidat mit hoeherem VRAM-Bedarf und etwas weniger TPS
 # Nur die beiden folgenden Zeilen aendern; die passenden Turbo4-Guards duerfen auf 1 bleiben.
-TARGET_TYPE_K="turbo4_k"  # experimental 4-bit randomized-WHT target K cache
-TARGET_TYPE_V="turbo4_k"  # experimental symmetric Turbo4 V cache; saves the most target KV memory
-DRAFT_TYPE_K="q4_0"  # quality-oriented 8-bit MTP-draft K cache
-DRAFT_TYPE_V="q4_0"  # quality-oriented 8-bit MTP-draft V cache; requires Flash Attention
-LLAMA_KV_Q4_SCALE="weighted-k"  # Q4-only scale policy: legacy winner for speed; weighted-k is the quality A/B candidate
+TARGET_TYPE_K="turbo4_k"  # experimental DFlash target K cache
+TARGET_TYPE_V="turbo4_k"  # experimental DFlash target V cache; requires Flash Attention
+DRAFT_TYPE_K="q4_0"  # speculative draft K cache for MTP or DFlash
+DRAFT_TYPE_V="q4_0"  # speculative draft V cache for MTP or DFlash; requires Flash Attention
+LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy used by the measured DFlash winner
 LLAMA_TURBO4_V_EXPERIMENTAL="1"  # required guard for Turbo4 target V; 0 rejects this configuration
 LLAMA_TURBO4_MTP_EXPERIMENTAL="1"  # required guard for target Turbo4 with draft-mtp
+LLAMA_TURBO4_DFLASH_EXPERIMENTAL="1"  # required guard for target Turbo4 with draft-dflash
 LLAMA_TURBO4_DRAFT_EXPERIMENTAL="0"  # required guard for Turbo4 in the MTP draft context
 LLAMA_TURBO4_Q8_FALLBACK_LAYERS=""  # optional comma/range list of target K layers kept at Q8, e.g. 23,35,27
 GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH="2"  # tested MTP-2 crossover: multi-token verify/prefill uses the FP16 FA path
 GGML_CUDA_TURBO4_FAST_F16_CONVERT="0"  # generic converter is the SM75 winner; 1/2 were slower experiments
 GGML_CUDA_TURBO4_WHT_SHUFFLE="0"  # original WHT is the SM75 winner; shuffle-first was neutral/slower
-MTP_N="2"  # draft tokens per MTP step; valid values are 0 (off), 1, 2, or 3
+MTP_N="2"  # inactive DFlash fallback; used only after switching SPEC_MODE to mtp
 LLAMA_MTP_REQUANTIZE_OUTPUT="none"  # none is the 6-GiB winner; q4_K/q5_K add a draft-only LM head but consume 273/334 MiB VRAM
 LLAMA_MTP_HEAD_TRACE="0"  # 1 prints the selected MTP-head source/type once; diagnostic only
-DRAFT_NGL="auto"  # draft GPU layers; auto fits the draft context to available VRAM
+SPEC_DRAFT_N_MAX="2"  # DFlash-only draft block size
+SPEC_DRAFT_N_MIN="0"  # DFlash-only minimum accepted draft length
+SPEC_DRAFT_P_MIN="0.75"  # DFlash-only confidence threshold in [0, 1]
+SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash-only backend sampling switch
+DFLASH_COMBINED="1"  # fuse target feature projection and draft KV injection into the target graph
+DRAFT_NGL="all"  # the measured winner keeps all six DFlash layers on the GPU
 REASONING="auto"  # let the model template select reasoning mode
 REASONING_BUDGET="1024"  # measured quality/latency compromise; clients may request another value
 REASONING_PRESERVE="1"  # preserve reasoning in history: 1 enabled, 0 disabled
@@ -95,29 +102,28 @@ FLASH_ATTN="on"  # Flash Attention mode: on, off, or auto
 KV_OFFLOAD="1"  # place KV cache on the GPU when set to 1
 THREADS="8"  # target generation CPU workers; test physical-core/SMT alternatives
 THREADS_BATCH="8"  # CPU workers for prompt/batch processing
-DRAFT_THREADS="8"  # CPU workers for the MTP draft context
+DRAFT_THREADS="8"  # CPU workers for the speculative draft context
 DRAFT_THREADS_BATCH="8"  # draft workers for draft prompt/batch processing
 THREADS_HTTP=""  # HTTP worker count; empty uses the server default
 TARGET_BACKEND_SAMPLING="1"  # target sampling on CUDA; 0 provides an A/B control
-DRAFT_BACKEND_SAMPLING="1"  # draft sampling on the backend; 0 forces CPU draft sampling
+DRAFT_BACKEND_SAMPLING="1"  # MTP draft sampling on the backend; 0 forces CPU draft sampling
 
 # Prompt/decode batching. GPU_ARCH accepts auto, 6.1 (GTX1080), or 7.5
 # (GTX1660Ti). CMOE_BATCH/CMOE_UBATCH accept a number or auto. The four phase
 # values are empty by default; setting them enables the experimental prefill /
 # decode switch implemented in common/arg.cpp.
 GPU_ARCH="auto"  # architecture used to choose an auto batch default
-CMOE_BATCH="64"  # measured 1660-Ti winner that retains S=33; 384+ can clamp S or OOM under cache
-CMOE_UBATCH="64"  # physical ubatch; keep equal to CMOE_BATCH for the stable 6-GiB path
-# Phase-Prefill leer lassen: 1024/1024 erreicht ~100 tok/s PP, sprengt aber peak VRAM
-# (Aktivierung/Graph) mit Turbo4+S=33+Prompt-Cache auf 6 GiB (CUDA OOM).
-# Fuer hoeheres PP spaeter: 512/512 vorsichtig testen, nie 1024 auf dieser Karte.
-CMOE_PREFILL_BATCH="768"  # empty = use CMOE_BATCH during prompt processing (safe with cache)
-CMOE_PREFILL_UBATCH="768"  # empty = use CMOE_UBATCH; do not set 1024 on 6 GiB + S=33
+CMOE_BATCH="64"  # DFlash decode batch used by the measured 6-GiB winner
+CMOE_UBATCH="64"  # physical decode ubatch; keep equal to CMOE_BATCH
+# DFlash reserves independently at the decode geometry. These values only size
+# the target prompt graph; DFlash processes larger prompts in 64-token chunks.
+CMOE_PREFILL_BATCH="768"  # measured fast target prompt-processing batch
+CMOE_PREFILL_UBATCH="768"  # physical target prompt ubatch
 CMOE_DECODE_BATCH=""  # optional logical batch used only during token generation
 CMOE_DECODE_UBATCH=""  # optional physical ubatch used only during token generation
 
 # Prompt-cache controls
-CTX_CHECKPOINTS="4"  # disabled: avoids background checkpoint work after a completed response
+CTX_CHECKPOINTS="4"  # keep up to four host-side context checkpoints
 CACHE_RAM="1024"  # host-side prompt-cache budget (MiB); does not replace a safe GPU ubatch
 CACHE_PROMPT="1"  # enable prompt-prefix reuse when set to 1
 CACHE_REUSE="16"  # minimum reusable prompt tokens/threshold for server cache logic
@@ -126,7 +132,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots in the prompt cache when set to 1
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="34"  # one more fixed expert/layer; needs lowered VRAM reserve (see below)
+LLAMA_EXPERT_S="33"  # leaves production headroom for CUDA graph instances
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
@@ -157,7 +163,7 @@ LLAMA_EXPERT_WARM_ADMISSION_WINDOW="8"  # window/half-life used by frequency adm
 LLAMA_EXPERT_WARM_PREFETCH="0"  # W=0 production winner; do not create copy traffic
 LLAMA_EXPERT_PREFETCH_STREAMS="1"  # number of prefetch CUDA streams; current implementation requires 1
 LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT="2"  # maximum simultaneous expert copies
-LLAMA_EXPERT_VRAM_RESERVE_MIB="400"  # was 512; 400 MiB frees ~one extra uniform S (S=34) on 6 GiB
+LLAMA_EXPERT_VRAM_RESERVE_MIB="400"  # runtime auto-fit reserve; forced S remains capped if necessary
 LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL="0"  # retain the MTP warmcache correctness guard
 LLAMA_EXPERT_STATIC_NO_SYNC="1"  # safe here: adaptation, stats, timing, usage, and W are disabled
 
@@ -207,9 +213,6 @@ GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS="2"  # 2..16 and at least K; inactive while 
 # GTX 1080 binary and has no effect on this native sm_75 launcher.
 LLAMA_EXPERT_SHARED_HOT_IDS="1"  # share one mapped hot-ID tensor across Gate, Up, and Down
 LLAMA_EXPERT_SKIP_SENTINEL="1"  # 3x2K winner: 44.744 -> 46.487 tok/s (+3.90%), hash-identical
-# Compact hot-only MMVQ: packs non-sentinel work and shrinks grid.y. Bit-identical
-# but -0.27% on 3x256 (D2H cost); keep off. Needs SKIP_SENTINEL=1 when testing.
-GGML_CUDA_MMVQ_COMPACT_SKIP="0"  # rejected on sm_75; leave 0
 GGML_CUDA_MOE_MULTI_FUSION="1"  # fuse Gate+Up+GLU for 2-4 target tokens on sm_75+
 GGML_CUDA_MOE_COMBINE_FUSION="1"  # exact combine fusion measured neutral (+0.07%)
 GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS="4"  # 3x2K winner: 46.831 -> 47.436 token/s
@@ -226,6 +229,7 @@ GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE="128"  # active together with flat dim-0 in 
 GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0="1"  # 3x2K winner: 47.794 -> 48.599 token/s
 GGML_CUDA_ASYNC_HOST_COPY="1"  # 3x2K winner: pinned split H2D, 47.435 -> 48.335 token/s
 GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate: +0.48% q4 and +0.24% q8 screens
+GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner: 47.340 -> 47.713 token/s (+0.79%)
 
 # ============================================================================
 # End of editable configuration
@@ -260,12 +264,20 @@ if [[ -n "$API_KEY_FILE" && ! -f "$API_KEY_FILE" ]]; then
     die "API-Key-Datei nicht gefunden: $API_KEY_FILE"
 fi
 
+case "$SPEC_MODE" in none|mtp|dflash) ;; *) die "SPEC_MODE muss none, mtp oder dflash sein." ;; esac
 case "$MTP_N" in 0|1|2|3) ;; *) die "MTP_N muss 0, 1, 2 oder 3 sein." ;; esac
+[[ "$SPEC_DRAFT_N_MAX" =~ ^[1-9][0-9]*$ ]] || die "SPEC_DRAFT_N_MAX muss eine positive Ganzzahl sein."
+[[ "$SPEC_DRAFT_N_MIN" =~ ^[0-9]+$ ]] || die "SPEC_DRAFT_N_MIN muss eine nichtnegative Ganzzahl sein."
+(( SPEC_DRAFT_N_MIN <= SPEC_DRAFT_N_MAX )) || die "SPEC_DRAFT_N_MIN darf SPEC_DRAFT_N_MAX nicht ueberschreiten."
+[[ "$SPEC_DRAFT_P_MIN" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] || die "SPEC_DRAFT_P_MIN muss zwischen 0 und 1 liegen."
+case "$SPEC_DRAFT_BACKEND_SAMPLING" in 0|1) ;; *) die "SPEC_DRAFT_BACKEND_SAMPLING muss 0 oder 1 sein." ;; esac
+case "$DFLASH_COMBINED" in 0|1) ;; *) die "DFLASH_COMBINED muss 0 oder 1 sein." ;; esac
 case "$TARGET_BACKEND_SAMPLING" in 0|1) ;; *) die "TARGET_BACKEND_SAMPLING muss 0 oder 1 sein." ;; esac
 case "$DRAFT_BACKEND_SAMPLING" in 0|1) ;; *) die "DRAFT_BACKEND_SAMPLING muss 0 oder 1 sein." ;; esac
 case "$REASONING_PRESERVE" in 0|1) ;; *) die "REASONING_PRESERVE muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_V_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_V_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_MTP_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_MTP_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
+case "$LLAMA_TURBO4_DFLASH_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_DFLASH_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_DRAFT_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_DRAFT_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_KV_Q4_SCALE" in legacy|weighted|weighted-k|weighted-v) ;; *) die "LLAMA_KV_Q4_SCALE muss legacy, weighted, weighted-k oder weighted-v sein." ;; esac
 case "$LLAMA_MTP_REQUANTIZE_OUTPUT" in none|q4_K|q4_k|q5_K|q5_k) ;; *) die "LLAMA_MTP_REQUANTIZE_OUTPUT muss none, q4_K oder q5_K sein." ;; esac
@@ -283,7 +295,6 @@ case "$GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY" in 0|1) ;; *) die "GGML_CUDA_EXPERT_BRI
     die "GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS muss zwischen 2 und 16 liegen."
 case "$LLAMA_EXPERT_SHARED_HOT_IDS" in 0|1) ;; *) die "LLAMA_EXPERT_SHARED_HOT_IDS muss 0 oder 1 sein." ;; esac
 case "$LLAMA_EXPERT_SKIP_SENTINEL" in 0|1) ;; *) die "LLAMA_EXPERT_SKIP_SENTINEL muss 0 oder 1 sein." ;; esac
-case "$GGML_CUDA_MMVQ_COMPACT_SKIP" in 0|1) ;; *) die "GGML_CUDA_MMVQ_COMPACT_SKIP muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MOE_MULTI_FUSION" in 0|1) ;; *) die "GGML_CUDA_MOE_MULTI_FUSION muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MOE_COMBINE_FUSION" in 0|1) ;; *) die "GGML_CUDA_MOE_COMBINE_FUSION muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
@@ -300,6 +311,7 @@ case "$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE" in 0|32|64|128|256) ;; *) die "GGML_
 case "$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0" in 0|1) ;; *) die "GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_ASYNC_HOST_COPY" in 0|1) ;; *) die "GGML_CUDA_ASYNC_HOST_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_ASYNC_D2H_COPY" in 0|1) ;; *) die "GGML_SCHED_ASYNC_D2H_COPY muss 0 oder 1 sein." ;; esac
+case "$GGML_SCHED_DEDUP_DST_SYNC" in 0|1) ;; *) die "GGML_SCHED_DEDUP_DST_SYNC muss 0 oder 1 sein." ;; esac
 [[ -z "$LLAMA_EXPERT_S" || -z "$LLAMA_EXPERT_PLACEMENT" ]] || \
     die "LLAMA_EXPERT_S und LLAMA_EXPERT_PLACEMENT sind gegenseitig exklusiv."
 if [[ "$LLAMA_EXPERT_LOOKAHEAD_TRACE" != 0 && "$LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON" == 0 ]]; then
@@ -311,8 +323,14 @@ fi
 if [[ ( "$TARGET_TYPE_K" == turbo4_k || "$TARGET_TYPE_V" == turbo4_k ) && "$FLASH_ATTN" != on ]]; then
     die "Turbo4-KV benötigt FLASH_ATTN=on."
 fi
-if [[ "$MTP_N" != 0 && ( "$TARGET_TYPE_K" == turbo4_k || "$TARGET_TYPE_V" == turbo4_k ) && "$LLAMA_TURBO4_MTP_EXPERIMENTAL" != 1 ]]; then
+if [[ "$SPEC_MODE" == mtp && "$MTP_N" != 0 && ( "$TARGET_TYPE_K" == turbo4_k || "$TARGET_TYPE_V" == turbo4_k ) && "$LLAMA_TURBO4_MTP_EXPERIMENTAL" != 1 ]]; then
     die "Target-Turbo4 mit MTP benötigt LLAMA_TURBO4_MTP_EXPERIMENTAL=1."
+fi
+if [[ "$SPEC_MODE" == dflash && ( "$TARGET_TYPE_K" == turbo4_k || "$TARGET_TYPE_V" == turbo4_k ) && "$LLAMA_TURBO4_DFLASH_EXPERIMENTAL" != 1 ]]; then
+    die "Target-Turbo4 mit DFlash benoetigt LLAMA_TURBO4_DFLASH_EXPERIMENTAL=1."
+fi
+if [[ "$SPEC_MODE" == dflash && ( "$DRAFT_TYPE_K" == turbo4_k || "$DRAFT_TYPE_V" == turbo4_k ) ]]; then
+    die "Draft-Turbo4 ist fuer DFlash nicht freigegeben; DRAFT_TYPE_K/V auf q4_0 setzen."
 fi
 if [[ ( "$DRAFT_TYPE_K" == turbo4_k || "$DRAFT_TYPE_V" == turbo4_k ) && "$LLAMA_TURBO4_DRAFT_EXPERIMENTAL" != 1 ]]; then
     die "Draft-Turbo4 benötigt LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1."
@@ -345,11 +363,29 @@ for phase_value in "$CMOE_PREFILL_BATCH" "$CMOE_PREFILL_UBATCH" "$CMOE_DECODE_BA
     [[ -z "$phase_value" || "$phase_value" =~ ^[1-9][0-9]*$ ]] || die "Phase-Batchwerte muessen leer oder positive Ganzzahlen sein."
 done
 
-if [[ "$MTP_N" != 0 ]]; then
-    SPEC_TYPE="draft-mtp"
-else
-    SPEC_TYPE="none"
-fi
+case "$SPEC_MODE" in
+    none)
+        SPEC_TYPE="none"
+        EFFECTIVE_SPEC_DRAFT_N_MAX="0"
+        EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING="$DRAFT_BACKEND_SAMPLING"
+        ;;
+    mtp)
+        if [[ "$MTP_N" == 0 ]]; then
+            SPEC_TYPE="none"
+        else
+            SPEC_TYPE="draft-mtp"
+        fi
+        EFFECTIVE_SPEC_DRAFT_N_MAX="$MTP_N"
+        EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING="$DRAFT_BACKEND_SAMPLING"
+        ;;
+    dflash)
+        [[ -n "$SPEC_DRAFT_MODEL" ]] || die "SPEC_DRAFT_MODEL darf fuer SPEC_MODE=dflash nicht leer sein."
+        [[ -f "$SPEC_DRAFT_MODEL" ]] || die "DFlash-Modell nicht gefunden: $SPEC_DRAFT_MODEL"
+        SPEC_TYPE="draft-dflash"
+        EFFECTIVE_SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"
+        EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING="$SPEC_DRAFT_BACKEND_SAMPLING"
+        ;;
+esac
 
 # Explicit environment passed to the server. Optional variables are removed
 # first so a caller's shell environment cannot silently change this file's
@@ -375,19 +411,20 @@ env_args=(
     "LLAMA_KV_Q4_SCALE=$LLAMA_KV_Q4_SCALE"
     "LLAMA_TURBO4_V_EXPERIMENTAL=$LLAMA_TURBO4_V_EXPERIMENTAL"
     "LLAMA_TURBO4_MTP_EXPERIMENTAL=$LLAMA_TURBO4_MTP_EXPERIMENTAL"
+    "LLAMA_TURBO4_DFLASH_EXPERIMENTAL=$LLAMA_TURBO4_DFLASH_EXPERIMENTAL"
     "LLAMA_TURBO4_DRAFT_EXPERIMENTAL=$LLAMA_TURBO4_DRAFT_EXPERIMENTAL"
     "GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=$GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH"
     "GGML_CUDA_TURBO4_FAST_F16_CONVERT=$GGML_CUDA_TURBO4_FAST_F16_CONVERT"
     "GGML_CUDA_TURBO4_WHT_SHUFFLE=$GGML_CUDA_TURBO4_WHT_SHUFFLE"
     "LLAMA_ARG_SPEC_TYPE=$SPEC_TYPE"
-    "LLAMA_ARG_SPEC_DRAFT_N_MAX=$MTP_N"
+    "LLAMA_ARG_SPEC_DRAFT_N_MAX=$EFFECTIVE_SPEC_DRAFT_N_MAX"
     "LLAMA_MTP_REQUANTIZE_OUTPUT=$LLAMA_MTP_REQUANTIZE_OUTPUT"
     "LLAMA_MTP_HEAD_TRACE=$LLAMA_MTP_HEAD_TRACE"
     "LLAMA_ARG_N_GPU_LAYERS_DRAFT=$DRAFT_NGL"
     "LLAMA_ARG_SPEC_DRAFT_THREADS=$DRAFT_THREADS"
     "LLAMA_ARG_SPEC_DRAFT_THREADS_BATCH=$DRAFT_THREADS_BATCH"
     "LLAMA_ARG_BACKEND_SAMPLING=$TARGET_BACKEND_SAMPLING"
-    "LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING=$DRAFT_BACKEND_SAMPLING"
+    "LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING=$EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING"
     "LLAMA_ARG_REASONING=$REASONING"
     "LLAMA_ARG_THINK_BUDGET=$REASONING_BUDGET"
     "LLAMA_ARG_REASONING_PRESERVE=$REASONING_PRESERVE"
@@ -458,7 +495,6 @@ env_args=(
     "GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS=$GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS"
     "LLAMA_EXPERT_SHARED_HOT_IDS=$LLAMA_EXPERT_SHARED_HOT_IDS"
     "LLAMA_EXPERT_SKIP_SENTINEL=$LLAMA_EXPERT_SKIP_SENTINEL"
-    "GGML_CUDA_MMVQ_COMPACT_SKIP=$GGML_CUDA_MMVQ_COMPACT_SKIP"
     "GGML_CUDA_MOE_MULTI_FUSION=$GGML_CUDA_MOE_MULTI_FUSION"
     "GGML_CUDA_MOE_COMBINE_FUSION=$GGML_CUDA_MOE_COMBINE_FUSION"
     "GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS"
@@ -475,7 +511,18 @@ env_args=(
     "GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0"
     "GGML_CUDA_ASYNC_HOST_COPY=$GGML_CUDA_ASYNC_HOST_COPY"
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
+    "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"
+    "LLAMA_DFLASH_COMBINED=$DFLASH_COMBINED"
 )
+
+if [[ "$SPEC_MODE" == dflash ]]; then
+    env_args+=(
+        "LLAMA_ARG_SPEC_DRAFT_MODEL=$SPEC_DRAFT_MODEL"
+        "LLAMA_ARG_SPEC_DRAFT_N_MIN=$SPEC_DRAFT_N_MIN"
+        "LLAMA_ARG_SPEC_DRAFT_P_MIN=$SPEC_DRAFT_P_MIN"
+    )
+    [[ -n "$DFLASH_TARGET_TENSOR_OVERRIDE" ]] && env_args+=("LLAMA_ARG_OVERRIDE_TENSOR=$DFLASH_TARGET_TENSOR_OVERRIDE")
+fi
 
 # Phase-specific batching is opt-in by editing the four values above.
 [[ -n "$CMOE_PREFILL_BATCH" ]] && env_args+=("LLAMA_CMOE_PREFILL_BATCH=$CMOE_PREFILL_BATCH")
@@ -532,22 +579,25 @@ llama-wackMall-hybrid start
   listen:       $HOST:$PORT
   GPU:          $CUDA_VISIBLE_DEVICES_VALUE${GPU_ARCH:+ (compute $GPU_ARCH)}
   context:      $CONTEXT
-  MTP:          $MTP_N
+  spec mode:    $SPEC_MODE ($SPEC_TYPE)
+  MTP fallback: $MTP_N
+  DFlash:       model=${SPEC_DRAFT_MODEL:-<none>} n=$SPEC_DRAFT_N_MIN..$SPEC_DRAFT_N_MAX p-min=$SPEC_DRAFT_P_MIN backend-sampling=$SPEC_DRAFT_BACKEND_SAMPLING combined=$DFLASH_COMBINED
+  DFlash target override: ${DFLASH_TARGET_TENSOR_OVERRIDE:-none}
   KV target:    $TARGET_TYPE_K/$TARGET_TYPE_V
   KV draft:     $DRAFT_TYPE_K/$DRAFT_TYPE_V
   Q4 scale:     $LLAMA_KV_Q4_SCALE
-  Turbo4:       V-guard=$LLAMA_TURBO4_V_EXPERIMENTAL MTP-guard=$LLAMA_TURBO4_MTP_EXPERIMENTAL draft-guard=$LLAMA_TURBO4_DRAFT_EXPERIMENTAL FP16-threshold=$GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH convert=$GGML_CUDA_TURBO4_FAST_F16_CONVERT wht-shuffle=$GGML_CUDA_TURBO4_WHT_SHUFFLE Q8-layers=${LLAMA_TURBO4_Q8_FALLBACK_LAYERS:-none}
+  Turbo4:       V-guard=$LLAMA_TURBO4_V_EXPERIMENTAL MTP-guard=$LLAMA_TURBO4_MTP_EXPERIMENTAL DFlash-guard=$LLAMA_TURBO4_DFLASH_EXPERIMENTAL draft-guard=$LLAMA_TURBO4_DRAFT_EXPERIMENTAL FP16-threshold=$GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH convert=$GGML_CUDA_TURBO4_FAST_F16_CONVERT wht-shuffle=$GGML_CUDA_TURBO4_WHT_SHUFFLE Q8-layers=${LLAMA_TURBO4_Q8_FALLBACK_LAYERS:-none}
   MTP head:     $LLAMA_MTP_REQUANTIZE_OUTPUT (trace=$LLAMA_MTP_HEAD_TRACE)
   CMoE batch:   $CMOE_BATCH/$CMOE_UBATCH
   phase batch:  prefill=${CMOE_PREFILL_BATCH:-base}/${CMOE_PREFILL_UBATCH:-base} decode=${CMOE_DECODE_BATCH:-base}/${CMOE_DECODE_UBATCH:-base}
   fixed S:      ${LLAMA_EXPERT_S:-auto-fit}, warm W: $LLAMA_EXPERT_WARM_SLOTS
   CPU threads:  $THREADS/$THREADS_BATCH (draft $DRAFT_THREADS/$DRAFT_THREADS_BATCH)
-  backend samp: target=$TARGET_BACKEND_SAMPLING draft=$DRAFT_BACKEND_SAMPLING
+  backend samp: target=$TARGET_BACKEND_SAMPLING draft=$EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING
   CUDA rows:    Q8n1=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS Q8n2=$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS Q8n3=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS Q6n1=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS Q6n3=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS
   Q6 probes:    warps=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS warp-rows=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS reuse-y=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y
   CUDA concat:  flat-dim0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 block=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
+  split copies: async-h2d=$GGML_CUDA_ASYNC_HOST_COPY async-d2h=$GGML_SCHED_ASYNC_D2H_COPY dedup-dst-sync=$GGML_SCHED_DEDUP_DST_SYNC
   skip sentinel: $LLAMA_EXPERT_SKIP_SENTINEL (1=MMVQ early-exit on cold sentinel slots)
-  compact skip:  $GGML_CUDA_MMVQ_COMPACT_SKIP (1=pack hot-only MMVQ launches; needs skip sentinel)
   shared hot IDs: $LLAMA_EXPERT_SHARED_HOT_IDS
   CPU fused GU: $LLAMA_EXPERT_CPU_FUSED_GATE_UP
   bridge:       consume=$GGML_CUDA_EXPERT_BRIDGE_CONSUME device-quant=$GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT hit-only=$GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY cache=${GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS:-off}/$GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS
@@ -557,12 +607,21 @@ EOF
 # Empty values for S/placement and inactive optional controls must not inherit
 # from the shell that launched this file.
 unset_args=(
+    -u GGML_CUDA_DISABLE_GRAPHS
     -u LLAMA_EXPERT_S
     -u LLAMA_EXPERT_PLACEMENT
+    -u LLAMA_ARG_OVERRIDE_TENSOR
     -u GGML_CUDA_EXPERT_BRIDGE_LAYER
     -u LLAMA_TURBOQUANT_LIVE_MASK_LAYER
     -u LLAMA_TURBOQUANT_CAPTURE_VALUES
 )
+if [[ "$SPEC_MODE" != dflash ]]; then
+    unset_args+=(
+        -u LLAMA_ARG_SPEC_DRAFT_MODEL
+        -u LLAMA_ARG_SPEC_DRAFT_N_MIN
+        -u LLAMA_ARG_SPEC_DRAFT_P_MIN
+    )
+fi
 [[ -n "$THREADS_HTTP" ]] || unset_args+=(-u LLAMA_ARG_THREADS_HTTP)
 [[ -n "$CMOE_PREFILL_BATCH" ]] || unset_args+=(-u LLAMA_CMOE_PREFILL_BATCH)
 [[ -n "$CMOE_PREFILL_UBATCH" ]] || unset_args+=(-u LLAMA_CMOE_PREFILL_UBATCH)
