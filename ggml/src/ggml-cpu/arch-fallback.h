@@ -1,6 +1,14 @@
 
 #pragma once
 
+// The Q4_K Gate/Up pair dot has an x86 specialization. Other architectures
+// publish the exact generic two-call implementation under the common name so
+// callers stay portable even though the optimization itself remains x86-only.
+#if defined(GGML_CPU_GENERIC) || \
+        !(defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64))
+#define ggml_vec_dot_q4_K_q8_K_pair_generic ggml_vec_dot_q4_K_q8_K_pair
+#endif
+
 // Rename `_generic` functions if no native implementation is available.
 // This effectively selects the generic implementation.
 

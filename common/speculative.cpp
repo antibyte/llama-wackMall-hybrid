@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -40,6 +41,16 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
 };
+
+static bool turbo4_mtp_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_MTP_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static bool turbo4_draft_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_DRAFT_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
     std::string result;
@@ -911,6 +922,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    // backend sampler chain per seq, attached to ctx_dft
+    std::vector<llama_sampler *> backend_chains;
+
+    bool combined_graph = false;
+
     int32_t n_embd_dec = 0;  // draft hidden size
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
@@ -937,7 +953,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
-        GGML_ASSERT(target_layer_ids_n > 0 && "DFlash model has no target_layer_ids");
+        if (target_layer_ids_n == 0) {
+            throw std::runtime_error("DFlash model has no target layer IDs");
+        }
+
+        const int32_t n_layer_tgt = llama_model_n_layer(model_tgt);
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            if (target_layer_ids[k] < 0 || target_layer_ids[k] >= n_layer_tgt) {
+                throw std::runtime_error(
+                        "DFlash target layer ID " + std::to_string(target_layer_ids[k]) +
+                        " is outside the target model's " + std::to_string(n_layer_tgt) + " layers");
+            }
+        }
 
         n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd(model_dft);
@@ -953,8 +980,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
+        if (block_size < 2) {
+            throw std::runtime_error("invalid DFlash block size: " + std::to_string(block_size));
+        }
+        if (mask_token_id < 0) {
+            throw std::runtime_error("DFlash model has no mask token");
+        }
+
         LOG_INF("%s: adding speculative implementation 'draft-dflash'\n", __func__);
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, backend_sampling=%d\n",
+                __func__, this->params.n_max, this->params.n_min, this->params.p_min,
+                (int) this->params.backend_sampling);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
 
         // DFlash input is [id_last, <mask> * (block_size-1)], so it can draft at most block_size-1 tokens per step
@@ -977,6 +1013,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
+        // offload the top-k reduction for every mask output to the backend
+        backend_chains.assign(n_seq, nullptr);
+        if (this->params.backend_sampling) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+
+                if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                    LOG_WRN("%s: backend offload failed for seq_id=%d; using CPU sampler\n", __func__, (int) seq_id);
+                    llama_sampler_free(chain);
+                    chain = nullptr;
+                }
+                backend_chains[seq_id] = chain;
+            }
+        }
+
         // turn on extraction of the target layers' input embeddings
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
@@ -984,9 +1036,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+
+        combined_graph = llama_attach_dflash(ctx_tgt, ctx_dft);
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        if (combined_graph && this->params.ctx_tgt) {
+            llama_detach_dflash(this->params.ctx_tgt, this->params.ctx_dft);
+        }
+
+        auto * ctx_dft = this->params.ctx_dft;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+            if (backend_chains[seq_id] == nullptr) {
+                continue;
+            }
+            if (ctx_dft) {
+                llama_set_sampler(ctx_dft, seq_id, nullptr);
+            }
+            llama_sampler_free(backend_chains[seq_id]);
+        }
+        backend_chains.clear();
+
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
     }
@@ -1014,7 +1084,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        if (combined_graph && llama_take_dflash_injected(this->params.ctx_tgt)) {
+            return true;
+        }
+
+        if ((batch_in.token == nullptr) == (batch_in.embd == nullptr)) {
             return true;
         }
 
@@ -1116,6 +1190,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        int32_t n_active = 0;
+        for (const auto & dp : dparams) {
+            n_active += dp.drafting;
+        }
+        const int32_t n_draft_cap = n_active > 0 ?
+                std::max(0, (int32_t) std::min(llama_n_batch(ctx_dft), llama_n_ubatch(ctx_dft)) / n_active - 1) : 0;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1130,12 +1211,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (dp.n_max > 0) {
                 n_draft = std::min(n_draft, dp.n_max);
             }
+            n_draft = std::min(n_draft, n_draft_cap);
+            if (n_draft <= 0 || n_draft < params.n_min) {
+                continue;
+            }
 
             const int32_t n_block_tokens = n_draft + 1; // id_last + n_draft * <mask>
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, i != 0);
             }
         }
 
@@ -2244,7 +2329,34 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
-    result.n_outputs_max = params.n_parallel;
+
+    const bool spec_dflash = std::find(
+            params.speculative.types.begin(),
+            params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
+
+    if (spec_dflash) {
+        if (params.cmoe_n_batch_decode > 0 && params.cmoe_n_ubatch_decode > 0) {
+            // Prompt state is chunked by the draft context; target-only prefill limits must not size it.
+            const int64_t block_tokens = (int64_t) std::max(1, params.n_parallel) *
+                    ((int64_t) std::max(0, params_spec.n_max) + 1);
+            const int32_t n_batch_draft = (int32_t) std::min<int64_t>(
+                    result.n_batch, std::max<int64_t>(params.cmoe_n_batch_decode, block_tokens));
+            const int32_t n_ubatch_draft = (int32_t) std::min<int64_t>(
+                    result.n_ubatch, std::max<int64_t>(params.cmoe_n_ubatch_decode, block_tokens));
+
+            result.n_batch  = std::max(n_batch_draft, n_ubatch_draft);
+            result.n_ubatch = n_ubatch_draft;
+        }
+
+        const auto limits = common_speculative_get_draft_output_limits(
+                result.n_batch, params.n_parallel, params_spec.n_max);
+        result.n_outputs_max = limits.total;
+        result.n_sampling_outputs_per_seq_max = limits.per_seq;
+    } else {
+        result.n_outputs_max = params.n_parallel;
+        result.n_sampling_outputs_per_seq_max = 1;
+    }
 
     return result;
 }
@@ -2268,6 +2380,24 @@ common_speculative_init_result::common_speculative_init_result(
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     GGML_ASSERT(has_draft || spec_mtp);
+
+    if (params.cache_type_k == GGML_TYPE_TURBO4_K || params.cache_type_v == GGML_TYPE_TURBO4_K) {
+        const bool mtp_only = spec_mtp &&
+            std::all_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type type) {
+                return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
+            });
+        if (!turbo4_mtp_experimental_enabled() || !mtp_only) {
+            LOG_ERR("%s: turbo4_k draft KV requires draft-mtp only and "
+                    "LLAMA_TURBO4_MTP_EXPERIMENTAL=1\n", __func__);
+            return;
+        }
+        if ((params.speculative.draft.cache_type_k == GGML_TYPE_TURBO4_K ||
+             params.speculative.draft.cache_type_v == GGML_TYPE_TURBO4_K) &&
+            !turbo4_draft_experimental_enabled()) {
+            LOG_ERR("%s: turbo4_k draft KV requires LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1\n", __func__);
+            return;
+        }
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -2328,6 +2458,28 @@ llama_context * common_speculative_init_result::context() {
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
     return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
+}
+
+common_speculative_output_limits common_speculative_get_output_limits(
+        int32_t n_batch, int32_t n_parallel, int32_t n_draft) {
+    const int64_t per_seq = 1 + (int64_t) std::max(0, n_draft);
+    const int64_t total   = (int64_t) n_parallel * per_seq;
+
+    return {
+        /* .total   = */ (int32_t) std::min<int64_t>(n_batch, total),
+        /* .per_seq = */ (int32_t) std::min<int64_t>(n_batch, per_seq),
+    };
+}
+
+common_speculative_output_limits common_speculative_get_draft_output_limits(
+        int32_t n_batch, int32_t n_parallel, int32_t n_draft) {
+    const int64_t per_seq = std::max(0, n_draft);
+    const int64_t total   = (int64_t) n_parallel * per_seq;
+
+    return {
+        /* .total   = */ (int32_t) std::min<int64_t>(n_batch, total),
+        /* .per_seq = */ (int32_t) std::min<int64_t>(n_batch, per_seq),
+    };
 }
 
 // initialization of the speculative decoding system

@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "turbo4-k.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -328,6 +329,85 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     return sum;
 }
 
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_k(
+        const char * __restrict__ K_c,
+        const void * __restrict__ Q_v,
+        const int * __restrict__ Q_q8,
+        const void * __restrict__ Q_ds_v) {
+    const block_turbo4_k * K_turbo = (const block_turbo4_k *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+            const int elem0 = 2*k_KQ;
+            const int block = elem0 / QK_TURBO4_K;
+            const int offset = elem0 % QK_TURBO4_K;
+            const float norm = __half2float(K_turbo[block].norm);
+            const uint8_t packed = K_turbo[block].qs[offset / 2];
+            const float2 kv = make_float2(
+                norm*turbo4_k_centroids_cuda[packed & 0x0f],
+                norm*turbo4_k_centroids_cuda[(packed >> 4) & 0x0f]);
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            ggml_cuda_mad(sum, kv, __half22float2(qv));
+#else
+            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += kv.x*qv.x + kv.y*qv.y;
+#endif
+        }
+    }
+    return sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_k_dp4a(
+        const char * __restrict__ K_c,
+        const void * __restrict__ Q_v,
+        const int * __restrict__ Q_q8,
+        const void * __restrict__ Q_ds_v) {
+    const block_turbo4_k * K_turbo = (const block_turbo4_k *) K_c;
+    GGML_UNUSED(Q_v);
+    static_assert(nthreads == WARP_SIZE, "Turbo4 DP4A requires one warp per K/Q dot product");
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int lane = threadIdx.x;
+        const int query_local = Q_q8[k_KQ_0/nthreads];
+        const float query_scale_local = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads].x;
+        const int source0 = 2*(lane & 0x0f);
+        const int source1 = source0 + 1;
+        const int query0 = __shfl_sync(0xffffffff, query_local, source0);
+        const int query1 = __shfl_sync(0xffffffff, query_local, source1);
+        const float query_scale0 = __shfl_sync(0xffffffff, query_scale_local, source0);
+        const float query_scale1 = __shfl_sync(0xffffffff, query_scale_local, source1);
+
+        if (lane < WARP_SIZE/2) {
+            const int block = k_KQ_0 / (QK_TURBO4_K/sizeof(int));
+            int packed;
+            ggml_cuda_memcpy_1<sizeof(packed), sizeof(packed)>(&packed, K_turbo[block].qs + 4*lane);
+
+            const int2 values = get_int_from_table_16(packed, turbo4_k_centroid_i8_cuda);
+            const int value0 = __byte_perm(values.x, values.y, 0x5140);
+            const int value1 = __byte_perm(values.x, values.y, 0x7362);
+            const float key_scale = __half2float(K_turbo[block].norm)*turbo4_k_centroid_i8_scale_cuda;
+            sum += key_scale*(
+                query_scale0*ggml_cuda_dp4a(value0, query0, 0) +
+                query_scale1*ggml_cuda_dp4a(value1, query1, 0));
+        }
+    }
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -617,6 +697,36 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo4_k(
+        const void * __restrict__ vx,
+        void * __restrict__ dst,
+        const int64_t i0) {
+    const block_turbo4_k * x = (const block_turbo4_k *) vx;
+    const int64_t ib = i0 / QK_TURBO4_K;
+    const int iqs = i0 % QK_TURBO4_K;
+    const float norm = __half2float(x[ib].norm);
+
+    static_assert(ne % 2 == 0, "bad ne");
+#pragma unroll
+    for (int l0 = 0; l0 < ne; l0 += 2) {
+        const uint8_t packed = x[ib].qs[(iqs + l0) / 2];
+        const float2 values = make_float2(
+            norm*turbo4_k_centroids_cuda[ packed       & 0x0f],
+            norm*turbo4_k_centroids_cuda[(packed >> 4) & 0x0f]);
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+            ((half2 *) dst)[l0/2] = __float22half2_rn(values);
+        } else
+#endif
+        if constexpr (std::is_same_v<T, float>) {
+            ((float2 *) dst)[l0/2] = values;
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -633,6 +743,12 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO4_K) {
+#ifdef GGML_CUDA_TURBO4_KQ_DP4A
+        return vec_dot_fattn_vec_KQ_turbo4_k_dp4a<D, nthreads>;
+#else
+        return vec_dot_fattn_vec_KQ_turbo4_k<D, nthreads>;
+#endif
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -653,6 +769,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO4_K) {
+        return dequantize_V_turbo4_k<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else {

@@ -311,7 +311,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_1,
 };
 
-static ggml_type kv_cache_type_from_str(const std::string & s) {
+static ggml_type kv_cache_type_from_str(const std::string & s, bool allow_experimental_turbo4_k = false) {
+    if (allow_experimental_turbo4_k && s == ggml_type_name(GGML_TYPE_TURBO4_K)) {
+        return GGML_TYPE_TURBO4_K;
+    }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
@@ -320,10 +323,13 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     throw std::runtime_error("Unsupported cache type: " + s);
 }
 
-static std::string get_all_kv_cache_types() {
+static std::string get_all_kv_cache_types(bool allow_experimental_turbo4_k = false) {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
         msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+    }
+    if (allow_experimental_turbo4_k) {
+        msg << ", " << ggml_type_name(GGML_TYPE_TURBO4_K);
     }
     return msg.str();
 }
@@ -356,6 +362,42 @@ static bool spec_types_is_default(const common_params & params) {
     return params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE};
 }
 
+static bool turbo4_mtp_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_MTP_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static bool turbo4_dflash_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_DFLASH_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static bool turbo4_draft_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_DRAFT_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static bool turbo4_v_experimental_enabled() {
+    const char * value = std::getenv("LLAMA_TURBO4_V_EXPERIMENTAL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static bool spec_types_is_mtp_only(const common_params & params) {
+    const auto & types = params.speculative.types;
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() &&
+        std::all_of(types.begin(), types.end(), [](common_speculative_type type) {
+            return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_NONE;
+        });
+}
+
+static bool spec_types_is_dflash_only(const common_params & params) {
+    const auto & types = params.speculative.types;
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end() &&
+        std::all_of(types.begin(), types.end(), [](common_speculative_type type) {
+            return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_NONE;
+        });
+}
+
 common_models_handler common_models_handler_init(const common_params & params, llama_example curr_ex) {
     common_download_hf_plan plan;
     common_download_hf_plan plan_spec;
@@ -373,6 +415,63 @@ common_models_handler common_models_handler_init(const common_params & params, l
     const bool spec_type_draft_eagle3 = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params.speculative.types.end();
+
+    const bool turbo4_k = params.cache_type_k == GGML_TYPE_TURBO4_K;
+    const bool turbo4_v = params.cache_type_v == GGML_TYPE_TURBO4_K;
+    if (turbo4_k || turbo4_v) {
+        if (turbo4_v && !turbo4_v_experimental_enabled()) {
+            throw std::invalid_argument(
+                "experimental turbo4_k target V requires LLAMA_TURBO4_V_EXPERIMENTAL=1");
+        }
+        if (turbo4_k && params.cache_type_v != GGML_TYPE_Q8_0 && !turbo4_v) {
+            throw std::invalid_argument("experimental turbo4_k target K requires q8_0 or turbo4_k target V");
+        }
+        if (turbo4_v && params.cache_type_k != GGML_TYPE_Q8_0 && !turbo4_k) {
+            throw std::invalid_argument("experimental turbo4_k target V requires q8_0 or turbo4_k target K");
+        }
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            throw std::invalid_argument("experimental turbo4_k requires --flash-attn on");
+        }
+        const bool turbo4_spec_enabled =
+            (turbo4_mtp_experimental_enabled() && spec_types_is_mtp_only(params)) ||
+            (turbo4_dflash_experimental_enabled() && spec_types_is_dflash_only(params));
+        if (!spec_types_is_default(params) && !turbo4_spec_enabled) {
+            throw std::invalid_argument(
+                "experimental turbo4_k speculative decoding requires either draft-mtp only with "
+                "LLAMA_TURBO4_MTP_EXPERIMENTAL=1 or draft-dflash only with "
+                "LLAMA_TURBO4_DFLASH_EXPERIMENTAL=1");
+        }
+    } else if (const char * value = std::getenv("LLAMA_TURBO4_Q8_FALLBACK_LAYERS")) {
+        if (value[0] != '\0') {
+            throw std::invalid_argument(
+                "LLAMA_TURBO4_Q8_FALLBACK_LAYERS requires target K type turbo4_k");
+        }
+    }
+
+    const bool draft_turbo4_k = params.speculative.draft.cache_type_k == GGML_TYPE_TURBO4_K;
+    const bool draft_turbo4_v = params.speculative.draft.cache_type_v == GGML_TYPE_TURBO4_K;
+    if ((draft_turbo4_k || draft_turbo4_v) && !spec_types_is_default(params)) {
+        if (!turbo4_draft_experimental_enabled()) {
+            throw std::invalid_argument(
+                "experimental turbo4_k draft KV requires LLAMA_TURBO4_DRAFT_EXPERIMENTAL=1");
+        }
+        if (!spec_types_is_mtp_only(params)) {
+            throw std::invalid_argument("experimental turbo4_k draft KV requires draft-mtp only");
+        }
+        if (draft_turbo4_v && !turbo4_v_experimental_enabled()) {
+            throw std::invalid_argument(
+                "experimental turbo4_k draft V requires LLAMA_TURBO4_V_EXPERIMENTAL=1");
+        }
+        if (draft_turbo4_k && params.speculative.draft.cache_type_v != GGML_TYPE_Q8_0 && !draft_turbo4_v) {
+            throw std::invalid_argument("experimental turbo4_k draft K requires q8_0 or turbo4_k draft V");
+        }
+        if (draft_turbo4_v && params.speculative.draft.cache_type_k != GGML_TYPE_Q8_0 && !draft_turbo4_k) {
+            throw std::invalid_argument("experimental turbo4_k draft V requires q8_0 or turbo4_k draft K");
+        }
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            throw std::invalid_argument("experimental turbo4_k draft KV requires --flash-attn on");
+        }
+    }
 
     // only download mmproj if the current example is using it
     bool use_mmproj = false;
@@ -724,8 +823,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     };
 
+    std::set<std::string> seen_args;
     auto parse_cli_args = [&]() {
-        std::set<std::string> seen_args;
 
         for (int i = 1; i < argc; i++) {
             const std::string arg_prefix = "--";
@@ -802,6 +901,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    auto has_cli_arg = [&](std::initializer_list<const char *> names) {
+        return std::any_of(names.begin(), names.end(), [&](const char * name) {
+            return seen_args.count(name);
+        });
+    };
+
     if (params.cmoe) {
         params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         params.fit_params = true;
@@ -809,8 +914,108 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (params.n_parallel < 0) {
             params.n_parallel = 1;
         }
-        params.n_batch = 256;
-        params.n_ubatch = 256;
+        auto cmoe_batch_from_env = [](const char * name, int & target) {
+            const char * value = std::getenv(name);
+
+            if (value == nullptr || *value == '\0') {
+                return false;
+            }
+
+            const int parsed = std::stoi(value);
+
+            if (parsed <= 0) {
+                throw std::invalid_argument(
+                    std::string(name) + " must be greater than zero");
+            }
+
+            target = parsed;
+            return true;
+        };
+
+        // Environment overrides intentionally win over CLI parsing.  In their
+        // absence, retain explicit -b/-ub values and apply the cmoe defaults
+        // only to parameters that the user did not set.
+        const bool batch_from_env  = cmoe_batch_from_env("LLAMA_CMOE_BATCH",  params.n_batch);
+        const bool ubatch_from_env = cmoe_batch_from_env("LLAMA_CMOE_UBATCH", params.n_ubatch);
+        const bool batch_from_cli  = has_cli_arg({"-b", "--batch-size"});
+        const bool ubatch_from_cli = has_cli_arg({"-ub", "--ubatch-size"});
+        if (!batch_from_env && !batch_from_cli && params.n_batch == 2048) {
+            // Preserve programmatic values. If only ubatch was explicitly
+            // configured, make the logical batch large enough to contain it.
+            params.n_batch = (ubatch_from_env || ubatch_from_cli) ? std::max(256, params.n_ubatch) : 256;
+        }
+        if (!ubatch_from_env && !ubatch_from_cli && params.n_ubatch == 512) {
+            params.n_ubatch = std::min(256, params.n_batch);
+        }
+
+        if (params.n_ubatch > params.n_batch) {
+            throw std::invalid_argument(
+                "cmoe ubatch size must not exceed batch size");
+        }
+
+        auto cmoe_phase_batch_from_env = [](const char * name, int & target) {
+            const char * value = std::getenv(name);
+            if (value == nullptr || *value == '\0') {
+                return false;
+            }
+
+            const int parsed = std::stoi(value);
+            if (parsed <= 0) {
+                throw std::invalid_argument(std::string(name) + " must be greater than zero");
+            }
+
+            target = parsed;
+            return true;
+        };
+
+        const int base_batch  = params.n_batch;
+        const int base_ubatch = params.n_ubatch;
+        params.cmoe_n_batch_prefill  = base_batch;
+        params.cmoe_n_ubatch_prefill = base_ubatch;
+        params.cmoe_n_batch_decode   = base_batch;
+        params.cmoe_n_ubatch_decode  = base_ubatch;
+
+        bool phase_batching = false;
+        phase_batching |= cmoe_phase_batch_from_env(
+                "LLAMA_CMOE_PREFILL_BATCH", params.cmoe_n_batch_prefill);
+        phase_batching |= cmoe_phase_batch_from_env(
+                "LLAMA_CMOE_PREFILL_UBATCH", params.cmoe_n_ubatch_prefill);
+        phase_batching |= cmoe_phase_batch_from_env(
+                "LLAMA_CMOE_DECODE_BATCH", params.cmoe_n_batch_decode);
+        phase_batching |= cmoe_phase_batch_from_env(
+                "LLAMA_CMOE_DECODE_UBATCH", params.cmoe_n_ubatch_decode);
+
+        if (phase_batching) {
+            if (params.cmoe_n_ubatch_prefill > params.cmoe_n_batch_prefill) {
+                throw std::invalid_argument(
+                        "LLAMA_CMOE_PREFILL_UBATCH must not exceed LLAMA_CMOE_PREFILL_BATCH");
+            }
+            if (params.cmoe_n_ubatch_decode > params.cmoe_n_batch_decode) {
+                throw std::invalid_argument(
+                        "LLAMA_CMOE_DECODE_UBATCH must not exceed LLAMA_CMOE_DECODE_BATCH");
+            }
+
+            params.n_batch = std::max(
+                    params.cmoe_n_batch_prefill, params.cmoe_n_batch_decode);
+            params.n_ubatch = std::max(
+                    params.cmoe_n_ubatch_prefill, params.cmoe_n_ubatch_decode);
+
+            LOG_INF("cmoe phase batching: prefill=%d/%d decode=%d/%d reserve=%d/%d\n",
+                    params.cmoe_n_batch_prefill,
+                    params.cmoe_n_ubatch_prefill,
+                    params.cmoe_n_batch_decode,
+                    params.cmoe_n_ubatch_decode,
+                    params.n_batch,
+                    params.n_ubatch);
+        } else {
+            params.cmoe_n_batch_prefill = 0;
+            params.cmoe_n_ubatch_prefill = 0;
+            params.cmoe_n_batch_decode = 0;
+            params.cmoe_n_ubatch_decode = 0;
+        }
+
+        LOG_INF("cmoe batch/ubatch = %d/%d\n",
+                params.n_batch, params.n_ubatch);
         params.kv_unified = true;
         params.no_kv_offload = false;
     }
@@ -2350,11 +2555,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for K\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(true).c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            params.cache_type_k = kv_cache_type_from_str(value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -2363,11 +2568,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for V\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(true).c_str(),
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_v = kv_cache_type_from_str(value);
+            params.cache_type_v = kv_cache_type_from_str(value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
@@ -2588,12 +2793,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- none: no special loading mode\n"
         "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
         "- mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
+        "- mmap+mlock: explicit mmap plus mlock mode\n"
         "- dio: use DirectIO if available\n",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "none")  { params.load_mode = LLAMA_LOAD_MODE_NONE;      }
             else if (value == "mmap")  { params.load_mode = LLAMA_LOAD_MODE_MMAP;      }
-            else if (value == "mlock") { params.load_mode = LLAMA_LOAD_MODE_MLOCK;     }
-            else if (value == "dio")   { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO; }
+            else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
+            else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
+            else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
@@ -3953,11 +4160,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(true).c_str(),
             ggml_type_name(params.speculative.draft.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value, true);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -3966,11 +4173,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(true).c_str(),
             ggml_type_name(params.speculative.draft.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value, true);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(

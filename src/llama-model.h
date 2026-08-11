@@ -568,6 +568,7 @@ struct llama_model {
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
+    struct ggml_tensor * output_mtp      = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
@@ -691,6 +692,12 @@ struct llama_model {
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
+
+    virtual bool build_dflash_injection(
+            llm_graph_context              & graph,
+            ggml_tensor                    * features,
+            const llama_cparams            & cparams_draft,
+            const llama_memory_context_i * mctx_draft) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;

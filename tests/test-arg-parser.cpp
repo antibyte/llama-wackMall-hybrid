@@ -2,7 +2,9 @@
 #include "common.h"
 #include "download.h"
 #include "llama.h"
+#include "speculative.h"
 
+#include <limits>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -13,6 +15,102 @@
 
 static void test(void) {
     common_params params;
+
+    auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
+                                   int32_t total, int32_t per_seq) {
+        const auto limits = common_speculative_get_output_limits(n_batch, n_parallel, n_draft);
+        assert(limits.total == total);
+        assert(limits.per_seq == per_seq);
+    };
+
+    assert_output_limits(16, 2,  3, 8, 4);
+    assert_output_limits(16, 2, -1, 2, 1);
+    assert_output_limits( 6, 2,  3, 6, 4);
+    assert_output_limits( 2, 1,  3, 2, 2);
+    assert_output_limits(
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max());
+
+    auto assert_draft_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
+                                         int32_t total, int32_t per_seq) {
+        const auto limits = common_speculative_get_draft_output_limits(n_batch, n_parallel, n_draft);
+        assert(limits.total == total);
+        assert(limits.per_seq == per_seq);
+    };
+
+    assert_draft_output_limits(16, 2,  3, 6, 3);
+    assert_draft_output_limits( 5, 2,  3, 5, 3);
+    assert_draft_output_limits(16, 2, -1, 0, 0);
+    assert_draft_output_limits(
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max());
+
+    {
+        common_params base;
+        base.n_parallel = 4;
+        base.n_sampling_outputs_per_seq_max = 8;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_outputs_max == 4);
+        assert(draft.n_sampling_outputs_per_seq_max == 1);
+    }
+
+    {
+        common_params base;
+        base.n_batch = 16;
+        base.n_ubatch = 16;
+        base.n_parallel = 4;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        base.speculative.draft.n_max = 3;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_outputs_max == 12);
+        assert(draft.n_sampling_outputs_per_seq_max == 3);
+    }
+
+    {
+        common_params base;
+        base.n_batch = 768;
+        base.n_ubatch = 768;
+        base.n_parallel = 1;
+        base.cmoe_n_batch_prefill = 768;
+        base.cmoe_n_ubatch_prefill = 768;
+        base.cmoe_n_batch_decode = 64;
+        base.cmoe_n_ubatch_decode = 64;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        base.speculative.draft.n_max = 2;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_batch == 64);
+        assert(draft.n_ubatch == 64);
+        assert(draft.n_outputs_max == 2);
+        assert(draft.n_sampling_outputs_per_seq_max == 2);
+    }
+
+    {
+        common_params base;
+        base.n_batch = 16;
+        base.n_ubatch = 16;
+        base.n_parallel = 2;
+        base.cmoe_n_batch_prefill = 16;
+        base.cmoe_n_ubatch_prefill = 16;
+        base.cmoe_n_batch_decode = 2;
+        base.cmoe_n_ubatch_decode = 2;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        base.speculative.draft.n_max = 3;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_batch == 8);
+        assert(draft.n_ubatch == 8);
+        assert(draft.n_outputs_max == 6);
+        assert(draft.n_sampling_outputs_per_seq_max == 3);
+    }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
@@ -112,6 +210,15 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
 
+    {
+        common_params turbo4_draft_params;
+        argv = {"binary_name", "--spec-draft-type-k", "turbo4_k", "--spec-draft-type-v", "turbo4_k"};
+        assert(true == common_params_parse(
+            argv.size(), list_str_to_char(argv).data(), turbo4_draft_params, LLAMA_EXAMPLE_SERVER));
+        assert(turbo4_draft_params.speculative.draft.cache_type_k == GGML_TYPE_TURBO4_K);
+        assert(turbo4_draft_params.speculative.draft.cache_type_v == GGML_TYPE_TURBO4_K);
+    }
+
     argv = {"binary_name", "-t", "1234"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.cpuparams.n_threads == 1234);
@@ -165,6 +272,24 @@ static void test(void) {
     printf("test-arg-parser: skip on windows build\n");
 #else
     printf("test-arg-parser: test environment variables (valid + invalid usages)\n\n");
+
+    // The hybrid-specific CMOE environment knobs are intentionally applied
+    // after CLI parsing, but absent variables must not replace explicit CLI
+    // values. This preserves the established benchmark override contract.
+    unsetenv("LLAMA_CMOE_BATCH");
+    unsetenv("LLAMA_CMOE_UBATCH");
+    argv = {"binary_name", "--batch-size", "9090", "--ubatch-size", "8080"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.n_batch == 9090);
+    assert(params.n_ubatch == 8080);
+
+    setenv("LLAMA_CMOE_BATCH", "64", true);
+    setenv("LLAMA_CMOE_UBATCH", "32", true);
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.n_batch == 64);
+    assert(params.n_ubatch == 32);
+    unsetenv("LLAMA_CMOE_BATCH");
+    unsetenv("LLAMA_CMOE_UBATCH");
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};

@@ -53,12 +53,14 @@
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/turbo4-wht.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/expert-bridge.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -87,9 +89,1181 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+struct ggml_cuda_expert_bridge_state {
+    static constexpr size_t max_tokens = 32;
+    static constexpr size_t id_capacity = 4096;
+    static constexpr int max_candidates = 3;
+    bool loaded = false;
+    bool enabled = false;
+    int layer = -1;
+    char predictor_name[64] = {};
+    char router_name[64] = {};
+    std::string json_path;
+    int32_t * predictor_ids = nullptr;
+    int32_t * router_ids = nullptr;
+    size_t predictor_capacity = id_capacity;
+    size_t router_capacity = id_capacity;
+    size_t predictor_count = 0;
+    size_t router_count = 0;
+    size_t predictor_width = 0;
+    size_t predictor_tokens = 0;
+    size_t router_width = 0;
+    size_t router_tokens = 0;
+    size_t input_tokens = 0;
+    std::mutex mutex;
+    uint64_t predictor_callbacks = 0;
+    uint64_t router_callbacks = 0;
+    uint64_t paired_callbacks = 0;
+    uint64_t predictor_token_rows = 0;
+    uint64_t router_token_rows = 0;
+    uint64_t input_token_rows = 0;
+    uint64_t bytes = 0;
+    int64_t last_predictor_us = 0;
+    int64_t lead_us = 0;
+    bool registered = false;
+    bool consume = false;
+    bool verify = false;
+    bool recurrence = false;
+    bool telemetry = false;
+    bool device_quant = false;
+    bool hit_only = false;
+    int cache_slots = 0;
+    std::vector<int> cache_experts;
+    std::vector<uint64_t> cache_ages;
+    uint64_t cache_clock = 0;
+    int candidate_limit = 1;
+    int device = 0;
+    const char * gate_data = nullptr;
+    const char * up_data = nullptr;
+    size_t gate_slice = 0;
+    size_t up_slice = 0;
+    int n_expert = 0;
+    std::vector<uint8_t> cold_mask;
+    char * staging = nullptr;
+    void * device_scratch = nullptr;
+    cudaStream_t copy_stream = nullptr;
+    int n_embd = 0;
+    int n_ff = 0;
+    float * input_host = nullptr;
+    block_q8_K * input_q8_host = nullptr;
+    block_q8_K * input_q8_device = nullptr;
+    float * output_host = nullptr;
+    float * output_device = nullptr;
+    cudaEvent_t input_d2h_start_event = nullptr;
+    cudaEvent_t input_d2h_end_event = nullptr;
+    cudaEvent_t compute_start_event = nullptr;
+    cudaEvent_t input_h2d_end_event = nullptr;
+    cudaEvent_t kernel_end_event = nullptr;
+    cudaEvent_t output_d2h_end_event = nullptr;
+    bool input_timing_pending = false;
+    bool input_timing_device_quant = false;
+    bool input_ready = false;
+    bool result_ready = false;
+    std::condition_variable cv;
+    std::thread worker;
+    bool stop = false;
+    bool job_active = false;
+    bool copy_requested = false;
+    bool copy_done = false;
+    bool router_known = false;
+    int candidate_count = 0;
+    int predicted_experts[max_candidates] = { -1, -1, -1 };
+    bool actual_hits[max_candidates] = {};
+    int queued_experts[max_candidates] = { -1, -1, -1 };
+    int queued_count = 0;
+    int actual_hit_count = 0;
+    int pending_fetches = 0;
+    int predicted_token = -1;
+    int64_t job_start_us = 0;
+    int64_t router_us = 0;
+    int64_t copy_done_us = 0;
+    uint64_t copies = 0;
+    uint64_t copy_batches = 0;
+    uint64_t useful_copies = 0;
+    uint64_t late_copies = 0;
+    uint64_t skipped_predictions = 0;
+    uint64_t copied_bytes = 0;
+    int64_t staging_us = 0;
+    int64_t transfer_us = 0;
+    int64_t exposed_wait_us = 0;
+    uint64_t consumed_gate_up = 0;
+    uint64_t multi_token_jobs = 0;
+    uint64_t consumed_multi_token = 0;
+    uint64_t prediction_graphs = 0;
+    uint64_t predicted_candidates = 0;
+    uint64_t repeated_candidates = 0;
+    uint64_t reuse_within_1 = 0;
+    uint64_t reuse_within_2 = 0;
+    uint64_t reuse_within_4 = 0;
+    uint64_t reuse_within_8 = 0;
+    std::vector<uint64_t> last_prediction_graph;
+    int64_t quantize_us = 0;
+    int64_t compute_us = 0;
+    int64_t worker_queue_us = 0;
+    int64_t router_wait_us = 0;
+    int64_t router_to_compute_us = 0;
+    int64_t result_latency_us = 0;
+    int64_t claim_wait_us = 0;
+    int64_t fetch_wait_us = 0;
+    int64_t result_copy_us = 0;
+    uint64_t diagnostic_jobs = 0;
+    uint64_t device_quantized_rows = 0;
+    uint64_t computed_candidates = 0;
+    uint64_t returned_bytes = 0;
+    uint64_t cache_hits = 0;
+    uint64_t cache_misses = 0;
+    uint64_t cache_evictions = 0;
+    uint64_t claim_waits = 0;
+    uint64_t fetch_waits = 0;
+    double input_d2h_ms = 0.0;
+    double device_quant_ms = 0.0;
+    double input_h2d_ms = 0.0;
+    double kernel_ms = 0.0;
+    double output_d2h_ms = 0.0;
+};
+
+static constexpr int ggml_cuda_expert_bridge_max_layers = 4;
+static ggml_cuda_expert_bridge_state g_expert_bridges[ggml_cuda_expert_bridge_max_layers];
+static int g_expert_bridge_count = 0;
+static bool g_expert_bridge_loaded = false;
+static std::string g_expert_bridge_json_path;
+static thread_local ggml_cuda_expert_bridge_state * g_expert_bridge_current = nullptr;
+
+#define g_expert_bridge (*g_expert_bridge_current)
+
+static void ggml_cuda_expert_bridge_load();
+
+static bool ggml_cuda_expert_bridge_env_has_layer(const char * name, int layer) {
+    const char * cursor = getenv(name);
+    if (!cursor || !cursor[0]) return false;
+    while (*cursor) {
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        char * end = nullptr;
+        errno = 0;
+        const long parsed = strtol(cursor, &end, 10);
+        if (errno || !end || end == cursor || parsed < 0 || parsed > INT32_MAX) return false;
+        if (parsed == layer) return true;
+        cursor = end;
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        if (*cursor == '\0') break;
+        if (*cursor != ',') return false;
+        ++cursor;
+    }
+    return false;
+}
+
+static void ggml_cuda_expert_bridge_start_job_locked(
+        const int * experts, int count, int predicted_token) {
+    if (count <= 0) return;
+    if (g_expert_bridge.recurrence) {
+        g_expert_bridge.predictor_callbacks++;
+        g_expert_bridge.last_predictor_us = ggml_time_us();
+    }
+    const uint64_t graph = ++g_expert_bridge.prediction_graphs;
+    for (int i = 0; i < count; ++i) {
+        const int expert = experts[i];
+        const uint64_t previous = g_expert_bridge.last_prediction_graph[(size_t) expert];
+        g_expert_bridge.predicted_candidates++;
+        if (previous > 0) {
+            const uint64_t distance = graph - previous;
+            g_expert_bridge.repeated_candidates++;
+            if (distance <= 1) g_expert_bridge.reuse_within_1++;
+            if (distance <= 2) g_expert_bridge.reuse_within_2++;
+            if (distance <= 4) g_expert_bridge.reuse_within_4++;
+            if (distance <= 8) g_expert_bridge.reuse_within_8++;
+        }
+        g_expert_bridge.last_prediction_graph[(size_t) expert] = graph;
+    }
+    g_expert_bridge.job_active = true;
+    g_expert_bridge.copy_requested = true;
+    g_expert_bridge.candidate_count = count;
+    for (int i = 0; i < count; ++i) {
+        g_expert_bridge.predicted_experts[i] = experts[i];
+        g_expert_bridge.actual_hits[i] = false;
+    }
+    g_expert_bridge.predicted_token = predicted_token;
+    g_expert_bridge.job_start_us = ggml_time_us();
+    g_expert_bridge.cv.notify_one();
+}
+
+static void ggml_cuda_expert_bridge_write_json() {
+    if (g_expert_bridge_count == 0 || g_expert_bridge_json_path.empty()) return;
+    FILE * file = fopen(g_expert_bridge_json_path.c_str(), "w");
+    if (!file) return;
+    fputs("{\n  \"schema\":\"llama-wackmall-cuda-transfer-bridge-v6\",\n  \"layers\":[\n", file);
+    for (int i = 0; i < g_expert_bridge_count; ++i) {
+        ggml_cuda_expert_bridge_state & state = g_expert_bridges[i];
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (i > 0) fputs(",\n", file);
+        fprintf(file,
+                "    {\"layer\":%d,\"candidate_limit\":%d,\"prediction_mode\":\"%s\","
+                "\"predictor_callbacks\":%llu,\"router_callbacks\":%llu,"
+                "\"paired_callbacks\":%llu,\"readback_bytes\":%llu,\"lead_ms\":%.3f,"
+                "\"predictor_token_rows\":%llu,\"router_token_rows\":%llu,"
+                "\"input_token_rows\":%llu,\"copy_batches\":%llu,\"copies\":%llu,"
+                "\"useful_copies\":%llu,\"late_copies\":%llu,"
+                "\"skipped_predictions\":%llu,\"copied_bytes\":%llu,"
+                "\"staging_ms\":%.3f,\"transfer_ms\":%.3f,\"exposed_wait_ms\":%.3f,"
+                "\"consume\":%s,\"verify\":%s,\"consumed_gate_up\":%llu,"
+                "\"multi_token_jobs\":%llu,\"consumed_multi_token\":%llu,"
+                "\"prediction_graphs\":%llu,\"predicted_candidates\":%llu,"
+                "\"repeated_candidates\":%llu,\"reuse_within_1\":%llu,"
+                "\"reuse_within_2\":%llu,\"reuse_within_4\":%llu,\"reuse_within_8\":%llu,"
+                "\"quantize_ms\":%.3f,\"compute_ms\":%.3f,"
+                "\"telemetry\":%s,\"device_quant\":%s,\"hit_only\":%s,\"cache_slots\":%d,"
+                "\"diagnostic_jobs\":%llu,\"device_quantized_rows\":%llu,"
+                "\"computed_candidates\":%llu,\"returned_bytes\":%llu,"
+                "\"cache_hits\":%llu,\"cache_misses\":%llu,\"cache_evictions\":%llu,"
+                "\"worker_queue_ms\":%.3f,\"router_wait_ms\":%.3f,"
+                "\"router_to_compute_ms\":%.3f,\"result_latency_ms\":%.3f,"
+                "\"claim_waits\":%llu,\"claim_wait_ms\":%.3f,"
+                "\"fetch_waits\":%llu,\"fetch_wait_ms\":%.3f,"
+                "\"result_copy_ms\":%.3f,\"input_d2h_ms\":%.3f,\"device_quant_ms\":%.3f,"
+                "\"input_h2d_ms\":%.3f,\"kernel_ms\":%.3f,"
+                "\"output_d2h_ms\":%.3f}",
+                state.layer, state.candidate_limit, state.recurrence ? "recurrence" : "lookahead",
+                (unsigned long long) state.predictor_callbacks,
+                (unsigned long long) state.router_callbacks,
+                (unsigned long long) state.paired_callbacks,
+                (unsigned long long) state.bytes,
+                state.lead_us/1000.0,
+                (unsigned long long) state.predictor_token_rows,
+                (unsigned long long) state.router_token_rows,
+                (unsigned long long) state.input_token_rows,
+                (unsigned long long) state.copy_batches,
+                (unsigned long long) state.copies,
+                (unsigned long long) state.useful_copies,
+                (unsigned long long) state.late_copies,
+                (unsigned long long) state.skipped_predictions,
+                (unsigned long long) state.copied_bytes,
+                state.staging_us/1000.0,
+                state.transfer_us/1000.0,
+                state.exposed_wait_us/1000.0,
+                state.consume ? "true" : "false",
+                state.verify ? "true" : "false",
+                (unsigned long long) state.consumed_gate_up,
+                (unsigned long long) state.multi_token_jobs,
+                (unsigned long long) state.consumed_multi_token,
+                (unsigned long long) state.prediction_graphs,
+                (unsigned long long) state.predicted_candidates,
+                (unsigned long long) state.repeated_candidates,
+                (unsigned long long) state.reuse_within_1,
+                (unsigned long long) state.reuse_within_2,
+                (unsigned long long) state.reuse_within_4,
+                (unsigned long long) state.reuse_within_8,
+                state.quantize_us/1000.0,
+                state.compute_us/1000.0,
+                state.telemetry ? "true" : "false",
+                state.device_quant ? "true" : "false",
+                state.hit_only ? "true" : "false",
+                state.cache_slots,
+                (unsigned long long) state.diagnostic_jobs,
+                (unsigned long long) state.device_quantized_rows,
+                (unsigned long long) state.computed_candidates,
+                (unsigned long long) state.returned_bytes,
+                (unsigned long long) state.cache_hits,
+                (unsigned long long) state.cache_misses,
+                (unsigned long long) state.cache_evictions,
+                state.worker_queue_us/1000.0,
+                state.router_wait_us/1000.0,
+                state.router_to_compute_us/1000.0,
+                state.result_latency_us/1000.0,
+                (unsigned long long) state.claim_waits,
+                state.claim_wait_us/1000.0,
+                (unsigned long long) state.fetch_waits,
+                state.fetch_wait_us/1000.0,
+                state.result_copy_us/1000.0,
+                state.input_d2h_ms,
+                state.device_quant_ms,
+                state.input_h2d_ms,
+                state.kernel_ms,
+                state.output_d2h_ms);
+    }
+    fputs("\n  ]\n}\n", file);
+    fclose(file);
+}
+
+static void ggml_cuda_expert_bridge_finish_job_locked() {
+    if (!g_expert_bridge.copy_done || !g_expert_bridge.router_known) return;
+    if (g_expert_bridge.actual_hit_count > 0) {
+        g_expert_bridge.useful_copies += g_expert_bridge.actual_hit_count;
+        if (g_expert_bridge.copy_done_us > g_expert_bridge.router_us) {
+            g_expert_bridge.late_copies += g_expert_bridge.actual_hit_count;
+            g_expert_bridge.exposed_wait_us += g_expert_bridge.copy_done_us - g_expert_bridge.router_us;
+        }
+    }
+    g_expert_bridge.job_active = false;
+    g_expert_bridge.copy_done = false;
+    g_expert_bridge.router_known = false;
+    g_expert_bridge.actual_hit_count = 0;
+    g_expert_bridge.pending_fetches = 0;
+    g_expert_bridge.input_ready = false;
+    g_expert_bridge.input_tokens = 0;
+    g_expert_bridge.input_timing_pending = false;
+    g_expert_bridge.input_timing_device_quant = false;
+    g_expert_bridge.result_ready = false;
+    for (int i = 0; i < ggml_cuda_expert_bridge_state::max_candidates; ++i) {
+        g_expert_bridge.predicted_experts[i] = -1;
+        g_expert_bridge.actual_hits[i] = false;
+    }
+    g_expert_bridge.candidate_count = 0;
+    g_expert_bridge.predicted_token = -1;
+    if (g_expert_bridge.recurrence && g_expert_bridge.queued_count > 0) {
+        int experts[ggml_cuda_expert_bridge_state::max_candidates];
+        const int count = g_expert_bridge.queued_count;
+        for (int i = 0; i < count; ++i) {
+            experts[i] = g_expert_bridge.queued_experts[i];
+            g_expert_bridge.queued_experts[i] = -1;
+        }
+        g_expert_bridge.queued_count = 0;
+        ggml_cuda_expert_bridge_start_job_locked(experts, count, -1);
+    } else {
+        g_expert_bridge.cv.notify_all();
+    }
+}
+
+static int ggml_cuda_expert_bridge_nearest_int(float value) {
+    float adjusted = value + 12582912.0f;
+    int bits;
+    memcpy(&bits, &adjusted, sizeof(bits));
+    return (bits & 0x007fffff) - 0x00400000;
+}
+
+static void ggml_cuda_expert_bridge_quantize_q8_k_cpu() {
+    const float * token_input = g_expert_bridge.input_host +
+            (size_t) g_expert_bridge.predicted_token*g_expert_bridge.n_embd;
+    for (int offset = 0; offset < g_expert_bridge.n_embd; offset += QK_K) {
+        const float * input = token_input + offset;
+        block_q8_K & output = g_expert_bridge.input_q8_host[offset/QK_K];
+        float maximum = 0.0f;
+        float absolute_maximum = 0.0f;
+        for (int i = 0; i < QK_K; ++i) {
+            const float absolute = fabsf(input[i]);
+            if (absolute > absolute_maximum) {
+                absolute_maximum = absolute;
+                maximum = input[i];
+            }
+        }
+        if (absolute_maximum == 0.0f) {
+            output.d = 0.0f;
+            memset(output.qs, 0, sizeof(output.qs));
+            memset(output.bsums, 0, sizeof(output.bsums));
+            continue;
+        }
+        const float inverse_scale = -127.0f/maximum;
+        for (int i = 0; i < QK_K; ++i) {
+            const int value = ggml_cuda_expert_bridge_nearest_int(inverse_scale*input[i]);
+            output.qs[i] = (int8_t) std::min(127, value);
+        }
+        for (int group = 0; group < QK_K/16; ++group) {
+            int sum = 0;
+            for (int i = 0; i < 16; ++i) sum += output.qs[16*group + i];
+            output.bsums[group] = (int16_t) sum;
+        }
+        output.d = 1.0f/inverse_scale;
+    }
+}
+
+static void ggml_cuda_expert_bridge_worker(ggml_cuda_expert_bridge_state * state) {
+    g_expert_bridge_current = state;
+    CUDA_CHECK(cudaSetDevice(g_expert_bridge.device));
+    std::unique_lock<std::mutex> lock(g_expert_bridge.mutex);
+    while (true) {
+        g_expert_bridge.cv.wait(lock, [] {
+            return g_expert_bridge.stop || g_expert_bridge.copy_requested;
+        });
+        if (g_expert_bridge.stop) return;
+        const int64_t worker_start_us = ggml_time_us();
+        if (g_expert_bridge.telemetry && g_expert_bridge.job_start_us > 0 &&
+                worker_start_us >= g_expert_bridge.job_start_us) {
+            g_expert_bridge.worker_queue_us += worker_start_us - g_expert_bridge.job_start_us;
+        }
+        const int candidate_count = g_expert_bridge.candidate_count;
+        int experts[ggml_cuda_expert_bridge_state::max_candidates];
+        for (int i = 0; i < candidate_count; ++i) experts[i] = g_expert_bridge.predicted_experts[i];
+        int candidate_slots[ggml_cuda_expert_bridge_state::max_candidates] = {};
+        int missed_candidates[ggml_cuda_expert_bridge_state::max_candidates] = {};
+        int missed_count = 0;
+        if (g_expert_bridge.cache_slots > 0) {
+            for (int candidate = 0; candidate < candidate_count; ++candidate) {
+                int slot = -1;
+                for (int i = 0; i < g_expert_bridge.cache_slots; ++i) {
+                    if (g_expert_bridge.cache_experts[(size_t) i] == experts[candidate]) slot = i;
+                }
+                if (slot >= 0) {
+                    g_expert_bridge.cache_hits++;
+                } else {
+                    g_expert_bridge.cache_misses++;
+                    slot = 0;
+                    for (int i = 0; i < g_expert_bridge.cache_slots; ++i) {
+                        if (g_expert_bridge.cache_experts[(size_t) i] < 0) {
+                            slot = i;
+                            break;
+                        }
+                        if (g_expert_bridge.cache_ages[(size_t) i] <
+                                g_expert_bridge.cache_ages[(size_t) slot]) {
+                            slot = i;
+                        }
+                    }
+                    if (g_expert_bridge.cache_experts[(size_t) slot] >= 0) {
+                        g_expert_bridge.cache_evictions++;
+                    }
+                    g_expert_bridge.cache_experts[(size_t) slot] = experts[candidate];
+                    missed_candidates[missed_count++] = candidate;
+                }
+                g_expert_bridge.cache_ages[(size_t) slot] = ++g_expert_bridge.cache_clock;
+                candidate_slots[candidate] = slot;
+            }
+        } else {
+            for (int candidate = 0; candidate < candidate_count; ++candidate) {
+                candidate_slots[candidate] = candidate;
+                missed_candidates[missed_count++] = candidate;
+            }
+        }
+        g_expert_bridge.copy_requested = false;
+        lock.unlock();
+
+        const int64_t staging_start = ggml_time_us();
+        const size_t expert_bytes = g_expert_bridge.gate_slice + g_expert_bridge.up_slice;
+        for (int i = 0; i < missed_count; ++i) {
+            const int candidate = missed_candidates[i];
+            char * destination = g_expert_bridge.staging + (size_t) i*expert_bytes;
+            memcpy(destination,
+                    g_expert_bridge.gate_data + (size_t) experts[candidate]*g_expert_bridge.gate_slice,
+                    g_expert_bridge.gate_slice);
+            memcpy(destination + g_expert_bridge.gate_slice,
+                    g_expert_bridge.up_data + (size_t) experts[candidate]*g_expert_bridge.up_slice,
+                    g_expert_bridge.up_slice);
+        }
+        const int64_t staging_done = ggml_time_us();
+        const size_t copy_bytes = (size_t) missed_count*expert_bytes;
+        if (g_expert_bridge.cache_slots > 0) {
+            for (int i = 0; i < missed_count; ++i) {
+                const int slot = candidate_slots[missed_candidates[i]];
+                CUDA_CHECK(cudaMemcpyAsync((char *) g_expert_bridge.device_scratch + (size_t) slot*expert_bytes,
+                        g_expert_bridge.staging + (size_t) i*expert_bytes,
+                        expert_bytes, cudaMemcpyHostToDevice, g_expert_bridge.copy_stream));
+            }
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(g_expert_bridge.device_scratch, g_expert_bridge.staging,
+                    copy_bytes, cudaMemcpyHostToDevice, g_expert_bridge.copy_stream));
+        }
+        if (missed_count > 0) CUDA_CHECK(cudaStreamSynchronize(g_expert_bridge.copy_stream));
+        const int64_t copy_done_us = ggml_time_us();
+        lock.lock();
+        if (missed_count > 0) g_expert_bridge.copy_batches++;
+        g_expert_bridge.copies += missed_count;
+        g_expert_bridge.copied_bytes += copy_bytes;
+        g_expert_bridge.staging_us += staging_done - staging_start;
+        g_expert_bridge.transfer_us += copy_done_us - staging_done;
+        g_expert_bridge.copy_done_us = copy_done_us;
+        g_expert_bridge.copy_done = true;
+        if (!g_expert_bridge.consume) {
+            ggml_cuda_expert_bridge_finish_job_locked();
+            continue;
+        }
+
+        const int64_t router_wait_start_us = ggml_time_us();
+        g_expert_bridge.cv.wait(lock, [] {
+            return g_expert_bridge.stop || g_expert_bridge.router_known;
+        });
+        if (g_expert_bridge.telemetry) {
+            g_expert_bridge.router_wait_us += ggml_time_us() - router_wait_start_us;
+        }
+        if (g_expert_bridge.stop) return;
+        if (g_expert_bridge.actual_hit_count == 0 || !g_expert_bridge.input_ready) {
+            ggml_cuda_expert_bridge_finish_job_locked();
+            continue;
+        }
+        const int64_t router_us = g_expert_bridge.router_us;
+        const bool input_timing_pending = g_expert_bridge.telemetry &&
+                g_expert_bridge.input_timing_pending;
+        const bool input_timing_device_quant = g_expert_bridge.input_timing_device_quant;
+        int compute_candidates[ggml_cuda_expert_bridge_state::max_candidates] = {};
+        int compute_weight_slots[ggml_cuda_expert_bridge_state::max_candidates] = {};
+        int compute_candidate_count = 0;
+        if (g_expert_bridge.hit_only) {
+            for (int candidate = 0; candidate < candidate_count; ++candidate) {
+                if (g_expert_bridge.actual_hits[candidate]) {
+                    compute_weight_slots[compute_candidate_count] = candidate_slots[candidate];
+                    compute_candidates[compute_candidate_count++] = candidate;
+                }
+            }
+        } else {
+            for (int candidate = 0; candidate < candidate_count; ++candidate) {
+                compute_weight_slots[compute_candidate_count] = candidate_slots[candidate];
+                compute_candidates[compute_candidate_count++] = candidate;
+            }
+        }
+        GGML_ASSERT(compute_candidate_count > 0);
+        g_expert_bridge.input_timing_pending = false;
+        g_expert_bridge.input_timing_device_quant = false;
+        lock.unlock();
+
+        const int64_t quantize_start = ggml_time_us();
+        if (g_expert_bridge.telemetry && router_us > 0 && quantize_start >= router_us) {
+            g_expert_bridge.router_to_compute_us += quantize_start - router_us;
+        }
+        if (input_timing_pending) {
+            float elapsed_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,
+                    g_expert_bridge.input_d2h_start_event, g_expert_bridge.input_d2h_end_event));
+            if (input_timing_device_quant) {
+                g_expert_bridge.device_quant_ms += elapsed_ms;
+            } else {
+                g_expert_bridge.input_d2h_ms += elapsed_ms;
+            }
+        }
+        if (!g_expert_bridge.device_quant) {
+            ggml_cuda_expert_bridge_quantize_q8_k_cpu();
+        }
+        const int64_t quantize_done = ggml_time_us();
+        const size_t input_bytes = (size_t) (g_expert_bridge.n_embd/QK_K)*sizeof(block_q8_K);
+        if (g_expert_bridge.telemetry) {
+            CUDA_CHECK(cudaEventRecord(g_expert_bridge.compute_start_event, g_expert_bridge.copy_stream));
+        }
+        block_q8_K * input_q8_device = g_expert_bridge.input_q8_device;
+        if (g_expert_bridge.device_quant) {
+            input_q8_device += (size_t) g_expert_bridge.predicted_token*g_expert_bridge.n_embd/QK_K;
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(input_q8_device, g_expert_bridge.input_q8_host,
+                    input_bytes, cudaMemcpyHostToDevice, g_expert_bridge.copy_stream));
+        }
+        if (g_expert_bridge.telemetry) {
+            CUDA_CHECK(cudaEventRecord(g_expert_bridge.input_h2d_end_event, g_expert_bridge.copy_stream));
+        }
+        if (g_expert_bridge.hit_only || g_expert_bridge.cache_slots > 0) {
+            ggml_cuda_expert_bridge_q4_k_q8_k_indexed(g_expert_bridge.device_scratch,
+                    input_q8_device, g_expert_bridge.n_embd, g_expert_bridge.n_ff,
+                    compute_weight_slots, compute_candidates, compute_candidate_count,
+                    g_expert_bridge.output_device, g_expert_bridge.copy_stream);
+        } else {
+            ggml_cuda_expert_bridge_q4_k_q8_k(g_expert_bridge.device_scratch,
+                    input_q8_device, g_expert_bridge.n_embd,
+                    candidate_count*2*g_expert_bridge.n_ff,
+                    g_expert_bridge.output_device, g_expert_bridge.copy_stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (g_expert_bridge.telemetry) {
+            CUDA_CHECK(cudaEventRecord(g_expert_bridge.kernel_end_event, g_expert_bridge.copy_stream));
+        }
+        const size_t candidate_output_bytes = (size_t) 2*g_expert_bridge.n_ff*sizeof(float);
+        if (g_expert_bridge.hit_only) {
+            for (int i = 0; i < compute_candidate_count; ++i) {
+                const size_t offset = (size_t) compute_candidates[i]*2*g_expert_bridge.n_ff;
+                CUDA_CHECK(cudaMemcpyAsync(g_expert_bridge.output_host + offset,
+                        g_expert_bridge.output_device + offset, candidate_output_bytes,
+                        cudaMemcpyDeviceToHost, g_expert_bridge.copy_stream));
+            }
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(g_expert_bridge.output_host, g_expert_bridge.output_device,
+                    (size_t) candidate_count*candidate_output_bytes, cudaMemcpyDeviceToHost,
+                    g_expert_bridge.copy_stream));
+        }
+        if (g_expert_bridge.telemetry) {
+            CUDA_CHECK(cudaEventRecord(g_expert_bridge.output_d2h_end_event, g_expert_bridge.copy_stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(g_expert_bridge.copy_stream));
+        const int64_t compute_done = ggml_time_us();
+
+        if (g_expert_bridge.telemetry) {
+            float elapsed_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,
+                    g_expert_bridge.compute_start_event, g_expert_bridge.input_h2d_end_event));
+            g_expert_bridge.input_h2d_ms += elapsed_ms;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,
+                    g_expert_bridge.input_h2d_end_event, g_expert_bridge.kernel_end_event));
+            g_expert_bridge.kernel_ms += elapsed_ms;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,
+                    g_expert_bridge.kernel_end_event, g_expert_bridge.output_d2h_end_event));
+            g_expert_bridge.output_d2h_ms += elapsed_ms;
+        }
+
+        lock.lock();
+        g_expert_bridge.quantize_us += quantize_done - quantize_start;
+        g_expert_bridge.compute_us += compute_done - quantize_done;
+        g_expert_bridge.computed_candidates += compute_candidate_count;
+        g_expert_bridge.returned_bytes += (uint64_t) compute_candidate_count*candidate_output_bytes;
+        if (g_expert_bridge.telemetry) {
+            if (router_us > 0 && compute_done >= router_us) {
+                g_expert_bridge.result_latency_us += compute_done - router_us;
+            }
+            g_expert_bridge.diagnostic_jobs++;
+        }
+        g_expert_bridge.result_ready = true;
+        g_expert_bridge.cv.notify_all();
+    }
+}
+
+static bool ggml_backend_cuda_expert_bridge_fetch_gate_up(
+        int layer, int expert, int token, float * gate, float * up, int64_t n_ff) {
+    g_expert_bridge_current = nullptr;
+    for (int i = 0; i < g_expert_bridge_count; ++i) {
+        if (g_expert_bridges[i].layer == layer) g_expert_bridge_current = &g_expert_bridges[i];
+    }
+    if (!g_expert_bridge_current || !g_expert_bridge.consume ||
+            n_ff != g_expert_bridge.n_ff || !gate || !up) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(g_expert_bridge.mutex);
+    int candidate = -1;
+    if (g_expert_bridge.job_active && token == g_expert_bridge.predicted_token) {
+        for (int i = 0; i < g_expert_bridge.candidate_count; ++i) {
+            if (g_expert_bridge.predicted_experts[i] == expert) candidate = i;
+        }
+    }
+    if (candidate < 0 || !g_expert_bridge.actual_hits[candidate]) {
+        return false;
+    }
+    const int64_t wait_start_us = ggml_time_us();
+    g_expert_bridge.cv.wait(lock, [] {
+        return g_expert_bridge.stop || !g_expert_bridge.job_active || g_expert_bridge.result_ready;
+    });
+    if (g_expert_bridge.telemetry) {
+        g_expert_bridge.fetch_waits++;
+        g_expert_bridge.fetch_wait_us += ggml_time_us() - wait_start_us;
+    }
+    if (!g_expert_bridge.result_ready) return false;
+    const float * result = g_expert_bridge.output_host + (size_t) candidate*2*n_ff;
+    const int64_t copy_start_us = ggml_time_us();
+    memcpy(gate, result, (size_t) n_ff*sizeof(float));
+    memcpy(up, result + n_ff, (size_t) n_ff*sizeof(float));
+    if (g_expert_bridge.telemetry) {
+        g_expert_bridge.result_copy_us += ggml_time_us() - copy_start_us;
+    }
+    g_expert_bridge.consumed_gate_up++;
+    if (g_expert_bridge.router_tokens > 1) g_expert_bridge.consumed_multi_token++;
+    GGML_ASSERT(g_expert_bridge.pending_fetches > 0);
+    g_expert_bridge.pending_fetches--;
+    if (g_expert_bridge.pending_fetches == 0) ggml_cuda_expert_bridge_finish_job_locked();
+    return true;
+}
+
+static bool ggml_backend_cuda_expert_bridge_claim_gate_up(
+        int layer, int expert, int token, int64_t n_ff) {
+    g_expert_bridge_current = nullptr;
+    for (int i = 0; i < g_expert_bridge_count; ++i) {
+        if (g_expert_bridges[i].layer == layer) g_expert_bridge_current = &g_expert_bridges[i];
+    }
+    if (!g_expert_bridge_current || !g_expert_bridge.consume || n_ff != g_expert_bridge.n_ff) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(g_expert_bridge.mutex);
+    int candidate = -1;
+    if (g_expert_bridge.job_active && token == g_expert_bridge.predicted_token) {
+        for (int i = 0; i < g_expert_bridge.candidate_count; ++i) {
+            if (g_expert_bridge.predicted_experts[i] == expert) candidate = i;
+        }
+    }
+    if (candidate < 0) {
+        return false;
+    }
+    const int64_t wait_start_us = ggml_time_us();
+    g_expert_bridge.cv.wait(lock, [] {
+        return g_expert_bridge.stop || !g_expert_bridge.job_active || g_expert_bridge.router_known;
+    });
+    if (g_expert_bridge.telemetry) {
+        g_expert_bridge.claim_waits++;
+        g_expert_bridge.claim_wait_us += ggml_time_us() - wait_start_us;
+    }
+    return g_expert_bridge.job_active && g_expert_bridge.actual_hits[candidate] &&
+            g_expert_bridge.input_ready;
+}
+
+static void ggml_cuda_expert_bridge_cleanup() {
+    for (int i = 0; i < g_expert_bridge_count; ++i) {
+        g_expert_bridge_current = &g_expert_bridges[i];
+        {
+            std::lock_guard<std::mutex> lock(g_expert_bridge.mutex);
+            g_expert_bridge.stop = true;
+            g_expert_bridge.cv.notify_all();
+        }
+    }
+    for (int i = 0; i < g_expert_bridge_count; ++i) {
+        g_expert_bridge_current = &g_expert_bridges[i];
+        if (g_expert_bridge.worker.joinable()) g_expert_bridge.worker.join();
+        if (g_expert_bridge.registered) {
+            CUDA_CHECK(cudaSetDevice(g_expert_bridge.device));
+            CUDA_CHECK(cudaStreamDestroy(g_expert_bridge.copy_stream));
+            if (g_expert_bridge.input_d2h_start_event) CUDA_CHECK(cudaEventDestroy(g_expert_bridge.input_d2h_start_event));
+            if (g_expert_bridge.input_d2h_end_event) CUDA_CHECK(cudaEventDestroy(g_expert_bridge.input_d2h_end_event));
+            if (g_expert_bridge.compute_start_event) CUDA_CHECK(cudaEventDestroy(g_expert_bridge.compute_start_event));
+            if (g_expert_bridge.input_h2d_end_event) CUDA_CHECK(cudaEventDestroy(g_expert_bridge.input_h2d_end_event));
+            if (g_expert_bridge.kernel_end_event) CUDA_CHECK(cudaEventDestroy(g_expert_bridge.kernel_end_event));
+            if (g_expert_bridge.output_d2h_end_event) CUDA_CHECK(cudaEventDestroy(g_expert_bridge.output_d2h_end_event));
+            if (g_expert_bridge.output_device) CUDA_CHECK(cudaFree(g_expert_bridge.output_device));
+            if (g_expert_bridge.output_host) CUDA_CHECK(cudaFreeHost(g_expert_bridge.output_host));
+            if (g_expert_bridge.input_q8_device) CUDA_CHECK(cudaFree(g_expert_bridge.input_q8_device));
+            if (g_expert_bridge.input_q8_host) CUDA_CHECK(cudaFreeHost(g_expert_bridge.input_q8_host));
+            if (g_expert_bridge.input_host) CUDA_CHECK(cudaFreeHost(g_expert_bridge.input_host));
+            CUDA_CHECK(cudaFree(g_expert_bridge.device_scratch));
+            CUDA_CHECK(cudaFreeHost(g_expert_bridge.staging));
+        }
+        if (g_expert_bridge.predictor_ids) CUDA_CHECK(cudaFreeHost(g_expert_bridge.predictor_ids));
+        if (g_expert_bridge.router_ids) CUDA_CHECK(cudaFreeHost(g_expert_bridge.router_ids));
+    }
+}
+
+static bool ggml_backend_cuda_expert_bridge_register(
+        int layer, const void * gate_data, size_t gate_slice,
+        const void * up_data, size_t up_slice,
+        int n_expert, int weight_type, int n_embd, int n_ff, const uint8_t * cold_mask) {
+    ggml_cuda_expert_bridge_load();
+    g_expert_bridge_current = nullptr;
+    for (int i = 0; i < g_expert_bridge_count; ++i) {
+        if (g_expert_bridges[i].layer == layer) g_expert_bridge_current = &g_expert_bridges[i];
+    }
+    if (!g_expert_bridge_current || !g_expert_bridge.enabled ||
+            !gate_data || !up_data || !cold_mask || !gate_slice || !up_slice || n_expert <= 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_expert_bridge.mutex);
+    if (g_expert_bridge.registered) return false;
+    g_expert_bridge.gate_data = (const char *) gate_data;
+    g_expert_bridge.up_data = (const char *) up_data;
+    g_expert_bridge.gate_slice = gate_slice;
+    g_expert_bridge.up_slice = up_slice;
+    g_expert_bridge.n_expert = n_expert;
+    g_expert_bridge.n_embd = n_embd;
+    g_expert_bridge.n_ff = n_ff;
+    g_expert_bridge.cold_mask.assign(cold_mask, cold_mask + n_expert);
+    g_expert_bridge.last_prediction_graph.assign((size_t) n_expert, 0);
+    const char * consume = getenv("GGML_CUDA_EXPERT_BRIDGE_CONSUME");
+    g_expert_bridge.consume = consume && strcmp(consume, "1") == 0 &&
+        weight_type == GGML_TYPE_Q4_K && n_embd > 0 && n_embd % QK_K == 0 && n_ff > 0 &&
+        gate_slice == ggml_row_size(GGML_TYPE_Q4_K, n_embd)*(size_t) n_ff &&
+        up_slice == ggml_row_size(GGML_TYPE_Q4_K, n_embd)*(size_t) n_ff;
+    const char * verify = getenv("GGML_CUDA_EXPERT_BRIDGE_VERIFY");
+    g_expert_bridge.verify = g_expert_bridge.consume && verify && strcmp(verify, "1") == 0;
+    const char * telemetry = getenv("GGML_CUDA_EXPERT_BRIDGE_TELEMETRY");
+    g_expert_bridge.telemetry = g_expert_bridge.consume && telemetry && strcmp(telemetry, "1") == 0;
+    const char * device_quant = getenv("GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT");
+    g_expert_bridge.device_quant = g_expert_bridge.consume && device_quant && strcmp(device_quant, "1") == 0;
+    const char * hit_only = getenv("GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY");
+    g_expert_bridge.hit_only = g_expert_bridge.consume && hit_only && strcmp(hit_only, "1") == 0;
+    const char * recurrence = getenv("GGML_CUDA_EXPERT_BRIDGE_RECURRENCE");
+    bool secondary_layer = false;
+    for (int i = 1; i < g_expert_bridge_count; ++i) {
+        if (&g_expert_bridges[i] == g_expert_bridge_current) secondary_layer = true;
+    }
+    g_expert_bridge.recurrence = secondary_layer || (recurrence && strcmp(recurrence, "1") == 0) ||
+            ggml_cuda_expert_bridge_env_has_layer("GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_LAYERS", layer);
+    const char * device_quant_recurrence = getenv("GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT_RECURRENCE");
+    if (g_expert_bridge.recurrence &&
+            (!device_quant_recurrence || strcmp(device_quant_recurrence, "1") != 0)) {
+        g_expert_bridge.device_quant = false;
+    }
+    if (g_expert_bridge.recurrence) {
+        if (const char * value = getenv("GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_K")) {
+            char * end = nullptr;
+            errno = 0;
+            const long parsed = strtol(value, &end, 10);
+            if (!errno && end && *end == '\0' && parsed >= 1 &&
+                    parsed <= ggml_cuda_expert_bridge_state::max_candidates) {
+                g_expert_bridge.candidate_limit = (int) parsed;
+            }
+        }
+    }
+    if (ggml_cuda_expert_bridge_env_has_layer("GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS", layer)) {
+        if (const char * value = getenv("GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS")) {
+            char * end = nullptr;
+            errno = 0;
+            const long parsed = strtol(value, &end, 10);
+            if (!errno && end && *end == '\0' && parsed >= g_expert_bridge.candidate_limit && parsed <= 16) {
+                g_expert_bridge.cache_slots = (int) parsed;
+                g_expert_bridge.cache_experts.assign((size_t) parsed, -1);
+                g_expert_bridge.cache_ages.assign((size_t) parsed, 0);
+            }
+        }
+    }
+    const size_t bytes = gate_slice + up_slice;
+    const size_t staging_bytes = (size_t) g_expert_bridge.candidate_limit*bytes;
+    const size_t scratch_bytes = (size_t) (g_expert_bridge.cache_slots > 0 ?
+            g_expert_bridge.cache_slots : g_expert_bridge.candidate_limit)*bytes;
+    CUDA_CHECK(cudaGetDevice(&g_expert_bridge.device));
+    CUDA_CHECK(cudaHostAlloc(&g_expert_bridge.staging, staging_bytes, cudaHostAllocDefault));
+    CUDA_CHECK(cudaMalloc(&g_expert_bridge.device_scratch, scratch_bytes));
+    if (g_expert_bridge.consume) {
+        const size_t input_q8_bytes = (size_t) (n_embd/QK_K)*sizeof(block_q8_K);
+        if (!g_expert_bridge.device_quant) {
+            CUDA_CHECK(cudaHostAlloc(&g_expert_bridge.input_host,
+                    ggml_cuda_expert_bridge_state::max_tokens*(size_t) n_embd*sizeof(float),
+                    cudaHostAllocDefault));
+            CUDA_CHECK(cudaHostAlloc(&g_expert_bridge.input_q8_host,
+                    input_q8_bytes, cudaHostAllocDefault));
+        }
+        CUDA_CHECK(cudaMalloc(&g_expert_bridge.input_q8_device,
+                input_q8_bytes*(g_expert_bridge.device_quant ? ggml_cuda_expert_bridge_state::max_tokens : 1)));
+        CUDA_CHECK(cudaHostAlloc(&g_expert_bridge.output_host,
+                (size_t) g_expert_bridge.candidate_limit*2*n_ff*sizeof(float), cudaHostAllocDefault));
+        CUDA_CHECK(cudaMalloc(&g_expert_bridge.output_device,
+                (size_t) g_expert_bridge.candidate_limit*2*n_ff*sizeof(float)));
+    }
+    CUDA_CHECK(cudaStreamCreateWithFlags(&g_expert_bridge.copy_stream, cudaStreamNonBlocking));
+    if (g_expert_bridge.telemetry) {
+        CUDA_CHECK(cudaEventCreate(&g_expert_bridge.input_d2h_start_event));
+        CUDA_CHECK(cudaEventCreate(&g_expert_bridge.input_d2h_end_event));
+        CUDA_CHECK(cudaEventCreate(&g_expert_bridge.compute_start_event));
+        CUDA_CHECK(cudaEventCreate(&g_expert_bridge.input_h2d_end_event));
+        CUDA_CHECK(cudaEventCreate(&g_expert_bridge.kernel_end_event));
+        CUDA_CHECK(cudaEventCreate(&g_expert_bridge.output_d2h_end_event));
+    }
+    g_expert_bridge.registered = true;
+    g_expert_bridge.worker = std::thread(ggml_cuda_expert_bridge_worker, g_expert_bridge_current);
+    GGML_LOG_INFO("CUDA expert bridge: registered %.3f MiB Gate+Up scratch for layer %d; K=%d cache=%d consume=%s verify=%s telemetry=%s device_quant=%s hit_only=%s\n",
+            scratch_bytes/(1024.0*1024.0), layer, g_expert_bridge.candidate_limit,
+            g_expert_bridge.cache_slots,
+            g_expert_bridge.consume ? "on" : "off", g_expert_bridge.verify ? "on" : "off",
+            g_expert_bridge.telemetry ? "on" : "off", g_expert_bridge.device_quant ? "on" : "off",
+            g_expert_bridge.hit_only ? "on" : "off");
+    return true;
+}
+
+static void ggml_cuda_expert_bridge_load() {
+    if (g_expert_bridge_loaded) return;
+    g_expert_bridge_loaded = true;
+    const char * layers = getenv("GGML_CUDA_EXPERT_BRIDGE_LAYERS");
+    if (!layers || !layers[0]) layers = getenv("GGML_CUDA_EXPERT_BRIDGE_LAYER");
+    const char * path = getenv("GGML_CUDA_EXPERT_BRIDGE_JSON");
+    if (!layers || !path || !path[0]) return;
+    int candidate_limit = 1;
+    if (const char * value = getenv("GGML_CUDA_EXPERT_BRIDGE_K")) {
+        char * k_end = nullptr;
+        errno = 0;
+        const long k = strtol(value, &k_end, 10);
+        if (errno || !k_end || *k_end || k < 1 ||
+                k > ggml_cuda_expert_bridge_state::max_candidates) {
+            GGML_LOG_WARN("CUDA expert bridge: invalid GGML_CUDA_EXPERT_BRIDGE_K='%s'; using K=1\n", value);
+        } else {
+            candidate_limit = (int) k;
+        }
+    }
+    const char * cursor = layers;
+    while (*cursor && g_expert_bridge_count < ggml_cuda_expert_bridge_max_layers) {
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        char * end = nullptr;
+        errno = 0;
+        const long parsed = strtol(cursor, &end, 10);
+        if (errno || !end || end == cursor || parsed < 0 || parsed > INT32_MAX) {
+            GGML_LOG_WARN("CUDA expert bridge: invalid layer list '%s'; bridge disabled\n", layers);
+            g_expert_bridge_count = 0;
+            return;
+        }
+        cursor = end;
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        if (*cursor != '\0' && *cursor != ',') {
+            GGML_LOG_WARN("CUDA expert bridge: invalid layer list '%s'; bridge disabled\n", layers);
+            g_expert_bridge_count = 0;
+            return;
+        }
+        bool duplicate = false;
+        for (int i = 0; i < g_expert_bridge_count; ++i) {
+            if (g_expert_bridges[i].layer == parsed) duplicate = true;
+        }
+        if (!duplicate) {
+            ggml_cuda_expert_bridge_state & state = g_expert_bridges[g_expert_bridge_count++];
+            state.layer = (int) parsed;
+            state.candidate_limit = candidate_limit;
+        }
+        if (*cursor == ',') ++cursor;
+    }
+    while (*cursor == ' ' || *cursor == '\t') ++cursor;
+    if (*cursor != '\0') {
+        GGML_LOG_WARN("CUDA expert bridge: at most %d layers are supported; bridge disabled\n",
+                ggml_cuda_expert_bridge_max_layers);
+        g_expert_bridge_count = 0;
+        return;
+    }
+    if (g_expert_bridge_count == 0) return;
+    g_expert_bridge_json_path = path;
+    for (int i = 0; i < g_expert_bridge_count; ++i) {
+        ggml_cuda_expert_bridge_state & state = g_expert_bridges[i];
+        snprintf(state.predictor_name, sizeof(state.predictor_name),
+                "lookahead_topk_snapshot-%d", state.layer);
+        snprintf(state.router_name, sizeof(state.router_name),
+                "lookahead_actual_topk_snapshot-%d", state.layer);
+        CUDA_CHECK(cudaHostAlloc(&state.predictor_ids,
+                state.predictor_capacity*sizeof(int32_t), cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&state.router_ids,
+                state.router_capacity*sizeof(int32_t), cudaHostAllocDefault));
+        state.enabled = true;
+        GGML_LOG_INFO("CUDA expert bridge: layer=%d predictor=%s router=%s\n",
+                state.layer, state.predictor_name, state.router_name);
+    }
+    atexit(ggml_cuda_expert_bridge_write_json);
+    atexit(ggml_cuda_expert_bridge_cleanup);
+}
+
+static void CUDART_CB ggml_cuda_expert_bridge_predictor_ready(void * user_data) {
+    g_expert_bridge_current = (ggml_cuda_expert_bridge_state *) user_data;
+    std::lock_guard<std::mutex> lock(g_expert_bridge.mutex);
+    g_expert_bridge.predictor_callbacks++;
+    g_expert_bridge.last_predictor_us = ggml_time_us();
+    if (!g_expert_bridge.registered) return;
+    if (g_expert_bridge.job_active) {
+        g_expert_bridge.skipped_predictions++;
+        return;
+    }
+    int predicted_token = -1;
+    int predicted_experts[ggml_cuda_expert_bridge_state::max_candidates] = { -1, -1, -1 };
+    int candidate_count = 0;
+    for (size_t token = g_expert_bridge.predictor_tokens; token-- > 0;) {
+        for (size_t rank = 0; rank < g_expert_bridge.predictor_width; ++rank) {
+            const size_t index = token*g_expert_bridge.predictor_width + rank;
+            if (index >= g_expert_bridge.predictor_count) break;
+            const int expert = g_expert_bridge.predictor_ids[index];
+            if (expert >= 0 && expert < g_expert_bridge.n_expert &&
+                    g_expert_bridge.cold_mask[(size_t) expert]) {
+                bool duplicate = false;
+                for (int i = 0; i < candidate_count; ++i) {
+                    if (predicted_experts[i] == expert) duplicate = true;
+                }
+                if (duplicate) continue;
+                predicted_experts[candidate_count++] = expert;
+                predicted_token = (int) token;
+                if (candidate_count == g_expert_bridge.candidate_limit) break;
+            }
+        }
+        if (candidate_count > 0) break;
+    }
+    if (candidate_count == 0) return;
+    if (g_expert_bridge.predictor_tokens > 1) g_expert_bridge.multi_token_jobs++;
+    ggml_cuda_expert_bridge_start_job_locked(predicted_experts, candidate_count, predicted_token);
+}
+
+static void CUDART_CB ggml_cuda_expert_bridge_router_ready(void * user_data) {
+    g_expert_bridge_current = (ggml_cuda_expert_bridge_state *) user_data;
+    std::lock_guard<std::mutex> lock(g_expert_bridge.mutex);
+    g_expert_bridge.router_callbacks++;
+    const int64_t now = ggml_time_us();
+    if (g_expert_bridge.last_predictor_us > 0 && now >= g_expert_bridge.last_predictor_us) {
+        g_expert_bridge.paired_callbacks++;
+        g_expert_bridge.lead_us += now - g_expert_bridge.last_predictor_us;
+        g_expert_bridge.last_predictor_us = 0;
+    }
+    if (g_expert_bridge.recurrence) {
+        g_expert_bridge.queued_count = 0;
+        for (size_t token = g_expert_bridge.router_tokens; token-- > 0;) {
+            const size_t begin = token*g_expert_bridge.router_width;
+            const size_t end = std::min(begin + g_expert_bridge.router_width,
+                    g_expert_bridge.router_count);
+            for (size_t i = begin; i < end; ++i) {
+                const int expert = g_expert_bridge.router_ids[i];
+                if (expert < 0 || expert >= g_expert_bridge.n_expert ||
+                        !g_expert_bridge.cold_mask[(size_t) expert]) {
+                    continue;
+                }
+                bool duplicate = false;
+                for (int candidate = 0; candidate < g_expert_bridge.queued_count; ++candidate) {
+                    if (g_expert_bridge.queued_experts[candidate] == expert) duplicate = true;
+                }
+                if (duplicate) continue;
+                g_expert_bridge.queued_experts[g_expert_bridge.queued_count++] = expert;
+                if (g_expert_bridge.queued_count == g_expert_bridge.candidate_limit) break;
+            }
+            if (g_expert_bridge.queued_count > 0) break;
+        }
+    }
+    if (g_expert_bridge.job_active) {
+        g_expert_bridge.router_known = true;
+        g_expert_bridge.router_us = now;
+        if (g_expert_bridge.recurrence) {
+            for (size_t token = g_expert_bridge.router_tokens; token-- > 0;) {
+                bool hits[ggml_cuda_expert_bridge_state::max_candidates] = {};
+                int hit_count = 0;
+                const size_t begin = token*g_expert_bridge.router_width;
+                const size_t end = std::min(begin + g_expert_bridge.router_width,
+                        g_expert_bridge.router_count);
+                for (int candidate = 0; candidate < g_expert_bridge.candidate_count; ++candidate) {
+                    for (size_t i = begin; i < end; ++i) {
+                        if (g_expert_bridge.router_ids[i] ==
+                                g_expert_bridge.predicted_experts[candidate]) {
+                            hits[candidate] = true;
+                            hit_count++;
+                            break;
+                        }
+                    }
+                }
+                if (hit_count > 0) {
+                    g_expert_bridge.predicted_token = (int) token;
+                    g_expert_bridge.actual_hit_count = hit_count;
+                    for (int candidate = 0; candidate < g_expert_bridge.candidate_count; ++candidate) {
+                        g_expert_bridge.actual_hits[candidate] = hits[candidate];
+                    }
+                    break;
+                }
+            }
+        } else {
+            const size_t token = (size_t) g_expert_bridge.predicted_token;
+            if (token < g_expert_bridge.router_tokens &&
+                    (!g_expert_bridge.consume || token < g_expert_bridge.input_tokens)) {
+                const size_t begin = token*g_expert_bridge.router_width;
+                const size_t end = std::min(begin + g_expert_bridge.router_width,
+                        g_expert_bridge.router_count);
+                for (int candidate = 0; candidate < g_expert_bridge.candidate_count; ++candidate) {
+                    for (size_t i = begin; i < end; ++i) {
+                        if (g_expert_bridge.router_ids[i] ==
+                                g_expert_bridge.predicted_experts[candidate]) {
+                            g_expert_bridge.actual_hits[candidate] = true;
+                            g_expert_bridge.actual_hit_count++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (g_expert_bridge.consume && (g_expert_bridge.predicted_token < 0 ||
+                (size_t) g_expert_bridge.predicted_token >= g_expert_bridge.input_tokens)) {
+            g_expert_bridge.input_ready = false;
+        }
+        if (g_expert_bridge.recurrence && g_expert_bridge.router_tokens > 1) {
+            g_expert_bridge.multi_token_jobs++;
+        }
+        g_expert_bridge.pending_fetches = g_expert_bridge.input_ready ?
+                g_expert_bridge.actual_hit_count : 0;
+        g_expert_bridge.cv.notify_all();
+        if (!g_expert_bridge.consume) ggml_cuda_expert_bridge_finish_job_locked();
+    } else if (g_expert_bridge.recurrence && g_expert_bridge.queued_count > 0) {
+        int experts[ggml_cuda_expert_bridge_state::max_candidates];
+        const int count = g_expert_bridge.queued_count;
+        for (int i = 0; i < count; ++i) {
+            experts[i] = g_expert_bridge.queued_experts[i];
+            g_expert_bridge.queued_experts[i] = -1;
+        }
+        g_expert_bridge.queued_count = 0;
+        ggml_cuda_expert_bridge_start_job_locked(experts, count, -1);
+    }
+}
+
+static void ggml_cuda_expert_bridge_observe(
+        ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_tensor * node) {
+    ggml_cuda_expert_bridge_load();
+    if (g_expert_bridge_count == 0 || !node || !node->data) return;
+    if (node->type != GGML_TYPE_I32 || node->ne[0] <= 0) return;
+    if (node->ne[2] != 1 || node->ne[3] != 1) return;
+    g_expert_bridge_current = nullptr;
+    for (int i = 0; i < g_expert_bridge_count; ++i) {
+        if (strcmp(node->name, g_expert_bridges[i].predictor_name) == 0 ||
+                strcmp(node->name, g_expert_bridges[i].router_name) == 0) {
+            g_expert_bridge_current = &g_expert_bridges[i];
+            break;
+        }
+    }
+    if (!g_expert_bridge_current) return;
+    const size_t element_count = (size_t) ggml_nelements(node);
+    const size_t width = (size_t) node->ne[0];
+    const size_t tokens = element_count/width;
+    if (tokens == 0 || tokens > ggml_cuda_expert_bridge_state::max_tokens ||
+            element_count > ggml_cuda_expert_bridge_state::id_capacity) {
+        return;
+    }
+    void * host = nullptr;
+    cudaHostFn_t callback = nullptr;
+    size_t capacity = 0;
+    if (strcmp(node->name, g_expert_bridge.predictor_name) == 0) {
+        host = g_expert_bridge.predictor_ids;
+        capacity = g_expert_bridge.predictor_capacity;
+        callback = ggml_cuda_expert_bridge_predictor_ready;
+    } else if (strcmp(node->name, g_expert_bridge.router_name) == 0) {
+        host = g_expert_bridge.router_ids;
+        capacity = g_expert_bridge.router_capacity;
+        callback = ggml_cuda_expert_bridge_router_ready;
+        if (g_expert_bridge.consume && g_expert_bridge.registered) {
+            char gate_name[64];
+            snprintf(gate_name, sizeof(gate_name), "ffn_moe_gate-%d", g_expert_bridge.layer);
+            ggml_tensor * input = nullptr;
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                ggml_tensor * candidate = cgraph->nodes[i];
+                if (strcmp(candidate->name, gate_name) == 0 &&
+                        candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[1] &&
+                        candidate->src[1]->type == GGML_TYPE_F32 &&
+                        ggml_nelements(candidate->src[1]) % g_expert_bridge.n_embd == 0 &&
+                        ggml_nelements(candidate->src[1])/g_expert_bridge.n_embd <=
+                                (int64_t) ggml_cuda_expert_bridge_state::max_tokens &&
+                        ggml_is_contiguous(candidate->src[1])) {
+                    input = candidate->src[1];
+                    break;
+                }
+            }
+            const size_t input_tokens = input ?
+                    (size_t) ggml_nelements(input)/g_expert_bridge.n_embd : 0;
+            int predicted_token = -1;
+            bool recurrence_job = false;
+            {
+                std::lock_guard<std::mutex> lock(g_expert_bridge.mutex);
+                if (g_expert_bridge.job_active) predicted_token = g_expert_bridge.predicted_token;
+                recurrence_job = g_expert_bridge.recurrence && g_expert_bridge.job_active;
+                g_expert_bridge.input_ready = input != nullptr && g_expert_bridge.job_active &&
+                        (recurrence_job || (predicted_token >= 0 && (size_t) predicted_token < input_tokens));
+                g_expert_bridge.input_tokens = input_tokens;
+                g_expert_bridge.input_token_rows += input_tokens;
+            }
+            const bool predicted_input = predicted_token >= 0 && (size_t) predicted_token < input_tokens;
+            if (input && (recurrence_job || predicted_input)) {
+                const size_t first_token = recurrence_job ? 0 : (size_t) predicted_token;
+                const size_t prepared_tokens = recurrence_job ? input_tokens : 1;
+                const size_t input_bytes = prepared_tokens*(size_t) g_expert_bridge.n_embd*sizeof(float);
+                if (g_expert_bridge.telemetry) {
+                    CUDA_CHECK(cudaEventRecord(g_expert_bridge.input_d2h_start_event, cuda_ctx->stream()));
+                }
+                if (g_expert_bridge.device_quant) {
+                    const float * source = (const float *) input->data + first_token*g_expert_bridge.n_embd;
+                    block_q8_K * destination = g_expert_bridge.input_q8_device +
+                            first_token*(size_t) g_expert_bridge.n_embd/QK_K;
+                    ggml_cuda_expert_bridge_quantize_q8_k(source, destination,
+                            g_expert_bridge.n_embd, (int) prepared_tokens, cuda_ctx->stream());
+                    CUDA_CHECK(cudaGetLastError());
+                } else {
+                    CUDA_CHECK(cudaMemcpyAsync(g_expert_bridge.input_host +
+                                first_token*g_expert_bridge.n_embd,
+                            (const float *) input->data + first_token*g_expert_bridge.n_embd,
+                            input_bytes, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+                }
+                if (g_expert_bridge.telemetry) {
+                    CUDA_CHECK(cudaEventRecord(g_expert_bridge.input_d2h_end_event, cuda_ctx->stream()));
+                }
+                std::lock_guard<std::mutex> lock(g_expert_bridge.mutex);
+                if (g_expert_bridge.device_quant) {
+                    g_expert_bridge.device_quantized_rows += prepared_tokens;
+                } else {
+                    g_expert_bridge.bytes += input_bytes;
+                }
+                g_expert_bridge.input_timing_pending = g_expert_bridge.telemetry;
+                g_expert_bridge.input_timing_device_quant = g_expert_bridge.device_quant;
+            }
+        }
+    } else {
+        return;
+    }
+    const size_t bytes = element_count*sizeof(int32_t);
+    if (bytes > capacity*sizeof(int32_t)) return;
+    {
+        std::lock_guard<std::mutex> lock(g_expert_bridge.mutex);
+        if (host == g_expert_bridge.predictor_ids) {
+            g_expert_bridge.predictor_count = bytes/sizeof(int32_t);
+            g_expert_bridge.predictor_width = width;
+            g_expert_bridge.predictor_tokens = tokens;
+            g_expert_bridge.predictor_token_rows += tokens;
+        } else {
+            g_expert_bridge.router_count = bytes/sizeof(int32_t);
+            g_expert_bridge.router_width = width;
+            g_expert_bridge.router_tokens = tokens;
+            g_expert_bridge.router_token_rows += tokens;
+        }
+    }
+    CUDA_CHECK(cudaMemcpy2DAsync(host, width*sizeof(int32_t), node->data, node->nb[1],
+            width*sizeof(int32_t), tokens, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), callback, g_expert_bridge_current));
+    {
+        std::lock_guard<std::mutex> lock(g_expert_bridge.mutex);
+        g_expert_bridge.bytes += bytes;
+    }
+}
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -1538,12 +2712,29 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
     if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
-        CUBLAS_CHECK(
-            cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                    ne01, ne11, ne10,
-                    (const float *) alpha, (const float *) src0_ptr, s01,
-                                           (const float *) src1_ptr, s11,
-                    (const float *) beta,  (float       *)  dst_ptr, ne0));
+        const cublasStatus_t status = cublasSgemm(
+                ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ne10,
+                (const float *) alpha, (const float *) src0_ptr, s01,
+                                       (const float *) src1_ptr, s11,
+                (const float *) beta,  (float       *) dst_ptr, ne0);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("cublasSgemm tensor diagnostic: src0='%s' type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ptr=%p converted=%p; "
+                    "src1='%s' type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ptr=%p converted=%p; "
+                    "dst='%s' ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ptr=%p selected=%p; m=%lld n=%lld k=%lld lda=%lld ldb=%lld ldc=%lld\n",
+                    src0->name, ggml_type_name(src0->type),
+                    (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03,
+                    nb00, nb01, nb02, nb03, src0->data, src0_ptr,
+                    src1->name, ggml_type_name(src1->type),
+                    (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                    nb10, nb11, nb12, nb13, src1->data, src1_ptr,
+                    dst->name,
+                    (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3,
+                    nb0, nb1, nb2, nb3, dst->data, dst_ptr,
+                    (long long) ne01, (long long) ne11, (long long) ne10,
+                    (long long) s01, (long long) s11, (long long) ne0);
+        }
+        CUBLAS_CHECK(status);
     } else if (ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1780,7 +2971,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool allow_multi_token_moe = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1797,12 +2988,16 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
+    static const bool multi_token_moe = getenv("GGML_CUDA_MOE_MULTI_FUSION") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_MOE_MULTI_FUSION"));
+    const bool use_multi_token_moe = allow_multi_token_moe && multi_token_moe &&
+            tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] >= 2 && dst->ne[2] <= 4;
+
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1 && !use_multi_token_moe) {
         return false;
     }
 
@@ -2030,6 +3225,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
+            break;
+        case GGML_OP_TURBO4_WHT:
+            ggml_cuda_turbo4_wht(ctx, dst);
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
@@ -2423,6 +3621,30 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    static const bool async_host_copy = getenv("GGML_CUDA_ASYNC_HOST_COPY") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_ASYNC_HOST_COPY")) != 0;
+
+    // Scheduler split inputs allocated in the CUDA host buffer are page-locked
+    // and remain alive until their copy slot is reused. Enqueue their H2D copy
+    // on the destination compute stream so the following graph is ordered after
+    // the copy without a host-side cudaStreamSynchronize().
+    if (async_host_copy &&
+        ggml_backend_dev_type(ggml_backend_get_device(backend_src)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+        ggml_backend_is_cuda(backend_dst) &&
+        ggml_backend_buft_is_cuda_host(buf_src->buft) &&
+        ggml_backend_buffer_is_cuda(buf_dst)) {
+        ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+        ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+
+        if (cuda_ctx_dst->device != buf_ctx_dst->device) {
+            return false;
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst),
+                cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+        return true;
+    }
 
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
@@ -3140,6 +4362,86 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+struct ggml_cuda_moe_combine_args {
+    const ggml_tensor * experts = nullptr;
+    const ggml_tensor * weights = nullptr;
+    ggml_tensor * dst = nullptr;
+};
+
+static int ggml_cuda_moe_combine_fusion(
+        ggml_cgraph * cgraph, int node_idx, ggml_cuda_moe_combine_args & args) {
+    static const bool enabled = getenv("GGML_CUDA_MOE_COMBINE_FUSION") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_MOE_COMBINE_FUSION"));
+    if (!enabled || node_idx >= cgraph->n_nodes) {
+        return 0;
+    }
+
+    ggml_tensor * weighted = cgraph->nodes[node_idx];
+    static constexpr char prefix[] = "ffn_moe_weighted-";
+    if (weighted->op != GGML_OP_MUL || strncmp(weighted->name, prefix, sizeof(prefix) - 1) != 0 ||
+            weighted->type != GGML_TYPE_F32 || weighted->ne[1] < 2 || weighted->ne[1] > 32 ||
+            weighted->ne[2] < 1 || weighted->ne[3] != 1) {
+        return 0;
+    }
+
+    const int n_experts = weighted->ne[1];
+    const int n_ops = 2*n_experts;
+    if (node_idx + n_ops > cgraph->n_nodes) {
+        return 0;
+    }
+
+    const ggml_tensor * experts = weighted->src[0];
+    const ggml_tensor * weights = weighted->src[1];
+    if (!experts || !weights || experts->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(experts, weighted) || experts->nb[0] != sizeof(float) ||
+            weights->ne[0] != 1 || weights->ne[1] != n_experts ||
+            weights->ne[2] != weighted->ne[2] || weights->ne[3] != 1 ||
+            weights->nb[0] != sizeof(float)) {
+        return 0;
+    }
+
+    std::vector<ggml_op> ops;
+    ops.reserve(n_ops);
+    ops.push_back(GGML_OP_MUL);
+    std::vector<ggml_tensor *> views;
+    views.reserve(n_experts);
+    for (int expert = 0; expert < n_experts; ++expert) {
+        ggml_tensor * view = cgraph->nodes[node_idx + 1 + expert];
+        if (view->op != GGML_OP_VIEW || view->src[0] != weighted || view->type != GGML_TYPE_F32 ||
+                view->ne[0] != weighted->ne[0] || view->ne[1] != weighted->ne[2] ||
+                view->ne[2] != 1 || view->ne[3] != 1 || view->nb[0] != sizeof(float)) {
+            return 0;
+        }
+        views.push_back(view);
+        ops.push_back(GGML_OP_VIEW);
+    }
+
+    ggml_tensor * previous = views[0];
+    for (int expert = 1; expert < n_experts; ++expert) {
+        ggml_tensor * add = cgraph->nodes[node_idx + n_experts + expert];
+        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+                !((add->src[0] == previous && add->src[1] == views[expert]) ||
+                  (add->src[1] == previous && add->src[0] == views[expert])) ||
+                add->ne[0] != weighted->ne[0] || add->ne[1] != weighted->ne[2] ||
+                add->ne[2] != 1 || add->ne[3] != 1 || add->nb[0] != sizeof(float)) {
+            return 0;
+        }
+        previous = add;
+        ops.push_back(GGML_OP_ADD);
+    }
+
+    const int output_node = node_idx + n_ops - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, n_ops, ops.data(), &output_node, 1) ||
+            !ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, n_ops, &output_node, 1)) {
+        return 0;
+    }
+
+    args.experts = experts;
+    args.weights = weights;
+    args.dst = previous;
+    return n_ops - 1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3149,6 +4451,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    ggml_cuda_moe_combine_args moe_combine;
+    const int moe_combine_skip = ggml_cuda_moe_combine_fusion(cgraph, i, moe_combine);
+    if (moe_combine_skip > 0) {
+        static std::atomic<bool> logged{false};
+        if (getenv("GGML_CUDA_MOE_COMBINE_TRACE") && !logged.exchange(true)) {
+            fprintf(stderr, "ggml_cuda: MoE weighted combine fusion active: experts=%lld tokens=%lld skipped_nodes=%d\n",
+                    (long long) moe_combine.experts->ne[1],
+                    (long long) moe_combine.experts->ne[2], moe_combine_skip);
+        }
+        ggml_cuda_op_moe_combine(*cuda_ctx, moe_combine.experts, moe_combine.weights, moe_combine.dst);
+        return moe_combine_skip;
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -3462,6 +4777,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.x_scale    = up_scale;
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
+                fusion_data.skip_slot  = ggml_cuda_mul_mat_id_skip_slot(up_n);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
@@ -3555,6 +4871,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.x_scale    = up_scale;
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
+                fusion_data.skip_slot  = ggml_cuda_mul_mat_id_skip_slot(up_n);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
@@ -3624,6 +4941,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.x_bias    = up_bias_tensor;
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+                fusion_data.skip_slot  = ggml_cuda_mul_mat_id_skip_slot(up_n);
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
@@ -3650,6 +4968,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
+                fusion_data.skip_slot  = ggml_cuda_mul_mat_id_skip_slot(up);
 
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
@@ -3657,10 +4976,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
+                fusion_data.skip_slot  = ggml_cuda_mul_mat_id_skip_slot(up);
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
@@ -3748,6 +5068,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_mm_fusion_args_host fusion_data{};
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
+            fusion_data.skip_slot = ggml_cuda_mul_mat_id_skip_slot(mm_node);
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
@@ -3806,6 +5127,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.x_bias = bias_tensor;
+        fusion_data.skip_slot = ggml_cuda_mul_mat_id_skip_slot(mm_node);
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
@@ -3999,6 +5321,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 prev_i = i;
 
                 if (ggml_cuda_is_view_or_noop(node)) {
+                    ggml_cuda_expert_bridge_observe(cuda_ctx, cgraph, node);
                     continue;
                 }
 
@@ -4015,6 +5338,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    for (int observed = i; observed <= i + nodes_to_skip; ++observed) {
+                        ggml_cuda_expert_bridge_observe(cuda_ctx, cgraph, cgraph->nodes[observed]);
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4036,6 +5362,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                ggml_cuda_expert_bridge_observe(cuda_ctx, cgraph, node);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4878,7 +6206,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                               (op->type == GGML_TYPE_TURBO4_K && op->ne[0] % QK_TURBO4_K == 0)) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
@@ -4886,6 +6215,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        ) &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
+        case GGML_OP_TURBO4_WHT:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) && op->src[0]->ne[0] % QK_TURBO4_K == 0;
         case GGML_OP_SET:
             {
                 const ggml_type t = op->type;
@@ -5333,6 +6665,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_bridge_register") == 0) {
+        return (void *)ggml_backend_cuda_expert_bridge_register;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_bridge_fetch_gate_up") == 0) {
+        return (void *)ggml_backend_cuda_expert_bridge_fetch_gate_up;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_bridge_claim_gate_up") == 0) {
+        return (void *)ggml_backend_cuda_expert_bridge_claim_gate_up;
     }
     return nullptr;
 }

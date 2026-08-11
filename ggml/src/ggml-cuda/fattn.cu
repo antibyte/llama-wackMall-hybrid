@@ -5,6 +5,27 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#ifdef GGML_CUDA_TURBO4_F16_PREFILL
+static int ggml_cuda_turbo4_f16_prefill_min_batch() {
+    static const int value = []() {
+        const char * env = std::getenv("GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH");
+        if (env == nullptr || env[0] == '\0') {
+            return GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH;
+        }
+
+        const int parsed = std::atoi(env);
+        if (parsed < 1) {
+            GGML_LOG_WARN(
+                "invalid GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH='%s'; using build default %d\n",
+                env, GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH);
+            return GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH;
+        }
+        return parsed;
+    }();
+    return value;
+}
+#endif
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -324,6 +345,13 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_K, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_K, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_K, GGML_TYPE_TURBO4_K)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_K, GGML_TYPE_TURBO4_K)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_K)
+    FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_K)
+
     GGML_ABORT("fatal error");
 }
 
@@ -349,6 +377,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TURBO4_K:
             return true;
         default:
             return false;
@@ -440,7 +469,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    if (K->type != V->type &&
+        !((K->type == GGML_TYPE_TURBO4_K && V->type == GGML_TYPE_Q8_0) ||
+          (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_K))) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -456,6 +487,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    if (K->type == GGML_TYPE_TURBO4_K || V->type == GGML_TYPE_TURBO4_K) {
+#ifndef GGML_CUDA_TURBO4_F16_PREFILL
+        return can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+#else
+        // Keep small prompt fragments on the native Turbo4 vector path. Large
+        // prompt/verify batches can use existing FP16 tile/MMA kernels after
+        // converting whichever K/V side uses rotated Turbo4 storage.
+        if (can_use_vector_kernel && Q->ne[1] < ggml_cuda_turbo4_f16_prefill_min_batch()) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+#endif
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

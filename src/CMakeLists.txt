@@ -17,6 +17,11 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-expert-adaptation.cpp
+            llama-expert-cache.cpp
+            llama-expert-lookahead.cpp
+            llama-expert-lookahead-metrics.cpp
+            llama-expert-placement.cpp
             llama-expert-tier.cpp
             llama-grammar.cpp
             llama-graph.cpp

@@ -66,6 +66,7 @@ struct llama_context {
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
+    uint32_t runtime_ubatch() const;
     uint32_t n_seq_max() const;
 
     uint32_t n_threads()       const;
@@ -109,6 +110,7 @@ struct llama_context {
     void detach_threadpool();
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
+    bool set_runtime_ubatch(uint32_t n_ubatch);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
@@ -223,7 +225,7 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    uint32_t output_reserve(int32_t n_outputs, bool encoder_only = false);
 
     void output_reorder();
 
@@ -253,6 +255,10 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    bool attach_dflash(llama_context * ctx_draft);
+    void detach_dflash(llama_context * ctx_draft);
+    bool take_dflash_injected();
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -280,6 +286,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    uint32_t runtime_n_ubatch = 0;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
@@ -377,6 +384,10 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    struct dflash_bridge;
+    std::unique_ptr<dflash_bridge> dflash;
+    llama_context * dflash_target = nullptr;
 
     // perf
     mutable int64_t t_start_us  = 0;

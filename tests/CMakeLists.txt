@@ -259,6 +259,70 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 
+add_executable(test-expert-warm-cache
+    test-expert-warm-cache.cpp
+    ../src/llama-expert-cache.cpp
+)
+target_include_directories(test-expert-warm-cache PRIVATE ../src)
+target_compile_features(test-expert-warm-cache PRIVATE cxx_std_17)
+llama_test(test-expert-warm-cache)
+
+add_executable(test-expert-adaptation
+    test-expert-adaptation.cpp
+    ../src/llama-expert-adaptation.cpp
+)
+target_include_directories(test-expert-adaptation PRIVATE ../src)
+target_compile_features(test-expert-adaptation PRIVATE cxx_std_17)
+llama_test(test-expert-adaptation)
+
+add_executable(test-expert-placement
+    test-expert-placement.cpp
+    ../src/llama-expert-placement.cpp
+)
+target_include_directories(test-expert-placement PRIVATE ../src)
+target_compile_features(test-expert-placement PRIVATE cxx_std_17)
+llama_test(test-expert-placement)
+
+add_executable(test-expert-lookahead
+    test-expert-lookahead.cpp
+    ../src/llama-expert-lookahead-metrics.cpp
+)
+target_include_directories(test-expert-lookahead PRIVATE ../src)
+target_compile_features(test-expert-lookahead PRIVATE cxx_std_17)
+llama_test(test-expert-lookahead)
+
+add_executable(test-turboquant-ref
+    test-turboquant-ref.cpp
+    ../tools/turboquant-ref/turboquant-ref.cpp
+)
+target_include_directories(test-turboquant-ref PRIVATE ../tools/turboquant-ref ../ggml/include ../ggml/src)
+target_link_libraries(test-turboquant-ref PRIVATE ggml-base)
+target_compile_features(test-turboquant-ref PRIVATE cxx_std_17)
+llama_test(test-turboquant-ref)
+
+add_executable(test-turboquant-layer-policy
+    test-turboquant-layer-policy.cpp
+)
+target_include_directories(test-turboquant-layer-policy PRIVATE ../src)
+target_compile_features(test-turboquant-layer-policy PRIVATE cxx_std_17)
+llama_test(test-turboquant-layer-policy)
+
+add_executable(test-kv-q4-scale
+    test-kv-q4-scale.cpp
+)
+target_include_directories(test-kv-q4-scale PRIVATE ../ggml/src)
+target_link_libraries(test-kv-q4-scale PRIVATE ggml-base)
+target_compile_features(test-kv-q4-scale PRIVATE cxx_std_17)
+llama_test(test-kv-q4-scale)
+
+add_executable(test-moe-multi-row
+    test-moe-multi-row.cpp
+)
+target_include_directories(test-moe-multi-row PRIVATE ../ggml/src ../ggml/src/ggml-cpu)
+target_link_libraries(test-moe-multi-row PRIVATE ggml)
+target_compile_features(test-moe-multi-row PRIVATE cxx_std_17)
+llama_test(test-moe-multi-row)
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)

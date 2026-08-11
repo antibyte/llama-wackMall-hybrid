@@ -654,6 +654,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+    fusion_local.skip_slot = -1;
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
@@ -675,6 +676,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+        fusion_local.skip_slot = fusion->skip_slot;
+    }
+    if (ids && fusion_local.skip_slot < 0) {
+        fusion_local.skip_slot = ggml_cuda_mul_mat_id_skip_slot(dst);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -757,6 +762,7 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t stride_sample_dst  = 0;
 
     ggml_cuda_mm_fusion_args_device empty{};
+    empty.skip_slot = -1;
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0_dd_i;

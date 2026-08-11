@@ -25,6 +25,19 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+struct common_speculative_output_limits {
+    int32_t total;
+    int32_t per_seq;
+};
+
+// return the output limits needed for speculative decoding
+common_speculative_output_limits common_speculative_get_output_limits(
+        int32_t n_batch, int32_t n_parallel, int32_t n_draft);
+
+// return the output limits needed by a parallel block-draft decode
+common_speculative_output_limits common_speculative_get_draft_output_limits(
+        int32_t n_batch, int32_t n_parallel, int32_t n_draft);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);

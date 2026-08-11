@@ -30,3 +30,53 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+----------------------------------------------------------------------
+Hybrid expert-cache architecture reference
+
+The experimental hybrid design documented in HYBRID_ANALYSIS.md and
+HYBRID_ATTRIBUTION.md was informed by LuceBox's Apache-2.0-licensed Spark
+expert placement, bounded cache, and CPU/GPU overlap work:
+
+Copyright (c) 2026 Lucebox contributors
+https://github.com/Luce-Org/lucebox-hub
+
+No LuceBox source code is copied in the initial hybrid implementation. See
+HYBRID_ATTRIBUTION.md for the exact files examined and the distinction between
+referenced concepts and new implementation.
+
+----------------------------------------------------------------------
+TurboQuant reference implementation and experimental runtime adaptation
+
+The optional offline reference codec under tools/turboquant-ref was informed
+by atomicmilkshake/llama-cpp-turboquant at commit
+f67e13573ab344d98090ea7612056a0119fcc5ef:
+
+https://github.com/atomicmilkshake/llama-cpp-turboquant
+
+Copyright (c) 2023-2026 The ggml authors
+Licensed under the MIT License reproduced above. See
+TURBOQUANT_ATTRIBUTION.md for the exact adapted constants and algorithms.
+
+The experimental Turbo4 target-V FlashAttention specialization was also
+informed by and partially adapted from TheTom/llama-cpp-turboquant at commit
+284ffc73181f019d7a4f919ba5b9dc8e1c85c388:
+
+https://github.com/TheTom/llama-cpp-turboquant
+
+It is MIT licensed. Exact examined and adapted files are recorded in
+TURBOQUANT_ATTRIBUTION.md.
+
+----------------------------------------------------------------------
+ik_llama.cpp quantization and MTP implementation reference
+
+The optional low-perplexity Q4_0 scale and MTP-only output-head experiments
+were informed by ik_llama.cpp at commit
+40dffce6857b4fe051f096379dc464764c718458:
+
+https://github.com/ikawrakow/ik_llama.cpp
+
+Copyright (c) 2024-2025 The ik_llama.cpp authors
+Licensed under the MIT License reproduced above. Exact examined, adapted, and
+newly implemented components are recorded in TURBOQUANT_ATTRIBUTION.md and
+IK_LLAMA_EXPERIMENTS.md. No IQK CPU source is included.

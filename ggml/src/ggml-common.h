@@ -287,6 +287,16 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// Experimental TurboQuant 4-bit key-cache block. The second half is reserved
+// for format compatibility and must be zero in the current PolarQuant mode.
+#define QK_TURBO4_K 128
+typedef struct {
+    ggml_half norm;
+    ggml_half reserved;
+    uint8_t qs[QK_TURBO4_K / 2];
+} block_turbo4_k;
+static_assert(sizeof(block_turbo4_k) == 68, "wrong turbo4_k block size/padding");
+
 //
 // Super-block quantization structures
 //

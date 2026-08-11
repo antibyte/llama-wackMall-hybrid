@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
+#include "quants.h"
 #include "simd-gemm.h"
 #include "ggml.h"
 #include "unary-ops.h"
@@ -666,6 +667,7 @@ void ggml_compute_forward_add(
             } break;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TURBO4_K:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1248,6 +1250,7 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TURBO4_K:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -5120,7 +5123,11 @@ static void ggml_compute_forward_set_rows_impl(
 
     const size_t rs = ggml_row_size(src0->type, nc);
 
-    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    ggml_from_float_t from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    const uint32_t flags = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    if (dst->type == GGML_TYPE_Q4_0 && (flags & GGML_SET_ROWS_FLAG_Q4_0_WEIGHTED_SCALE)) {
+        from_float = quantize_row_q4_0_weighted;
+    }
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -5780,6 +5787,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TURBO4_K:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:

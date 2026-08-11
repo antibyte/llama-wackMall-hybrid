@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TURBO4_K = 43, // Experimental TurboQuant 4-bit KV key cache
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -577,6 +578,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_TURBO4_WHT,
 
         GGML_OP_UNARY,
 
@@ -1756,6 +1758,18 @@ extern "C" {
     //   ne3 % ne12 == 0
     //
     // return view(a)
+    enum ggml_set_rows_flags {
+        GGML_SET_ROWS_FLAG_NONE                = 0,
+        GGML_SET_ROWS_FLAG_Q4_0_WEIGHTED_SCALE = 1u << 0,
+    };
+
+    GGML_API struct ggml_tensor * ggml_set_rows_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // destination
+            struct ggml_tensor  * b,  // source
+            struct ggml_tensor  * c,  // row indices
+                     uint32_t     flags);
+
     GGML_API struct ggml_tensor * ggml_set_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // destination
@@ -2491,6 +2505,13 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // Experimental forward 128-point randomized Walsh-Hadamard rotation used
+    // for queries paired with Turbo4 keys. An internal op parameter selects
+    // the inverse direction for Turbo4 value outputs.
+    GGML_API struct ggml_tensor * ggml_turbo4_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

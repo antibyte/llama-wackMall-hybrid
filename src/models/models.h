@@ -1269,6 +1269,12 @@ struct llama_model_dflash : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    bool build_dflash_injection(
+            llm_graph_context              & graph,
+            ggml_tensor                    * features,
+            const llama_cparams            & cparams_draft,
+            const llama_memory_context_i * mctx_draft) const override;
 };
 
 
@@ -2077,7 +2083,10 @@ struct llama_model_qwen35moe : public llama_model_base {
 
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
-                            int   il);
+                            int   il,
+                    ggml_tensor ** selected_experts_out = nullptr,
+                    ggml_tensor ** weights_out = nullptr,
+                           bool   snapshot_selected_experts = false);
 
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,

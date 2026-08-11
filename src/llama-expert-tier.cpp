@@ -1,5 +1,10 @@
 #include "llama-expert-tier.h"
 
+#include "llama-expert-adaptation.h"
+#include "llama-expert-cache.h"
+#include "llama-expert-lookahead.h"
+#include "llama-expert-placement.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 
@@ -7,243 +12,56 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
-#include <atomic>
+#include <cerrno>
 #include <cfloat>
+#include <chrono>
+#include <cmath>
 #include <condition_variable>
-#include <cstdint>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
-#include <memory>
 #include <mutex>
+#include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <sys/mman.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#else
-#define NOMINMAX
-#include <malloc.h>
-#include <intrin.h>
-#include <windows.h>
-#include <BaseTsd.h> // SSIZE_T
-typedef SSIZE_T ssize_t; // POSIX type not provided on Windows
-#endif
-
-// expert tiering hooks live in the CPU backend (ggml-cpu.c). Under
-// GGML_BACKEND_DL the backend is a runtime-loaded .so, so libllama cannot
-// link the setters directly; resolve them once from the backend registry
-// (same pattern as llama-context.cpp for ggml_backend_cpu_set_threadpool).
-typedef void (*moe_predict_hook_fn)(const ggml_tensor *, const ggml_tensor *);
-typedef const char * (*moe_addr_hook_fn)(const void *, int64_t, const char *);
-
-typedef void (*moe_set_predict_fn)(moe_predict_hook_fn);
-typedef void (*moe_set_addr_fn)(moe_addr_hook_fn);
-typedef void (*moe_set_route_fn)(FILE *, int);
-typedef uint64_t (*moe_timer_fn)(void);
-
-static moe_set_predict_fn g_fn_predict = NULL;
-static moe_set_addr_fn    g_fn_probe   = NULL;
-static moe_set_addr_fn    g_fn_fetch   = NULL;
-static moe_set_route_fn   g_fn_route   = NULL;
-static moe_timer_fn       g_fn_timer   = NULL;
-
-static void tier_resolve_moe_hooks(void) {
-    if (g_fn_predict) {
-        return;
-    }
-    ggml_backend_t backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!backend_cpu) {
-        return;
-    }
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend_cpu);
-    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    if (!reg) {
-        return;
-    }
-    g_fn_predict = (moe_set_predict_fn) ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_predict_hook");
-    g_fn_probe   = (moe_set_addr_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_probe_hook");
-    g_fn_fetch   = (moe_set_addr_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_fetch_hook");
-    g_fn_route   = (moe_set_route_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_set_route_trace");
-    g_fn_timer   = (moe_timer_fn)       ggml_backend_reg_get_proc_address(reg, "ggml_moe_cold_timer_us");
-}
-
-#define MOE_PREDICT_HOOK(fn)   do { if (g_fn_predict) g_fn_predict((fn)); } while (0)
-#define MOE_PROBE_HOOK(fn)     do { if (g_fn_probe)   g_fn_probe((fn));   } while (0)
-#define MOE_FETCH_HOOK(fn)     do { if (g_fn_fetch)   g_fn_fetch((fn));   } while (0)
-#define MOE_ROUTE_HOOK(f, n)   do { if (g_fn_route)   g_fn_route((f), (n)); } while (0)
-#define MOE_TIMER_HOOK()       (g_fn_timer ? g_fn_timer() : 0)
-
-// portable atomic access to single i32s inside plain buffers (lut_host must
-// stay a plain i32 vector: it is uploaded wholesale into the GPU lut tensor)
-static inline int32_t tier_atomic_load_i32(const int32_t * p) {
-#if defined(_MSC_VER)
-    return _InterlockedExchangeAdd((volatile long *) p, 0);
-#else
-    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
-#endif
-}
-
-static inline void tier_atomic_store_i32(int32_t * p, int32_t v) {
-#if defined(_MSC_VER)
-    _InterlockedExchange((volatile long *) p, (long) v);
-#else
-    __atomic_store_n(p, v, __ATOMIC_RELEASE);
-#endif
-}
-
 // tier status must print at default verbosity; libllama INFO requires -v
 #define TIER_LOG(...) fprintf(stderr, __VA_ARGS__)
 
-// page hints on mmap'd source weights: drop = free the file-backed pages of a
-// GPU-resident expert (bytes refault from the model file on next touch).
-// never call on malloc'd buffers - DONTNEED would zero anonymous pages.
-static void tier_madvise(const void * p, size_t len, bool drop) {
-#if !defined(_WIN32)
-    static const long page = sysconf(_SC_PAGESIZE);
-    const uintptr_t a = (uintptr_t) p & ~(uintptr_t) (page - 1);
-    const uintptr_t b = ((uintptr_t) p + len + page - 1) & ~(uintptr_t) (page - 1);
-    if (b > a) {
-        madvise((void *) a, b - a, drop ? MADV_DONTNEED : MADV_WILLNEED);
-    }
-#else
-    (void) p; (void) len; (void) drop;
-#endif
-}
-
-// pread helper: portable persistent read for demand fetch
-// POSIX: pread() on a shared read-only fd (thread-safe)
-// Windows: ReadFile+OVERLAPPED (compile-guarded, marked UNTESTED)
-static int g_pread_fd = -1;
-#if defined(_WIN32)
-static HANDLE g_pread_handle = INVALID_HANDLE_VALUE;
-#endif
-static bool g_pread_disabled = false; // KAT failure or mmap-off disables the path
-
-static bool tier_pread_init(const char * path) {
-    if (g_pread_disabled) {
-        return false;
-    }
-#if !defined(_WIN32)
-    g_pread_fd = open(path, O_RDONLY);
-    if (g_pread_fd < 0) {
-        TIER_LOG("%s: pread open failed: %s\n", __func__, strerror(errno));
-        g_pread_disabled = true;
-        return false;
-    }
-#else
-    g_pread_handle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (g_pread_handle == INVALID_HANDLE_VALUE) {
-        TIER_LOG("%s: pread CreateFileA failed\n", __func__);
-        g_pread_disabled = true;
-        return false;
-    }
-#endif
-    return true;
-}
-
-static void tier_pread_close() {
-#if !defined(_WIN32)
-    if (g_pread_fd >= 0) {
-        close(g_pread_fd);
-        g_pread_fd = -1;
-    }
-#else
-    if (g_pread_handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_pread_handle);
-        g_pread_handle = INVALID_HANDLE_VALUE;
-    }
-#endif
-}
-
-// pread a list of (offset, size) pairs into dest; returns total bytes read or -1 on error
-// coalesces adjacent reads (offset + size == next offset) into a single call
-static ssize_t tier_pread_list(void * dest, const std::vector<std::pair<size_t, size_t>> & spans) {
-    if (g_pread_disabled || spans.empty()) {
-        return -1;
-    }
-    char * dp = (char *) dest;
-    ssize_t total = 0;
-    size_t i = 0;
-    while (i < spans.size()) {
-        size_t off = spans[i].first;
-        size_t sz = spans[i].second;
-        size_t j = i + 1;
-        while (j < spans.size() && spans[j].first == off + sz) {
-            sz += spans[j].second;
-            j++;
-        }
-#if !defined(_WIN32)
-        ssize_t n = pread(g_pread_fd, dp, sz, off);
-        if (n != (ssize_t) sz) {
-            return -1;
-        }
-#else
-        OVERLAPPED ov = {};
-        ov.Offset = (DWORD) off;
-        ov.OffsetHigh = (DWORD) (off >> 32);
-        DWORD n = 0;
-        if (!ReadFile(g_pread_handle, dp, (DWORD) sz, &n, &ov)) {
-            return -1;
-        }
-        if (n != (DWORD) sz) {
-            return -1;
-        }
-#endif
-        dp += sz;
-        total += (ssize_t) sz;
-        i = j;
-    }
-    return total;
-}
-
-// KAT: pread the first 4 KiB of a host expert tensor, byte-compare vs the
-// mmap. offset 0 is unusable: the loader munmaps the metadata fragment after
-// load (llama_model_loader::load_all_data), so the header pages are no
-// longer backed by the file mapping. the tensor span also validates the
-// (data - mmap_base) offset math the fetch path relies on.
-static bool tier_pread_kat(const void * tensor_data, size_t file_off) {
-    if (g_pread_disabled || !tensor_data) {
-        return false;
-    }
-    const size_t K = 4096;
-    char buf[K];
-    ssize_t n = tier_pread_list(buf, {{file_off, K}});
-    if (n != (ssize_t) K) {
-        TIER_LOG("%s: KAT pread failed\n", __func__);
-        g_pread_disabled = true;
-        return false;
-    }
-    if (memcmp(buf, tensor_data, K) != 0) {
-        TIER_LOG("%s: KAT byte mismatch\n", __func__);
-        g_pread_disabled = true;
-        return false;
-    }
-    return true;
-}
-
 namespace llama_expert_tier {
+
+enum class warm_admission_mode {
+    immediate,
+    second_hit,
+    frequency,
+};
+
+enum class expert_usage_mode {
+    cumulative,
+    session,
+};
+
+enum class adapt_interval {
+    request,
+    graph,
+};
 
 struct store {
     ggml_tensor * w_hot  = nullptr; // [ne0, ne1, n_slots] on GPU, sentinel slot zeroed
     ggml_tensor * lut    = nullptr; // i32 [n_expert] on GPU: expert -> hot slot | sentinel
     ggml_tensor * mask   = nullptr; // i32 [n_expert] on CPU: 1 = cold
     ggml_tensor * counts = nullptr; // i32 [n_expert+1] on CPU: selection stats
-    ggml_tensor * ptrs   = nullptr; // i64 [n_expert] on CPU: weight source address (pool slot | mmap)
-    int  il      = -1;
-    bool is_down = false;
-    bool discardable = false; // mmap-backed and not mlocked: pages may be dropped
-    bool poolable    = false; // weights_discardable regardless of LLAMA_EXPERT_MADVISE
-    size_t pool_off = 0;      // offset of this tensor's slice within a pool slot
+    int  il       = -1;
+    int  sentinel = 0; // last w_hot channel; cold experts map here
+    bool is_down  = false;
 };
 
 // per-layer grouping for stats and online repin
@@ -251,40 +69,71 @@ struct layer_tier {
     int il       = -1;
     int n_expert = 0;
     int n_slots  = 0; // incl. sentinel slot
+    int n_fixed  = 0;
     int sentinel = 0;
     store * sd = nullptr; // store holding the down weight (counts source)
     std::vector<std::pair<const ggml_tensor *, store *>> ws;
     std::vector<int32_t> slot_expert; // [n_slots], -1 = empty
     std::vector<int32_t> lut_host;    // [n_expert]
     std::vector<float>   score;       // [n_expert], cumulative (LLAMA_EXPERT_DECAY)
-    std::vector<uint64_t> cum;        // [n_expert], exact counts for persistence
+    std::vector<uint64_t> cum;        // [n_expert], seed + observations (legacy persistence)
+    std::vector<uint64_t> observed;   // [n_expert], observations from this process only
     std::vector<int32_t> dwell;       // [n_slots]
-    uint64_t cum_cold = 0, cum_total = 0, cum_graphs = 0;
-    // RAM pool: slot = one expert across all tiered tensors of this layer
-    char * pool = nullptr;
-    size_t pool_slot_bytes = 0;
-    int    n_pool_slots = 0;
-    std::vector<int32_t> pool_slot_expert; // [n_pool_slots], -1 = empty
-    std::vector<int32_t> pool_dwell;       // [n_pool_slots]
-    // residency contract: 0 free / 1 filling / 2 ready / 3 resident.
-    // the update() window owns FREE/READY/RESIDENT transitions; the prefetch
-    // worker only claims FREE->FILLING->READY mid-step (atomic CAS).
-    std::unique_ptr<std::atomic<int32_t>[]> pool_slot_state; // [n_pool_slots]
-    std::unique_ptr<std::atomic<int32_t>[]> pool_lut;        // [n_expert], -1 = not pooled
-    // spec pool (prefetch): worker-only cache for predicted experts, probe-served
-    char * poolB = nullptr;
-    int    n_slotsB = 0;
-    std::vector<int32_t> ownersB;                // [n_slotsB], -1 = empty
-    std::unique_ptr<std::atomic<int32_t>[]> stateB; // [n_slotsB] 0 free/1 filling/2 ready/3 resident
-    std::unique_ptr<std::atomic<int32_t>[]> lutB;   // [n_expert], -1 = not in B
-    std::unique_ptr<std::atomic<int64_t>[]> lastB;  // [n_slotsB] last-predicted step
+    llama_expert_cache::state warm_cache;
+    llama_expert_cache::second_hit_admission warm_admission;
+    std::vector<float> warm_frequency;
+    std::vector<int32_t> warm_pending;
+    bool warm_enabled = false;
+    uint64_t cum_fixed = 0, cum_warm = 0, cum_cold = 0, cum_total = 0, cum_graphs = 0;
+    uint64_t warm_promotions = 0, warm_evictions = 0;
+    uint64_t warm_to_fixed = 0;
+    uint64_t warm_admission_deferrals = 0;
 };
 
 static int  g_S        = 16;
+static int  g_W        = 0;
 static int  g_tmax     = 16;
 static bool g_adapt    = false;
-static bool g_madvise  = true; // LLAMA_EXPERT_MADVISE=0 disables page hints
 static bool g_hot_only = false; // set by build_moe_cold per layer
+static bool g_warm_auto = false;
+static int  g_warm_auto_max = 4;
+static int  g_vram_reserve_mib = 512;
+static bool g_warm_reset_request = true;
+static warm_admission_mode g_warm_admission = warm_admission_mode::immediate;
+static expert_usage_mode g_usage_mode = expert_usage_mode::cumulative;
+static adapt_interval g_adapt_interval = adapt_interval::request;
+static int  g_warm_admission_window = 8;
+static bool g_prefetch_requested = false;
+static bool g_prefetch_ready = false;
+static bool g_collect_counts = true;
+static bool g_timing_enabled = false;
+static int  g_cpu_single_row_chunk = 64;
+static bool g_cpu_parallel_activation = false;
+static bool g_cpu_async = false;
+static int  g_cpu_down_prefetch = 0;
+static bool g_cpu_reuse_rows = false;
+static bool g_cpu_multi_row = false;
+static bool g_cpu_fused_gate_up = false;
+static bool g_shared_hot_ids = false;
+// When true, MUL_MAT_ID results for the hot store carry op_params that tell the
+// CUDA MMVQ kernels to skip the zeroed sentinel slot (cold experts) instead of
+// loading and computing against zero weights. Default off until measured.
+static bool g_skip_sentinel = false;
+static bool g_static_no_sync_requested = false;
+static bool g_static_no_sync_active = false;
+static int  g_prefetch_streams = 1;
+static int  g_prefetch_max_inflight = 2;
+static int  g_mtp_n = 0;
+static bool g_warm_mtp_guarded = false;
+static bool g_variable_placement = false;
+static bool g_configured_enabled = false;
+static bool g_request_scoped = false;
+static bool g_request_seen = false;
+static bool g_usage_checkpoint_request = true;
+static bool g_adapt_cuda_graphs_experimental = false;
+static bool g_mutable_disabled_cuda_graphs = false;
+static llama_expert_placement::manifest g_placement;
+static std::string g_usage_path;
 
 static ggml_context * g_ctx_gpu = nullptr; // owned for process lifetime
 static ggml_context * g_ctx_cpu = nullptr;
@@ -292,633 +141,810 @@ static ggml_context * g_ctx_cpu = nullptr;
 static std::unordered_map<const ggml_tensor *, store> g_stores;
 static std::vector<layer_tier> g_layers;
 static uint64_t g_repins = 0; // hot-set changes since init
+static uint64_t g_warm_promotions = 0;
+static uint64_t g_warm_evictions  = 0;
+static uint64_t g_warm_to_fixed   = 0;
+static uint64_t g_warm_admission_deferrals = 0;
+static uint64_t g_h2d_copies      = 0;
+static uint64_t g_h2d_bytes       = 0;
+static int64_t  g_h2d_copy_us     = 0;
+static std::string g_model_desc;
+static uint64_t g_request_id = 0;
+static size_t g_async_layer_cursor = 0;
 
-static size_t   g_pool_bytes = 0; // LLAMA_EXPERT_RAMPOOL budget in bytes (0 = off)
-static size_t   g_pool_alloc = 0; // resident pool bytes
-static size_t   g_pool_fill_budget = 0; // per-update() fill budget
-static uint64_t g_pool_fills = 0, g_pool_evictions = 0;
-static uint64_t g_pool_hits = 0, g_pool_cold = 0;
-
-static uint64_t g_fetch_us = 0;   // cumulative wall time in pool_fill() memcpy
-static uint64_t g_steps = 0;      // update() calls (= graph computes)
-static FILE *   g_route_log = nullptr; // actual-routing trace (co-opened with pred log)
-
-// pre-gate predictor: immutable CPU mirrors of each MoE layer's router and
-// ffn norm weights. The fused cold op reports its router input x through the
-// predict hook; running the NEXT MoE layer's router on x (with its norm
-// exactly reconstructed as w_next * (x / w_cur)) predicts that layer's
-// experts one layer ahead of demand. No learned parameters: the predictor
-// is the model's own gating function applied early.
-struct pred_layer {
-    int il = -1;
-    int n_routed = 0;
-    std::vector<float> norm;
-    std::vector<float> gate;
+struct async_copy_job {
+    ggml_backend_buffer_t host_buffer = nullptr;
+    ggml_backend_event_t event = nullptr;
+    void * host_ptr = nullptr;
+    size_t capacity = 0;
+    bool active = false;
+    bool completed = false;
+    int layer = -1;
+    int slot = -1;
+    int expert = -1;
+    uint64_t bytes = 0;
+    int64_t started_us = 0;
+    int64_t completed_us = 0;
 };
 
-static std::vector<pred_layer> g_pred;
-static std::unordered_map<const void *, int> g_pred_ix; // counts->data -> g_pred index
-static bool g_predict = false; // LLAMA_EXPERT_PREDICT=1 enables
-static FILE * g_pred_log = nullptr; // LLAMA_EXPERT_PREDICT_LOG (debug)
-static uint64_t g_pred_pushes = 0;
+static ggml_backend_t g_prefetch_backend = nullptr;
+static std::vector<async_copy_job> g_async_jobs;
+static std::mutex g_async_mutex;
+static std::condition_variable g_async_cv;
+static std::mutex g_graph_mutex;
 
-// prefetch probe: lets a cold op read an expert straight from a READY
-// (fully memcpy'd, not yet published) pool slot instead of the mmap source.
-// keyed by the store's ptrs->data; content is byte-identical either way, so
-// a probe miss costs speed, never correctness.
-struct probe_ctx {
-    const std::atomic<int32_t> * lut;
-    const std::atomic<int32_t> * states;
-    const int32_t * owners;
-    const char * pool;
-    int64_t slot_bytes;
-    int64_t pool_off;
-};
-static std::unordered_map<const void *, probe_ctx> g_probe_ix; // ptrs->data -> ctx
-static std::atomic<uint64_t> g_probe_hits{0}, g_probe_miss{0};
-
-static bool g_dirty = false;
-static std::string g_sidecar_path;
-static uint64_t g_fingerprint = 0;
-
-static const char * pregate_probe(const void * key, int64_t e, const char * fallback) {
-    auto it = g_probe_ix.find(key);
-    if (it == g_probe_ix.end()) {
-        return fallback;
+graph_guard::graph_guard() {
+    if (!g_layers.empty() && requires_post_graph_sync()) {
+        g_graph_mutex.lock();
+        locked_ = true;
     }
-    const probe_ctx & c = it->second;
-    const int32_t k = c.lut[e].load(std::memory_order_acquire);
-    if (k >= 0 && c.states[k].load(std::memory_order_acquire) >= 2 && c.owners[k] == (int32_t) e) {
-        g_probe_hits.fetch_add(1, std::memory_order_relaxed);
-        return c.pool + (size_t) k*c.slot_bytes + c.pool_off;
+}
+
+graph_guard::~graph_guard() {
+    if (locked_) {
+        g_graph_mutex.unlock();
     }
-    g_probe_miss.fetch_add(1, std::memory_order_relaxed);
-    return fallback;
 }
+static std::deque<size_t> g_async_queue;
+static std::thread g_async_worker;
+static bool g_async_stop = false;
 
-static uint64_t fnv1a_64(const void * data, size_t len, uint64_t h = 14695981039346656037ULL) {
-    const uint8_t * p = (const uint8_t *) data;
-    for (size_t i = 0; i < len; i++) {
-        h ^= (uint64_t) p[i];
-        h *= 1099511628211ULL;
+static bool parse_nonnegative_int(const char * value, int & result) {
+    if (!value || !value[0]) {
+        return false;
     }
-    return h;
+    char * end = nullptr;
+    errno = 0;
+    const long parsed = strtol(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed < 0 || parsed > INT32_MAX) {
+        return false;
+    }
+    result = (int) parsed;
+    return true;
 }
 
-static uint64_t fnv1a_64_str(const char * s, uint64_t h = 14695981039346656037ULL) {
-    return fnv1a_64(s, strlen(s), h);
+static bool parse_bridge_layers(const char * value, std::vector<int> & layers) {
+    layers.clear();
+    if (!value || !value[0]) return false;
+    const char * cursor = value;
+    while (*cursor && layers.size() < 4) {
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        char * end = nullptr;
+        errno = 0;
+        const long parsed = strtol(cursor, &end, 10);
+        if (errno || !end || end == cursor || parsed < 0 || parsed > INT32_MAX) return false;
+        if (std::find(layers.begin(), layers.end(), (int) parsed) == layers.end()) {
+            layers.push_back((int) parsed);
+        }
+        cursor = end;
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        if (*cursor == '\0') break;
+        if (*cursor != ',') return false;
+        ++cursor;
+        if (*cursor == '\0') return false;
+    }
+    while (*cursor == ' ' || *cursor == '\t') ++cursor;
+    return *cursor == '\0' && !layers.empty();
 }
 
-static uint64_t fnv1a_64_u64(uint64_t v, uint64_t h = 14695981039346656037ULL) {
-    return fnv1a_64(&v, sizeof(v), h);
+static bool output_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value && value[0] && strcmp(value, "0");
 }
 
-static uint64_t compute_fingerprint(const llama_model & model) {
-    uint64_t h = 14695981039346656037ULL;
-    const char * arch = llm_arch_name(model.arch);
-    h = fnv1a_64_str(arch ? arch : "unknown", h);
-    h = fnv1a_64_u64((uint64_t) model.size(), h);
-    h = fnv1a_64_u64((uint64_t) model.n_tensors(), h);
-    for (const auto & kv : model.tensors_by_name) {
-        h = fnv1a_64_str(kv.first.c_str(), h);
-        const ggml_tensor * t = kv.second;
-        for (int i = 0; i < GGML_MAX_DIMS; i++) {
-            h = fnv1a_64_u64((uint64_t) t->ne[i], h);
+static bool warm_mtp_experimental() {
+    const char * value = getenv("LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL");
+    return value && !strcmp(value, "1");
+}
+
+static void warm_invariant_abort(const layer_tier & L, const char * where) {
+    std::string error;
+    if (L.warm_cache.validate(&error)) {
+        if ((int) L.warm_pending.size() != L.warm_cache.n_warm()) {
+            error = "pending vector size mismatch";
         }
     }
-    return h;
-}
-
-static void save_sidecar();
-
-static std::vector<std::vector<float>> load_sidecar(const llama_model & model) {
-    std::vector<std::vector<float>> result;
-    if (g_sidecar_path.empty()) {
-        return result;
-    }
-    std::ifstream in(g_sidecar_path, std::ios::binary);
-    if (!in) {
-        TIER_LOG("%s: no sidecar at %s\n", __func__, g_sidecar_path.c_str());
-        return result;
-    }
-    uint32_t version = 0;
-    uint64_t fp = 0;
-    in.read((char *) &version, sizeof(version));
-    in.read((char *) &fp, sizeof(fp));
-    if (!in || version != 1) {
-        TIER_LOG("%s: sidecar version mismatch (got %u, want 1), ignoring\n", __func__, version);
-        return result;
-    }
-    if (fp != g_fingerprint) {
-        TIER_LOG("%s: sidecar fingerprint mismatch (got %016llx, want %016llx), ignoring\n",
-                __func__, (unsigned long long) fp, (unsigned long long) g_fingerprint);
-        return result;
-    }
-    const int n_layer = model.hparams.n_layer();
-    const int n_expert = model.hparams.n_expert;
-    result.resize(n_layer);
-    for (int il = 0; il < n_layer; il++) {
-        result[il].resize(n_expert);
-        in.read((char *) result[il].data(), n_expert * sizeof(float));
-        if (!in) {
-            TIER_LOG("%s: sidecar truncated at layer %d, ignoring\n", __func__, il);
-            result.clear();
-            return result;
-        }
-    }
-    TIER_LOG("%s: loaded sidecar %s (fingerprint %016llx)\n", __func__, g_sidecar_path.c_str(), (unsigned long long) fp);
-    return result;
-}
-
-static void save_sidecar() {
-    if (!g_dirty || g_sidecar_path.empty() || g_fingerprint == 0) {
-        return;
-    }
-    const std::string tmp = g_sidecar_path + ".tmp";
-    std::ofstream out(tmp, std::ios::binary);
-    if (!out) {
-        TIER_LOG("%s: cannot create %s\n", __func__, tmp.c_str());
-        return;
-    }
-    const uint32_t version = 1;
-    out.write((const char *) &version, sizeof(version));
-    out.write((const char *) &g_fingerprint, sizeof(g_fingerprint));
-    for (const auto & L : g_layers) {
-        if (L.score.empty()) {
-            continue;
-        }
-        out.write((const char *) L.score.data(), L.score.size() * sizeof(float));
-    }
-    out.close();
-    if (!out) {
-        TIER_LOG("%s: write failed for %s\n", __func__, tmp.c_str());
-        std::remove(tmp.c_str());
-        return;
-    }
-#if defined(_WIN32)
-    const bool ok = MoveFileExA(tmp.c_str(), g_sidecar_path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
-#else
-    const bool ok = std::rename(tmp.c_str(), g_sidecar_path.c_str()) == 0;
-#endif
-    if (!ok) {
-        TIER_LOG("%s: rename failed for %s\n", __func__, g_sidecar_path.c_str());
-        std::remove(tmp.c_str());
-    } else {
-        TIER_LOG("%s: saved sidecar %s (fingerprint %016llx)\n", __func__, g_sidecar_path.c_str(), (unsigned long long) g_fingerprint);
-    }
-}
-
-// demand-fetch staging ring (LLAMA_EXPERT_PREAD): bounded, page-aligned,
-// owned by the cold path, separate from the score-managed demand pool. the
-// first compute thread to touch a pool-miss expert claims a slot and preads
-// the expert's slices (all tiered tensors of its layer) from the model file;
-// threads claiming different experts pread in parallel; a thread needing an
-// in-flight expert waits on the slot word. a slot is reclaimable only by a
-// claim from a different layer's op: cold ops are serialized by the
-// threadpool, so a slot keyed by another layer has no live readers. no
-// pool/lut/score metadata is touched here; update() stays the single writer.
-// slot word: bits [0:2) state (0 free / 1 claimed / 2 ready), [2:34) expert,
-// [34:64) layer - one atomic word so claim+key is a single CAS.
-static char * g_stage_base = nullptr;
-static size_t g_stage_stride = 0; // page-aligned slot stride
-static int    g_stage_n = 0;
-static std::unique_ptr<std::atomic<uint64_t>[]> g_stage_word; // [g_stage_n]
-static const char * g_stage_mmap = nullptr; // model mmap base (offset math)
-static std::atomic<uint64_t> g_stage_fetches{0}, g_stage_bytes{0};
-static std::atomic<uint64_t> g_stage_stalls{0}, g_stage_fallbacks{0}, g_stage_fails{0};
-static bool g_stage_fail_test = false; // LLAMA_EXPERT_PREAD_FAIL (test-only)
-
-struct stage_ctx {
-    int          il;
-    int64_t      pool_off; // this tensor's offset within a slot
-    const char * w_data;   // mmap base of the tensor (residency check)
-    int64_t      slice;    // per-expert bytes of this tensor
-};
-static std::unordered_map<const void *, stage_ctx> g_stage_ix; // ptrs->data -> ctx
-
-static uint64_t stage_word(int il, int64_t e, uint64_t st) {
-    return ((uint64_t) il << 34) | ((uint64_t) e << 2) | st;
-}
-
-static const char * stage_fetch(const void * key, int64_t e, const char * fallback) {
-    auto it = g_stage_ix.find(key);
-    if (it == g_stage_ix.end()) {
-        return fallback;
-    }
-    const stage_ctx & c = it->second;
-    if (fallback != c.w_data + e*c.slice) {
-        return fallback; // resident: demand pool or a READY spec slot
-    }
-    const uint64_t mykey = stage_word(c.il, e, 0);
-    for (int attempt = 0; attempt < 4; attempt++) {
-        int cand = -1;
-        uint64_t candw = 0;
-        for (int k = 0; k < g_stage_n; k++) {
-            const uint64_t w = g_stage_word[k].load(std::memory_order_acquire);
-            const uint64_t st = w & 3;
-            if (st != 0 && (w & ~3ull) == mykey) {
-                if (st == 2) {
-                    return g_stage_base + (size_t) k*g_stage_stride + c.pool_off;
-                }
-                // claimed by another thread: wait for the fill to finish
-                g_stage_stalls.fetch_add(1, std::memory_order_relaxed);
-                uint64_t v = w;
-                int spins = 0;
-                while ((v = g_stage_word[k].load(std::memory_order_acquire)) == w) {
-                    if ((++spins & 0x3FF) == 0) {
-                        std::this_thread::yield();
-                    }
-                }
-                if ((v & ~3ull) == mykey && (v & 3) == 2) {
-                    return g_stage_base + (size_t) k*g_stage_stride + c.pool_off;
-                }
-                g_stage_fallbacks.fetch_add(1, std::memory_order_relaxed);
-                return fallback; // fill failed: mmap fallback
+    if (error.empty()) {
+        std::vector<int> pending_occurrences(L.n_expert, 0);
+        for (size_t warm_index = 0; warm_index < L.warm_pending.size(); ++warm_index) {
+            const int expert = L.warm_pending[warm_index];
+            if (expert < 0) {
+                continue;
             }
-            if (cand < 0 && (st == 0 || (st == 2 && (int) (w >> 34) != c.il))) {
-                cand  = k;
-                candw = w;
+            const int slot = L.warm_cache.n_fixed() + (int) warm_index;
+            if (expert >= L.n_expert) {
+                error = "pending slot " + std::to_string(slot) + " has invalid expert " + std::to_string(expert);
+                break;
+            }
+            if (++pending_occurrences[expert] != 1) {
+                error = "pending expert " + std::to_string(expert) + " is duplicated at slot " + std::to_string(slot);
+                break;
+            }
+            if (L.warm_cache.locate(expert) != llama_expert_cache::location::cold ||
+                    L.warm_cache.expert_in_slot(slot) != -1) {
+                error = "pending expert " + std::to_string(expert) + " owns non-empty slot " + std::to_string(slot);
+                break;
             }
         }
-        if (cand < 0) {
-            break; // ring full of live slots: mmap fallback
-        }
-        if (!g_stage_word[cand].compare_exchange_strong(candw, mykey | 1,
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
-            continue; // lost the claim race: rescan
-        }
-        char * slot = g_stage_base + (size_t) cand*g_stage_stride;
-        size_t total = 0;
-        bool ok = !g_stage_fail_test;
-        if (ok) {
-            const layer_tier & L = g_layers[c.il];
-            for (const auto & kv : L.ws) {
-                const size_t slice = ggml_nbytes(kv.first)/L.n_expert;
-                const size_t off = (size_t) ((const char *) kv.first->data - g_stage_mmap) + (size_t) e*slice;
-                if (tier_pread_list(slot + kv.second->pool_off, {{off, slice}}) != (ssize_t) slice) {
-                    ok = false;
+    }
+    if (error.empty()) {
+        const auto & lut = L.warm_cache.lut();
+        if (L.sd && L.sd->mask && L.sd->mask->data) {
+            const int32_t * mask = (const int32_t *) L.sd->mask->data;
+            for (int expert = 0; expert < L.n_expert; ++expert) {
+                const int want = lut[expert] == L.warm_cache.sentinel() ? 1 : 0;
+                if (mask[expert] != want) {
+                    error = "mask/lut mismatch for expert " + std::to_string(expert);
                     break;
                 }
-                total += slice;
             }
         }
-        if (ok) {
-            g_stage_word[cand].store(mykey | 2, std::memory_order_release);
-            g_stage_fetches.fetch_add(1, std::memory_order_relaxed);
-            g_stage_bytes.fetch_add(total, std::memory_order_relaxed);
-            return slot + c.pool_off;
-        }
-        g_stage_word[cand].store(0, std::memory_order_release);
-        const uint64_t nf = g_stage_fails.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (nf <= 3 || (nf & (nf - 1)) == 0) { // rate-limited
-            TIER_LOG("%s: pread failed (%llu total), mmap fallback\n", __func__, (unsigned long long) nf);
-        }
-        return fallback;
     }
-    g_stage_fallbacks.fetch_add(1, std::memory_order_relaxed);
-    return fallback;
+    if (!error.empty()) {
+        TIER_LOG("expert_tier: FATAL warm-cache invariant at %s: layer=%d state=%s request=%llu mtp_step=-1\n",
+                where, L.il, error.c_str(), (unsigned long long) g_request_id);
+        abort();
+    }
 }
 
-// prefetch worker: drains predicted (layer, expert) pairs mid-step, claiming
-// FREE pool slots via CAS (FILLING), memcpy'ing from the mmap source, then
-// release-storing READY. owns state 1 only; the update() window owns 0/2/3.
-static std::deque<std::pair<int32_t, int32_t>> g_work_q; // (g_pred target index, expert)
-static std::mutex g_work_mu;
-static std::condition_variable g_work_cv;
-static bool g_work_exit = false;
-static std::vector<std::thread> g_workers;
-static std::atomic<int64_t> g_work_inflight{0};
-static int64_t g_work_budget = 64*1024*1024; // LLAMA_EXPERT_PREFETCH_MB
-static size_t g_poolB_bytes = 0;   // LLAMA_EXPERT_PREFETCH_GB (default 0 = off)
-static size_t g_poolB_alloc = 0;
-static int g_n_workers = 2;        // LLAMA_EXPERT_PREFETCH_THREADS (clamp 1..8)
-static std::atomic<uint64_t> g_pred_step{0}; // window tick for lastB timestamps
-static uint64_t g_predB_evict = 0; // timestamp evictions by the window
-static uint64_t g_pred_fills = 0, g_pred_published = 0;
-static uint64_t g_pred_drop_hot = 0, g_pred_drop_dup = 0, g_pred_drop_budget = 0, g_pred_drop_full = 0;
-
-static void prefetch_fill(int pi, int e) {
-    layer_tier & L = g_layers[g_pred[pi].il];
-    if (!L.poolB) {
-        return;
-    }
-    if (tier_atomic_load_i32(&L.lut_host[e]) != L.sentinel) {
-        g_pred_drop_hot++;
-        return; // hot already
-    }
-    if (L.pool_lut[e].load(std::memory_order_acquire) >= 0) {
-        g_pred_drop_dup++;
-        return; // in the demand pool already
-    }
-    const int64_t step = (int64_t) g_pred_step.load(std::memory_order_relaxed);
-    const int32_t k0 = L.lutB[e].load(std::memory_order_acquire);
-    if (k0 >= 0) {
-        L.lastB[k0].store(step, std::memory_order_release); // refresh on re-prediction
-        g_pred_drop_dup++;
-        return;
-    }
-    if (g_work_inflight.load(std::memory_order_relaxed) + (int64_t) L.pool_slot_bytes > g_work_budget) {
-        g_pred_drop_budget++;
-        return;
-    }
-    // claim a FREE slot; never evict - the window keeps ~25% of slots free
-    int k = -1;
-    for (int i = 0; i < L.n_slotsB; i++) {
-        int32_t free_state = 0;
-        if (L.stateB[i].compare_exchange_strong(free_state, 1, std::memory_order_acquire)) {
-            k = i;
-            break;
-        }
-    }
-    if (k < 0) {
-        g_pred_drop_full++;
-        return;
-    }
-    int32_t expect = -1;
-    if (!L.lutB[e].compare_exchange_strong(expect, k, std::memory_order_release)) {
-        // another worker won; free the slot, refresh the winner's timestamp
-        L.stateB[k].store(0, std::memory_order_release);
-        L.lastB[expect].store(step, std::memory_order_release);
-        g_pred_drop_dup++;
-        return;
-    }
-    L.ownersB[k] = e;
-    L.lastB[k].store(step, std::memory_order_relaxed);
-    g_work_inflight.fetch_add((int64_t) L.pool_slot_bytes, std::memory_order_relaxed);
+static void upload_warm_maps(layer_tier & L) {
+    const auto & lut = L.warm_cache.lut();
+    const int sentinel = L.warm_cache.sentinel();
     for (auto & kv : L.ws) {
         store & st = *kv.second;
-        const size_t slice = ggml_nbytes(kv.first)/L.n_expert;
-        memcpy(L.poolB + (size_t) k*L.pool_slot_bytes + st.pool_off, (const char *) kv.first->data + slice*e, slice);
-    }
-    L.stateB[k].store(2, std::memory_order_release);
-    g_work_inflight.fetch_sub((int64_t) L.pool_slot_bytes, std::memory_order_relaxed);
-    g_pred_fills++;
-}
-
-static void prefetch_worker() {
-    std::unique_lock<std::mutex> lk(g_work_mu);
-    for (;;) {
-        g_work_cv.wait(lk, [] { return g_work_exit || !g_work_q.empty(); });
-        if (g_work_exit) {
-            return;
+        int32_t * mask = (int32_t *) st.mask->data;
+        for (int expert = 0; expert < L.n_expert; ++expert) {
+            mask[expert] = lut[expert] == sentinel ? 1 : 0;
         }
-        const auto req = g_work_q.front();
-        g_work_q.pop_front();
-        lk.unlock();
-        prefetch_fill(req.first, req.second);
-        lk.lock();
+        ggml_backend_tensor_set(st.lut, lut.data(), 0, L.n_expert*sizeof(int32_t));
     }
 }
 
-static void pred_shutdown() {
-    if (!g_workers.empty()) {
-        { std::lock_guard<std::mutex> lk(g_work_mu); g_work_exit = true; }
-        g_work_cv.notify_all();
-        for (auto & t : g_workers) {
-            t.join();
-        }
-    }
-}
-
-// called from ggml_compute_forward_moe_cold at ith==0
-static void pregate_hook(const ggml_tensor * counts, const ggml_tensor * x) {
-    static uint64_t seq = 0;
-    const uint64_t cur_seq = seq++; // unconditional: one per op call, aligned with the trace seq
-    if (!counts || !counts->data || x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float)) {
-        return;
-    }
-    auto it = g_pred_ix.find(counts->data);
-    if (it == g_pred_ix.end() || it->second + 1 >= (int) g_pred.size()) {
-        return;
-    }
-    const pred_layer & cur = g_pred[it->second];
-    const pred_layer & nxt = g_pred[it->second + 1];
-    const int64_t ne0 = x->ne[0];
-    if ((int64_t) cur.norm.size() != ne0 || (int64_t) nxt.norm.size() != ne0) {
-        return;
-    }
-    const int64_t n_exp = (int64_t) (nxt.gate.size()/ne0);
-    thread_local std::vector<float> hv, lg;
-    thread_local std::vector<int32_t> idx;
-    hv.resize(ne0);
-    lg.resize(n_exp);
-    idx.resize(n_exp);
-    const int K = nxt.n_routed;
-    for (int64_t t = 0; t < x->ne[1]; t++) {
-        const float * xt = (const float *) ((const char *) x->data + t*x->nb[1]);
-        for (int64_t i = 0; i < ne0; i++) {
-            const float w = cur.norm[i];
-            hv[i] = nxt.norm[i]*(w*w > 1e-12f ? xt[i]/w : 0.0f);
-        }
-        for (int64_t e = 0; e < n_exp; e++) {
-            const float * g = nxt.gate.data() + (size_t) e*ne0;
-            float s = 0.0f;
-            for (int64_t i = 0; i < ne0; i++) {
-                s += g[i]*hv[i];
+static void async_worker_main() {
+    while (true) {
+        size_t job_index = 0;
+        {
+            std::unique_lock<std::mutex> lock(g_async_mutex);
+            g_async_cv.wait(lock, [] { return g_async_stop || !g_async_queue.empty(); });
+            if (g_async_stop && g_async_queue.empty()) {
+                return;
             }
-            lg[e] = s;
+            job_index = g_async_queue.front();
+            g_async_queue.pop_front();
         }
-        for (int64_t e = 0; e < n_exp; e++) {
-            idx[e] = (int32_t) e;
+
+        // Measure the actual blocking interval per stream. Timestamping when a
+        // later job is merely enqueued would double-count time spent behind an
+        // earlier copy on the same stream.
+        const int64_t wait_started_us = ggml_time_us();
+        ggml_backend_event_synchronize(g_async_jobs[job_index].event);
+
+        {
+            std::lock_guard<std::mutex> lock(g_async_mutex);
+            g_async_jobs[job_index].started_us = wait_started_us;
+            g_async_jobs[job_index].completed_us = ggml_time_us();
+            g_async_jobs[job_index].completed = true;
         }
-        std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
-                [&](int32_t a, int32_t b) { return lg[a] > lg[b]; });
-        if (g_pred_log) {
-            fprintf(g_pred_log, "%llu,%lld,%d", (unsigned long long) cur_seq, (long long) x->ne[1], nxt.il);
-            for (int k = 0; k < K; k++) {
-                fprintf(g_pred_log, ",%d", idx[k]);
-            }
-            fprintf(g_pred_log, "\n");
-        }
-        if (!g_workers.empty()) {
-            std::lock_guard<std::mutex> lk(g_work_mu);
-            if (g_work_q.size() < 4096) {
-                layer_tier & LT = g_layers[nxt.il];
-                for (int k = 0; k < K; k++) {
-                    if (LT.pool_lut && LT.pool_lut[idx[k]].load(std::memory_order_relaxed) >= 0) {
-                        continue; // already in demand pool
-                    }
-                    g_work_q.emplace_back((int32_t) (it->second + 1), idx[k]);
-                }
-            }
-        }
-        g_pred_pushes++;
-    }
-    if (!g_workers.empty()) {
-        g_work_cv.notify_one();
     }
 }
 
-static void pred_init(const llama_model & model) {
-    if (!g_predict) {
-        return;
+static void shutdown_async_resources() {
+    {
+        std::lock_guard<std::mutex> lock(g_async_mutex);
+        g_async_stop = true;
     }
-    const int n_layer = model.hparams.n_layer();
-    std::vector<float> raw;
-    size_t mirror_bytes = 0;
-    for (int il = 0; il < n_layer; il++) {
-        if (g_layers[il].ws.empty() || !g_layers[il].sd) {
-            continue;
-        }
-        const ggml_tensor * gate = model.layers[il].ffn_gate_inp;
-        // pre-router norm: ffn_norm on classic archs, attn_post_norm on the
-        // hybrid qwen35/qwen36 archs (GGUF post_attention_norm)
-        const ggml_tensor * norm = model.layers[il].ffn_norm;
-        if (!norm) {
-            norm = model.layers[il].attn_post_norm;
-        }
-        if (!gate || !norm || gate->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32) {
-            continue;
-        }
-        const int64_t ne0 = gate->ne[0];
-        const int64_t n_exp = gate->ne[1];
-        if (n_exp != g_layers[il].n_expert || norm->ne[0] != ne0) {
-            continue;
-        }
-        pred_layer pl;
-        pl.il = il;
-        pl.n_routed = model.hparams.n_expert_used;
-        pl.norm.resize(ne0);
-        pl.gate.resize((size_t) n_exp*ne0);
-        ggml_backend_tensor_get(norm, pl.norm.data(), 0, ne0*sizeof(float));
-        ggml_backend_tensor_get(gate, pl.gate.data(), 0, (size_t) n_exp*ne0*sizeof(float));
-        g_pred_ix[g_layers[il].sd->counts->data] = (int) g_pred.size();
-        g_pred.push_back(std::move(pl));
-        mirror_bytes += (size_t) (n_exp + 1)*ne0*sizeof(float);
+    g_async_cv.notify_all();
+    if (g_async_worker.joinable()) {
+        g_async_worker.join();
     }
-    const bool want_worker = g_predict && g_poolB_bytes > 0 && g_pred.size() >= 2;
-    if (g_pred.size() >= 2 && (g_pred_log || want_worker)) {
-        tier_resolve_moe_hooks();
-        MOE_PREDICT_HOOK(pregate_hook);
+
+    for (auto & job : g_async_jobs) {
+        if (job.event) {
+            ggml_backend_event_free(job.event);
+            job.event = nullptr;
+        }
+        if (job.host_buffer) {
+            ggml_backend_buffer_free(job.host_buffer);
+            job.host_buffer = nullptr;
+        }
     }
-    if (want_worker) {
-        for (auto & kv : g_stores) {
-            store & st = kv.second;
-            if (!st.ptrs || !st.ptrs->data) {
+    g_async_jobs.clear();
+    g_async_queue.clear();
+    if (g_prefetch_backend) {
+        ggml_backend_free(g_prefetch_backend);
+        g_prefetch_backend = nullptr;
+    }
+    g_prefetch_ready = false;
+}
+
+static bool init_async_resources(ggml_backend_dev_t dev, size_t staging_size) {
+    if (!dev || staging_size == 0 || g_prefetch_streams != 1 || g_prefetch_max_inflight <= 0) {
+        return false;
+    }
+
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev, &props);
+    if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
+        TIER_LOG("expert_tier: async prefetch requires backend async, pinned-host, and event support\n");
+        return false;
+    }
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if (!host_buft) {
+        TIER_LOG("expert_tier: async prefetch has no device host-buffer type\n");
+        return false;
+    }
+
+    g_prefetch_backend = ggml_backend_dev_init(dev, nullptr);
+    if (!g_prefetch_backend) {
+        TIER_LOG("expert_tier: cannot create the async prefetch backend stream\n");
+        return false;
+    }
+
+    g_async_jobs.resize((size_t) g_prefetch_max_inflight);
+    for (auto & job : g_async_jobs) {
+        job.host_buffer = ggml_backend_buft_alloc_buffer(host_buft, staging_size);
+        job.event = ggml_backend_event_new(dev);
+        if (!job.host_buffer || !job.event) {
+            TIER_LOG("expert_tier: cannot allocate async prefetch staging/event resources\n");
+            shutdown_async_resources();
+            return false;
+        }
+        job.host_ptr = ggml_backend_buffer_get_base(job.host_buffer);
+        job.capacity = ggml_backend_buffer_get_size(job.host_buffer);
+    }
+
+    g_async_stop = false;
+    g_async_worker = std::thread(async_worker_main);
+    g_prefetch_ready = true;
+    atexit(shutdown_async_resources);
+    TIER_LOG("expert_tier: async prefetch ready: streams=1 max_inflight=%d staging=%.2f MiB\n",
+            g_prefetch_max_inflight, (double) staging_size/(1024.0*1024.0));
+    return true;
+}
+
+static int reserve_async_job() {
+    std::lock_guard<std::mutex> lock(g_async_mutex);
+    for (size_t i = 0; i < g_async_jobs.size(); ++i) {
+        if (!g_async_jobs[i].active) {
+            g_async_jobs[i].active = true;
+            g_async_jobs[i].completed = false;
+            g_async_jobs[i].completed_us = 0;
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+static bool warm_expert_pending(const layer_tier & L, int expert) {
+    return std::find(L.warm_pending.begin(), L.warm_pending.end(), expert) != L.warm_pending.end();
+}
+
+static void poll_async_completions() {
+    struct completion {
+        int layer;
+        int slot;
+        int expert;
+        uint64_t bytes;
+        int64_t started_us;
+        int64_t completed_us;
+    };
+    std::vector<completion> completed;
+
+    {
+        std::lock_guard<std::mutex> lock(g_async_mutex);
+        for (auto & job : g_async_jobs) {
+            if (!job.active || !job.completed) {
                 continue;
             }
-            layer_tier & L = g_layers[st.il];
-            if (!L.poolB || L.n_slotsB <= 0) {
-                continue;
-            }
-            probe_ctx c{ L.lutB.get(), L.stateB.get(), L.ownersB.data(),
-                         L.poolB, (int64_t) L.pool_slot_bytes, (int64_t) st.pool_off };
-            g_probe_ix[st.ptrs->data] = c;
+            completed.push_back({job.layer, job.slot, job.expert, job.bytes, job.started_us, job.completed_us});
+            job.active = false;
+            job.completed = false;
+            job.layer = -1;
+            job.slot = -1;
+            job.expert = -1;
+            job.bytes = 0;
         }
-        tier_resolve_moe_hooks();
-        MOE_PROBE_HOOK(pregate_probe);
-        for (int i = 0; i < g_n_workers; i++) {
-            g_workers.emplace_back(prefetch_worker);
+    }
+
+    std::vector<bool> changed(g_layers.size(), false);
+    for (const auto & done : completed) {
+        if (done.layer < 0 || done.layer >= (int) g_layers.size()) {
+            TIER_LOG("expert_tier: FATAL async completion has invalid layer=%d\n", done.layer);
+            abort();
         }
-        atexit(pred_shutdown); // registered after dump_stats: runs first (reverse order)
+        layer_tier & L = g_layers[done.layer];
+        const int warm_index = done.slot - L.warm_cache.n_fixed();
+        if (warm_index < 0 || warm_index >= (int) L.warm_pending.size() ||
+                L.warm_pending[warm_index] != done.expert) {
+            TIER_LOG("expert_tier: FATAL async completion mismatch layer=%d expert=%d slot=%d request=%llu\n",
+                    done.layer, done.expert, done.slot, (unsigned long long) g_request_id);
+            abort();
+        }
+        try {
+            L.warm_cache.bind_ready_warm_slot(done.slot, done.expert);
+        } catch (const std::exception & error) {
+            TIER_LOG("expert_tier: FATAL async publish layer=%d expert=%d slot=%d: %s\n",
+                    done.layer, done.expert, done.slot, error.what());
+            abort();
+        }
+        if (g_warm_admission != warm_admission_mode::immediate) {
+            L.warm_admission.mark_resident(done.expert);
+        }
+        L.warm_pending[warm_index] = -1;
+        L.lut_host = L.warm_cache.lut();
+        changed[done.layer] = true;
+        g_h2d_copy_us += std::max<int64_t>(0, done.completed_us - done.started_us);
     }
-    char wrk[64] = "";
-    if (want_worker) {
-        snprintf(wrk, sizeof(wrk), ", prefetching (%d threads)", g_n_workers);
+
+    for (size_t layer = 0; layer < changed.size(); ++layer) {
+        if (changed[layer]) {
+            upload_warm_maps(g_layers[layer]);
+            warm_invariant_abort(g_layers[layer], "async_publish");
+        }
     }
-    TIER_LOG("%s: pre-gate predictor: %zu layers, %.1f MiB mirrors%s\n", __func__,
-            g_pred.size(), (double) mirror_bytes/(1024.0*1024.0),
-            want_worker ? wrk : (g_pred.size() >= 2 && g_pred_log ? ", logging" : " (inactive)"));
 }
 
+static bool schedule_async_copy(layer_tier & L, llama_expert_cache::state & next,
+        int expert, const llama_expert_cache::insertion & target) {
+    const int job_index = reserve_async_job();
+    if (job_index < 0) {
+        return false;
+    }
 
+    async_copy_job & job = g_async_jobs[(size_t) job_index];
+    size_t staging_offset = 0;
+    for (const auto & kv : L.ws) {
+        const ggml_tensor * weight = kv.first;
+        const size_t slice = ggml_nbytes(weight)/L.n_expert;
+        if (staging_offset + slice > job.capacity) {
+            TIER_LOG("expert_tier: FATAL async staging overflow layer=%d expert=%d need=%zu capacity=%zu\n",
+                    L.il, expert, staging_offset + slice, job.capacity);
+            abort();
+        }
+        memcpy((char *) job.host_ptr + staging_offset, (const char *) weight->data + slice*expert, slice);
+        staging_offset += slice;
+    }
 
-// RAM pool (LLAMA_EXPERT_RAMPOOL): per-layer contiguous blocks, one tier
-// below VRAM. cold ops read weights through store::ptrs (pool slot or mmap
-// fallback). all mutations happen on the host between compute steps (post
-// sched sync); the compute threads only read the tables, lock-free.
-#define POOL_ALIGN 64
+    next.evict_warm_slot(target.slot);
+    const int warm_index = target.slot - next.n_fixed();
+    if (warm_index < 0 || warm_index >= (int) L.warm_pending.size() || L.warm_pending[warm_index] >= 0) {
+        TIER_LOG("expert_tier: FATAL async reservation layer=%d expert=%d slot=%d\n", L.il, expert, target.slot);
+        abort();
+    }
+    L.warm_pending[warm_index] = expert;
 
-static size_t pool_align(size_t n) {
-    return (n + POOL_ALIGN - 1) & ~(size_t) (POOL_ALIGN - 1);
-}
-
-// point every store's ptrs[e] at the expert's current location
-static void pool_publish(layer_tier & L, int e) {
-    const int k = L.pool_lut[e];
-    for (auto & kv : L.ws) {
+    staging_offset = 0;
+    for (const auto & kv : L.ws) {
+        const ggml_tensor * weight = kv.first;
         store & st = *kv.second;
-        if (!st.ptrs) {
+        const size_t slice = ggml_nbytes(weight)/L.n_expert;
+        ggml_backend_tensor_set_async(g_prefetch_backend, st.w_hot,
+                (const char *) job.host_ptr + staging_offset, slice*target.slot, slice);
+        staging_offset += slice;
+    }
+    ggml_backend_event_record(job.event, g_prefetch_backend);
+
+    {
+        std::lock_guard<std::mutex> lock(g_async_mutex);
+        job.layer = L.il;
+        job.slot = target.slot;
+        job.expert = expert;
+        job.bytes = staging_offset;
+        job.started_us = 0;
+        g_async_queue.push_back((size_t) job_index);
+    }
+    g_async_cv.notify_one();
+
+    g_h2d_copies++;
+    g_h2d_bytes += staging_offset;
+    return true;
+}
+
+void configure_mtp(int mtp_n) {
+    llama_expert_lookahead::configure_mtp(mtp_n);
+    if (mtp_n <= 0) {
+        return;
+    }
+    const bool already_configured = g_mtp_n >= mtp_n;
+    g_mtp_n = std::max(g_mtp_n, mtp_n);
+    if (g_adapt_interval == adapt_interval::graph) {
+        g_adapt_interval = adapt_interval::request;
+        TIER_LOG("expert_tier: MTP-%d forces request-boundary adaptation; graph-granular repinning is unsafe across shared target/draft state\n",
+                g_mtp_n);
+    }
+    if (already_configured) {
+        return;
+    }
+    if (warm_mtp_experimental()) {
+        TIER_LOG("expert_tier: WARNING experimental warm cache with MTP-%d explicitly enabled; deterministic equivalence is not established\n",
+                g_mtp_n);
+        return;
+    }
+
+    g_warm_mtp_guarded = true;
+    if (g_layers.empty()) {
+        return;
+    }
+
+    // Context creation is a graph-free boundary. Drain dedicated transfers,
+    // remove all warm ownership, and restore CPU fallback before an MTP
+    // context can share the process-wide tier state.
+    if (g_prefetch_ready) {
+        shutdown_async_resources();
+    }
+    for (auto & L : g_layers) {
+        if (!L.warm_enabled) {
             continue;
         }
-        const size_t slice = ggml_nbytes(kv.first)/L.n_expert;
-        const char * addr = k >= 0 ? L.pool + (size_t) k*L.pool_slot_bytes + st.pool_off
-                                   : (const char *) kv.first->data + slice*e;
-        ((int64_t *) st.ptrs->data)[e] = (int64_t) (uintptr_t) addr;
-    }
-}
-
-// copy expert e from the mmap source into pool slot k and publish it; the
-// mmap copy is dropped afterwards: the pool is the sole resident copy
-static void pool_fill(layer_tier & L, int k, int e) {
-    int32_t free_state = 0;
-    if (!L.pool_slot_state[k].compare_exchange_strong(free_state, 3, std::memory_order_acquire)) {
-        return;
-    }
-    const int64_t t0 = ggml_time_us();
-    for (auto & kv : L.ws) {
-        store & st = *kv.second;
-        const size_t slice = ggml_nbytes(kv.first)/L.n_expert;
-        const char * src = (const char *) kv.first->data + slice*e;
-        memcpy(L.pool + (size_t) k*L.pool_slot_bytes + st.pool_off, src, slice);
-        if (st.poolable) {
-            tier_madvise(src, slice, true);
+        for (int slot = L.warm_cache.n_fixed(); slot < L.warm_cache.sentinel(); ++slot) {
+            L.warm_cache.evict_warm_slot(slot);
         }
+        std::fill(L.warm_pending.begin(), L.warm_pending.end(), -1);
+        L.lut_host = L.warm_cache.lut();
+        upload_warm_maps(L);
+        warm_invariant_abort(L, "mtp_guard");
     }
-    g_fetch_us += (uint64_t)(ggml_time_us() - t0);
-    L.pool_slot_expert[k] = e;
-    L.pool_lut[e] = k;
-    L.pool_dwell[k] = 0;
-    pool_publish(L, e);
-    g_pool_fills++;
+    g_prefetch_requested = false;
+    TIER_LOG("expert_tier: warm cache disabled for MTP-%d; set LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL=1 only for controlled diagnostics\n",
+            g_mtp_n);
 }
 
-static void pool_evict(layer_tier & L, int k) {
-    const int e = L.pool_slot_expert[k];
-    if (e < 0) {
-        return;
-    }
-    L.pool_slot_expert[k] = -1;
-    L.pool_lut[e] = -1;
-    L.pool_slot_state[k].store(0, std::memory_order_release);
-    L.pool_dwell[k] = 0;
-    pool_publish(L, e); // back to the mmap fallback
-    g_pool_evictions++;
-}
-
-static bool parse_heat_csv(const std::string & path, int n_layer,
+static bool parse_heat_csv(const std::string & path, int n_layer, int n_expert,
         std::vector<std::vector<std::pair<int64_t, int32_t>>> & heat) {
     std::ifstream in(path);
     if (!in) {
         LLAMA_LOG_ERROR("%s: cannot open heat csv '%s'\n", __func__, path.c_str());
         return false;
     }
-    heat.resize(n_layer);
+    heat.assign(n_layer, {});
+    std::vector<std::vector<bool>> seen(n_layer, std::vector<bool>(n_expert, false));
     std::string line;
-    std::getline(in, line); // header
+    if (!std::getline(in, line)) {
+        LLAMA_LOG_ERROR("%s: heat csv '%s' is empty\n", __func__, path.c_str());
+        return false;
+    }
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    if (line != "layer,expert,count") {
+        LLAMA_LOG_ERROR("%s: heat csv '%s' has invalid header '%s'\n", __func__, path.c_str(), line.c_str());
+        return false;
+    }
+    int line_no = 1;
     while (std::getline(in, line)) {
+        line_no++;
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            LLAMA_LOG_ERROR("%s: heat csv '%s' has an empty row at line %d\n", __func__, path.c_str(), line_no);
+            return false;
+        }
+        if (line.back() == ',') {
+            LLAMA_LOG_ERROR("%s: heat csv '%s' has an empty trailing column at line %d\n", __func__, path.c_str(), line_no);
+            return false;
+        }
         std::stringstream ss(line);
         std::string tok;
         std::vector<int64_t> vals;
-        while (std::getline(ss, tok, ',')) {
-            vals.push_back(std::stoll(tok));
+        try {
+            while (std::getline(ss, tok, ',')) {
+                size_t used = 0;
+                const int64_t value = std::stoll(tok, &used);
+                if (used != tok.size()) {
+                    throw std::invalid_argument("trailing characters");
+                }
+                vals.push_back(value);
+            }
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: heat csv '%s' has an invalid integer at line %d: %s\n", __func__, path.c_str(), line_no, e.what());
+            return false;
         }
-        if (vals.size() < 3) {
-            continue;
+        if (vals.size() != 3) {
+            LLAMA_LOG_ERROR("%s: heat csv '%s' line %d has %zu columns, expected 3\n", __func__, path.c_str(), line_no, vals.size());
+            return false;
+        }
+        if (vals[0] < 0 || vals[0] >= n_layer) {
+            LLAMA_LOG_ERROR("%s: heat csv '%s' line %d has layer %lld outside [0, %d)\n", __func__, path.c_str(), line_no, (long long) vals[0], n_layer);
+            return false;
         }
         const int il = (int) vals[0];
-        if (il < 0 || il >= n_layer) {
-            continue;
+        if (vals[1] < 0 || vals[1] >= n_expert) {
+            LLAMA_LOG_ERROR("%s: heat csv '%s' line %d has expert %lld outside [0, %d)\n", __func__, path.c_str(), line_no, (long long) vals[1], n_expert);
+            return false;
         }
-        heat[il].emplace_back(vals[2], (int32_t) vals[1]);
+        const int expert = (int) vals[1];
+        if (vals[2] < 0) {
+            LLAMA_LOG_ERROR("%s: heat csv '%s' line %d has negative count %lld\n", __func__, path.c_str(), line_no, (long long) vals[2]);
+            return false;
+        }
+        if (seen[il][expert]) {
+            LLAMA_LOG_ERROR("%s: heat csv '%s' line %d duplicates layer %d expert %d\n", __func__, path.c_str(), line_no, il, expert);
+            return false;
+        }
+        seen[il][expert] = true;
+        heat[il].emplace_back(vals[2], (int32_t) expert);
     }
     return true;
 }
 
-// consume selection counts, update decayed scores + cumulative stats, and
-// (LLAMA_EXPERT_ADAPT) repin at most one slot. called at graph build time,
-// i.e. between compute steps; counts are written by the fused cold op.
-static void maybe_update(layer_tier & L) {
+static void copy_expert_to_slot(const layer_tier & L, int expert, int slot) {
+    const int64_t started = ggml_time_us();
+    uint64_t copied = 0;
+    for (const auto & kv : L.ws) {
+        const ggml_tensor * w = kv.first;
+        store & st = *kv.second;
+        const size_t slice = ggml_nbytes(w)/L.n_expert;
+        ggml_backend_tensor_set(st.w_hot, (const char *) w->data + slice*expert, slice*slot, slice);
+        copied += slice;
+    }
+    g_h2d_copies++;
+    g_h2d_bytes += copied;
+    g_h2d_copy_us += ggml_time_us() - started;
+}
+
+// Warm-cache updates are graph-granular: all counts from one completed graph
+// are classified against one stable LUT. Up to W highest-frequency cold
+// experts from that graph are admitted, and a newly written slot is protected
+// from being replaced again in the same transaction.
+static bool maybe_repin_warm_fixed(layer_tier & L, llama_expert_cache::state & next) {
+    if (!g_adapt) {
+        return false;
+    }
+
+    int fixed_slot = -1;
+    float fixed_score = FLT_MAX;
+    for (int slot = 0; slot < next.n_fixed(); ++slot) {
+        const int expert = next.expert_in_slot(slot);
+        const float score = expert < 0 ? 0.0f : L.score[expert];
+        if (score < fixed_score) {
+            fixed_score = score;
+            fixed_slot = slot;
+        }
+    }
+
+    int candidate = -1;
+    float candidate_score = 0.0f;
+    for (int expert = 0; expert < L.n_expert; ++expert) {
+        if (next.locate(expert) != llama_expert_cache::location::fixed &&
+                !warm_expert_pending(L, expert) && L.score[expert] > candidate_score) {
+            candidate_score = L.score[expert];
+            candidate = expert;
+        }
+    }
+
+    if (fixed_slot < 0 || candidate < 0) {
+        return false;
+    }
+
+    const int incumbent = next.expert_in_slot(fixed_slot);
+    if (incumbent >= 0 && (L.dwell[fixed_slot] < 32 || candidate_score <= 1.5f*fixed_score)) {
+        return false;
+    }
+
+    const bool from_warm = next.locate(candidate) == llama_expert_cache::location::warm;
+    copy_expert_to_slot(L, candidate, fixed_slot);
+    next.replace_fixed(fixed_slot, candidate);
+    if (g_warm_admission != warm_admission_mode::immediate) {
+        L.warm_admission.mark_resident(candidate);
+    }
+    L.dwell[fixed_slot] = 0;
+    g_repins++;
+    if (from_warm) {
+        L.warm_to_fixed++;
+        g_warm_to_fixed++;
+    }
+    return true;
+}
+
+static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
+    if (!L.sd || !L.sd->counts->data) {
+        return;
+    }
+    int32_t * cnt = (int32_t *) L.sd->counts->data;
+    const int n = L.n_expert;
+    if (cnt[n] == 0) {
+        return;
+    }
+
+    static const float decay = [] {
+        const char * e = getenv("LLAMA_EXPERT_DECAY");
+        return e ? (float) atof(e) : 1.0f;
+    }();
+
+    const bool use_probation = g_warm_admission != warm_admission_mode::immediate;
+    const bool use_frequency = g_warm_admission == warm_admission_mode::frequency;
+    if (use_probation) {
+        L.warm_admission.next_epoch();
+    }
+    const float frequency_decay = use_frequency ? powf(0.5f, 1.0f/(float) g_warm_admission_window) : 0.0f;
+
+    std::vector<std::pair<int32_t, int>> cold_selected;
+    for (int expert = 0; expert < n; ++expert) {
+        const int32_t selected = cnt[expert];
+        if (use_frequency) {
+            L.warm_frequency[expert] = L.warm_frequency[expert]*frequency_decay + (float) selected;
+        }
+        L.score[expert] = L.score[expert]*decay + (float) selected;
+        L.cum[expert] += (uint64_t) selected;
+        L.observed[expert] += (uint64_t) selected;
+        if (selected > 0) {
+            switch (L.warm_cache.locate(expert)) {
+                case llama_expert_cache::location::fixed:
+                    L.cum_fixed += (uint64_t) selected;
+                    if (use_probation) {
+                        L.warm_admission.mark_resident(expert);
+                    }
+                    break;
+                case llama_expert_cache::location::warm:
+                    L.cum_warm += (uint64_t) selected;
+                    L.warm_cache.touch_warm(expert);
+                    if (use_probation) {
+                        L.warm_admission.mark_resident(expert);
+                    }
+                    break;
+                case llama_expert_cache::location::cold:
+                    L.cum_cold += (uint64_t) selected;
+                    if ((!use_probation || L.warm_admission.record_miss(expert)) &&
+                            !warm_expert_pending(L, expert)) {
+                        cold_selected.emplace_back(selected, expert);
+                    } else {
+                        L.warm_admission_deferrals++;
+                        g_warm_admission_deferrals++;
+                    }
+                    break;
+            }
+        }
+        cnt[expert] = 0;
+    }
+    L.cum_total += (uint64_t) cnt[n];
+    L.cum_graphs++;
+    cnt[n] = 0;
+
+    llama_expert_cache::state next = L.warm_cache;
+    bool maps_changed = false;
+
+    if (g_adapt) {
+        for (int slot = 0; slot < next.n_fixed(); ++slot) {
+            L.dwell[slot]++;
+        }
+    }
+    if (allow_fixed_repin && maybe_repin_warm_fixed(L, next)) {
+        maps_changed = true;
+    }
+
+    if (g_warm_mtp_guarded) {
+        if (maps_changed) {
+            L.warm_cache = std::move(next);
+            L.lut_host = L.warm_cache.lut();
+            upload_warm_maps(L);
+        }
+        warm_invariant_abort(L, "mtp_guarded_update");
+        return;
+    }
+
+    std::sort(cold_selected.begin(), cold_selected.end(), [](const auto & a, const auto & b) {
+        if (a.first != b.first) {
+            return a.first > b.first;
+        }
+        return a.second < b.second;
+    });
+
+    std::vector<bool> protected_slots(next.n_slots(), false);
+    for (size_t warm_index = 0; warm_index < L.warm_pending.size(); ++warm_index) {
+        if (L.warm_pending[warm_index] >= 0) {
+            protected_slots[(size_t) next.n_fixed() + warm_index] = true;
+        }
+    }
+    int admitted = 0;
+    for (const auto & selected : cold_selected) {
+        if (admitted >= next.n_warm() || next.locate(selected.second) != llama_expert_cache::location::cold) {
+            continue;
+        }
+        const auto target = next.insertion_target(protected_slots);
+        if (!target) {
+            continue;
+        }
+        if (use_frequency) {
+            if (target.evicted >= 0 &&
+                    L.warm_frequency[selected.second] <= L.warm_frequency[target.evicted]) {
+                L.warm_admission_deferrals++;
+                g_warm_admission_deferrals++;
+                continue;
+            }
+        }
+        if (g_prefetch_ready) {
+            if (!schedule_async_copy(L, next, selected.second, target)) {
+                break;
+            }
+            protected_slots[target.slot] = true;
+            L.warm_promotions++;
+            g_warm_promotions++;
+            if (target.evicted >= 0) {
+                L.warm_evictions++;
+                g_warm_evictions++;
+            }
+            admitted++;
+            maps_changed = true;
+            continue;
+        }
+        const auto inserted = next.insert_warm(selected.second, protected_slots);
+        if (!inserted) {
+            continue;
+        }
+        copy_expert_to_slot(L, selected.second, inserted.slot);
+        if (use_probation) {
+            L.warm_admission.mark_resident(selected.second);
+        }
+        protected_slots[inserted.slot] = true;
+        L.warm_promotions++;
+        g_warm_promotions++;
+        if (inserted.evicted >= 0) {
+            L.warm_evictions++;
+            g_warm_evictions++;
+        }
+        admitted++;
+        maps_changed = true;
+    }
+
+    if (maps_changed) {
+        L.warm_cache = std::move(next);
+        L.lut_host = L.warm_cache.lut();
+        upload_warm_maps(L);
+    }
+    warm_invariant_abort(L, "update");
+}
+
+static void fixed_invariant_abort(const layer_tier & L, const char * where) {
+    auto fail = [&](int expert, int slot, const char * reason) {
+        TIER_LOG("expert_tier: FATAL fixed invariant at %s layer=%d expert=%d slot=%d sentinel=%d request=%llu mtp=%d: %s\n",
+                where, L.il, expert, slot, L.sentinel, (unsigned long long) g_request_id, g_mtp_n, reason);
+        abort();
+    };
+
+    if (L.sentinel < 0 || L.sentinel >= L.n_slots || L.sentinel != L.n_slots - 1 ||
+            L.slot_expert.size() != (size_t) L.n_slots || L.lut_host.size() != (size_t) L.n_expert) {
+        fail(-1, L.sentinel, "invalid slot or sentinel dimensions");
+    }
+    if (L.slot_expert[L.sentinel] != -1) {
+        fail(L.slot_expert[L.sentinel], L.sentinel, "sentinel owns an expert");
+    }
+
+    std::vector<int> seen(L.n_expert, 0);
+    for (int slot = 0; slot < L.sentinel; ++slot) {
+        const int expert = L.slot_expert[slot];
+        if (expert < 0 || expert >= L.n_expert) {
+            fail(expert, slot, "fixed slot has no valid expert");
+        }
+        if (++seen[expert] != 1) {
+            fail(expert, slot, "expert appears in more than one fixed slot");
+        }
+        if (L.lut_host[expert] != slot) {
+            fail(expert, slot, "slot owner disagrees with LUT");
+        }
+    }
+
+    for (int expert = 0; expert < L.n_expert; ++expert) {
+        const int slot = L.lut_host[expert];
+        if (slot < 0 || slot > L.sentinel) {
+            fail(expert, slot, "LUT points outside fixed/sentinel range");
+        }
+        if (slot < L.sentinel && L.slot_expert[slot] != expert) {
+            fail(expert, slot, "LUT owner disagrees with fixed slot");
+        }
+        for (const auto & kv : L.ws) {
+            const int32_t * mask = (const int32_t *) kv.second->mask->data;
+            const int expected = slot == L.sentinel ? 1 : 0;
+            if (!mask || mask[expert] != expected) {
+                fail(expert, slot, "CPU mask disagrees with LUT");
+            }
+        }
+    }
+}
+
+// Counts are written by the fused cold/count op and consumed only after the
+// guarded scheduler barrier. Harvesting never changes GPU ownership.
+static void harvest_fixed_counts(layer_tier & L) {
     if (!L.sd || !L.sd->counts->data) {
         return;
     }
@@ -931,23 +957,15 @@ static void maybe_update(layer_tier & L) {
 
     static const float decay = [] {
         const char * e = getenv("LLAMA_EXPERT_DECAY");
-        return e ? (float) atof(e) : 0.999f;
+        return e ? (float) atof(e) : 1.0f;
     }();
 
     for (int e = 0; e < n; e++) {
-        if (cnt[e] > 0) {
-            g_dirty = true;
-        }
         L.score[e] = L.score[e]*decay + (float) cnt[e];
         L.cum[e]  += (uint64_t) cnt[e];
+        L.observed[e] += (uint64_t) cnt[e];
         if (mask[e]) {
             L.cum_cold += (uint64_t) cnt[e];
-            if (L.pool) {
-                g_pool_cold += (uint64_t) cnt[e];
-                if (L.pool_lut[e] >= 0) {
-                    g_pool_hits += (uint64_t) cnt[e];
-                }
-            }
         }
         cnt[e] = 0;
     }
@@ -955,227 +973,197 @@ static void maybe_update(layer_tier & L) {
     L.cum_graphs++;
     cnt[n] = 0;
 
-    // publish completed prefetch fills (READY -> RESIDENT); recycle any whose
-    // expert went hot mid-fill or that pool A picked up. then keep ~25% of
-    // slots free for the worker by evicting the oldest-timestamped.
-    if (L.poolB && L.n_slotsB > 0) {
-        for (int k = 0; k < L.n_slotsB; k++) {
-            if (L.stateB[k].load(std::memory_order_acquire) != 2) {
-                continue;
-            }
-            const int32_t e = L.ownersB[k];
-            if (tier_atomic_load_i32(&L.lut_host[e]) != L.sentinel || L.pool_lut[e].load(std::memory_order_relaxed) >= 0) {
-                L.lutB[e].store(-1, std::memory_order_release);
-                L.ownersB[k] = -1;
-                L.stateB[k].store(0, std::memory_order_release);
-                continue;
-            }
-            L.stateB[k].store(3, std::memory_order_release);
-            g_pred_published++;
-        }
-        int free_n = 0;
-        for (int k = 0; k < L.n_slotsB; k++) {
-            if (L.stateB[k].load(std::memory_order_acquire) == 0) {
-                free_n++;
-            }
-        }
-        const int target = L.n_slotsB/4 + 1;
-        while (free_n < target) {
-            int kv = -1;
-            int64_t tmin = INT64_MAX;
-            for (int k = 0; k < L.n_slotsB; k++) {
-                const int32_t st = L.stateB[k].load(std::memory_order_acquire);
-                if (st != 2 && st != 3) {
-                    continue;
-                }
-                const int64_t v = L.lastB[k].load(std::memory_order_acquire);
-                if (v < tmin) {
-                    tmin = v;
-                    kv = k;
-                }
-            }
-            if (kv < 0) {
-                break;
-            }
-            const int32_t e = L.ownersB[kv];
-            if (e >= 0) {
-                L.lutB[e].store(-1, std::memory_order_release);
-            }
-            L.ownersB[kv] = -1;
-            L.stateB[kv].store(0, std::memory_order_release);
-            g_predB_evict++;
-            free_n++;
-        }
-    }
-
     if (!g_adapt) {
         return;
     }
 
-    for (int s = 0; s < L.n_slots; s++) {
-        L.dwell[s]++;
-    }
-
-    // coldest hot slot (empty slots count as score 0)
-    int si = -1;
-    float smin = FLT_MAX;
-    for (int s = 0; s < L.n_slots; s++) {
-        if (s == L.sentinel) {
-            continue;
-        }
-        const float v = L.slot_expert[s] < 0 ? 0.0f : L.score[L.slot_expert[s]];
-        if (v < smin) {
-            smin = v;
-            si = s;
-        }
-    }
-    // hottest cold expert
-    int ec = -1;
-    float sc = 0.0f;
-    for (int e = 0; e < n; e++) {
-        if (mask[e] && L.score[e] > sc) {
-            sc = L.score[e];
-            ec = e;
-        }
-    }
-    if (si >= 0 && ec >= 0) {
-        const int eold = L.slot_expert[si];
-        if (eold < 0 || (L.dwell[si] >= 32 && sc > 1.5f*smin)) {
-            const bool ec_pooled = L.pool && L.pool_lut[ec] >= 0;
-            tier_atomic_store_i32(&L.lut_host[ec], si); // pairs with worker reads
-            if (eold >= 0) {
-                tier_atomic_store_i32(&L.lut_host[eold], L.sentinel);
-            }
-            for (auto & kv : L.ws) {
-                const ggml_tensor * w = kv.first;
-                store & st = *kv.second;
-                const size_t slice = ggml_nbytes(w)/n;
-                // H2D source: the pool copy when resident (its mmap pages are dropped)
-                const char * srcp = st.ptrs ? (const char *) (uintptr_t) ((const int64_t *) st.ptrs->data)[ec]
-                                            : (const char *) w->data + slice*ec;
-                ggml_backend_tensor_set(st.w_hot, srcp, slice*si, slice);
-                if (st.discardable) {
-                    tier_madvise((const char *) w->data + slice*ec, slice, true);
-                    if (eold >= 0) {
-                        tier_madvise((const char *) w->data + slice*eold, slice, false);
-                    }
-                }
-                ggml_backend_tensor_set(st.lut, L.lut_host.data(), 0, n*sizeof(int32_t));
-                int32_t * m = (int32_t *) st.mask->data;
-                m[ec] = 0;
-                if (eold >= 0) {
-                    m[eold] = 1;
-                }
-            }
-            if (ec_pooled) {
-                // promotion consumed the pool copy; the slot goes back to empty.
-                // a FILLING slot is the worker's: the publish pass recycles it
-                // next window (the H2D above read ptrs = mmap, correct bytes).
-                const int k = L.pool_lut[ec];
-                if (L.pool_slot_state[k].load(std::memory_order_acquire) != 1) {
-                    L.pool_slot_expert[k] = -1;
-                    L.pool_slot_state[k].store(0, std::memory_order_release);
-                    L.pool_lut[ec] = -1;
-                    L.pool_dwell[k] = 0;
-                    pool_publish(L, ec);
-                    g_pool_evictions++;
-                }
-            }
-            L.slot_expert[si] = ec;
-            L.dwell[si] = 0;
-            g_repins++;
-        }
-    }
-
-    // RAM pool: same hysteresis shape as the hot tier, one level down
-    if (L.pool && L.n_pool_slots > 0) {
-        for (int k = 0; k < L.n_pool_slots; k++) {
-            L.pool_dwell[k]++;
-        }
-        // coldest pooled slot (empty slots count as score 0); FILLING/READY
-        // slots are the publish pass's (defensive: pool A never sees them)
-        int ki = -1;
-        float pmin = FLT_MAX;
-        for (int k = 0; k < L.n_pool_slots; k++) {
-            if (L.pool_slot_state[k].load(std::memory_order_acquire) == 1 ||
-                L.pool_slot_state[k].load(std::memory_order_acquire) == 2) {
-                continue;
-            }
-            const float v = L.pool_slot_expert[k] < 0 ? 0.0f : L.score[L.pool_slot_expert[k]];
-            if (v < pmin) {
-                pmin = v;
-                ki = k;
-            }
-        }
-        // hottest cold expert that is neither hot nor pooled
-        int ep = -1;
-        float sp = 0.0f;
-        for (int e = 0; e < n; e++) {
-            if (mask[e] && L.pool_lut[e] < 0 && L.score[e] > sp) {
-                sp = L.score[e];
-                ep = e;
-            }
-        }
-        if (ki >= 0 && ep >= 0 && g_pool_fill_budget >= L.pool_slot_bytes) {
-            const int ev = L.pool_slot_expert[ki];
-            if (ev < 0 || (L.pool_dwell[ki] >= 32 && sp > 1.5f*pmin)) {
-                pool_evict(L, ki);
-                pool_fill(L, ki, ep);
-                g_pool_fill_budget -= L.pool_slot_bytes;
-            }
-        }
+    for (int slot = 0; slot < L.sentinel; ++slot) {
+        L.dwell[slot]++;
     }
 }
 
+// Publish one replacement as a transaction: copy all weights first, then
+// publish every LUT/mask, and commit host ownership last.
+static bool maybe_repin_fixed(layer_tier & L) {
+    if (!g_adapt) {
+        return false;
+    }
+
+    llama_expert_adaptation::decision selected;
+    try {
+        selected = llama_expert_adaptation::select_fixed_repin(
+                L.slot_expert, L.lut_host, L.score, L.dwell, L.sentinel);
+    } catch (const std::exception & error) {
+        TIER_LOG("expert_tier: FATAL adaptation policy layer=%d request=%llu mtp=%d: %s\n",
+                L.il, (unsigned long long) g_request_id, g_mtp_n, error.what());
+        abort();
+    }
+    if (!selected) {
+        return false;
+    }
+
+    std::vector<int32_t> next_lut = L.lut_host;
+    std::vector<int32_t> next_slots = L.slot_expert;
+    next_lut[selected.replacement] = selected.slot;
+    if (selected.incumbent >= 0) {
+        next_lut[selected.incumbent] = L.sentinel;
+    }
+    next_slots[selected.slot] = selected.replacement;
+
+    for (auto & kv : L.ws) {
+        const ggml_tensor * w = kv.first;
+        store & st = *kv.second;
+        const size_t slice = ggml_nbytes(w)/L.n_expert;
+        if (slice != w->nb[2] || slice != st.w_hot->nb[2]) {
+            TIER_LOG("expert_tier: FATAL non-contiguous expert slice layer=%d tensor=%s slice=%zu source_stride=%zu hot_stride=%zu\n",
+                    L.il, w->name, slice, w->nb[2], st.w_hot->nb[2]);
+            abort();
+        }
+        ggml_backend_tensor_set(st.w_hot,
+                (const char *) w->data + slice*selected.replacement,
+                slice*selected.slot, slice);
+    }
+
+    std::vector<int32_t> next_mask(L.n_expert, 1);
+    for (int expert = 0; expert < L.n_expert; ++expert) {
+        next_mask[expert] = next_lut[expert] == L.sentinel ? 1 : 0;
+    }
+    for (auto & kv : L.ws) {
+        store & st = *kv.second;
+        ggml_backend_tensor_set(st.lut, next_lut.data(), 0, L.n_expert*sizeof(int32_t));
+        ggml_backend_tensor_set(st.mask, next_mask.data(), 0, L.n_expert*sizeof(int32_t));
+    }
+
+    L.lut_host = std::move(next_lut);
+    L.slot_expert = std::move(next_slots);
+    L.dwell[selected.slot] = 0;
+    g_repins++;
+    fixed_invariant_abort(L, "repin");
+    return true;
+}
+
+static void write_json_string(FILE * f, const std::string & value) {
+    fputc('"', f);
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': fputs("\\\"", f); break;
+            case '\\': fputs("\\\\", f); break;
+            case '\b': fputs("\\b", f); break;
+            case '\f': fputs("\\f", f); break;
+            case '\n': fputs("\\n", f); break;
+            case '\r': fputs("\\r", f); break;
+            case '\t': fputs("\\t", f); break;
+            default:
+                if (c < 0x20) {
+                    fprintf(f, "\\u%04x", c);
+                } else {
+                    fputc(c, f);
+                }
+                break;
+        }
+    }
+    fputc('"', f);
+}
+
+static bool write_usage_profile_atomic() {
+    if (g_usage_path.empty()) {
+        return false;
+    }
+
+    const std::string temporary = g_usage_path + ".tmp." + std::to_string(ggml_time_us());
+    FILE * f = fopen(temporary.c_str(), "w");
+    if (!f) {
+        TIER_LOG("expert_tier: cannot open usage checkpoint '%s': %s\n",
+                temporary.c_str(), strerror(errno));
+        return false;
+    }
+
+    fprintf(f, "layer,expert,count\n");
+    for (const auto & L : g_layers) {
+        const auto & usage = g_usage_mode == expert_usage_mode::session ? L.observed : L.cum;
+        for (int expert = 0; expert < (int) usage.size(); ++expert) {
+            if (usage[expert] > 0) {
+                fprintf(f, "%d,%d,%llu\n", L.il, expert, (unsigned long long) usage[expert]);
+            }
+        }
+    }
+
+    const bool write_ok = fflush(f) == 0 && !ferror(f);
+    const int close_result = fclose(f);
+    if (!write_ok || close_result != 0) {
+        const int saved_errno = errno;
+        std::remove(temporary.c_str());
+        TIER_LOG("expert_tier: failed to finish usage checkpoint '%s': %s\n",
+                temporary.c_str(), strerror(saved_errno));
+        return false;
+    }
+    if (std::rename(temporary.c_str(), g_usage_path.c_str()) != 0) {
+        const int saved_errno = errno;
+        std::remove(temporary.c_str());
+        TIER_LOG("expert_tier: cannot publish usage checkpoint '%s': %s\n",
+                g_usage_path.c_str(), strerror(saved_errno));
+        return false;
+    }
+    return true;
+}
+
 static void dump_stats() {
-    if (const char * p = getenv("LLAMA_EXPERT_STATS")) {
+    if (g_cpu_async) {
+        uint64_t jobs = 0;
+        uint64_t wait_us = 0;
+        ggml_cpu_moe_async_stats_get(&jobs, &wait_us);
+        TIER_LOG("expert_tier: CPU async cold jobs %llu join_wait_ms %.3f\n",
+                (unsigned long long) jobs, (double) wait_us/1000.0);
+    }
+    if (output_env_enabled("LLAMA_EXPERT_STATS")) {
+        const char * p = getenv("LLAMA_EXPERT_STATS");
         FILE * f = strcmp(p, "1") ? fopen(p, "w") : stderr;
         if (f) {
             fprintf(f, "expert_tier: repins %llu\n", (unsigned long long) g_repins);
-            if (g_pool_bytes) {
-                fprintf(f, "expert_pool: fills %llu evictions %llu hits %llu / %llu cold (%.1f%%) resident %.2f GiB\n",
-                        (unsigned long long) g_pool_fills, (unsigned long long) g_pool_evictions,
-                        (unsigned long long) g_pool_hits, (unsigned long long) g_pool_cold,
-                        g_pool_cold ? 100.0*(double) g_pool_hits/(double) g_pool_cold : 0.0,
-                        (double) g_pool_alloc/(double) (1 << 30));
-            }
-            if (g_pred.size() >= 2) {
-                fprintf(f, "expert_predict: pushes %llu fills %llu published %llu specevict %llu probe %llu/%llu drop hot %llu dup %llu budget %llu full %llu\n",
-                        (unsigned long long) g_pred_pushes, (unsigned long long) g_pred_fills,
-                        (unsigned long long) g_pred_published, (unsigned long long) g_predB_evict,
-                        (unsigned long long) g_probe_hits.load(), (unsigned long long) g_probe_miss.load(),
-                        (unsigned long long) g_pred_drop_hot, (unsigned long long) g_pred_drop_dup,
-                        (unsigned long long) g_pred_drop_budget, (unsigned long long) g_pred_drop_full);
-            }
-            if (g_stage_n > 0) {
-                fprintf(f, "expert_pread: fetches %llu bytes %llu stalls %llu fallbacks %llu fails %llu\n",
-                        (unsigned long long) g_stage_fetches.load(),
-                        (unsigned long long) g_stage_bytes.load(),
-                        (unsigned long long) g_stage_stalls.load(),
-                        (unsigned long long) g_stage_fallbacks.load(),
-                        (unsigned long long) g_stage_fails.load());
-            }
-            {
-                const uint64_t cold_us = MOE_TIMER_HOOK();
-                fprintf(f, "expert_timers: steps %llu fetch %llu us (%.2f ms/step) cold_compute %llu us (%.2f ms/step)\n",
-                        (unsigned long long) g_steps,
-                        (unsigned long long) g_fetch_us,
-                        g_steps ? (double) g_fetch_us / (double) g_steps / 1000.0 : 0.0,
-                        (unsigned long long) cold_us,
-                        g_steps ? (double) cold_us / (double) g_steps / 1000.0 : 0.0);
-            }
+            fprintf(f, "expert_tier: warm_admissions %llu warm_evictions %llu warm_to_fixed %llu h2d_copies %llu h2d_bytes %llu h2d_ms %.3f\n",
+                    (unsigned long long) g_warm_promotions, (unsigned long long) g_warm_evictions,
+                    (unsigned long long) g_warm_to_fixed, (unsigned long long) g_h2d_copies,
+                    (unsigned long long) g_h2d_bytes, (double) g_h2d_copy_us/1000.0);
+            fprintf(f, "expert_tier: warm_admission_deferrals %llu\n",
+                    (unsigned long long) g_warm_admission_deferrals);
             for (const auto & L : g_layers) {
                 if (L.ws.empty() || L.cum_total == 0) {
                     continue;
                 }
-                fprintf(f, "layer %2d: cold %llu / %llu (%.1f%%) graphs %llu\n", L.il,
-                        (unsigned long long) L.cum_cold, (unsigned long long) L.cum_total,
-                        100.0*(double) L.cum_cold/(double) L.cum_total,
-                        (unsigned long long) L.cum_graphs);
+                if (L.warm_enabled) {
+                    fprintf(f, "layer %2d: fixed %llu warm %llu cold %llu / %llu (%.1f%%) graphs %llu warm_admissions %llu evictions %llu warm_to_fixed %llu\n",
+                            L.il, (unsigned long long) L.cum_fixed, (unsigned long long) L.cum_warm,
+                            (unsigned long long) L.cum_cold, (unsigned long long) L.cum_total,
+                            100.0*(double) L.cum_cold/(double) L.cum_total,
+                            (unsigned long long) L.cum_graphs, (unsigned long long) L.warm_promotions,
+                            (unsigned long long) L.warm_evictions, (unsigned long long) L.warm_to_fixed);
+                } else {
+                    fprintf(f, "layer %2d: cold %llu / %llu (%.1f%%) graphs %llu\n", L.il,
+                            (unsigned long long) L.cum_cold, (unsigned long long) L.cum_total,
+                            100.0*(double) L.cum_cold/(double) L.cum_total,
+                            (unsigned long long) L.cum_graphs);
+                }
+                if (g_timing_enabled) {
+                    uint64_t runs = 0;
+                    uint64_t wall_us = 0;
+                    uint64_t gate_up_us = 0;
+                    uint64_t activation_us = 0;
+                    uint64_t down_us = 0;
+                    ggml_cpu_moe_profile_get(L.il, &runs, &wall_us);
+                    ggml_cpu_moe_profile_get_phases(L.il, &gate_up_us, &activation_us, &down_us);
+                    fprintf(f, "layer %2d: cpu_cold_ms %.3f cpu_gate_up_ms %.3f cpu_activation_ms %.3f cpu_down_ms %.3f cpu_cold_runs %llu\n", L.il,
+                            (double) wall_us/1000.0, (double) gate_up_us/1000.0,
+                            (double) activation_us/1000.0, (double) down_us/1000.0,
+                            (unsigned long long) runs);
+                }
             }
             // invariant: mask agrees with lut, slot<->expert bijection holds
             for (const auto & L : g_layers) {
                 if (!L.sd) {
+                    continue;
+                }
+                if (L.warm_enabled) {
+                    warm_invariant_abort(L, "stats");
                     continue;
                 }
                 const int32_t * m = (const int32_t *) L.sd->mask->data;
@@ -1194,34 +1182,6 @@ static void dump_stats() {
                         bad++;
                     }
                 }
-                if (L.pool) {
-                    for (int k = 0; k < L.n_pool_slots; k++) {
-                        if (L.pool_slot_expert[k] >= 0 && L.pool_lut[L.pool_slot_expert[k]] != k) {
-                            bad++;
-                        }
-                    }
-                    for (int e = 0; e < L.n_expert; e++) {
-                        const int k = L.pool_lut[e];
-                        if (k >= 0 && L.pool_slot_expert[k] != e) {
-                            bad++; // pool<->expert bijection, all claimed states
-                        } else if (k >= 0 && L.pool_slot_state[k] == 3 && m[e] != 1) {
-                            bad++; // resident implies cold
-                        }
-                    }
-                }
-                if (L.poolB) {
-                    for (int e = 0; e < L.n_expert; e++) {
-                        const int k = L.lutB[e];
-                        if (k >= 0 && L.ownersB[k] != e) {
-                            bad++;
-                        }
-                    }
-                    for (int k = 0; k < L.n_slotsB; k++) {
-                        if (L.ownersB[k] >= 0 && (int32_t) L.lutB[L.ownersB[k]].load() != k) {
-                            bad++;
-                        }
-                    }
-                }
                 if (bad) {
                     fprintf(f, "layer %2d: INVARIANT VIOLATIONS %d\n", L.il, bad);
                 }
@@ -1231,32 +1191,279 @@ static void dump_stats() {
             }
         }
     }
-    if (const char * p = getenv("LLAMA_EXPERT_USAGE")) {
+    if (!g_usage_path.empty()) {
+        write_usage_profile_atomic();
+    }
+    if (output_env_enabled("LLAMA_EXPERT_STATS_JSON")) {
+        const char * p = getenv("LLAMA_EXPERT_STATS_JSON");
         FILE * f = fopen(p, "w");
-        if (f) {
-            fprintf(f, "layer,expert,count\n");
-            for (const auto & L : g_layers) {
-                if (L.cum.empty()) {
-                    continue;
-                }
-                for (int e = 0; e < L.n_expert; e++) {
-                    if (L.cum[e] > 0) {
-                        fprintf(f, "%d,%d,%llu\n", L.il, e, (unsigned long long) L.cum[e]);
-                    }
-                }
-            }
-            fclose(f);
+        if (!f) {
+            TIER_LOG("expert_tier: cannot write JSON stats '%s': %s\n", p, strerror(errno));
+            return;
         }
+        uint64_t selected_total = 0;
+        uint64_t fixed_hits = 0;
+        uint64_t warm_hits = 0;
+        uint64_t cold_hits = 0;
+        uint64_t cpu_cold_us = 0;
+        uint64_t cpu_gate_up_us = 0;
+        uint64_t cpu_activation_us = 0;
+        uint64_t cpu_down_us = 0;
+        uint64_t cpu_async_jobs = 0;
+        uint64_t cpu_async_wait_us = 0;
+        ggml_cpu_moe_async_stats_get(&cpu_async_jobs, &cpu_async_wait_us);
+        int hot_slots_total = 0;
+        int hot_slots_min = INT32_MAX;
+        int hot_slots_max = 0;
+        for (const auto & L : g_layers) {
+            if (L.ws.empty()) {
+                continue;
+            }
+            selected_total += L.cum_total;
+            fixed_hits += L.warm_enabled ? L.cum_fixed : L.cum_total - L.cum_cold;
+            warm_hits += L.cum_warm;
+            cold_hits += L.cum_cold;
+            uint64_t runs = 0;
+            uint64_t wall_us = 0;
+            ggml_cpu_moe_profile_get(L.il, &runs, &wall_us);
+            cpu_cold_us += wall_us;
+            uint64_t gate_up_us = 0;
+            uint64_t activation_us = 0;
+            uint64_t down_us = 0;
+            ggml_cpu_moe_profile_get_phases(L.il, &gate_up_us, &activation_us, &down_us);
+            cpu_gate_up_us += gate_up_us;
+            cpu_activation_us += activation_us;
+            cpu_down_us += down_us;
+            hot_slots_total += L.n_fixed;
+            hot_slots_min = std::min(hot_slots_min, L.n_fixed);
+            hot_slots_max = std::max(hot_slots_max, L.n_fixed);
+        }
+        if (hot_slots_min == INT32_MAX) {
+            hot_slots_min = 0;
+        }
+        fputs("{\n  \"model\": ", f);
+        write_json_string(f, g_model_desc);
+        fprintf(f,
+                ",\n  \"context\": 0,\n  \"mtp_n\": %d,\n  \"timing_enabled\": %s,\n  \"layers\": [",
+                g_mtp_n, g_timing_enabled ? "true" : "false");
+        bool first = true;
+        for (const auto & L : g_layers) {
+            if (L.ws.empty()) {
+                continue;
+            }
+            uint64_t cpu_cold_runs = 0;
+            uint64_t layer_cpu_cold_us = 0;
+            uint64_t layer_gate_up_us = 0;
+            uint64_t layer_activation_us = 0;
+            uint64_t layer_down_us = 0;
+            ggml_cpu_moe_profile_get(L.il, &cpu_cold_runs, &layer_cpu_cold_us);
+            ggml_cpu_moe_profile_get_phases(L.il, &layer_gate_up_us, &layer_activation_us, &layer_down_us);
+            fprintf(f, "%s\n    {\"layer\": %d, \"fixed_slots\": %d, \"selected_total\": %llu, \"hot_hits\": %llu, \"warm_hits\": %llu, \"cold_hits\": %llu, \"warm_promotions\": %llu, \"warm_evictions\": %llu, \"cpu_cold_runs\": %llu, \"cpu_cold_ms\": %.3f, \"cpu_gate_up_ms\": %.3f, \"cpu_activation_ms\": %.3f, \"cpu_down_ms\": %.3f}",
+                    first ? "" : ",", L.il, L.n_fixed, (unsigned long long) L.cum_total,
+                    (unsigned long long) (L.warm_enabled ? L.cum_fixed : L.cum_total - L.cum_cold),
+                    (unsigned long long) L.cum_warm, (unsigned long long) L.cum_cold,
+                    (unsigned long long) L.warm_promotions, (unsigned long long) L.warm_evictions,
+                    (unsigned long long) cpu_cold_runs, (double) layer_cpu_cold_us/1000.0,
+                    (double) layer_gate_up_us/1000.0, (double) layer_activation_us/1000.0,
+                    (double) layer_down_us/1000.0);
+            first = false;
+        }
+        fprintf(f,
+                "\n  ],\n"
+                "  \"hot_slots_per_layer\": %d,\n"
+                "  \"hot_slots_total\": %d,\n"
+                "  \"hot_slots_min\": %d,\n"
+                "  \"hot_slots_max\": %d,\n"
+                "  \"warm_slots_per_layer\": %d,\n"
+                "  \"cpu_single_row_chunk\": %d,\n"
+                "  \"cpu_parallel_activation\": %s,\n"
+                "  \"cpu_down_prefetch\": %d,\n"
+                "  \"cpu_reuse_rows\": %s,\n"
+                "  \"cpu_multi_row\": %s,\n"
+                "  \"cpu_async\": %s,\n"
+                "  \"cpu_async_jobs\": %llu,\n"
+                "  \"cpu_async_wait_ms\": %.3f,\n"
+                "  \"selected_total\": %llu,\n"
+                "  \"hot_hits\": %llu,\n"
+                "  \"warm_hits\": %llu,\n"
+                "  \"cold_hits\": %llu,\n"
+                "  \"repins\": %llu,\n"
+                "  \"warm_promotions\": %llu,\n"
+                "  \"warm_evictions\": %llu,\n"
+                "  \"warm_admission_deferrals\": %llu,\n"
+                "  \"h2d_copies\": %llu,\n"
+                "  \"h2d_bytes\": %llu,\n"
+                "  \"h2d_copy_ms\": %.3f,\n"
+                "  \"cpu_expert_ms\": %.3f,\n"
+                "  \"cpu_gate_up_ms\": %.3f,\n"
+                "  \"cpu_activation_ms\": %.3f,\n"
+                "  \"cpu_down_ms\": %.3f,\n"
+                "  \"gpu_expert_ms\": 0.0,\n"
+                "  \"sync_wait_ms\": 0.0,\n"
+                "  \"decode_tokens\": 0,\n"
+                "  \"decode_tokens_per_second\": 0.0\n"
+                "}\n",
+                g_variable_placement ? -1 : g_S, hot_slots_total, hot_slots_min, hot_slots_max,
+                g_W, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "true" : "false",
+                g_cpu_down_prefetch, g_cpu_reuse_rows ? "true" : "false",
+                g_cpu_multi_row ? "true" : "false",
+                g_cpu_async ? "true" : "false", (unsigned long long) cpu_async_jobs,
+                (double) cpu_async_wait_us/1000.0,
+                (unsigned long long) selected_total, (unsigned long long) fixed_hits,
+                (unsigned long long) warm_hits, (unsigned long long) cold_hits,
+                (unsigned long long) g_repins, (unsigned long long) g_warm_promotions,
+                (unsigned long long) g_warm_evictions, (unsigned long long) g_warm_admission_deferrals,
+                (unsigned long long) g_h2d_copies,
+                (unsigned long long) g_h2d_bytes, (double) g_h2d_copy_us/1000.0,
+                (double) cpu_cold_us/1000.0, (double) cpu_gate_up_us/1000.0,
+                (double) cpu_activation_us/1000.0, (double) cpu_down_us/1000.0);
+        fclose(f);
+    }
+}
+
+static void discard_pre_request_counts() {
+    uint64_t discarded = 0;
+    for (auto & L : g_layers) {
+        if (!L.sd || !L.sd->counts->data) {
+            continue;
+        }
+        int32_t * cnt = (int32_t *) L.sd->counts->data;
+        discarded += (uint64_t) std::max<int32_t>(0, cnt[L.n_expert]);
+        memset(cnt, 0, ((size_t) L.n_expert + 1)*sizeof(int32_t));
+    }
+    if (discarded > 0) {
+        TIER_LOG("expert_tier: discarded %llu internal pre-request expert selections\n",
+                (unsigned long long) discarded);
     }
 }
 
 void update() {
-    g_pred_step.fetch_add(1, std::memory_order_relaxed);
-    g_steps++;
-    for (auto & L : g_layers) {
-        g_pool_fill_budget = 16 << 20;
-        maybe_update(L);
+    if (g_static_no_sync_active) {
+        return;
     }
+    if (g_prefetch_ready) {
+        // update() is called only after the just-submitted graph has completed.
+        // Publishing a finished slot here keeps one LUT stable for the entire
+        // graph, including a multi-token MTP verification graph.
+        poll_async_completions();
+    }
+    if (g_layers.empty()) {
+        return;
+    }
+    if (g_request_scoped && !g_request_seen) {
+        // llama_context performs internal warm-up computes while the server is
+        // loading. They are not workload observations and must not affect the
+        // learned scores or the persistent cumulative profile.
+        discard_pre_request_counts();
+        return;
+    }
+
+    const size_t begin = g_prefetch_ready ? g_async_layer_cursor % g_layers.size() : 0;
+    const bool publish_fixed = g_adapt && g_adapt_interval == adapt_interval::graph;
+    for (size_t offset = 0; offset < g_layers.size(); ++offset) {
+        auto & L = g_layers[(begin + offset) % g_layers.size()];
+        if (L.warm_enabled) {
+            maybe_update_warm(L, publish_fixed);
+        } else {
+            harvest_fixed_counts(L);
+            if (publish_fixed) {
+                maybe_repin_fixed(L);
+            }
+        }
+    }
+    if (g_prefetch_ready) {
+        // A global in-flight cap would otherwise always favor the first model
+        // layers. Rotate admission priority without skipping count harvesting.
+        g_async_layer_cursor = (begin + 1) % g_layers.size();
+    }
+}
+
+bool requires_post_graph_sync() {
+    return !g_static_no_sync_active;
+}
+
+void request_begin() {
+    std::unique_lock<std::mutex> graph_lock(g_graph_mutex, std::defer_lock);
+    if (requires_post_graph_sync()) {
+        graph_lock.lock();
+    }
+
+    if (g_adapt && g_adapt_interval == adapt_interval::request && g_request_id > 0) {
+        uint64_t published = 0;
+        for (auto & L : g_layers) {
+            if (L.ws.empty()) {
+                continue;
+            }
+            if (L.warm_enabled) {
+                llama_expert_cache::state next = L.warm_cache;
+                if (maybe_repin_warm_fixed(L, next)) {
+                    L.warm_cache = std::move(next);
+                    L.lut_host = L.warm_cache.lut();
+                    upload_warm_maps(L);
+                    warm_invariant_abort(L, "request_repin");
+                    published++;
+                }
+            } else if (maybe_repin_fixed(L)) {
+                published++;
+            }
+        }
+        if (published > 0) {
+            TIER_LOG("expert_tier: request boundary published %llu fixed repins before request %llu\n",
+                    (unsigned long long) published, (unsigned long long) (g_request_id + 1));
+        }
+    }
+
+    g_request_id++;
+    g_request_seen = true;
+    llama_expert_lookahead::request_begin();
+    if (!g_warm_reset_request) {
+        return;
+    }
+    for (auto & L : g_layers) {
+        if (L.warm_enabled) {
+            L.warm_cache.reset_warm_ages();
+            if (g_warm_admission != warm_admission_mode::immediate) {
+                L.warm_admission.reset(L.n_expert, (uint64_t) g_warm_admission_window);
+            }
+            if (g_warm_admission == warm_admission_mode::frequency) {
+                std::fill(L.warm_frequency.begin(), L.warm_frequency.end(), 0.0f);
+            }
+            warm_invariant_abort(L, "request_begin");
+        }
+    }
+}
+
+void request_end() {
+    llama_expert_lookahead::request_end();
+    if (!g_usage_checkpoint_request || g_usage_path.empty()) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> graph_lock(g_graph_mutex, std::defer_lock);
+    if (requires_post_graph_sync()) {
+        graph_lock.lock();
+    }
+    if (write_usage_profile_atomic()) {
+        TIER_LOG("expert_tier: atomically checkpointed learned usage after request %llu to %s\n",
+                (unsigned long long) g_request_id, g_usage_path.c_str());
+    }
+}
+
+std::vector<uint8_t> fixed_expert_mask(int il, int n_expert) {
+    if (n_expert <= 0) {
+        return {};
+    }
+    std::vector<uint8_t> result((size_t) n_expert, 0);
+    if (il < 0 || il >= (int) g_layers.size()) {
+        return result;
+    }
+    const auto & layer = g_layers[(size_t) il];
+    const int limit = std::min(n_expert, layer.n_expert);
+    for (int expert = 0; expert < limit; ++expert) {
+        const int slot = expert < (int) layer.lut_host.size() ? layer.lut_host[(size_t) expert] : layer.sentinel;
+        result[(size_t) expert] = slot >= 0 && slot < layer.n_fixed ? 1 : 0;
+    }
+    return result;
 }
 
 size_t expert_weight_bytes(const llama_model & model) {
@@ -1272,58 +1479,142 @@ size_t expert_weight_bytes(const llama_model & model) {
     return b;
 }
 
+static bool explicitly_requested_by_env() {
+    static const char * controls[] = {
+        "LLAMA_EXPERT_HOT",
+        "LLAMA_EXPERT_S",
+        "LLAMA_EXPERT_PLACEMENT",
+        "LLAMA_EXPERT_ADAPT",
+        "LLAMA_EXPERT_ADAPT_INTERVAL",
+        "LLAMA_EXPERT_ADAPT_CUDA_GRAPHS",
+        "LLAMA_EXPERT_STATS",
+        "LLAMA_EXPERT_USAGE",
+        "LLAMA_EXPERT_USAGE_CHECKPOINT",
+        "LLAMA_EXPERT_STATS_JSON",
+        "LLAMA_EXPERT_TIMING",
+        "LLAMA_EXPERT_CPU_CHUNK",
+        "LLAMA_EXPERT_CPU_ACT_PARALLEL",
+        "LLAMA_EXPERT_CPU_ASYNC",
+        "LLAMA_EXPERT_CPU_DOWN_PREFETCH",
+        "LLAMA_EXPERT_CPU_REUSE_ROWS",
+        "LLAMA_EXPERT_CPU_MULTI_ROW",
+        "LLAMA_EXPERT_SHARED_HOT_IDS",
+        "LLAMA_EXPERT_WARM_SLOTS",
+        "LLAMA_EXPERT_STATIC_NO_SYNC",
+        "LLAMA_EXPERT_LOOKAHEAD_TRACE",
+    };
+    for (const char * name : controls) {
+        if (getenv(name) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void configure_enabled(bool enabled) {
+    g_configured_enabled = enabled;
+
+    // CUDA graph support caches its environment decision during model load,
+    // before init() sees the model tensors. Establish the safe mutable-weight
+    // policy here; common.cpp calls this before llama_model_load_from_file().
+    const char * adapt_env = getenv("LLAMA_EXPERT_ADAPT");
+    const bool tier_requested = enabled || explicitly_requested_by_env();
+    const bool adapt_requested = adapt_env ? atoi(adapt_env) != 0 : tier_requested;
+    const char * warm_slots = getenv("LLAMA_EXPERT_WARM_SLOTS");
+    const bool warm_requested = warm_slots && strcmp(warm_slots, "0");
+    const bool mutable_weights = adapt_requested || warm_requested;
+    const bool keep_cuda_graphs = getenv("LLAMA_EXPERT_ADAPT_CUDA_GRAPHS") &&
+            !strcmp(getenv("LLAMA_EXPERT_ADAPT_CUDA_GRAPHS"), "1");
+    if (mutable_weights && (!keep_cuda_graphs || getenv("GGML_CUDA_DISABLE_GRAPHS"))) {
+        if (!getenv("GGML_CUDA_DISABLE_GRAPHS")) {
+#if defined(_WIN32)
+            _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
+#else
+            setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+#endif
+        }
+        g_mutable_disabled_cuda_graphs = true;
+    }
+}
+
+void configure_request_scoped(bool enabled) {
+    g_request_scoped = enabled;
+    g_request_seen = false;
+    llama_expert_lookahead::configure_request_scoped(enabled);
+}
+
 void init(const llama_model & model) {
+    // libllama's architecture and state tests create several unrelated model
+    // contexts in one process. The tier owns process-wide caches, so it must
+    // not attach implicitly to those direct API contexts. CLI/common users
+    // keep the zero-config -cmoe default via configure_enabled(true), while an
+    // explicit LLAMA_EXPERT_* control remains a supported direct opt-in.
+    if (!g_configured_enabled && !explicitly_requested_by_env()) {
+        return;
+    }
+    llama_expert_lookahead::init(model);
     if (!g_layers.empty()) {
         return; // already initialized
     }
+    char model_desc[256] = {};
+    llama_model_desc(&model, model_desc, sizeof(model_desc));
+    g_model_desc = model_desc;
+
     const char * env_s   = getenv("LLAMA_EXPERT_S");
     const char * env_hot = getenv("LLAMA_EXPERT_HOT");
+    const char * env_placement = getenv("LLAMA_EXPERT_PLACEMENT");
     if (const char * e = getenv("LLAMA_EXPERT_ADAPT")) {
         g_adapt = atoi(e) != 0;
     } else {
         g_adapt = true; // Auto-fit and online adaptation ON by default
     }
-    if (const char * e = getenv("LLAMA_EXPERT_MADVISE")) {
-        g_madvise = atoi(e) != 0;
-    }
-    if (const char * e = getenv("LLAMA_EXPERT_RAMPOOL")) {
-        g_pool_bytes = (size_t) (atof(e)*1073741824.0);
-    }
-    if (const char * e = getenv("LLAMA_EXPERT_PREDICT")) {
-        g_predict = atoi(e) != 0;
-    }
-    if (const char * e = getenv("LLAMA_EXPERT_PREDICT_LOG")) {
-        if (e[0]) {
-            g_pred_log = fopen(e, "w");
-            if (!g_pred_log) {
-                TIER_LOG("%s: cannot open predict log '%s'\n", __func__, e);
-            }
-            std::string rpath(e);
-            const auto dot = rpath.rfind('.');
-            if (dot != std::string::npos) {
-                rpath = rpath.substr(0, dot) + ".route" + rpath.substr(dot);
-            } else {
-                rpath += ".route";
-            }
-            g_route_log = fopen(rpath.c_str(), "w");
-            if (!g_route_log) {
-                TIER_LOG("%s: cannot open route trace '%s'\n", __func__, rpath.c_str());
-            }
+    if (const char * interval = getenv("LLAMA_EXPERT_ADAPT_INTERVAL")) {
+        if (!strcmp(interval, "request")) {
+            g_adapt_interval = adapt_interval::request;
+        } else if (!strcmp(interval, "graph")) {
+            g_adapt_interval = adapt_interval::graph;
+        } else {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_ADAPT_INTERVAL='%s'; expected request or graph\n",
+                    __func__, interval);
+            return;
         }
     }
-    if (const char * e = getenv("LLAMA_EXPERT_PREFETCH_MB")) {
-        g_work_budget = (int64_t) (atof(e)*1048576.0);
+    if (g_mtp_n > 0 && g_adapt_interval == adapt_interval::graph) {
+        g_adapt_interval = adapt_interval::request;
+        TIER_LOG("%s: MTP-%d forces LLAMA_EXPERT_ADAPT_INTERVAL=request\n", __func__, g_mtp_n);
     }
-    if (const char * e = getenv("LLAMA_EXPERT_PREFETCH_GB")) {
-        g_poolB_bytes = (size_t) (atof(e)*1073741824.0);
+    if (const char * cuda_graphs = getenv("LLAMA_EXPERT_ADAPT_CUDA_GRAPHS")) {
+        int value = 0;
+        if (!parse_nonnegative_int(cuda_graphs, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_ADAPT_CUDA_GRAPHS='%s'; expected 0 or 1\n",
+                    __func__, cuda_graphs);
+            return;
+        }
+        g_adapt_cuda_graphs_experimental = value == 1;
     }
-    if (const char * e = getenv("LLAMA_EXPERT_PREFETCH_THREADS")) {
-        g_n_workers = std::min(8, std::max(1, atoi(e)));
+    if (g_adapt && (!g_adapt_cuda_graphs_experimental || getenv("GGML_CUDA_DISABLE_GRAPHS"))) {
+        if (!getenv("GGML_CUDA_DISABLE_GRAPHS")) {
+#if defined(_WIN32)
+            _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
+#else
+            setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+#endif
+        }
+        g_mutable_disabled_cuda_graphs = true;
+        TIER_LOG("%s: CUDA graph capture/reuse disabled for mutable expert weights after a reproduced post-repin failure\n",
+                __func__);
+    } else if (g_adapt) {
+        TIER_LOG("%s: WARNING CUDA graph caching remains enabled during repinning by explicit diagnostic opt-in\n",
+                __func__);
     }
-    const bool want_pread = [] {
-        const char * e = getenv("LLAMA_EXPERT_PREAD");
-        return !e || atoi(e) != 0;
-    }();
+    if (const char * e = getenv("LLAMA_EXPERT_STATIC_NO_SYNC")) {
+        int value = 0;
+        if (!parse_nonnegative_int(e, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_STATIC_NO_SYNC='%s'; static no-sync disabled\n", __func__, e);
+        } else {
+            g_static_no_sync_requested = value == 1;
+        }
+    }
 
     bool manual_S = false;
     if (env_s) {
@@ -1334,100 +1625,357 @@ void init(const llama_model & model) {
     if (const char * e = getenv("LLAMA_EXPERT_TMAX")) {
         g_tmax = std::max(0, atoi(e));
     }
+    if (const char * e = getenv("LLAMA_EXPERT_VRAM_RESERVE_MIB")) {
+        if (!parse_nonnegative_int(e, g_vram_reserve_mib) || g_vram_reserve_mib > 65536) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_VRAM_RESERVE_MIB='%s'; expected 0..65536\n", __func__, e);
+            return;
+        }
+    }
+
+    bool warm_requested = false;
+    if (const char * e = getenv("LLAMA_EXPERT_WARM_SLOTS")) {
+        if (!strcmp(e, "auto")) {
+            g_warm_auto = true;
+            warm_requested = true;
+        } else if (!parse_nonnegative_int(e, g_W)) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_WARM_SLOTS='%s'; warm cache disabled\n", __func__, e);
+            g_W = 0;
+        } else {
+            warm_requested = g_W > 0;
+        }
+    }
+    if (warm_requested) {
+        if (const char * e = getenv("LLAMA_EXPERT_WARM_AUTO_MAX")) {
+            if (!parse_nonnegative_int(e, g_warm_auto_max) || g_warm_auto_max < 1 || g_warm_auto_max > 4096) {
+                TIER_LOG("%s: invalid LLAMA_EXPERT_WARM_AUTO_MAX='%s'; expected 1..4096\n", __func__, e);
+                return;
+            }
+        }
+        const char * policy = getenv("LLAMA_EXPERT_WARM_POLICY");
+        if (policy && strcmp(policy, "lru")) {
+            TIER_LOG("%s: unsupported LLAMA_EXPERT_WARM_POLICY='%s'; warm cache disabled\n", __func__, policy);
+            warm_requested = false;
+            g_warm_auto = false;
+            g_W = 0;
+        }
+        const char * reset = getenv("LLAMA_EXPERT_WARM_RESET");
+        if (reset && strcmp(reset, "request") && strcmp(reset, "persistent")) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_WARM_RESET='%s'; warm cache disabled\n", __func__, reset);
+            warm_requested = false;
+            g_warm_auto = false;
+            g_W = 0;
+        } else {
+            g_warm_reset_request = !reset || !strcmp(reset, "request");
+        }
+        const char * admission = getenv("LLAMA_EXPERT_WARM_ADMISSION");
+        if (!admission || !strcmp(admission, "immediate")) {
+            g_warm_admission = warm_admission_mode::immediate;
+        } else if (!strcmp(admission, "second-hit")) {
+            g_warm_admission = warm_admission_mode::second_hit;
+        } else if (!strcmp(admission, "frequency")) {
+            g_warm_admission = warm_admission_mode::frequency;
+        } else {
+            TIER_LOG("%s: unsupported LLAMA_EXPERT_WARM_ADMISSION='%s'; warm cache disabled\n", __func__, admission);
+            warm_requested = false;
+            g_warm_auto = false;
+            g_W = 0;
+        }
+        if (const char * e = getenv("LLAMA_EXPERT_WARM_ADMISSION_WINDOW")) {
+            if (!parse_nonnegative_int(e, g_warm_admission_window) || g_warm_admission_window == 0) {
+                TIER_LOG("%s: invalid LLAMA_EXPERT_WARM_ADMISSION_WINDOW='%s'; warm cache disabled\n", __func__, e);
+                warm_requested = false;
+                g_warm_auto = false;
+                g_W = 0;
+            }
+        }
+        int prefetch = 0;
+        if (const char * e = getenv("LLAMA_EXPERT_WARM_PREFETCH")) {
+            if (!parse_nonnegative_int(e, prefetch) || prefetch > 1) {
+                TIER_LOG("%s: invalid LLAMA_EXPERT_WARM_PREFETCH='%s'; warm cache disabled\n", __func__, e);
+                warm_requested = false;
+                g_warm_auto = false;
+                g_W = 0;
+            }
+        }
+        g_prefetch_requested = warm_requested && prefetch == 1;
+        if (g_prefetch_requested) {
+            if (const char * e = getenv("LLAMA_EXPERT_PREFETCH_STREAMS")) {
+                if (!parse_nonnegative_int(e, g_prefetch_streams) || g_prefetch_streams != 1) {
+                    TIER_LOG("%s: LLAMA_EXPERT_PREFETCH_STREAMS='%s' is unsupported; exactly one stream is required; warm cache disabled\n",
+                            __func__, e);
+                    warm_requested = false;
+                    g_warm_auto = false;
+                    g_W = 0;
+                }
+            }
+            if (const char * e = getenv("LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT")) {
+                if (!parse_nonnegative_int(e, g_prefetch_max_inflight) ||
+                        g_prefetch_max_inflight < 1 || g_prefetch_max_inflight > 64) {
+                    TIER_LOG("%s: invalid LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT='%s'; expected 1..64; warm cache disabled\n",
+                            __func__, e);
+                    warm_requested = false;
+                    g_warm_auto = false;
+                    g_W = 0;
+                }
+            }
+            if (!warm_requested) {
+                g_prefetch_requested = false;
+            }
+        } else if (getenv("LLAMA_EXPERT_PREFETCH_STREAMS") || getenv("LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT")) {
+            TIER_LOG("%s: prefetch stream/inflight settings ignored because LLAMA_EXPERT_WARM_PREFETCH is not 1\n", __func__);
+        }
+        if (!warm_requested) {
+            g_prefetch_requested = false;
+        }
+    }
+    const bool warm_config_requested = warm_requested;
+    if (warm_requested && g_mtp_n > 0 && g_warm_mtp_guarded) {
+        TIER_LOG("%s: warm cache guarded off for MTP-%d after deterministic mismatch; fixed hot tier remains enabled\n",
+                __func__, g_mtp_n);
+        warm_requested = false;
+        g_warm_auto = false;
+        g_W = 0;
+        g_prefetch_requested = false;
+    }
+    const bool stats_enabled = output_env_enabled("LLAMA_EXPERT_STATS");
+    const bool usage_enabled = output_env_enabled("LLAMA_EXPERT_USAGE");
+    const bool json_stats_enabled = output_env_enabled("LLAMA_EXPERT_STATS_JSON");
+    if (usage_enabled) {
+        g_usage_path = getenv("LLAMA_EXPERT_USAGE");
+        if (const char * checkpoint = getenv("LLAMA_EXPERT_USAGE_CHECKPOINT")) {
+            if (!strcmp(checkpoint, "request")) {
+                g_usage_checkpoint_request = true;
+            } else if (!strcmp(checkpoint, "exit")) {
+                g_usage_checkpoint_request = false;
+            } else {
+                TIER_LOG("%s: invalid LLAMA_EXPERT_USAGE_CHECKPOINT='%s'; expected request or exit\n",
+                        __func__, checkpoint);
+                return;
+            }
+        }
+    } else if (getenv("LLAMA_EXPERT_USAGE_CHECKPOINT")) {
+        TIER_LOG("%s: LLAMA_EXPERT_USAGE_CHECKPOINT is ignored because LLAMA_EXPERT_USAGE is disabled\n", __func__);
+    }
+    if (const char * timing = getenv("LLAMA_EXPERT_TIMING")) {
+        int value = 0;
+        if (!parse_nonnegative_int(timing, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_TIMING='%s'; expected 0 or 1\n", __func__, timing);
+            return;
+        }
+        g_timing_enabled = value == 1;
+    }
+    if (const char * chunk = getenv("LLAMA_EXPERT_CPU_CHUNK")) {
+        if (!parse_nonnegative_int(chunk, g_cpu_single_row_chunk) ||
+                g_cpu_single_row_chunk < 16 || g_cpu_single_row_chunk > 256 ||
+                (g_cpu_single_row_chunk & (g_cpu_single_row_chunk - 1)) != 0) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_CHUNK='%s'; expected a power of two in 16..256\n",
+                    __func__, chunk);
+            return;
+        }
+    }
+    if (const char * parallel = getenv("LLAMA_EXPERT_CPU_ACT_PARALLEL")) {
+        int value = 0;
+        if (!parse_nonnegative_int(parallel, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_ACT_PARALLEL='%s'; expected 0 or 1\n",
+                    __func__, parallel);
+            return;
+        }
+        g_cpu_parallel_activation = value == 1;
+    }
+    if (const char * async = getenv("LLAMA_EXPERT_CPU_ASYNC")) {
+        int value = 0;
+        if (!parse_nonnegative_int(async, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_ASYNC='%s'; expected 0 or 1\n",
+                    __func__, async);
+            return;
+        }
+        g_cpu_async = value == 1;
+    }
+    if (const char * prefetch = getenv("LLAMA_EXPERT_CPU_DOWN_PREFETCH")) {
+        if (!parse_nonnegative_int(prefetch, g_cpu_down_prefetch) || g_cpu_down_prefetch > 8) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_DOWN_PREFETCH='%s'; expected 0..8\n",
+                    __func__, prefetch);
+            return;
+        }
+    }
+    if (const char * reuse = getenv("LLAMA_EXPERT_CPU_REUSE_ROWS")) {
+        int value = 0;
+        if (!parse_nonnegative_int(reuse, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_REUSE_ROWS='%s'; expected 0 or 1\n",
+                    __func__, reuse);
+            return;
+        }
+        g_cpu_reuse_rows = value == 1;
+    }
+    if (const char * multi = getenv("LLAMA_EXPERT_CPU_MULTI_ROW")) {
+        int value = 0;
+        if (!parse_nonnegative_int(multi, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_MULTI_ROW='%s'; expected 0 or 1\n",
+                    __func__, multi);
+            return;
+        }
+        g_cpu_multi_row = value == 1;
+    }
+    if (const char * fused = getenv("LLAMA_EXPERT_CPU_FUSED_GATE_UP")) {
+        int value = 0;
+        if (!parse_nonnegative_int(fused, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_CPU_FUSED_GATE_UP='%s'; expected 0 or 1\n",
+                    __func__, fused);
+            return;
+        }
+        g_cpu_fused_gate_up = value == 1;
+    }
+    if (const char * shared = getenv("LLAMA_EXPERT_SHARED_HOT_IDS")) {
+        int value = 0;
+        if (!parse_nonnegative_int(shared, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_SHARED_HOT_IDS='%s'; expected 0 or 1\n",
+                    __func__, shared);
+            return;
+        }
+        g_shared_hot_ids = value == 1;
+    }
+    if (const char * skip = getenv("LLAMA_EXPERT_SKIP_SENTINEL")) {
+        int value = 0;
+        if (!parse_nonnegative_int(skip, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_SKIP_SENTINEL='%s'; expected 0 or 1\n",
+                    __func__, skip);
+            return;
+        }
+        g_skip_sentinel = value == 1;
+    }
+    ggml_cpu_moe_set_single_row_chunk(g_cpu_single_row_chunk);
+    ggml_cpu_moe_set_parallel_activation(g_cpu_parallel_activation);
+    ggml_cpu_moe_set_down_prefetch(g_cpu_down_prefetch);
+    ggml_cpu_moe_set_reuse_rows(g_cpu_reuse_rows);
+    ggml_cpu_moe_set_multi_row(g_cpu_multi_row);
+    ggml_cpu_moe_set_fused_gate_up(g_cpu_fused_gate_up);
+    ggml_cpu_moe_set_async(g_cpu_async);
+    ggml_cpu_moe_async_stats_reset();
+    ggml_cpu_moe_profile_reset();
+    ggml_cpu_moe_profile_enable(g_timing_enabled);
+    if (g_timing_enabled && !stats_enabled && !json_stats_enabled) {
+        TIER_LOG("%s: LLAMA_EXPERT_TIMING is enabled without a stats output path\n", __func__);
+    }
+    if (const char * mode = getenv("LLAMA_EXPERT_USAGE_MODE")) {
+        if (!strcmp(mode, "cumulative")) {
+            g_usage_mode = expert_usage_mode::cumulative;
+        } else if (!strcmp(mode, "session")) {
+            g_usage_mode = expert_usage_mode::session;
+        } else {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_USAGE_MODE='%s'; expected cumulative or session\n", __func__, mode);
+            return;
+        }
+        if (!usage_enabled) {
+            TIER_LOG("%s: LLAMA_EXPERT_USAGE_MODE is ignored because LLAMA_EXPERT_USAGE is disabled\n", __func__);
+        }
+    }
 
     const int n_layer  = model.hparams.n_layer();
     const int n_expert = model.hparams.n_expert;
 
-    if (g_route_log) {
-        tier_resolve_moe_hooks();
-        MOE_ROUTE_HOOK(g_route_log, n_layer);
-    }
-
     std::vector<std::vector<std::pair<int64_t, int32_t>>> heat;
-    if (env_hot && env_hot[0] && !parse_heat_csv(env_hot, n_layer, heat)) {
+    if (env_hot && env_hot[0] && !parse_heat_csv(env_hot, n_layer, n_expert, heat)) {
         return;
     }
-
-    // sidecar persistence: compute fingerprint, set path, load if no HOT override
-    g_fingerprint = compute_fingerprint(model);
-    const std::string mpath = model.path();
-    if (!mpath.empty()) {
-        g_sidecar_path = mpath + ".tier";
-    }
-    if (!env_hot || !env_hot[0]) {
-        const auto sidecar_heat = load_sidecar(model);
-        if (!sidecar_heat.empty()) {
-            heat.resize(n_layer);
-            for (int il = 0; il < n_layer && il < (int) sidecar_heat.size(); il++) {
-                for (int e = 0; e < n_expert && e < (int) sidecar_heat[il].size(); e++) {
-                    if (sidecar_heat[il][e] > 0.0f) {
-                        heat[il].emplace_back((int64_t) sidecar_heat[il][e], e);
-                    }
-                }
-            }
+    if (env_placement && env_placement[0]) {
+        if (!env_hot || !env_hot[0]) {
+            TIER_LOG("%s: LLAMA_EXPERT_PLACEMENT requires LLAMA_EXPERT_HOT for expert rankings\n", __func__);
+            return;
         }
-    } else {
-        TIER_LOG("%s: LLAMA_EXPERT_HOT set, ignoring sidecar\n", __func__);
+        if (manual_S) {
+            TIER_LOG("%s: LLAMA_EXPERT_PLACEMENT and LLAMA_EXPERT_S are mutually exclusive\n", __func__);
+            return;
+        }
+        if (g_adapt || warm_config_requested) {
+            TIER_LOG("%s: variable placement currently requires LLAMA_EXPERT_ADAPT=0 and no warm slots\n", __func__);
+            return;
+        }
+        std::string placement_error;
+        if (!llama_expert_placement::parse_manifest(
+                    env_placement, n_layer, n_expert, g_placement, placement_error)) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_PLACEMENT: %s\n", __func__, placement_error.c_str());
+            return;
+        }
+        if (g_placement.model_architecture != model.arch_name()) {
+            TIER_LOG("%s: placement architecture '%s' does not match loaded model '%s'\n",
+                    __func__, g_placement.model_architecture.c_str(), model.arch_name().c_str());
+            return;
+        }
+        std::string profile_digest;
+        if (!llama_expert_placement::sha256_file(env_hot, profile_digest, placement_error)) {
+            TIER_LOG("%s: cannot validate placement profile: %s\n", __func__, placement_error.c_str());
+            return;
+        }
+        if (profile_digest != g_placement.profile_sha256) {
+            TIER_LOG("%s: placement profile SHA-256 %s does not match LLAMA_EXPERT_HOT %s\n",
+                    __func__, g_placement.profile_sha256.c_str(), profile_digest.c_str());
+            return;
+        }
+        g_variable_placement = true;
     }
-
-    if (getenv("LLAMA_EXPERT_STATS") || getenv("LLAMA_EXPERT_USAGE")) {
+    if (stats_enabled || usage_enabled || json_stats_enabled || g_cpu_async) {
         atexit(dump_stats);
     }
-    atexit(save_sidecar);
 
-    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    // Prefer the device that actually owns every base layer.  A binary may
+    // contain several GPU backends (for example CUDA + Vulkan), in which case
+    // ggml_backend_dev_by_type() returns the first registered GPU rather than
+    // necessarily the device selected with --device.  Allocating the .hot
+    // tensors on that unrelated device makes a single-device Vulkan model
+    // fail graph allocation.  Mixed-device models still use the historical
+    // first-GPU behavior until hot storage is made per-layer/per-device.
+    ggml_backend_dev_t dev = nullptr;
+    bool uniform_layer_device = n_layer > 0;
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_backend_dev_t layer_dev = model.dev_layer(il);
+        const auto layer_dev_type = layer_dev ? ggml_backend_dev_type(layer_dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (!layer_dev || (layer_dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                           layer_dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+            uniform_layer_device = false;
+            break;
+        }
+        if (!dev) {
+            dev = layer_dev;
+        } else if (dev != layer_dev) {
+            uniform_layer_device = false;
+            break;
+        }
+    }
+    if (!uniform_layer_device) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev) {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+        }
+    }
     if (!dev) {
         TIER_LOG("%s: expert tiering disabled (no GPU device found)\n", __func__);
         return;
     }
-
-    // pread demand fetch: init + KAT
-    if (want_pread) {
-        const std::string mpath = model.path();
-        void * mbase = model.mmap_base();
-        const ggml_tensor * kat_w = nullptr;
-        for (int il = 0; il < n_layer && !kat_w; il++) {
-            const llama_layer & l = model.layers[il];
-            for (ggml_tensor * w : {l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps}) {
-                if (w && w->data && ggml_backend_buffer_is_host(w->buffer)) {
-                    kat_w = w;
-                    break;
-                }
-            }
-        }
-        if (mpath.empty()) {
-            TIER_LOG("%s: pread disabled (no model path)\n", __func__);
-            g_pread_disabled = true;
-        } else if (!mbase) {
-            TIER_LOG("%s: pread disabled (no mmap; --no-mmap?)\n", __func__);
-            g_pread_disabled = true;
-        } else if (!kat_w) {
-            TIER_LOG("%s: pread disabled (no host expert weights)\n", __func__);
-            g_pread_disabled = true;
-        } else if (!tier_pread_init(mpath.c_str())) {
-            TIER_LOG("%s: pread disabled (open failed)\n", __func__);
-        } else if (!tier_pread_kat(kat_w->data, (size_t) ((const char *) kat_w->data - (const char *) mbase))) {
-            TIER_LOG("%s: pread disabled (KAT failed)\n", __func__);
-            tier_pread_close();
-        } else {
-            TIER_LOG("%s: pread KAT passed\n", __func__);
-            atexit(tier_pread_close);
-        }
-    }
+    TIER_LOG("%s: expert hot storage device: %s%s\n", __func__,
+            ggml_backend_dev_name(dev), uniform_layer_device ? " (uniform layer device)" : " (mixed-device fallback)");
 
     // Calculate per-expert slot memory size across all layers for Auto-Fit
     size_t bytes_per_slot_all_layers = 0;
+    std::vector<size_t> bytes_per_slot_by_layer(n_layer, 0);
+    size_t max_layer_staging_bytes = 0;
     int n_tensors = 0;
     for (int il = 0; il < n_layer; il++) {
         const llama_layer & l = model.layers[il];
+        size_t layer_staging_bytes = 0;
         for (ggml_tensor * w : {l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps}) {
             if (w && ggml_backend_buffer_is_host(w->buffer)) {
                 n_tensors++;
                 if (n_expert > 0) {
-                    bytes_per_slot_all_layers += ggml_nbytes(w) / n_expert;
+                    const size_t slice = ggml_nbytes(w) / n_expert;
+                    bytes_per_slot_all_layers += slice;
+                    bytes_per_slot_by_layer[il] += slice;
+                    if (w->ne[3] == 1 && (int) w->ne[2] == n_expert) {
+                        layer_staging_bytes += slice;
+                    }
                 }
             }
         }
+        max_layer_staging_bytes = std::max(max_layer_staging_bytes, layer_staging_bytes);
     }
 
     if (n_tensors == 0) {
@@ -1435,14 +1983,62 @@ void init(const llama_model & model) {
         return;
     }
 
-    // Reserve 512 MB for the CUDA runtime, display, alignment and the graph
-    // capture buffers that allocate after this sizing (300 MB let capture OOM)
-    const size_t safety_buffer = 512ULL * 1024 * 1024;
+    // Reserve memory for the CUDA runtime, display, alignment and graph-capture
+    // buffers that allocate after this sizing. The default is 512 MiB because
+    // 300 MiB caused capture OOM on the original 6 GiB test card.
+    const size_t safety_buffer = (size_t) g_vram_reserve_mib*1024*1024;
     size_t free_vram = 0, total_vram = 0;
     ggml_backend_dev_memory(dev, &free_vram, &total_vram);
     const size_t usable_vram = (free_vram > safety_buffer) ? (free_vram - safety_buffer) : 0;
 
-    if (!manual_S && bytes_per_slot_all_layers > 0) {
+    if (g_variable_placement) {
+        uint64_t fixed_bytes = 0;
+        uint64_t sentinel_bytes = 0;
+        int min_slots = n_expert;
+        int max_slots = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & config = g_placement.layers[il];
+            if (config.slot_bytes != bytes_per_slot_by_layer[il]) {
+                TIER_LOG("%s: placement layer %d slot bytes %llu do not match loaded tensor bytes %zu\n",
+                        __func__, il, (unsigned long long) config.slot_bytes, bytes_per_slot_by_layer[il]);
+                return;
+            }
+            fixed_bytes += (uint64_t) config.fixed_slots*config.slot_bytes;
+            sentinel_bytes += config.slot_bytes;
+            min_slots = std::min(min_slots, config.fixed_slots);
+            max_slots = std::max(max_slots, config.fixed_slots);
+        }
+        if (fixed_bytes != g_placement.fixed_bytes_used || sentinel_bytes != g_placement.sentinel_bytes) {
+            TIER_LOG("%s: placement byte totals changed after model load\n", __func__);
+            return;
+        }
+        const uint64_t required = fixed_bytes + sentinel_bytes;
+        // Match the established fixed-S autofit contract: the configured hot
+        // budget must fit after the safety reserve, while the one sentinel per
+        // layer must at least fit in actual free memory. This preserves exact
+        // byte parity with a proven uniform S configuration. Report when the
+        // sentinels consume part of the conservative reserve.
+        if (fixed_bytes > usable_vram || required > free_vram) {
+            TIER_LOG("%s: variable placement requires %.2f MiB fixed + %.2f MiB sentinels; %.2f MiB fixed-budget and %.2f MiB physical free VRAM are available\n",
+                    __func__, (double) fixed_bytes/(1024.0*1024.0),
+                    (double) sentinel_bytes/(1024.0*1024.0),
+                    (double) usable_vram/(1024.0*1024.0),
+                    (double) free_vram/(1024.0*1024.0));
+            return;
+        }
+        if (required > usable_vram) {
+            TIER_LOG("%s: variable placement sentinels consume %.2f MiB of the conservative VRAM reserve\n",
+                    __func__, (double) (required - usable_vram)/(1024.0*1024.0));
+        }
+        g_S = max_slots;
+        TIER_LOG("%s: variable placement validated: %d total fixed slots, range %d..%d, %.2f MiB fixed + %.2f MiB sentinels\n",
+                __func__, std::accumulate(g_placement.layers.begin(), g_placement.layers.end(), 0,
+                    [](int total, const auto & layer) { return total + layer.fixed_slots; }),
+                min_slots, max_slots, (double) fixed_bytes/(1024.0*1024.0),
+                (double) sentinel_bytes/(1024.0*1024.0));
+    }
+
+    if (!g_variable_placement && !manual_S && bytes_per_slot_all_layers > 0 && !warm_requested) {
         if (usable_vram >= bytes_per_slot_all_layers) {
             int autofit_s = (int) (usable_vram / bytes_per_slot_all_layers);
             g_S = std::clamp(autofit_s, 1, n_expert);
@@ -1458,7 +2054,7 @@ void init(const llama_model & model) {
     }
 
     // clamp a forced S to what fits; the unclamped path OOMs at graph capture
-    if (manual_S && bytes_per_slot_all_layers > 0) {
+    if (!g_variable_placement && manual_S && bytes_per_slot_all_layers > 0 && !warm_requested) {
         const int afford = (int) (usable_vram / bytes_per_slot_all_layers);
         if (g_S > afford) {
             TIER_LOG("%s: manual S = %d exceeds free VRAM, clamping to %d\n", __func__, g_S, afford);
@@ -1466,12 +2062,32 @@ void init(const llama_model & model) {
         }
     }
 
+    // With an explicitly requested warm tier, keep the existing/default fixed
+    // tier first, reserve its sentinel, then consume only remaining slot-sized
+    // VRAM. Auto remains conservatively capped at four slots by default, but
+    // the cap is explicit so larger GPUs can use a measured higher limit.
+    if (warm_requested && bytes_per_slot_all_layers > 0) {
+        const int slot_budget = (int) (usable_vram / bytes_per_slot_all_layers);
+        const int fixed_afford = std::max(slot_budget - 1, 0);
+        g_S = std::min(g_S, n_expert);
+        if (g_S > fixed_afford) {
+            TIER_LOG("%s: fixed S = %d leaves no safe sentinel budget, clamping to %d\n", __func__, g_S, fixed_afford);
+            g_S = fixed_afford;
+        }
+        const int warm_afford = std::max(slot_budget - g_S - 1, 0);
+        const int requested = g_warm_auto ? std::min(warm_afford, std::min(g_warm_auto_max, n_expert)) : g_W;
+        g_W = std::min(requested, warm_afford);
+        if (!g_warm_auto && g_W < requested) {
+            TIER_LOG("%s: warm W = %d exceeds remaining VRAM, clamping to %d\n", __func__, requested, g_W);
+        }
+        TIER_LOG("%s: HYBRID AUTO-FIT -> fixed S = %d, warm W = %d (slot budget %d, per-slot %.2f MiB)\n",
+                __func__, g_S, g_W, slot_budget, (double) bytes_per_slot_all_layers/(1024.0*1024.0));
+    }
+
     if (g_S <= 0) {
         TIER_LOG("%s: expert tiering disabled (S=0)\n", __func__);
         return;
     }
-
-    TIER_LOG("%s: page hints: %s\n", __func__, g_madvise ? "on" : "off");
     ggml_backend_buffer_type_t buft_gpu = ggml_backend_dev_buffer_type(dev);
     ggml_backend_buffer_type_t buft_cpu = ggml_backend_cpu_buffer_type();
 
@@ -1481,7 +2097,7 @@ void init(const llama_model & model) {
         /*.no_alloc   =*/ true,
     };
     struct ggml_init_params ip_cpu = {
-        /*.mem_size   =*/ ggml_tensor_overhead()*3*n_tensors + 1024*1024,
+        /*.mem_size   =*/ ggml_tensor_overhead()*2*n_tensors + 1024*1024,
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
@@ -1497,32 +2113,43 @@ void init(const llama_model & model) {
 
     for (int il = 0; il < n_layer; il++) {
         const llama_layer & l = model.layers[il];
+        const int fixed_s = g_variable_placement ? g_placement.layers[il].fixed_slots : g_S;
 
         // top-S experts of this layer by heat
         std::vector<int32_t> top;
         if (il < (int) heat.size() && !heat[il].empty()) {
             auto h = heat[il];
-            std::sort(h.begin(), h.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+            std::sort(h.begin(), h.end(), [](const auto & a, const auto & b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
             int64_t layer_total = 0;
             for (const auto & p : h) {
                 layer_total += p.first;
             }
-            for (int i = 0; i < (int) h.size() && i < g_S; i++) {
+            for (int i = 0; i < (int) h.size() && i < fixed_s; i++) {
                 top.push_back(h[i].second);
                 hits += h[i].first;
             }
             total += layer_total;
         }
         if (top.empty()) {
-            if (!g_adapt) {
+            if (!g_adapt && g_W == 0) {
                 continue;
             }
-            for (int i = 0; i < std::min(g_S, n_expert); i++) {
+            for (int i = 0; i < std::min(fixed_s, n_expert); i++) {
                 top.push_back(i);
             }
         }
+        if ((g_adapt || g_W > 0) && (int) top.size() < fixed_s) {
+            for (int expert = 0; expert < n_expert && (int) top.size() < fixed_s; ++expert) {
+                if (std::find(top.begin(), top.end(), expert) == top.end()) {
+                    top.push_back(expert);
+                }
+            }
+        }
 
-        std::fill(lut_host.begin(),  lut_host.end(),  (int32_t) top.size());
+        const int sentinel = (g_adapt || g_W > 0) ? fixed_s + g_W : (int) top.size();
+        std::fill(lut_host.begin(),  lut_host.end(),  (int32_t) sentinel);
         std::fill(mask_host.begin(), mask_host.end(), 1);
         for (int s = 0; s < (int) top.size(); s++) {
             lut_host[top[s]]  = s;
@@ -1539,15 +2166,14 @@ void init(const llama_model & model) {
             const size_t slice = ggml_nbytes(w)/n_expert;
 
             store s;
-            s.w_hot  = ggml_new_tensor_3d(g_ctx_gpu, w->type, w->ne[0], w->ne[1], g_adapt ? g_S + 1 : (int) top.size() + 1);
+            const int n_slots = g_W > 0 ? fixed_s + g_W + 1 : (g_adapt ? fixed_s + 1 : (int) top.size() + 1);
+            s.w_hot  = ggml_new_tensor_3d(g_ctx_gpu, w->type, w->ne[0], w->ne[1], n_slots);
             s.lut    = ggml_new_tensor_2d(g_ctx_gpu, GGML_TYPE_I32, 1, n_expert);
             s.mask   = ggml_new_tensor_1d(g_ctx_cpu, GGML_TYPE_I32, n_expert);
             s.counts = ggml_new_tensor_1d(g_ctx_cpu, GGML_TYPE_I32, n_expert + 1);
             s.il      = il;
+            s.sentinel = sentinel;
             s.is_down = (w == l.ffn_down_exps);
-            s.poolable    = w->data && model.weights_discardable(w->data);
-            s.discardable = g_madvise && s.poolable;
-            s.ptrs = g_pool_bytes > 0 ? ggml_new_tensor_1d(g_ctx_cpu, GGML_TYPE_I64, n_expert) : nullptr;
 
             ggml_set_name(s.w_hot, (std::string(w->name) + ".hot").c_str());
 
@@ -1577,25 +2203,36 @@ void init(const llama_model & model) {
     g_layers.resize(n_layer);
     for (int il = 0; il < n_layer; il++) {
         const llama_layer & l = model.layers[il];
+        const int fixed_s = g_variable_placement ? g_placement.layers[il].fixed_slots : g_S;
 
         std::vector<int32_t> top;
         if (il < (int) heat.size() && !heat[il].empty()) {
             auto h = heat[il];
-            std::sort(h.begin(), h.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
-            for (int i = 0; i < (int) h.size() && i < g_S; i++) {
+            std::sort(h.begin(), h.end(), [](const auto & a, const auto & b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            for (int i = 0; i < (int) h.size() && i < fixed_s; i++) {
                 top.push_back(h[i].second);
             }
         }
         if (top.empty()) {
-            if (!g_adapt) {
+            if (!g_adapt && g_W == 0) {
                 continue;
             }
-            for (int i = 0; i < std::min(g_S, n_expert); i++) {
+            for (int i = 0; i < std::min(fixed_s, n_expert); i++) {
                 top.push_back(i);
             }
         }
+        if ((g_adapt || g_W > 0) && (int) top.size() < fixed_s) {
+            for (int expert = 0; expert < n_expert && (int) top.size() < fixed_s; ++expert) {
+                if (std::find(top.begin(), top.end(), expert) == top.end()) {
+                    top.push_back(expert);
+                }
+            }
+        }
 
-        std::fill(lut_host.begin(),  lut_host.end(),  (int32_t) top.size());
+        const int sentinel = (g_adapt || g_W > 0) ? fixed_s + g_W : (int) top.size();
+        std::fill(lut_host.begin(),  lut_host.end(),  (int32_t) sentinel);
         std::fill(mask_host.begin(), mask_host.end(), 1);
         for (int s = 0; s < (int) top.size(); s++) {
             lut_host[top[s]]  = s;
@@ -1609,26 +2246,21 @@ void init(const llama_model & model) {
             }
             store & s = it->second;
             const size_t slice = ggml_nbytes(w)/n_expert;
+            s.sentinel = sentinel;
 
             ggml_backend_tensor_set(s.lut,  lut_host.data(),  0, n_expert*sizeof(int32_t));
             ggml_backend_tensor_set(s.mask, mask_host.data(), 0, n_expert*sizeof(int32_t));
-            if (s.ptrs) {
-                for (int e = 0; e < n_expert; e++) {
-                    ((int64_t *) s.ptrs->data)[e] = (int64_t) (uintptr_t) ((const char *) w->data + slice*e);
-                }
-            }
 
             if (zeros.size() < slice) {
                 zeros.assign(slice, 0);
             }
             if (s.w_hot && s.w_hot->buffer) {
-                ggml_backend_tensor_set(s.w_hot, zeros.data(), slice*top.size(), slice);
+                for (int slot = (int) top.size(); slot <= sentinel; ++slot) {
+                    ggml_backend_tensor_set(s.w_hot, zeros.data(), slice*slot, slice);
+                }
                 for (int sl = 0; sl < (int) top.size(); sl++) {
                     const void * src_ptr = w->data ? (const char *) w->data + slice*top[sl] : zeros.data();
                     ggml_backend_tensor_set(s.w_hot, src_ptr, slice*sl, slice);
-                    if (s.discardable && w->data) {
-                        tier_madvise(src_ptr, slice, true);
-                    }
                 }
             }
         }
@@ -1637,13 +2269,15 @@ void init(const llama_model & model) {
         layer_tier L;
         L.il       = il;
         L.n_expert = n_expert;
-        L.sentinel = (int) top.size();
-        L.n_slots  = g_adapt ? g_S + 1 : (int) top.size() + 1;
+        L.sentinel = sentinel;
+        L.n_fixed  = fixed_s;
+        L.n_slots  = g_W > 0 ? fixed_s + g_W + 1 : (g_adapt ? fixed_s + 1 : (int) top.size() + 1);
         L.slot_expert.assign(L.n_slots, -1);
-        L.dwell.assign(L.n_slots, 0);
+        L.dwell.assign(g_W > 0 ? fixed_s : L.n_slots, 0);
         L.lut_host = lut_host;
         L.score.assign(n_expert, 0.0f);
         L.cum.assign(n_expert, 0);
+        L.observed.assign(n_expert, 0);
         if (il < (int) heat.size()) {
             for (const auto & p : heat[il]) {
                 L.cum[p.second]   = (uint64_t) p.first;
@@ -1652,6 +2286,15 @@ void init(const llama_model & model) {
         }
         for (int s = 0; s < (int) top.size(); s++) {
             L.slot_expert[s] = top[s];
+        }
+        if (g_W > 0) {
+            L.warm_cache.reset(n_expert, fixed_s, g_W, top);
+            L.warm_admission.reset(n_expert, (uint64_t) g_warm_admission_window);
+            L.warm_frequency.assign(n_expert, 0.0f);
+            L.warm_pending.assign(g_W, -1);
+            L.warm_enabled = true;
+            L.slot_expert = L.warm_cache.slot_experts();
+            L.lut_host = L.warm_cache.lut();
         }
         for (ggml_tensor * w : {l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps}) {
             auto it = g_stores.find(w);
@@ -1665,229 +2308,191 @@ void init(const llama_model & model) {
             }
         }
         if (!L.ws.empty()) {
+            if (L.warm_enabled) {
+                warm_invariant_abort(L, "init");
+            } else if (g_adapt) {
+                fixed_invariant_abort(L, "init");
+            }
             g_layers[il] = std::move(L);
         }
     }
 
-    // RAM pool: one block per layer; slot = one expert across all its tensors
-    if (g_pool_bytes > 0) {
-        int n_pool_layers = 0;
-        for (auto & L : g_layers) {
-            if (L.sd && L.sd->poolable) {
-                n_pool_layers++;
-            }
+    if (g_prefetch_requested) {
+        if (g_W <= 0) {
+            TIER_LOG("%s: async prefetch disabled because no warm slots fit\n", __func__);
+            g_prefetch_requested = false;
+        } else if (!init_async_resources(dev, max_layer_staging_bytes)) {
+            TIER_LOG("%s: async prefetch initialization failed; using the synchronous warm-cache path\n", __func__);
+            g_prefetch_requested = false;
         }
-        for (auto & L : g_layers) {
-            if (!L.sd || !L.sd->poolable || n_pool_layers == 0) {
-                continue;
-            }
-            size_t slot = 0;
-            for (auto & kv : L.ws) {
-                kv.second->pool_off = slot;
-                slot += pool_align(ggml_nbytes(kv.first)/L.n_expert);
-            }
-            L.pool_slot_bytes = slot;
-            const size_t per_layer = g_pool_bytes/(size_t) n_pool_layers;
-            L.n_pool_slots = slot > 0 ? (int) (per_layer/slot) : 0;
-            if (L.n_pool_slots <= 0) {
-                continue;
-            }
-            const size_t bytes = (size_t) L.n_pool_slots*slot;
-#if defined(_WIN32)
-            L.pool = (char *) _aligned_malloc(bytes, POOL_ALIGN);
-#else
-            void * p = nullptr;
-            if (posix_memalign(&p, POOL_ALIGN, bytes) != 0) {
-                p = nullptr;
-            }
-            L.pool = (char *) p;
-#endif
-            if (!L.pool) {
-                TIER_LOG("%s: pool alloc failed for layer %d (%zu MiB)\n", __func__, L.il, bytes >> 20);
-                L.n_pool_slots = 0;
-                continue;
-            }
-            g_pool_alloc += bytes;
-            L.pool_slot_expert.assign(L.n_pool_slots, -1);
-            L.pool_dwell.assign(L.n_pool_slots, 0);
-            L.pool_slot_state.reset(new std::atomic<int32_t>[L.n_pool_slots]);
-            for (int k = 0; k < L.n_pool_slots; k++) {
-                L.pool_slot_state[k].store(0, std::memory_order_relaxed);
-            }
-            L.pool_lut.reset(new std::atomic<int32_t>[L.n_expert]);
-            for (int e = 0; e < L.n_expert; e++) {
-                L.pool_lut[e].store(-1, std::memory_order_relaxed);
-            }
-            if (!heat.empty()) {
-                // seed: hottest cold experts by score
-                std::vector<int32_t> cold;
-                for (int e = 0; e < L.n_expert; e++) {
-                    if (L.lut_host[e] == L.sentinel) {
-                        cold.push_back(e);
-                    }
-                }
-                std::sort(cold.begin(), cold.end(), [&](int32_t a, int32_t b) {
-                    return L.score[a] != L.score[b] ? L.score[a] > L.score[b] : a < b;
-                });
-                for (int k = 0; k < L.n_pool_slots && k < (int) cold.size(); k++) {
-                    pool_fill(L, k, cold[k]);
-                }
-            }
-        }
-        TIER_LOG("%s: expert pool: %.2f GiB over %d layers\n",
-                __func__, (double) g_pool_alloc/(double) (1 << 30), n_pool_layers);
     }
 
-    // pread staging ring (LLAMA_EXPERT_PREAD): bounded, page-aligned, owned
-    // by the cold path; sized to hold one token's routed experts of the
-    // widest layer. requires the ptrs path (LLAMA_EXPERT_RAMPOOL > 0).
-    if (want_pread && !g_pread_disabled) {
-        if (g_pool_bytes == 0) {
-            TIER_LOG("%s: pread ring disabled (needs LLAMA_EXPERT_RAMPOOL > 0)\n", __func__);
+    g_collect_counts = g_adapt || g_W > 0 || stats_enabled || usage_enabled || json_stats_enabled || g_timing_enabled;
+    if (g_static_no_sync_requested) {
+        std::vector<const char *> blockers;
+        if (g_adapt) {
+            blockers.push_back("LLAMA_EXPERT_ADAPT is enabled");
+        }
+        if (g_W > 0 || warm_config_requested) {
+            blockers.push_back("warm slots are enabled or requested");
+        }
+        if (stats_enabled || usage_enabled || json_stats_enabled || g_timing_enabled) {
+            blockers.push_back("expert stats or usage output is enabled");
+        }
+        if (llama_expert_lookahead::enabled()) {
+            blockers.push_back("lookahead trace is enabled");
+        }
+        if (blockers.empty()) {
+            g_static_no_sync_active = true;
+            g_collect_counts = false;
+            TIER_LOG("expert_tier: static no-sync enabled; count collection and post-graph tier updates are disabled\n");
         } else {
-            g_stage_fail_test = [] {
-                const char * e = getenv("LLAMA_EXPERT_PREAD_FAIL");
-                return e && atoi(e) != 0;
-            }();
-            size_t max_slot = 0;
-            for (auto & L : g_layers) {
-                if (L.sd && L.sd->poolable && L.pool_slot_bytes > 0) {
-                    max_slot = std::max(max_slot, L.pool_slot_bytes);
-                }
+            TIER_LOG("expert_tier: static no-sync rejected:");
+            for (const char * blocker : blockers) {
+                TIER_LOG(" %s;", blocker);
             }
-            const size_t page = 4096;
-            g_stage_stride = max_slot > 0 ? (max_slot + page - 1) & ~(page - 1) : 0;
-            size_t ring_bytes = (size_t) model.hparams.n_expert_used*g_stage_stride;
-            if (const char * e = getenv("LLAMA_EXPERT_PREAD_RING_MB")) {
-                ring_bytes = (size_t) (atof(e)*1048576.0);
-            }
-            g_stage_n = g_stage_stride > 0 ? (int) std::max((size_t) 1, ring_bytes/g_stage_stride) : 0;
-            // single-file guard: every poolable tensor must lie in the first
-            // file mapping; sharded models disable the ring
-            const char * mbase = (const char *) model.mmap_base();
-            const size_t msize = model.mmap_size();
-            if (g_stage_n > 0 && (!mbase || msize == 0)) {
-                g_stage_n = 0;
-            }
-            for (const auto & L : g_layers) {
-                if (g_stage_n == 0) {
-                    break;
-                }
-                if (!L.sd || !L.sd->poolable || L.pool_slot_bytes == 0) {
+            TIER_LOG(" using synchronized tier updates\n");
+        }
+    }
+
+    if (g_variable_placement) {
+        TIER_LOG("%s: expert tiering on: variable fixed slots (max %d) + %d warm slots/layer, %zu tensors, %.2f GiB pinned, seed coverage %.1f%%\n",
+                __func__, g_S, g_W, g_stores.size(), (double) total_bytes/(1 << 30),
+                total > 0 ? 100.0*hits/total : 0.0);
+    } else {
+        TIER_LOG("%s: expert tiering on: %d fixed + %d warm slots/layer, %zu tensors, %.2f GiB pinned, seed coverage %.1f%%\n",
+                __func__, g_S, g_W, g_stores.size(), (double) total_bytes/(1 << 30),
+                total > 0 ? 100.0*hits/total : 0.0);
+    }
+    if (usage_enabled) {
+        TIER_LOG("%s: expert usage export mode: %s\n", __func__,
+                g_usage_mode == expert_usage_mode::session ? "session" : "cumulative");
+        TIER_LOG("%s: expert usage checkpoint: %s (%s)\n", __func__, g_usage_path.c_str(),
+                g_usage_checkpoint_request ? "after each request and at exit" : "at exit");
+    }
+    if (g_adapt) {
+        TIER_LOG("%s: fixed-tier adaptation publication: %s%s\n", __func__,
+                g_adapt_interval == adapt_interval::request ? "request boundary" : "every completed graph",
+                g_mtp_n > 0 ? " (MTP-safe)" : "");
+        TIER_LOG("%s: CUDA graph caching during adaptation: %s\n", __func__,
+                g_mutable_disabled_cuda_graphs ? "disabled" : "enabled (experimental)");
+    }
+    TIER_LOG("%s: CPU cold singleton chunk size: %d rows; block-parallel activation: %s; down prefetch: %d; row reuse: %s; multi-row AVX2: %s; fused Gate/Up AVX2: %s; shared hot IDs: %s; skip-sentinel MMVQ: %s; async overlap: %s\n",
+            __func__, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "on" : "off",
+            g_cpu_down_prefetch, g_cpu_reuse_rows ? "on" : "off", g_cpu_multi_row ? "on" : "off",
+            g_cpu_fused_gate_up ? "on" : "off", g_shared_hot_ids ? "on" : "off",
+            g_skip_sentinel ? "on" : "off", g_cpu_async ? "on" : "off");
+    if (g_W > 0) {
+        if (g_warm_admission == warm_admission_mode::frequency) {
+            TIER_LOG("%s: warm admission frequency window=%d graphs\n", __func__, g_warm_admission_window);
+        } else if (g_warm_admission == warm_admission_mode::second_hit) {
+            TIER_LOG("%s: warm admission second-hit window=%d graphs\n", __func__, g_warm_admission_window);
+        } else {
+            TIER_LOG("%s: warm admission immediate\n", __func__);
+        }
+    }
+
+    const char * bridge_consume_env = getenv("GGML_CUDA_EXPERT_BRIDGE_CONSUME");
+    const bool bridge_consume = bridge_consume_env && !strcmp(bridge_consume_env, "1");
+    const char * bridge_layers_env = getenv("GGML_CUDA_EXPERT_BRIDGE_LAYERS");
+    if (!bridge_layers_env || !bridge_layers_env[0]) bridge_layers_env = getenv("GGML_CUDA_EXPERT_BRIDGE_LAYER");
+    if (bridge_layers_env && !g_adapt && g_W == 0 &&
+            (!bridge_consume || (!g_cpu_async && !g_static_no_sync_active))) {
+        std::vector<int> bridge_layers;
+        if (parse_bridge_layers(bridge_layers_env, bridge_layers)) {
+            using register_fn = bool (*)(
+                    int, const void *, size_t, const void *, size_t,
+                    int, int, int, int, const uint8_t *);
+            using claim_fn = bool (*)(int, int, int, int64_t);
+            using fetch_fn = bool (*)(int, int, int, float *, float *, int64_t);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            register_fn register_bridge = (register_fn) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_expert_bridge_register");
+            int registered_layers = 0;
+            for (int bridge_layer : bridge_layers) {
+                if (!register_bridge || bridge_layer >= n_layer || bridge_layer >= (int) g_layers.size()) {
+                    TIER_LOG("%s: CUDA expert bridge rejected invalid layer %d\n", __func__, bridge_layer);
                     continue;
                 }
-                for (const auto & kv : L.ws) {
-                    const char * d = (const char *) kv.first->data;
-                    if (d < mbase || (size_t) (d - mbase) + ggml_nbytes(kv.first) > msize) {
-                        g_stage_n = 0;
-                        TIER_LOG("%s: pread ring disabled (tensor outside first file mapping - sharded?)\n", __func__);
-                        break;
+                const llama_layer & layer = model.layers[bridge_layer];
+                const layer_tier & tier = g_layers[(size_t) bridge_layer];
+                ggml_tensor * gate = layer.ffn_gate_exps;
+                ggml_tensor * up = layer.ffn_up_exps;
+                if (gate && up && gate->data && up->data && tier.n_expert == n_expert &&
+                        gate->ne[3] == 1 && up->ne[3] == 1 &&
+                        gate->ne[2] == n_expert && up->ne[2] == n_expert) {
+                    std::vector<uint8_t> cold((size_t) n_expert, 1);
+                    for (int expert = 0; expert < n_expert; ++expert) {
+                        cold[(size_t) expert] = tier.lut_host[(size_t) expert] == tier.sentinel ? 1 : 0;
+                    }
+                    const size_t gate_slice = ggml_nbytes(gate)/(size_t) n_expert;
+                    const size_t up_slice = ggml_nbytes(up)/(size_t) n_expert;
+                    if (!register_bridge(bridge_layer, gate->data, gate_slice,
+                                up->data, up_slice, n_expert, gate->type,
+                                (int) gate->ne[0], (int) gate->ne[1], cold.data())) {
+                        TIER_LOG("%s: CUDA expert bridge registration rejected for layer %d\n", __func__, bridge_layer);
+                    } else {
+                        registered_layers++;
                     }
                 }
             }
-            if (g_stage_n > 0) {
-#if defined(_WIN32)
-                g_stage_base = (char *) _aligned_malloc((size_t) g_stage_n*g_stage_stride, page);
-#else
-                void * p = nullptr;
-                if (posix_memalign(&p, page, (size_t) g_stage_n*g_stage_stride) != 0) {
-                    p = nullptr;
+            if (registered_layers > 0 && bridge_consume) {
+                claim_fn claim = (claim_fn) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_expert_bridge_claim_gate_up");
+                fetch_fn fetch = (fetch_fn) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_expert_bridge_fetch_gate_up");
+                if (claim && fetch) {
+                    ggml_cpu_moe_set_transient_gate_up(claim, fetch);
+                    const char * verify = getenv("GGML_CUDA_EXPERT_BRIDGE_VERIFY");
+                    ggml_cpu_moe_set_transient_gate_up_verify(verify && !strcmp(verify, "1"));
                 }
-                g_stage_base = (char *) p;
-#endif
-                if (!g_stage_base) {
-                    TIER_LOG("%s: pread ring alloc failed (%d x %.2f MiB)\n", __func__,
-                            g_stage_n, (double) g_stage_stride/(1024.0*1024.0));
-                    g_stage_n = 0;
-                } else {
-                    g_stage_word.reset(new std::atomic<uint64_t>[g_stage_n]);
-                    for (int k = 0; k < g_stage_n; k++) {
-                        g_stage_word[k].store(0, std::memory_order_relaxed);
-                    }
-                    g_stage_mmap = mbase;
-                    for (auto & L : g_layers) {
-                        if (!L.sd || !L.sd->poolable || L.pool_slot_bytes == 0) {
-                            continue;
-                        }
-                        for (auto & kv : L.ws) {
-                            store & st = *kv.second;
-                            if (!st.ptrs || !st.ptrs->data) {
-                                continue;
-                            }
-                            g_stage_ix[st.ptrs->data] = stage_ctx{ L.il, (int64_t) st.pool_off,
-                                    (const char *) kv.first->data, (int64_t) (ggml_nbytes(kv.first)/L.n_expert) };
-                        }
-                    }
-                    tier_resolve_moe_hooks();
-                    MOE_FETCH_HOOK(stage_fetch);
-                    TIER_LOG("%s: pread ring: %d slots x %.2f MiB%s\n", __func__,
-                            g_stage_n, (double) g_stage_stride/(1024.0*1024.0),
-                            g_stage_fail_test ? " (FAIL-TEST)" : "");
-                }
+            }
+            if (registered_layers > 0 && g_mtp_n > 0) {
+                TIER_LOG("%s: CUDA expert bridge enabled for %d layers in MTP-%d target verification graphs\n",
+                        __func__, registered_layers, g_mtp_n);
             }
         }
+    } else if (bridge_layers_env) {
+        TIER_LOG("%s: CUDA expert bridge disabled by adaptation, warm slots, or an incompatible consume mode\n", __func__);
     }
-
-    // spec pool (LLAMA_EXPERT_PREFETCH_GB): worker-only, probe-served; slots
-    // reuse the pool-A layout (pool_slot_bytes, per-store pool_off)
-    if (g_predict && g_poolB_bytes > 0) {
-        int n_pool_layers = 0;
-        for (auto & L : g_layers) {
-            if (L.sd && L.sd->poolable) {
-                n_pool_layers++;
-            }
-        }
-        for (auto & L : g_layers) {
-            if (!L.sd || !L.sd->poolable || n_pool_layers == 0) {
-                continue;
-            }
-            const size_t per_layer = g_poolB_bytes/(size_t) n_pool_layers;
-            L.n_slotsB = L.pool_slot_bytes > 0 ? (int) (per_layer/L.pool_slot_bytes) : 0;
-            if (L.n_slotsB <= 0) {
-                continue;
-            }
-            const size_t bytes = (size_t) L.n_slotsB*L.pool_slot_bytes;
-#if defined(_WIN32)
-            L.poolB = (char *) _aligned_malloc(bytes, POOL_ALIGN);
-#else
-            void * p = nullptr;
-            if (posix_memalign(&p, POOL_ALIGN, bytes) != 0) {
-                p = nullptr;
-            }
-            L.poolB = (char *) p;
-#endif
-            if (!L.poolB) {
-                TIER_LOG("%s: spec pool alloc failed for layer %d (%zu MiB)\n", __func__, L.il, bytes >> 20);
-                L.n_slotsB = 0;
-                continue;
-            }
-            g_poolB_alloc += bytes;
-            L.ownersB.assign(L.n_slotsB, -1);
-            L.stateB.reset(new std::atomic<int32_t>[L.n_slotsB]);
-            for (int k = 0; k < L.n_slotsB; k++) {
-                L.stateB[k].store(0, std::memory_order_relaxed);
-            }
-            L.lutB.reset(new std::atomic<int32_t>[L.n_expert]);
-            for (int e = 0; e < L.n_expert; e++) {
-                L.lutB[e].store(-1, std::memory_order_relaxed);
-            }
-            L.lastB.reset(new std::atomic<int64_t>[L.n_slotsB]);
-            for (int k = 0; k < L.n_slotsB; k++) {
-                L.lastB[k].store(0, std::memory_order_relaxed);
-            }
-        }
-        TIER_LOG("%s: spec pool: %.2f GiB over %d layers (%d threads)\n",
-                __func__, (double) g_poolB_alloc/(double) (1 << 30), n_pool_layers, g_n_workers);
-    }
-
-                TIER_LOG("%s: expert tiering on: %d slots/layer, %zu tensors, %.2f GiB pinned, seed coverage %.1f%%\n",
-            __func__, g_S, g_stores.size(), (double) total_bytes/(1 << 30),
-            total > 0 ? 100.0*hits/total : 0.0);
-
-    pred_init(model);
 }
 
-ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids) {
+static ggml_tensor * map_hot_ids(ggml_context * ctx, const store & s, ggml_tensor * ids) {
+    ggml_tensor * ids_src = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids);
+    ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ids_src, ids->ne[0]*ids->ne[1]);
+    ggml_tensor * hot_flat = ggml_get_rows(ctx, s.lut, ids_flat);
+    return ggml_reshape_2d(ctx, hot_flat, ids->ne[0], ids->ne[1]);
+}
+
+static void mark_skip_sentinel(ggml_tensor * hot, const store & s) {
+    if (!g_skip_sentinel || !hot) {
+        return;
+    }
+    // op_params[0]=1 enables CUDA MMVQ skip; op_params[1]=sentinel slot index.
+    // The sentinel weight channel is zeroed at tier init, so the math result is
+    // exact zero whether the kernel loads the zeros or takes the early exit.
+    hot->op_params[0] = 1;
+    hot->op_params[1] = s.sentinel;
+}
+
+ggml_tensor * build_hot_ids(ggml_context * ctx, ggml_tensor * w, ggml_tensor * ids) {
+    if (!g_shared_hot_ids) {
+        return nullptr;
+    }
+    auto it = g_stores.find(w);
+    if (it == g_stores.end() || ids->ne[1] > (int64_t) g_tmax) {
+        return nullptr;
+    }
+
+    return map_hot_ids(ctx, it->second, ids);
+}
+
+ggml_tensor * build_mul_mat_id(
+        ggml_context * ctx,
+        ggml_tensor * w,
+        ggml_tensor * x,
+        ggml_tensor * ids,
+        ggml_tensor * hot_ids) {
     auto it = g_stores.find(w);
     if (it == g_stores.end() || ids->ne[1] > (int64_t) g_tmax) {
         return ggml_mul_mat_id(ctx, w, x, ids);
@@ -1895,17 +2500,18 @@ ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
 
     const store & s = it->second;
 
-    // get_rows wants matching trailing dims, so flatten ids to 1d first
-    ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, ids), ids->ne[0]*ids->ne[1]);
-    ggml_tensor * hot_flat = ggml_get_rows(ctx, s.lut, ids_flat); // [1, n_used*n_tokens]
-    ggml_tensor * ids_hot  = ggml_reshape_2d(ctx, hot_flat, ids->ne[0], ids->ne[1]);
-    ggml_tensor * hot      = ggml_mul_mat_id(ctx, s.w_hot, x, ids_hot);    // GPU
+    if (!hot_ids) {
+        hot_ids = map_hot_ids(ctx, s, ids);
+    }
+    GGML_ASSERT(hot_ids->ne[0] == ids->ne[0] && hot_ids->ne[1] == ids->ne[1]);
+    ggml_tensor * hot = ggml_mul_mat_id(ctx, s.w_hot, x, hot_ids); // GPU
+    mark_skip_sentinel(hot, s);
 
     if (g_hot_only) {
         return hot;
     }
 
-    ggml_tensor * cold     = ggml_mul_mat_id_cold(ctx, w, x, ids, s.mask, s.ptrs); // CPU
+    ggml_tensor * cold     = ggml_mul_mat_id_cold(ctx, w, x, ids, s.mask, nullptr); // CPU
 
     return ggml_add(ctx, hot, cold);
 }
@@ -1928,6 +2534,10 @@ bool begin_moe_cold(bool eligible,
     return true;
 }
 
+bool cpu_async_enabled() {
+    return g_cpu_async;
+}
+
 ggml_tensor * end_moe_cold(ggml_context * ctx,
         ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,
         ggml_tensor * x, ggml_tensor * ids) {
@@ -1935,13 +2545,15 @@ ggml_tensor * end_moe_cold(ggml_context * ctx,
         return nullptr;
     }
     store & sd = g_stores[down_w];
-    return ggml_moe_cold(ctx, gate_w, up_w, down_w, x, ids, sd.mask, sd.counts,
-            g_stores[gate_w].ptrs, g_stores[up_w].ptrs, sd.ptrs);
+    ggml_tensor * result = ggml_moe_cold(ctx, gate_w, up_w, down_w, x, ids, sd.mask,
+            g_collect_counts ? sd.counts : nullptr, nullptr, nullptr, nullptr);
+    result->op_params[0] = sd.il;
+    return result;
 }
 
 ggml_tensor * build_moe_count(ggml_context * ctx, ggml_tensor * down_w, ggml_tensor * ids) {
     // prompt-sized batches skip the fused path; harvest router decisions anyway
-    if (g_hot_only || g_stores.empty()) {
+    if (!g_collect_counts || g_hot_only || g_stores.empty()) {
         return nullptr;
     }
     auto it = g_stores.find(down_w);

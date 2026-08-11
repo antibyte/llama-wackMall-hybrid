@@ -20,6 +20,7 @@ struct llama_cparams;
 struct llama_layer;
 
 struct llama_memory_context_i;
+struct llm_graph_context;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
@@ -319,10 +320,12 @@ public:
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_context * mctx) :
+            const llama_kv_cache_context * mctx,
+            bool use_mctx_draft = false) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        use_mctx_draft(use_mctx_draft) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -352,6 +355,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    const bool use_mctx_draft;
 };
 
 // V-less input for the KV cache
@@ -430,10 +434,12 @@ public:
     llm_graph_input_attn_kv_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_iswa_context * mctx) :
+            const llama_kv_cache_iswa_context * mctx,
+            bool use_mctx_draft = false) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        use_mctx_draft(use_mctx_draft) {
     }
     ~llm_graph_input_attn_kv_iswa() = default;
 
@@ -469,6 +475,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    const bool use_mctx_draft;
 };
 
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
@@ -670,6 +677,12 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+struct llm_graph_dflash_i {
+    virtual ~llm_graph_dflash_i() = default;
+
+    virtual bool build(llm_graph_context & graph) = 0;
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -686,7 +699,10 @@ struct llm_graph_params {
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
+    const llama_memory_context_i * mctx_draft;
     const llama_cross            * cross;
+
+    llm_graph_dflash_i * dflash;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -777,6 +793,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            dflash == other.dflash &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -789,6 +806,15 @@ struct llm_graph_fused_node {
     llm_fused_op op;
     ggml_tensor * tensor;
     int il;
+};
+
+struct llm_graph_lookahead_trace {
+    int source_layer = -1;
+    int target_layer = -1;
+    int top_m = 0;
+    ggml_tensor * predicted_ids = nullptr;
+    ggml_tensor * actual_ids = nullptr;
+    ggml_tensor * actual_weights = nullptr;
 };
 
 class llm_graph_result {
@@ -826,7 +852,11 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
+    void add_lookahead_prediction(llm_graph_lookahead_trace trace);
+    void set_lookahead_actual(int target_layer, ggml_tensor * actual_ids, ggml_tensor * actual_weights);
+
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+    const std::vector<llm_graph_lookahead_trace> & get_lookahead_traces() const { return lookahead_traces; }
 
     void set_params(const llm_graph_params & params);
 
@@ -840,13 +870,14 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
-    std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
-    std::map<llama_seq_id, ggml_tensor *> t_candidates;
-    std::map<llama_seq_id, ggml_tensor *> t_sampled;
-    std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
+    std::vector<ggml_tensor *> t_sampled;
+    std::vector<ggml_tensor *> t_sampled_probs;
+    std::vector<ggml_tensor *> t_sampled_logits;
+    std::vector<ggml_tensor *> t_candidates;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<llm_graph_lookahead_trace> lookahead_traces;
 
     ggml_context_ptr ctx_compute;
 
@@ -961,7 +992,8 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * hot_ids = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1017,7 +1049,10 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor ** selected_experts_out = nullptr,
+             ggml_tensor ** weights_out = nullptr,
+                    bool   snapshot_selected_experts = false) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1043,7 +1078,10 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor ** selected_experts_out = nullptr,
+             ggml_tensor ** weights_out = nullptr,
+                    bool   snapshot_selected_experts = false) const;
 
     //
     // inputs
@@ -1106,7 +1144,8 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kq_mask_override = nullptr) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

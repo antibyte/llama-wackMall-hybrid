@@ -1,0 +1,1 @@
+Design a robust local AI agent in Go. Cover concurrency, tools, persistent memory, error handling, tests, observability, and security. Include concrete interfaces and failure recovery behavior.

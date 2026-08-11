@@ -634,53 +634,121 @@ class Qwen3_5MoeTextModel(_Qwen35MtpMixin, _Qwen35MRopeMixin, _LinearAttentionVR
 class DFlashModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.DFLASH
 
-    def set_vocab(self):
+    @staticmethod
+    def _require_int(config: dict[str, Any], key: str, minimum: int) -> int:
+        value = config.get(key)
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"DFlash '{key}' must be an integer >= {minimum}")
+        return value
+
+    def _validate_config(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        dflash_config = self.hparams.get("dflash_config")
+        if not isinstance(dflash_config, dict):
+            raise ValueError("DFlash model requires an object-valued 'dflash_config'")
+
+        self._require_int(dflash_config, "block_size", 2)
+        mask_token_id = self._require_int(dflash_config, "mask_token_id", 0)
+
+        target_layer_ids = dflash_config.get("target_layer_ids")
+        if not isinstance(target_layer_ids, list) or not target_layer_ids:
+            raise ValueError("DFlash 'target_layer_ids' must be a non-empty array")
+        if any(type(layer_id) is not int or layer_id < 0 for layer_id in target_layer_ids):
+            raise ValueError("DFlash 'target_layer_ids' must contain non-negative integers")
+        if len(set(target_layer_ids)) != len(target_layer_ids):
+            raise ValueError("DFlash 'target_layer_ids' must not contain duplicates")
+
         if self.target_model_dir is None:
-            raise ValueError(
-                "DFlash draft model requires --target-model-dir to be specified. "
-                "Please provide the path to the target model directory containing the tokenizer."
-            )
+            raise ValueError("DFlash draft model requires --target-model-dir")
+        with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+            target_config = json.load(f)
+        if not isinstance(target_config, dict):
+            raise ValueError("DFlash target model config must be an object")
+        target_text_config = target_config.get("text_config", {})
+        if not isinstance(target_text_config, dict):
+            raise ValueError("DFlash target model has an invalid 'text_config'")
+        target_hparams = {**target_config, **target_text_config}
+
+        draft_hidden_size = self._require_int(self.hparams, "hidden_size", 1)
+        draft_vocab_size = self._require_int(self.hparams, "vocab_size", 1)
+        target_hidden_size = self._require_int(target_hparams, "hidden_size", 1)
+        target_vocab_size = self._require_int(target_hparams, "vocab_size", 1)
+        target_block_count = self._require_int(target_hparams, "num_hidden_layers", 1)
+
+        if draft_hidden_size != target_hidden_size:
+            raise ValueError(f"DFlash hidden size {draft_hidden_size} does not match target hidden size {target_hidden_size}")
+        if draft_vocab_size != target_vocab_size:
+            raise ValueError(f"DFlash vocabulary size {draft_vocab_size} does not match target vocabulary size {target_vocab_size}")
+        if mask_token_id >= target_vocab_size:
+            raise ValueError(f"DFlash mask token ID {mask_token_id} is outside target vocabulary size {target_vocab_size}")
+
+        extract_layer_ids = [layer_id + 1 for layer_id in target_layer_ids]
+        if any(layer_id >= target_block_count for layer_id in extract_layer_ids):
+            raise ValueError(f"DFlash target layer IDs {target_layer_ids} are outside target block count {target_block_count}")
+
+        use_sliding_window = self.hparams.get("use_sliding_window", False)
+        if type(use_sliding_window) is not bool:
+            raise ValueError("DFlash 'use_sliding_window' must be a boolean")
+        if use_sliding_window:
+            self._require_int(self.hparams, "sliding_window", 1)
+            draft_block_count = self._require_int(self.hparams, "num_hidden_layers", 1)
+            layer_types = self.hparams.get("layer_types")
+            if not isinstance(layer_types, list) or len(layer_types) != draft_block_count:
+                raise ValueError(f"DFlash 'layer_types' must contain {draft_block_count} entries")
+            if any(layer_type not in ("full_attention", "sliding_attention") for layer_type in layer_types):
+                raise ValueError("DFlash 'layer_types' contains an unsupported attention type")
+
+        return dflash_config, target_hparams
+
+    def set_vocab(self):
+        dflash_config, _ = self._validate_config()
+        assert self.target_model_dir is not None
         logger.info(f"DFlash: Using tokenizer from target model: {self.target_model_dir}")
         original_dir = self.dir_model
         self.dir_model = self.target_model_dir
 
-        # Reuse the target model's own vocab handler (e.g. Gemma-4 needs its
-        # own tokenizer logic, not the Qwen default).
-        from . import get_model_class
-        with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
-            target_arch = json.load(f)["architectures"][0]
-        target_cls = get_model_class(target_arch)
+        try:
+            # Reuse the target model's own vocab handler (e.g. Gemma-4 needs its
+            # own tokenizer logic, not the Qwen default).
+            from . import get_model_class
+            with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+                target_architectures = json.load(f).get("architectures")
+            if not isinstance(target_architectures, list) or not target_architectures or not isinstance(target_architectures[0], str):
+                raise ValueError("DFlash target model requires a non-empty 'architectures' array")
+            target_cls = get_model_class(target_architectures[0])
 
-        if target_cls is not type(self):
-            target_cls.set_vocab(self)  # ty: ignore[unresolved-attribute]
-        else:
-            super().set_vocab()
+            if target_cls is not type(self):
+                target_cls.set_vocab(self)  # ty: ignore[unresolved-attribute]
+            else:
+                super().set_vocab()
+        finally:
+            self.dir_model = original_dir
 
-        self.dir_model = original_dir
-
-        mask_token_id = self.hparams.get("dflash_config", {}).get("mask_token_id")
-        if mask_token_id is not None:
-            self.gguf_writer.add_mask_token_id(mask_token_id)
+        self.gguf_writer.add_mask_token_id(dflash_config["mask_token_id"])
 
     def set_gguf_parameters(self):
+        dflash_config, _ = self._validate_config()
         super().set_gguf_parameters()
 
-        block_size = self.hparams.get("block_size", 16)
-        self.gguf_writer.add_block_size(block_size)
-        dflash_config = self.hparams.get("dflash_config", {})
+        self.gguf_writer.add_block_size(dflash_config["block_size"])
+        self.gguf_writer.add_target_layers([i + 1 for i in dflash_config["target_layer_ids"]])
 
-        target_layer_ids = dflash_config.get("target_layer_ids", [])
-        if target_layer_ids:
-            extract_layer_ids = [i + 1 for i in target_layer_ids]
-            self.gguf_writer.add_target_layers(extract_layer_ids)
-
-        use_sliding_window = self.hparams.get("use_sliding_window", False)
-        sliding_window = self.hparams.get("sliding_window")
-        layer_types = self.hparams.get("layer_types")
-        if use_sliding_window and sliding_window and layer_types:
+        if self.hparams.get("use_sliding_window", False):
+            sliding_window = self.hparams["sliding_window"]
+            layer_types = self.hparams["layer_types"]
             is_swa = [lt == "sliding_attention" for lt in layer_types]
             self.gguf_writer.add_sliding_window(sliding_window)
             self.gguf_writer.add_sliding_window_pattern(is_swa)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name in ("fc.weight", "model.fc.weight"):
+            dflash_config, target_hparams = self._validate_config()
+            expected_shape = (
+                self.hparams["hidden_size"],
+                target_hparams["hidden_size"] * len(dflash_config["target_layer_ids"]),
+            )
+            if tuple(data_torch.shape) != expected_shape:
+                raise ValueError(f"Unexpected DFlash FC shape for {name}: {tuple(data_torch.shape)}, expected {expected_shape}")
+        yield from super().modify_tensors(data_torch, name, bid)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:

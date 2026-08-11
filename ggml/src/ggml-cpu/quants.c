@@ -34,6 +34,10 @@ void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q4_0_ref(x, y, k);
 }
 
+void quantize_row_q4_0_weighted(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_0_weighted_ref(x, y, k);
+}
+
 void quantize_row_q4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_1_ref(x, y, k);
 }
@@ -766,6 +770,14 @@ void ggml_vec_dot_q4_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     }
     for (int l = 0; l < 8; ++l) sumf += sums[l];
     *s = sumf;
+}
+
+void ggml_vec_dot_q4_K_q8_K_pair_generic(
+        int n, float * GGML_RESTRICT s0, float * GGML_RESTRICT s1,
+        const void * GGML_RESTRICT vx0, const void * GGML_RESTRICT vx1,
+        const void * GGML_RESTRICT vy) {
+    ggml_vec_dot_q4_K_q8_K_generic(n, s0, 0, vx0, 0, vy, 0, 1);
+    ggml_vec_dot_q4_K_q8_K_generic(n, s1, 0, vx1, 0, vy, 0, 1);
 }
 
 void ggml_vec_dot_q5_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,  size_t by, int nrc) {

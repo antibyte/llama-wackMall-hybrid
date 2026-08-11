@@ -1551,6 +1551,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    static const bool dedup_dst_sync_requested = getenv("GGML_SCHED_DEDUP_DST_SYNC") != NULL &&
+            atoi(getenv("GGML_SCHED_DEDUP_DST_SYNC")) != 0;
+    const bool dedup_dst_sync = dedup_dst_sync_requested && sched->n_copies == 1;
+    bool copy_slot_reusable[GGML_SCHED_MAX_BACKENDS] = {};
+
+    auto synchronize_backend = [&](ggml_backend_t backend) {
+        ggml_backend_synchronize(backend);
+        if (dedup_dst_sync) {
+            bool found = false;
+            for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+                if (sched->backends[backend_id] == backend) {
+                    copy_slot_reusable[backend_id] = true;
+                    found = true;
+                }
+            }
+            GGML_ASSERT(found);
+        }
+    };
+    auto synchronize_copy_slot = [&](int backend_id, ggml_backend_t backend) {
+        if (!dedup_dst_sync || !copy_slot_reusable[backend_id]) {
+            synchronize_backend(backend);
+        }
+    };
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1571,7 +1595,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    synchronize_copy_slot(split_backend_id, split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
@@ -1579,7 +1603,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    synchronize_copy_slot(split_backend_id, split_backend);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1594,7 +1618,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    ggml_backend_synchronize(input_backend);
+                    synchronize_backend(input_backend);
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1613,7 +1637,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                        synchronize_backend(ids_backend);
 
                         // find the used experts
                         used_ids.clear();
@@ -1671,19 +1695,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        ggml_backend_synchronize(input_backend);
+                        static const bool async_d2h_copy = getenv("GGML_SCHED_ASYNC_D2H_COPY") != NULL &&
+                                atoi(getenv("GGML_SCHED_ASYNC_D2H_COPY")) != 0;
+                        const bool can_async_d2h = async_d2h_copy &&
+                                input_backend->iface.get_tensor_async != NULL &&
+                                ggml_backend_buffer_is_host(input_cpy->buffer);
+
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
-                            ggml_backend_synchronize(split_backend);
+                            synchronize_copy_slot(split_backend_id, split_backend);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+
+                        if (can_async_d2h) {
+                            // Queue the readback after the source graph on the
+                            // source stream, then wait once at the CPU consumer.
+                            // This preserves synchronous visibility for the
+                            // following CPU split while avoiding a separate
+                            // pre-copy source synchronization and copy stream.
+                            ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                            synchronize_backend(input_backend);
+                        } else {
+                            synchronize_backend(input_backend);
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
                     }
                 }
             }
         }
 
         if (!sched->callback_eval) {
+            if (dedup_dst_sync) {
+                copy_slot_reusable[split_backend_id] = false;
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1706,13 +1750,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+                if (dedup_dst_sync) {
+                    copy_slot_reusable[split_backend_id] = false;
+                }
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                synchronize_backend(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;

@@ -395,12 +395,6 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         params.backend_sampling = false;
     }
 
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -559,6 +553,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & grmr  = gsmpl->grmr;
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
+    auto & cur   = gsmpl->cur;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
     gsmpl->set_logits(ctx, idx);
@@ -572,13 +567,29 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+
+            // A multi-output backend graph can sample later verification rows
+            // before accepting an earlier row exhausts the CPU-side reasoning
+            // budget.  Routing and logits remain unchanged; only the exact
+            // closing token is authoritative once the budget enters FORCING.
+            const llama_token forced = common_reasoning_budget_get_forced_token(rbudget);
+            if (forced != LLAMA_TOKEN_NULL) {
+                id = forced;
+            }
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
                     cur_p.selected = i;
                     break;
                 }
+            }
+
+            if (cur_p.selected < 0) {
+                // Backend filters such as top-k may have removed the forced
+                // token.  Preserve the sampler API contract with a synthetic
+                // singleton candidate rather than rerunning the CPU chain.
+                cur = { llama_token_data { id, 0.0f, 1.0f } };
+                cur_p = llama_token_data_array { cur.data(), cur.size(), 0, true };
             }
 
             return id;

@@ -7,7 +7,13 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef GGML_USE_CPU_HBM
@@ -96,6 +102,43 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
 
 // CPU backend - backend (stream)
 
+static std::atomic<bool>     g_moe_async_enabled { false };
+static std::atomic<uint64_t> g_moe_async_jobs    { 0 };
+static std::atomic<uint64_t> g_moe_async_wait_us { 0 };
+
+void ggml_cpu_moe_set_async(bool enabled) {
+    g_moe_async_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool ggml_cpu_moe_get_async(void) {
+    return g_moe_async_enabled.load(std::memory_order_relaxed);
+}
+
+void ggml_cpu_moe_async_stats_reset(void) {
+    g_moe_async_jobs.store(0, std::memory_order_relaxed);
+    g_moe_async_wait_us.store(0, std::memory_order_relaxed);
+}
+
+void ggml_cpu_moe_async_stats_get(uint64_t * jobs, uint64_t * wait_us) {
+    if (jobs) {
+        *jobs = g_moe_async_jobs.load(std::memory_order_relaxed);
+    }
+    if (wait_us) {
+        *wait_us = g_moe_async_wait_us.load(std::memory_order_relaxed);
+    }
+}
+
+struct ggml_backend_cpu_async_state {
+    std::mutex              mutex;
+    std::condition_variable cv;
+    std::thread             worker;
+    struct ggml_cgraph      graph = {};
+    enum ggml_status        status = GGML_STATUS_SUCCESS;
+    bool                    pending = false;
+    bool                    running = false;
+    bool                    stop = false;
+};
+
 struct ggml_backend_cpu_context {
     int                 n_threads;
     ggml_threadpool_t   threadpool;
@@ -107,7 +150,81 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+
+    ggml_backend_cpu_async_state async;
 };
+
+static enum ggml_status ggml_backend_cpu_graph_compute_sync(
+        struct ggml_backend_cpu_context * cpu_ctx, struct ggml_cgraph * cgraph);
+
+static enum ggml_status ggml_backend_cpu_wait_async(struct ggml_backend_cpu_context * cpu_ctx) {
+    auto & async = cpu_ctx->async;
+    if (!async.worker.joinable()) {
+        return GGML_STATUS_SUCCESS;
+    }
+    std::unique_lock<std::mutex> lock(async.mutex);
+    const bool had_work = async.pending || async.running;
+    const auto started = std::chrono::steady_clock::now();
+    async.cv.wait(lock, [&async]() { return !async.pending && !async.running; });
+    const enum ggml_status status = async.status;
+    lock.unlock();
+
+    if (had_work) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count();
+        g_moe_async_wait_us.fetch_add((uint64_t) std::max<int64_t>(0, elapsed), std::memory_order_relaxed);
+    }
+    return status;
+}
+
+static void ggml_backend_cpu_start_async_worker(struct ggml_backend_cpu_context * cpu_ctx) {
+    auto & async = cpu_ctx->async;
+    if (async.worker.joinable()) {
+        return;
+    }
+    async.worker = std::thread([cpu_ctx]() {
+        auto & state = cpu_ctx->async;
+        std::unique_lock<std::mutex> lock(state.mutex);
+        for (;;) {
+            state.cv.wait(lock, [&state]() { return state.stop || state.pending; });
+            if (state.stop && !state.pending) {
+                break;
+            }
+
+            struct ggml_cgraph graph = state.graph;
+            state.pending = false;
+            state.running = true;
+            lock.unlock();
+            const enum ggml_status status = ggml_backend_cpu_graph_compute_sync(cpu_ctx, &graph);
+            lock.lock();
+            state.status = status;
+            state.running = false;
+            state.cv.notify_all();
+        }
+    });
+}
+
+static bool ggml_backend_cpu_graph_is_moe_cold_only(const struct ggml_cgraph * cgraph) {
+    return cgraph->n_nodes == 1 && cgraph->nodes[0]->op == GGML_OP_MOE_COLD;
+}
+
+static enum ggml_status ggml_backend_cpu_dispatch_async(
+        struct ggml_backend_cpu_context * cpu_ctx, struct ggml_cgraph * cgraph) {
+    const enum ggml_status previous = ggml_backend_cpu_wait_async(cpu_ctx);
+    if (previous != GGML_STATUS_SUCCESS) {
+        return previous;
+    }
+
+    auto & async = cpu_ctx->async;
+    std::lock_guard<std::mutex> lock(async.mutex);
+    ggml_backend_cpu_start_async_worker(cpu_ctx);
+    async.graph = *cgraph;
+    async.status = GGML_STATUS_SUCCESS;
+    async.pending = true;
+    g_moe_async_jobs.fetch_add(1, std::memory_order_relaxed);
+    async.cv.notify_one();
+    return GGML_STATUS_SUCCESS;
+}
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
     return "CPU";
@@ -117,6 +234,15 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    ggml_backend_cpu_wait_async(cpu_ctx);
+    {
+        std::lock_guard<std::mutex> lock(cpu_ctx->async.mutex);
+        cpu_ctx->async.stop = true;
+        cpu_ctx->async.cv.notify_one();
+    }
+    if (cpu_ctx->async.worker.joinable()) {
+        cpu_ctx->async.worker.join();
+    }
     delete[] cpu_ctx->work_data;
     delete cpu_ctx;
     delete backend;
@@ -167,9 +293,8 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
-static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
-
+static enum ggml_status ggml_backend_cpu_graph_compute_sync(
+        struct ggml_backend_cpu_context * cpu_ctx, struct ggml_cgraph * cgraph) {
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
@@ -190,6 +315,26 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     return ggml_graph_compute(cgraph, &cplan);
 }
 
+static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+
+    if (ggml_cpu_moe_get_async() && ggml_backend_cpu_graph_is_moe_cold_only(cgraph)) {
+        return ggml_backend_cpu_dispatch_async(cpu_ctx, cgraph);
+    }
+
+    const enum ggml_status previous = ggml_backend_cpu_wait_async(cpu_ctx);
+    return previous == GGML_STATUS_SUCCESS ?
+            ggml_backend_cpu_graph_compute_sync(cpu_ctx, cgraph) : previous;
+}
+
+static void ggml_backend_cpu_synchronize(ggml_backend_t backend) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    const enum ggml_status status = ggml_backend_cpu_wait_async(cpu_ctx);
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_ABORT("asynchronous CPU MoE graph failed with status %d\n", status);
+    }
+}
+
 static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .get_name                = */ ggml_backend_cpu_get_name,
     /* .free                    = */ ggml_backend_cpu_free,
@@ -198,7 +343,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
-    /* .synchronize             = */ NULL,
+    /* .synchronize             = */ ggml_backend_cpu_synchronize,
     /* .graph_plan_create       = */ ggml_backend_cpu_graph_plan_create,
     /* .graph_plan_free         = */ ggml_backend_cpu_graph_plan_free,
     /* .graph_plan_update       = */ NULL,

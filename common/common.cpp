@@ -1218,6 +1218,11 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    llama_expert_tier::configure_mtp(has_mtp ? std::max(1, params.speculative.draft.n_max) : 0);
+    llama_expert_tier::configure_enabled(params.cmoe);
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1339,14 +1344,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.sampling.backend_sampling) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
-    }
-
-    if (!params.cmoe) {
-#ifdef _WIN32
-        _putenv_s("LLAMA_EXPERT_S", "0");
-#else
-        setenv("LLAMA_EXPERT_S", "0", 1);
-#endif
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);
@@ -1631,6 +1628,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+    cparams.n_sampling_outputs_per_seq_max = std::max(params.n_sampling_outputs_per_seq_max, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

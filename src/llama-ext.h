@@ -90,6 +90,12 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// Select the physical ubatch cap used by subsequent decode calls without
+// changing the context's allocation maximum. The value must be in
+// [1, llama_n_ubatch(ctx)]. Intended for phase-specific server batching.
+LLAMA_API bool llama_set_runtime_ubatch(struct llama_context * ctx, uint32_t n_ubatch);
+LLAMA_API uint32_t llama_get_runtime_ubatch(const struct llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
@@ -115,6 +121,13 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+// Attach a DFlash draft context to the target graph. Context destruction detaches the bridge; neither context owns the other.
+LLAMA_API bool llama_attach_dflash(struct llama_context * ctx, struct llama_context * ctx_draft);
+LLAMA_API void llama_detach_dflash(struct llama_context * ctx, struct llama_context * ctx_draft);
+
+// Consume the result of the most recent target decode.
+LLAMA_API bool llama_take_dflash_injected(struct llama_context * ctx);
 
 //
 // model/context data extraction

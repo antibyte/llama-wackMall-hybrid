@@ -34,6 +34,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <stdatomic.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
@@ -58,6 +59,144 @@
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
 // and we'll use C++ attribute syntax.
 #define GGML_CACHE_LINE  64
+
+#define GGML_MOE_PROFILE_MAX_LAYERS 4096
+
+static atomic_bool g_moe_profile_enabled;
+static atomic_uint_fast64_t g_moe_profile_runs[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_uint_fast64_t g_moe_profile_wall_us[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_uint_fast64_t g_moe_profile_gate_up_us[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_uint_fast64_t g_moe_profile_activation_us[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_uint_fast64_t g_moe_profile_down_us[GGML_MOE_PROFILE_MAX_LAYERS];
+static atomic_int g_moe_single_row_chunk = 64;
+static atomic_bool g_moe_parallel_activation;
+static atomic_int g_moe_down_prefetch;
+static atomic_bool g_moe_reuse_rows;
+static atomic_bool g_moe_multi_row;
+static atomic_bool g_moe_fused_gate_up;
+static _Atomic(ggml_cpu_moe_transient_gate_up_claim_fn) g_moe_transient_gate_up_claim;
+static _Atomic(ggml_cpu_moe_transient_gate_up_fetch_fn) g_moe_transient_gate_up_fetch;
+static atomic_bool g_moe_transient_gate_up_verify;
+static atomic_bool g_moe_transient_gate_up_verify_seen;
+
+void ggml_cpu_moe_profile_enable(bool enabled) {
+    atomic_store_explicit(&g_moe_profile_enabled, enabled, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_profile_reset(void) {
+    for (int layer = 0; layer < GGML_MOE_PROFILE_MAX_LAYERS; ++layer) {
+        atomic_store_explicit(&g_moe_profile_runs[layer], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_moe_profile_wall_us[layer], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_moe_profile_gate_up_us[layer], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_moe_profile_activation_us[layer], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_moe_profile_down_us[layer], 0, memory_order_relaxed);
+    }
+}
+
+bool ggml_cpu_moe_profile_get_phases(
+        int layer, uint64_t * gate_up_us, uint64_t * activation_us, uint64_t * down_us) {
+    if (layer < 0 || layer >= GGML_MOE_PROFILE_MAX_LAYERS ||
+            !gate_up_us || !activation_us || !down_us) {
+        return false;
+    }
+    *gate_up_us = atomic_load_explicit(&g_moe_profile_gate_up_us[layer], memory_order_relaxed);
+    *activation_us = atomic_load_explicit(&g_moe_profile_activation_us[layer], memory_order_relaxed);
+    *down_us = atomic_load_explicit(&g_moe_profile_down_us[layer], memory_order_relaxed);
+    return true;
+}
+
+bool ggml_cpu_moe_profile_get(int layer, uint64_t * runs, uint64_t * wall_us) {
+    if (layer < 0 || layer >= GGML_MOE_PROFILE_MAX_LAYERS || !runs || !wall_us) {
+        return false;
+    }
+    *runs = atomic_load_explicit(&g_moe_profile_runs[layer], memory_order_relaxed);
+    *wall_us = atomic_load_explicit(&g_moe_profile_wall_us[layer], memory_order_relaxed);
+    return *runs > 0;
+}
+
+void ggml_cpu_moe_set_single_row_chunk(int chunk_size) {
+    GGML_ASSERT(chunk_size > 0);
+    atomic_store_explicit(&g_moe_single_row_chunk, chunk_size, memory_order_relaxed);
+}
+
+int ggml_cpu_moe_get_single_row_chunk(void) {
+    return atomic_load_explicit(&g_moe_single_row_chunk, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_parallel_activation(bool enabled) {
+    atomic_store_explicit(&g_moe_parallel_activation, enabled, memory_order_relaxed);
+}
+
+bool ggml_cpu_moe_get_parallel_activation(void) {
+    return atomic_load_explicit(&g_moe_parallel_activation, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_down_prefetch(int rows) {
+    GGML_ASSERT(rows >= 0);
+    atomic_store_explicit(&g_moe_down_prefetch, rows, memory_order_relaxed);
+}
+
+int ggml_cpu_moe_get_down_prefetch(void) {
+    return atomic_load_explicit(&g_moe_down_prefetch, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_reuse_rows(bool enabled) {
+    atomic_store_explicit(&g_moe_reuse_rows, enabled, memory_order_relaxed);
+}
+
+bool ggml_cpu_moe_get_reuse_rows(void) {
+    return atomic_load_explicit(&g_moe_reuse_rows, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_multi_row(bool enabled) {
+    atomic_store_explicit(&g_moe_multi_row, enabled, memory_order_relaxed);
+}
+
+bool ggml_cpu_moe_get_multi_row(void) {
+    return atomic_load_explicit(&g_moe_multi_row, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_fused_gate_up(bool enabled) {
+    atomic_store_explicit(&g_moe_fused_gate_up, enabled, memory_order_relaxed);
+}
+
+bool ggml_cpu_moe_get_fused_gate_up(void) {
+    return atomic_load_explicit(&g_moe_fused_gate_up, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_transient_gate_up(
+        ggml_cpu_moe_transient_gate_up_claim_fn claim,
+        ggml_cpu_moe_transient_gate_up_fetch_fn fetch) {
+    atomic_store_explicit(&g_moe_transient_gate_up_fetch, fetch, memory_order_release);
+    atomic_store_explicit(&g_moe_transient_gate_up_claim, claim, memory_order_release);
+}
+
+void ggml_cpu_moe_set_transient_gate_up_verify(bool enabled) {
+    atomic_store_explicit(&g_moe_transient_gate_up_verify_seen, false, memory_order_relaxed);
+    atomic_store_explicit(&g_moe_transient_gate_up_verify, enabled, memory_order_release);
+}
+
+static bool ggml_cpu_moe_profile_is_enabled(void) {
+    return atomic_load_explicit(&g_moe_profile_enabled, memory_order_relaxed);
+}
+
+static void ggml_cpu_moe_profile_record(int layer, uint64_t wall_us) {
+    if (layer < 0 || layer >= GGML_MOE_PROFILE_MAX_LAYERS) {
+        return;
+    }
+    atomic_fetch_add_explicit(&g_moe_profile_runs[layer], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_moe_profile_wall_us[layer], wall_us, memory_order_relaxed);
+}
+
+static void ggml_cpu_moe_profile_record_phases(
+        int layer, uint64_t gate_up_us, uint64_t activation_us, uint64_t down_us) {
+    if (layer < 0 || layer >= GGML_MOE_PROFILE_MAX_LAYERS) {
+        return;
+    }
+    atomic_fetch_add_explicit(&g_moe_profile_gate_up_us[layer], gate_up_us, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_moe_profile_activation_us[layer], activation_us, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_moe_profile_down_us[layer], down_us, memory_order_relaxed);
+}
 
 #if defined(__clang__) || defined(__GNUC__)
 #define GGML_CACHE_ALIGN __attribute__((aligned(GGML_CACHE_LINE)))
@@ -234,6 +373,10 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q2_0,
         .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_K] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo4_k_ref,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q4_0] = {
@@ -1759,36 +1902,6 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
-// expert tiering: optional residency probe for in-flight prefetch fills,
-// set by the tier module; keyed by the ptrs tensor's data pointer
-static const char * (*g_moe_probe_hook)(const void *, int64_t, const char *) = NULL;
-
-void ggml_set_moe_probe_hook(const char * (*fn)(const void *, int64_t, const char *)) {
-    g_moe_probe_hook = fn;
-}
-
-// expert tiering: optional demand-fetch hook (pread staging ring), set by
-// the tier module; keyed by the ptrs tensor's data pointer
-static const char * (*g_moe_fetch_hook)(const void *, int64_t, const char *) = NULL;
-
-void ggml_set_moe_fetch_hook(const char * (*fn)(const void *, int64_t, const char *)) {
-    g_moe_fetch_hook = fn;
-}
-
-// resolve a cold expert's weight address: ptrs table first (pool | mmap),
-// then the prefetch probe (READY in-flight slot), then the demand-fetch
-// staging ring, else the mmap fallback
-static const char * moe_cold_addr(const struct ggml_tensor * ptrs, const int64_t * addr, int64_t e, const char * fallback) {
-    const char * a = (addr && addr[e]) ? (const char *) (uintptr_t) addr[e] : fallback;
-    if (g_moe_probe_hook && ptrs) {
-        a = g_moe_probe_hook(ptrs->data, e, a);
-    }
-    if (g_moe_fetch_hook && ptrs) {
-        a = g_moe_fetch_hook(ptrs->data, e, a);
-    }
-    return a;
-}
-
 // same as ggml_compute_forward_mul_mat_id, but computes only experts with
 // cold_mask[i02] == 1; all other output slots are zeroed. cold_mask is src[3],
 // an i32 tensor with n_expert entries.
@@ -1800,10 +1913,8 @@ static void ggml_compute_forward_mul_mat_id_cold(
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids  = dst->src[2];
     const struct ggml_tensor * mask = dst->src[3];
-    const struct ggml_tensor * ptrs = dst->src[4];
 
     const int32_t * cold_mask = (const int32_t *) mask->data;
-    const int64_t * addr = ptrs ? (const int64_t *) ptrs->data : NULL;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1916,7 +2027,7 @@ static void ggml_compute_forward_mul_mat_id_cold(
             continue;
         }
 
-        const char * src0_cur = moe_cold_addr(ptrs, addr, cur_a, (const char *) src0->data + cur_a * nb02);
+        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -2000,132 +2111,21 @@ static void ggml_compute_forward_moe_count(
     ((float *) dst->data)[0] = 0.0f;
 }
 
-// debug-only: per-token routing trace (LLAMA_EXPERT_TRACE=path); one record
-// per token: seq,ntok,e0..eN - seq identifies (step, layer) as (seq/nl, seq%nl)
-static void trace_moe_ids(const struct ggml_tensor * ids) {
-    static FILE * g_trace = NULL;
-    static int g_trace_state = -1;
-    static uint64_t g_trace_seq = 0;
-    if (g_trace_state < 0) {
-        const char * p = getenv("LLAMA_EXPERT_TRACE");
-        g_trace_state = 0;
-        if (p && p[0]) {
-            g_trace = fopen(p, "w");
-            g_trace_state = g_trace ? 1 : 0;
+static void ggml_moe_activate_range(
+        float * gate, const float * up, int64_t begin, int64_t end, bool is_gelu) {
+    if (is_gelu) {
+        for (int64_t i = begin; i < end; i++) {
+            const float g = gate[i];
+            const float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * g * (1.0f + 0.044715f * g * g)));
+            gate[i] = gelu_g * up[i];
+        }
+    } else {
+        for (int64_t i = begin; i < end; i++) {
+            const float g = gate[i];
+            const float silu_g = g / (1.0f + expf(-g));
+            gate[i] = silu_g * up[i];
         }
     }
-    if (!g_trace_state) {
-        return;
-    }
-    for (int64_t t = 0; t < ids->ne[1]; t++) {
-        fprintf(g_trace, "%llu,%lld", (unsigned long long) g_trace_seq, (long long) ids->ne[1]);
-        for (int id = 0; id < ids->ne[0]; id++) {
-            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
-            fprintf(g_trace, ",%d", e);
-        }
-        fprintf(g_trace, "\n");
-    }
-    g_trace_seq++;
-}
-
-// debug-only: per-token routing+router-input dump (LLAMA_EXPERT_TRACEX=path);
-// binary: 8B magic + i32 ne0; per token: u64 seq, i32 n_ids, i32 ids[n_ids],
-// f32 x[ne0]. seq identifies (step, layer) as (seq/nl, seq%nl). Only rows
-// present in both tensors are written (ids may be padded for graph reuse).
-static void trace_moe_dump(const struct ggml_tensor * ids, const struct ggml_tensor * x) {
-    static FILE * g_tracex = NULL;
-    static int g_tracex_state = -1;
-    static uint64_t g_tx_seq = 0;
-    static float g_row[16384];
-    if (g_tracex_state < 0) {
-        const char * p = getenv("LLAMA_EXPERT_TRACEX");
-        g_tracex_state = 0;
-        if (p && p[0]) {
-            g_tracex = fopen(p, "wb");
-            g_tracex_state = g_tracex ? 1 : 0;
-        }
-        if (g_tracex_state) {
-            const char magic[8] = {'M','E','X','T','X','0','1','\0'};
-            const int32_t ne0 = (int32_t) x->ne[0];
-            fwrite(magic, 1, 8, g_tracex);
-            fwrite(&ne0, 4, 1, g_tracex);
-        }
-    }
-    if (!g_tracex_state) {
-        return;
-    }
-    const int64_t ne0   = x->ne[0];
-    const int64_t n_ids = ids->ne[0];
-    const int64_t ntok  = ids->ne[1] < x->ne[1] ? ids->ne[1] : x->ne[1];
-    for (int64_t t = 0; t < ntok; t++) {
-        fwrite(&g_tx_seq, 8, 1, g_tracex);
-        const int32_t ni = (int32_t) n_ids;
-        fwrite(&ni, 4, 1, g_tracex);
-        for (int64_t id = 0; id < n_ids; id++) {
-            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
-            fwrite(&e, 4, 1, g_tracex);
-        }
-        const char * src = (const char *) x->data + t*x->nb[1];
-        if (x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && ne0 <= 16384) {
-            fwrite(src, sizeof(float), ne0, g_tracex);
-            continue;
-        }
-        if (ne0 > 16384) {
-            memset(g_row, 0, sizeof(g_row));
-        } else if (x->type == GGML_TYPE_F32) {
-            for (int64_t i = 0; i < ne0; i++) {
-                g_row[i] = *(const float *) (src + i*x->nb[0]);
-            }
-        } else if (x->type == GGML_TYPE_F16) {
-            for (int64_t i = 0; i < ne0; i++) {
-                g_row[i] = GGML_FP16_TO_FP32(*(const ggml_fp16_t *) (src + i*x->nb[0]));
-            }
-        } else {
-            memset(g_row, 0, ne0*sizeof(float));
-        }
-        fwrite(g_row, sizeof(float), ne0, g_tracex);
-    }
-    g_tx_seq++;
-}
-
-// expert tiering: actual-routing trace for predicted-vs-actual joins
-static FILE * g_route_trace = NULL;
-static int    g_route_nlayers = 0;
-static uint64_t g_route_seq = 0;
-
-void ggml_set_route_trace(FILE * f, int n_layers) {
-    g_route_trace = f;
-    g_route_nlayers = n_layers;
-}
-
-static void trace_moe_route(const struct ggml_tensor * ids) {
-    if (!g_route_trace) {
-        return;
-    }
-    const int layer = g_route_nlayers > 0 ? (int)(g_route_seq % (uint64_t)g_route_nlayers) : -1;
-    for (int64_t t = 0; t < ids->ne[1]; t++) {
-        fprintf(g_route_trace, "%llu,%d", (unsigned long long) g_route_seq, layer);
-        for (int id = 0; id < ids->ne[0]; id++) {
-            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
-            fprintf(g_route_trace, ",%d", e);
-        }
-        fprintf(g_route_trace, "\n");
-    }
-    g_route_seq++;
-}
-
-// expert tiering: wall-clock accumulator for MOE_COLD ops (ith==0 only)
-static uint64_t g_moe_cold_us = 0;
-
-uint64_t ggml_moe_cold_timer_us(void) {
-    return g_moe_cold_us;
-}
-
-// expert tiering: optional pre-gate prediction hook, set by the tier module
-static void (*g_moe_predict_hook)(const struct ggml_tensor *, const struct ggml_tensor *) = NULL;
-
-void ggml_set_moe_predict_hook(void (*fn)(const struct ggml_tensor *, const struct ggml_tensor *)) {
-    g_moe_predict_hook = fn;
 }
 
 static void ggml_compute_forward_moe_cold(
@@ -2141,11 +2141,6 @@ static void ggml_compute_forward_moe_cold(
     const struct ggml_tensor * counts = dst->src[6];
 
     const int32_t * cold_mask = (const int32_t *) mask->data;
-
-    // optional RAM-pool residency tables: per-expert weight source addresses
-    const int64_t * addr_g = dst->src[7] ? (const int64_t *) dst->src[7]->data : NULL;
-    const int64_t * addr_u = dst->src[8] ? (const int64_t *) dst->src[8]->data : NULL;
-    const int64_t * addr_d = dst->src[9] ? (const int64_t *) dst->src[9]->data : NULL;
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -2164,6 +2159,7 @@ static void ggml_compute_forward_moe_cold(
     const int64_t n_out    = w_down->ne[1];
     const int n_ids = ids->ne[0];
     const int n_as  = w_gate->ne[2];
+    GGML_ASSERT(n_as > 0);
 
     ggml_vec_dot_t    const vec_dot_g = type_traits_cpu[type_g].vec_dot;
     enum ggml_type    const vdt_g     = type_traits_cpu[type_g].vec_dot_type;
@@ -2197,7 +2193,29 @@ static void ggml_compute_forward_moe_cold(
     float * up_out   = gate_out + n_ff*maxc;
     char  * act_q    = (char *)  incr_ptr_aligned(&wdata_cur, q_ff*maxc, CACHE_LINE_SIZE);
 
+    uint8_t * transient_gate_up =
+        (uint8_t *) incr_ptr_aligned(&wdata_cur, (size_t) maxc*sizeof(uint8_t), sizeof(int64_t));
+    int64_t * transient_count =
+        (int64_t *) incr_ptr_aligned(&wdata_cur, sizeof(int64_t), sizeof(int64_t));
+    float * transient_verify =
+        (float *) incr_ptr_aligned(&wdata_cur, 2*n_ff*sizeof(float), CACHE_LINE_SIZE);
+
+    // Shared only while optional profiling is active. Keeping it in the
+    // graph work buffer avoids process-global timing state between barriers.
+    int64_t * phase_clock =
+        (int64_t *) incr_ptr_aligned(&wdata_cur, 4*sizeof(int64_t), sizeof(int64_t));
+
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
+
+    const bool profile_phases = ggml_cpu_moe_profile_is_enabled();
+    const int profile_layer = profile_phases ? dst->op_params[0] : -1;
+    const bool multi_row = ggml_cpu_moe_get_multi_row() && ggml_cpu_has_avx2();
+    const bool reuse_rows = ggml_cpu_moe_get_reuse_rows() || multi_row;
+    const bool multi_gate_up = multi_row && type_g == GGML_TYPE_Q4_K;
+    const bool multi_down = multi_row && type_d == GGML_TYPE_Q5_K;
+    const bool fused_gate_up = ggml_cpu_moe_get_fused_gate_up() &&
+            type_g == GGML_TYPE_Q4_K && ggml_cpu_has_avx2();
+    const bool verify_transient = atomic_load_explicit(&g_moe_transient_gate_up_verify, memory_order_acquire);
 
     // quantize x once, shared by all experts
     for (int64_t t = ith; t < n_tokens; t++) {
@@ -2207,13 +2225,6 @@ static void ggml_compute_forward_moe_cold(
     if (ith == 0) {
         memset(dst->data, 0, ggml_nbytes(dst));
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
-
-        trace_moe_ids(ids);
-        trace_moe_dump(ids, x);
-        trace_moe_route(ids);
-        if (g_moe_predict_hook) {
-            g_moe_predict_hook(counts, x);
-        }
 
         int32_t * cnt = counts ? (int32_t *) counts->data : NULL;
         for (int64_t t = 0; t < n_tokens; t++) {
@@ -2237,6 +2248,22 @@ static void ggml_compute_forward_moe_cold(
             col0[e] = coff;
             coff += matrix_row_counts[e];
         }
+        memset(transient_gate_up, 0, (size_t) maxc*sizeof(uint8_t));
+        *transient_count = 0;
+        ggml_cpu_moe_transient_gate_up_claim_fn claim =
+            atomic_load_explicit(&g_moe_transient_gate_up_claim, memory_order_acquire);
+        if (claim) {
+            const int layer = dst->op_params[0];
+            for (int e = 0; e < n_as; ++e) {
+                for (int64_t c = 0; c < matrix_row_counts[e]; ++c) {
+                    const struct mmid_row_mapping rm = matrix_rows[e*(int64_t)n_ids*n_tokens + c];
+                    if (claim(layer, e, rm.i2, n_ff)) {
+                        transient_gate_up[col0[e] + c] = 1;
+                        (*transient_count)++;
+                    }
+                }
+            }
+        }
     }
 
     // reset phase-A chunk counters
@@ -2246,6 +2273,12 @@ static void ggml_compute_forward_moe_cold(
     }
 
     ggml_barrier(params->threadpool);
+    if (profile_phases) {
+        if (ith == 0) {
+            phase_clock[0] = ggml_time_us();
+        }
+        ggml_barrier(params->threadpool);
+    }
 
     // phase A: gate/up dots for all cold slots into gate_out/up_out
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -2253,16 +2286,15 @@ static void ggml_compute_forward_moe_cold(
         if (cne1 == 0) {
             continue;
         }
-        const char * wg = moe_cold_addr(dst->src[7], addr_g, cur_a, (const char *) w_gate->data + cur_a*w_gate->nb[2]);
-        const char * wu = (w_gate == w_up) ? (wg + n_ff*w_gate->nb[1])
-                        : moe_cold_addr(dst->src[8], addr_u, cur_a, (const char *) w_up->data + cur_a*w_up->nb[2]);
+        const char * wg = (const char *) w_gate->data + cur_a*w_gate->nb[2];
+        const char * wu = (w_gate == w_up) ? (wg + n_ff*w_gate->nb[1]) : ((const char *) w_up->data + cur_a*w_up->nb[2]);
 
         const int64_t nr0 = n_ff;
         const int64_t nr1 = cne1;
 
         int chunk_size = 16;
         if (nr1 == 1) {
-            chunk_size = 64;
+            chunk_size = ggml_cpu_moe_get_single_row_chunk();
         }
         const bool disable_chunking = ggml_is_numa();
         int64_t nchunk0 = (nr0 + chunk_size - 1)/chunk_size;
@@ -2283,18 +2315,76 @@ static void ggml_compute_forward_moe_cold(
             const int64_t ir0_start = dr0*ith0, ir0_end = MIN(ir0_start + dr0, nr0);
             const int64_t ir1_start = dr1*ith1, ir1_end = MIN(ir1_start + dr1, nr1);
 
-            for (int64_t c = ir1_start; c < ir1_end; c++) {
-                const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
-                const char * xcol = xq + (int64_t) rm.i2*q_embd;
-                float * gout = gate_out + (col0[cur_a] + c)*n_ff;
-                float * uout = up_out   + (col0[cur_a] + c)*n_ff;
+            if (reuse_rows && ir1_end - ir1_start > 1) {
                 for (int64_t i = ir0_start; i < ir0_end; i++) {
-#if defined(__clang__) || defined(__GNUC__)
                     __builtin_prefetch(wg + (i + 1)*w_gate->nb[1], 0, 3);
                     __builtin_prefetch(wu + (i + 1)*w_up->nb[1], 0, 3);
-#endif
-                    vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
-                    vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                    for (int64_t c = ir1_start; c < ir1_end;) {
+                        if (transient_gate_up[col0[cur_a] + c] && !verify_transient) {
+                            c++;
+                            continue;
+                        }
+                        const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
+                        const char * xcol = xq + (int64_t) rm.i2*q_embd;
+                        int run = 1;
+                        if (multi_gate_up) {
+                            while (run < 4 && c + run < ir1_end) {
+                                if (transient_gate_up[col0[cur_a] + c + run] && !verify_transient) {
+                                    break;
+                                }
+                                const struct mmid_row_mapping next =
+                                    matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c + run];
+                                if (next.i2 != rm.i2 + run) {
+                                    break;
+                                }
+                                run++;
+                            }
+                        }
+                        if (run > 1) {
+                            float gres[4];
+                            float ures[4];
+                            vec_dot_g(ne_embd, gres, sizeof(float),
+                                    wg + i*w_gate->nb[1], 0, xcol, q_embd, run);
+                            vec_dot_g(ne_embd, ures, sizeof(float),
+                                    wu + i*w_up->nb[1], 0, xcol, q_embd, run);
+                            for (int r = 0; r < run; ++r) {
+                                gate_out[(col0[cur_a] + c + r)*n_ff + i] = gres[r];
+                                up_out[(col0[cur_a] + c + r)*n_ff + i] = ures[r];
+                            }
+                        } else {
+                            float * gout = gate_out + (col0[cur_a] + c)*n_ff;
+                            float * uout = up_out   + (col0[cur_a] + c)*n_ff;
+                            if (fused_gate_up) {
+                                ggml_vec_dot_q4_K_q8_K_pair(ne_embd, &gout[i], &uout[i],
+                                        wg + i*w_gate->nb[1], wu + i*w_up->nb[1], xcol);
+                            } else {
+                                vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
+                                vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                            }
+                        }
+                        c += run;
+                    }
+                }
+            } else {
+                for (int64_t c = ir1_start; c < ir1_end; c++) {
+                    if (transient_gate_up[col0[cur_a] + c] && !verify_transient) {
+                        continue;
+                    }
+                    const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
+                    const char * xcol = xq + (int64_t) rm.i2*q_embd;
+                    float * gout = gate_out + (col0[cur_a] + c)*n_ff;
+                    float * uout = up_out   + (col0[cur_a] + c)*n_ff;
+                    for (int64_t i = ir0_start; i < ir0_end; i++) {
+                        __builtin_prefetch(wg + (i + 1)*w_gate->nb[1], 0, 3);
+                        __builtin_prefetch(wu + (i + 1)*w_up->nb[1], 0, 3);
+                        if (fused_gate_up) {
+                            ggml_vec_dot_q4_K_q8_K_pair(ne_embd, &gout[i], &uout[i],
+                                    wg + i*w_gate->nb[1], wu + i*w_up->nb[1], xcol);
+                        } else {
+                            vec_dot_g(ne_embd, &gout[i], 0, wg + i*w_gate->nb[1], 0, xcol, 0, 1);
+                            vec_dot_g(ne_embd, &uout[i], 0, wu + i*w_up->nb[1], 0, xcol, 0, 1);
+                        }
+                    }
                 }
             }
 
@@ -2305,29 +2395,96 @@ static void ggml_compute_forward_moe_cold(
         }
     }
 
+    if (verify_transient) {
+        ggml_barrier(params->threadpool);
+    }
+    if (*transient_count > 0 && ith == 0) {
+        ggml_cpu_moe_transient_gate_up_fetch_fn fetch =
+            atomic_load_explicit(&g_moe_transient_gate_up_fetch, memory_order_acquire);
+        GGML_ASSERT(fetch);
+        const int layer = dst->op_params[0];
+        for (int e = 0; e < n_as; ++e) {
+            for (int64_t c = 0; c < matrix_row_counts[e]; ++c) {
+                if (transient_gate_up[col0[e] + c]) {
+                    const struct mmid_row_mapping rm = matrix_rows[e*(int64_t)n_ids*n_tokens + c];
+                    float * gate = gate_out + (col0[e] + c)*n_ff;
+                    float * up = up_out + (col0[e] + c)*n_ff;
+                    float * fetch_gate = verify_transient ? transient_verify : gate;
+                    float * fetch_up = verify_transient ? transient_verify + n_ff : up;
+                    GGML_ASSERT(fetch(layer, e, rm.i2, fetch_gate, fetch_up, n_ff));
+                    if (verify_transient) {
+                        const size_t bytes = (size_t) n_ff*sizeof(float);
+                        if (memcmp(gate, fetch_gate, bytes) != 0 || memcmp(up, fetch_up, bytes) != 0) {
+                            int64_t first = -1;
+                            bool first_is_up = false;
+                            for (int64_t i = 0; i < n_ff; ++i) {
+                                if (memcmp(gate + i, fetch_gate + i, sizeof(float)) != 0) {
+                                    first = i;
+                                    break;
+                                }
+                                if (memcmp(up + i, fetch_up + i, sizeof(float)) != 0) {
+                                    first = i;
+                                    first_is_up = true;
+                                    break;
+                                }
+                            }
+                            const float cpu = first_is_up ? up[first] : gate[first];
+                            const float gpu = first_is_up ? fetch_up[first] : fetch_gate[first];
+                            uint32_t cpu_bits;
+                            uint32_t gpu_bits;
+                            memcpy(&cpu_bits, &cpu, sizeof(cpu_bits));
+                            memcpy(&gpu_bits, &gpu, sizeof(gpu_bits));
+                            fprintf(stderr, "ggml_cpu_moe: transient mismatch layer=%d expert=%d token=%d part=%s index=%lld cpu=%08x gpu=%08x\n",
+                                    layer, e, rm.i2, first_is_up ? "up" : "gate", (long long) first, cpu_bits, gpu_bits);
+                        } else if (!atomic_exchange_explicit(&g_moe_transient_gate_up_verify_seen, true, memory_order_relaxed)) {
+                            fprintf(stderr, "ggml_cpu_moe: transient verification active; first row is bit-exact\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
     ggml_barrier(params->threadpool);
+    if (profile_phases) {
+        if (ith == 0) {
+            phase_clock[1] = ggml_time_us();
+        }
+        ggml_barrier(params->threadpool);
+    }
 
     // phase B (multi-threaded): activation (SwiGLU/GELU) + quantize the intermediate
     const int64_t total_cols = n_as > 0 ? (col0[n_as - 1] + matrix_row_counts[n_as - 1]) : 0;
     const bool is_gelu = (w_gate == w_up);
 
-    for (int64_t c = ith; c < total_cols; c += nth) {
-        float * go = gate_out + c*n_ff;
-        const float * uo = up_out + c*n_ff;
-        if (is_gelu) {
-            for (int64_t i = 0; i < n_ff; i++) {
-                const float g = go[i];
-                const float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * g * (1.0f + 0.044715f * g * g)));
-                go[i] = gelu_g * uo[i];
-            }
-        } else {
-            for (int64_t i = 0; i < n_ff; i++) {
-                const float g = go[i];
-                const float silu_g = g / (1.0f + expf(-g));
-                go[i] = silu_g * uo[i];
-            }
+    if (ggml_cpu_moe_get_parallel_activation()) {
+        // A decode graph often has fewer cold columns than CPU workers. Split
+        // the activation at quant-block boundaries so all workers can help a
+        // singleton column without changing any quantization block's inputs.
+        const int64_t block = ggml_blck_size(vdt_d);
+        GGML_ASSERT(block > 0 && n_ff % block == 0);
+        const int64_t blocks_per_col = n_ff / block;
+        const int64_t total_blocks = total_cols * blocks_per_col;
+        int64_t current = total_blocks * ith / nth;
+        const int64_t end = total_blocks * (ith + 1) / nth;
+
+        while (current < end) {
+            const int64_t c = current / blocks_per_col;
+            const int64_t column_end = MIN(end, (c + 1)*blocks_per_col);
+            const int64_t i0 = (current % blocks_per_col)*block;
+            const int64_t i1 = i0 + (column_end - current)*block;
+            float * go = gate_out + c*n_ff;
+            const float * uo = up_out + c*n_ff;
+            ggml_moe_activate_range(go, uo, i0, i1, is_gelu);
+            from_fa(go + i0, act_q + c*q_ff + ggml_row_size(vdt_d, i0), i1 - i0);
+            current = column_end;
         }
-        from_fa(go, act_q + c*q_ff, n_ff);
+    } else {
+        for (int64_t c = ith; c < total_cols; c += nth) {
+            float * go = gate_out + c*n_ff;
+            const float * uo = up_out + c*n_ff;
+            ggml_moe_activate_range(go, uo, 0, n_ff, is_gelu);
+            from_fa(go, act_q + c*q_ff, n_ff);
+        }
     }
 
     if (ith == 0) {
@@ -2339,21 +2496,28 @@ static void ggml_compute_forward_moe_cold(
     }
 
     ggml_barrier(params->threadpool);
+    if (profile_phases) {
+        if (ith == 0) {
+            phase_clock[2] = ggml_time_us();
+        }
+        ggml_barrier(params->threadpool);
+    }
 
     // phase C: down dots for all cold slots, scattered into dst
+    const int down_prefetch = ggml_cpu_moe_get_down_prefetch();
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) {
             continue;
         }
-        const char * wd = moe_cold_addr(dst->src[9], addr_d, cur_a, (const char *) w_down->data + cur_a*w_down->nb[2]);
+        const char * wd = (const char *) w_down->data + cur_a*w_down->nb[2];
 
         const int64_t nr0 = n_out;
         const int64_t nr1 = cne1;
 
         int chunk_size = 16;
         if (nr1 == 1) {
-            chunk_size = 64;
+            chunk_size = ggml_cpu_moe_get_single_row_chunk();
         }
         const bool disable_chunking = ggml_is_numa();
         int64_t nchunk0 = (nr0 + chunk_size - 1)/chunk_size;
@@ -2374,14 +2538,48 @@ static void ggml_compute_forward_moe_cold(
             const int64_t ir0_start = dr0*ith0, ir0_end = MIN(ir0_start + dr0, nr0);
             const int64_t ir1_start = dr1*ith1, ir1_end = MIN(ir1_start + dr1, nr1);
 
-            for (int64_t c = ir1_start; c < ir1_end; c++) {
-                const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
-                const char * acol = act_q + (col0[cur_a] + c)*q_ff;
-                float * dst_col = (float *) ((char *) dst->data + rm.i1*dst->nb[1] + (int64_t) rm.i2*dst->nb[2]);
+            if (reuse_rows && ir1_end - ir1_start > 1) {
                 for (int64_t j = ir0_start; j < ir0_end; j++) {
-                    float res = 0.0f;
-                    vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
-                    dst_col[j] += res;
+                    if (down_prefetch > 0 && j + down_prefetch < ir0_end) {
+                        __builtin_prefetch(wd + (j + down_prefetch)*w_down->nb[1], 0, 3);
+                    }
+                    for (int64_t c = ir1_start; c < ir1_end;) {
+                        const int run = multi_down ? MIN(4, ir1_end - c) : 1;
+                        const char * acol = act_q + (col0[cur_a] + c)*q_ff;
+                        float results[4];
+                        vec_dot_d(n_ff, results, sizeof(float),
+                                wd + j*w_down->nb[1], 0, acol, run > 1 ? q_ff : 0, run);
+                        for (int r = 0; r < run; ++r) {
+                            const struct mmid_row_mapping rm =
+                                matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c + r];
+                            float * dst_col = (float *) ((char *) dst->data +
+                                    rm.i1*dst->nb[1] + (int64_t) rm.i2*dst->nb[2]);
+                            dst_col[j] += results[r];
+                        }
+                        c += run;
+                    }
+                }
+            } else {
+                for (int64_t c = ir1_start; c < ir1_end; c++) {
+                    const struct mmid_row_mapping rm = matrix_rows[cur_a*(int64_t)n_ids*n_tokens + c];
+                    const char * acol = act_q + (col0[cur_a] + c)*q_ff;
+                    float * dst_col = (float *) ((char *) dst->data + rm.i1*dst->nb[1] + (int64_t) rm.i2*dst->nb[2]);
+                    if (down_prefetch > 0) {
+                        for (int64_t j = ir0_start; j < ir0_end; j++) {
+                            if (j + down_prefetch < ir0_end) {
+                                __builtin_prefetch(wd + (j + down_prefetch)*w_down->nb[1], 0, 3);
+                            }
+                            float res = 0.0f;
+                            vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
+                            dst_col[j] += res;
+                        }
+                    } else {
+                        for (int64_t j = ir0_start; j < ir0_end; j++) {
+                            float res = 0.0f;
+                            vec_dot_d(n_ff, &res, 0, wd + j*w_down->nb[1], 0, acol, 0, 1);
+                            dst_col[j] += res;
+                        }
+                    }
                 }
             }
 
@@ -2389,6 +2587,18 @@ static void ggml_compute_forward_moe_cold(
                 break;
             }
             current_chunk = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
+        }
+    }
+
+    if (profile_phases) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) {
+            phase_clock[3] = ggml_time_us();
+            ggml_cpu_moe_profile_record_phases(
+                    profile_layer,
+                    (uint64_t) (phase_clock[1] - phase_clock[0]),
+                    (uint64_t) (phase_clock[2] - phase_clock[1]),
+                    (uint64_t) (phase_clock[3] - phase_clock[2]));
         }
     }
 }
@@ -2835,6 +3045,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_TURBO4_WHT:
+            {
+                GGML_ABORT("GGML_OP_TURBO4_WHT requires the CUDA backend");
+            }
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -3601,6 +3815,12 @@ struct ggml_cplan ggml_graph_plan(
                         cur += 2*w_gate->ne[1]*maxc*sizeof(float) + CACHE_LINE_SIZE;
                         // act_q
                         cur += ggml_row_size(vdt_d, w_gate->ne[1])*maxc + CACHE_LINE_SIZE;
+                        // transient Gate+Up ownership flags
+                        cur += maxc*sizeof(uint8_t) + 2*sizeof(int64_t);
+                        // transient Gate+Up verification scratch
+                        cur += 2*w_gate->ne[1]*sizeof(float) + CACHE_LINE_SIZE;
+                        // optional phase timing scratch
+                        cur += 4*sizeof(int64_t) + sizeof(int64_t);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
@@ -3815,6 +4035,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    int pending_last_moe_layer = -1;
+    int64_t pending_last_moe_started_us = 0;
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3827,9 +4049,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        const bool profile_moe = node->op == GGML_OP_MOE_COLD && ggml_cpu_moe_profile_is_enabled();
+        const int profile_layer = profile_moe ? node->op_params[0] : -1;
+        const int64_t profile_started_us = profile_moe && state->ith == 0 ? ggml_time_us() : 0;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
-        const int64_t t_cold_0 = (state->ith == 0 && node->op == GGML_OP_MOE_COLD) ? ggml_time_us() : 0;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -3845,10 +4070,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
-        }
-
-        if (t_cold_0) {
-            g_moe_cold_us += (uint64_t)(ggml_time_us() - t_cold_0);
+            if (profile_moe && state->ith == 0) {
+                ggml_cpu_moe_profile_record(profile_layer, (uint64_t) (ggml_time_us() - profile_started_us));
+            }
+        } else if (profile_moe && state->ith == 0) {
+            pending_last_moe_layer = profile_layer;
+            pending_last_moe_started_us = profile_started_us;
         }
     }
 
@@ -3859,6 +4086,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+    if (state->ith == 0 && pending_last_moe_layer >= 0) {
+        ggml_cpu_moe_profile_record(
+                pending_last_moe_layer,
+                (uint64_t) (ggml_time_us() - pending_last_moe_started_us));
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);

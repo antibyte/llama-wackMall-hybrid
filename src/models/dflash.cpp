@@ -73,6 +73,122 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
     };
 }
 
+bool llama_model_dflash::build_dflash_injection(
+        llm_graph_context              & graph,
+        ggml_tensor                    * features,
+        const llama_cparams            & cparams_draft,
+        const llama_memory_context_i * mctx_draft) const {
+    if (features == nullptr || mctx_draft == nullptr) {
+        return false;
+    }
+
+    const int64_t n_tokens    = graph.ubatch.n_tokens;
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int64_t n_head_kv   = hparams.n_head_kv();
+
+    GGML_ASSERT(features->ne[0] == hparams.n_embd_inp_enc());
+    GGML_ASSERT(features->ne[1] == n_tokens);
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    auto inp_pos = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
+    inp_pos->pos = ggml_new_tensor_1d(
+            graph.ctx0, GGML_TYPE_I32, n_tokens*hparams.n_pos_per_embd());
+    ggml_set_input(inp_pos->pos);
+    ggml_tensor * pos = inp_pos->pos;
+    graph.res->add_input(std::move(inp_pos));
+
+    llm_graph_input_attn_kv      * inp_attn      = nullptr;
+    llm_graph_input_attn_kv_iswa * inp_attn_iswa = nullptr;
+
+    const bool use_iswa = hparams.swa_type != LLAMA_SWA_TYPE_NONE;
+    if (use_iswa) {
+        const auto * mctx = static_cast<const llama_kv_cache_iswa_context *>(mctx_draft);
+        auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams_draft, mctx, true);
+
+        inp->self_k_idxs     = mctx->get_base()->build_input_k_idxs(graph.ctx0, graph.ubatch);
+        inp->self_v_idxs     = mctx->get_base()->build_input_v_idxs(graph.ctx0, graph.ubatch);
+        inp->self_k_idxs_swa = mctx->get_swa()->build_input_k_idxs(graph.ctx0, graph.ubatch);
+        inp->self_v_idxs_swa = mctx->get_swa()->build_input_v_idxs(graph.ctx0, graph.ubatch);
+
+        inp->self_k_rot     = mctx->get_base()->build_input_k_rot(graph.ctx0);
+        inp->self_v_rot     = mctx->get_base()->build_input_v_rot(graph.ctx0);
+        inp->self_k_rot_swa = mctx->get_swa()->build_input_k_rot(graph.ctx0);
+        inp->self_v_rot_swa = mctx->get_swa()->build_input_v_rot(graph.ctx0);
+
+        inp_attn_iswa = static_cast<llm_graph_input_attn_kv_iswa *>(graph.res->add_input(std::move(inp)));
+    } else {
+        const auto * mctx = static_cast<const llama_kv_cache_context *>(mctx_draft);
+        auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams_draft, mctx, true);
+
+        inp->self_k_idxs = mctx->build_input_k_idxs(graph.ctx0, graph.ubatch);
+        inp->self_v_idxs = mctx->build_input_v_idxs(graph.ctx0, graph.ubatch);
+        inp->self_k_rot  = mctx->build_input_k_rot(graph.ctx0);
+        inp->self_v_rot  = mctx->build_input_v_rot(graph.ctx0);
+
+        inp_attn = static_cast<llm_graph_input_attn_kv *>(graph.res->add_input(std::move(inp)));
+    }
+
+    ggml_tensor * cur = ggml_mul_mat(graph.ctx0, fc, features);
+    graph.cb(cur, "dflash_fc", -1);
+
+    cur = ggml_rms_norm(graph.ctx0, cur, hparams.f_norm_rms_eps);
+    cur = ggml_mul(graph.ctx0, cur, output_norm_enc);
+    graph.cb(cur, "dflash_enc_norm", -1);
+
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        const auto & layer = layers[il];
+
+        ggml_tensor * Kcur = ggml_mul_mat(graph.ctx0, layer.wk, cur);
+        ggml_tensor * Vcur = ggml_mul_mat(graph.ctx0, layer.wv, cur);
+
+        Kcur = ggml_reshape_3d(graph.ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Vcur = ggml_reshape_3d(graph.ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+        Kcur = ggml_rms_norm(graph.ctx0, Kcur, hparams.f_norm_rms_eps);
+        Kcur = ggml_mul(graph.ctx0, Kcur, layer.attn_k_norm);
+        Kcur = ggml_rope_ext(
+                graph.ctx0, Kcur, pos, nullptr,
+                hparams.n_rot(), hparams.rope_type, cparams_draft.n_ctx_orig_yarn,
+                cparams_draft.rope_freq_base, cparams_draft.rope_freq_scale,
+                cparams_draft.yarn_ext_factor, cparams_draft.yarn_attn_factor,
+                cparams_draft.yarn_beta_fast, cparams_draft.yarn_beta_slow);
+
+        graph.cb(Kcur, "dflash_k_inject", il);
+        graph.cb(Vcur, "dflash_v_inject", il);
+
+        if (use_iswa) {
+            const bool is_swa = hparams.is_swa(il);
+            const auto * kv = is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base();
+            ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
+            ggml_tensor * v_idxs = is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs();
+            ggml_tensor * k_rot  = is_swa ? inp_attn_iswa->self_k_rot_swa : inp_attn_iswa->self_k_rot;
+            ggml_tensor * v_rot  = is_swa ? inp_attn_iswa->self_v_rot_swa : inp_attn_iswa->self_v_rot;
+
+            if (k_rot != nullptr) {
+                Kcur = llama_mul_mat_hadamard(graph.ctx0, Kcur, k_rot);
+            }
+            if (v_rot != nullptr) {
+                Vcur = llama_mul_mat_hadamard(graph.ctx0, Vcur, v_rot);
+            }
+
+            ggml_build_forward_expand(graph.gf, kv->cpy_k(graph.ctx0, Kcur, k_idxs, il));
+            ggml_build_forward_expand(graph.gf, kv->cpy_v(graph.ctx0, Vcur, v_idxs, il));
+        } else {
+            if (inp_attn->self_k_rot != nullptr) {
+                Kcur = llama_mul_mat_hadamard(graph.ctx0, Kcur, inp_attn->self_k_rot);
+            }
+            if (inp_attn->self_v_rot != nullptr) {
+                Vcur = llama_mul_mat_hadamard(graph.ctx0, Vcur, inp_attn->self_v_rot);
+            }
+
+            ggml_build_forward_expand(graph.gf, inp_attn->mctx->cpy_k(graph.ctx0, Kcur, inp_attn->get_k_idxs(), il));
+            ggml_build_forward_expand(graph.gf, inp_attn->mctx->cpy_v(graph.ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        }
+    }
+
+    return true;
+}
+
 template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
@@ -195,6 +311,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         return;
     }
 
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
     // tok_embd from the target model (shared via ctx_other)
     auto * tok_embd = model.tok_embd;
     if (tok_embd == nullptr) {
@@ -271,7 +389,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         inpL = cur;
     }
 
-    ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
+    ggml_tensor * cur = ggml_get_rows(ctx0, inpL, inp_out_ids);
+    cb(cur, "result_embd", -1);
+
+    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
     res->t_embd = cur;

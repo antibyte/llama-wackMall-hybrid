@@ -125,6 +125,43 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_cpu_init(void);
 
+    // Optional wall-clock telemetry for fused CPU cold-expert nodes. Disabled
+    // by default; layer is supplied in GGML_OP_MOE_COLD op_params[0].
+    GGML_BACKEND_API void ggml_cpu_moe_profile_enable(bool enabled);
+    GGML_BACKEND_API void ggml_cpu_moe_profile_reset(void);
+    GGML_BACKEND_API bool ggml_cpu_moe_profile_get(
+            int layer, uint64_t * runs, uint64_t * wall_us);
+    GGML_BACKEND_API bool ggml_cpu_moe_profile_get_phases(
+            int layer, uint64_t * gate_up_us, uint64_t * activation_us, uint64_t * down_us);
+    GGML_BACKEND_API void ggml_cpu_moe_set_single_row_chunk(int chunk_size);
+    GGML_BACKEND_API int  ggml_cpu_moe_get_single_row_chunk(void);
+    GGML_BACKEND_API void ggml_cpu_moe_set_parallel_activation(bool enabled);
+    GGML_BACKEND_API bool ggml_cpu_moe_get_parallel_activation(void);
+    GGML_BACKEND_API void ggml_cpu_moe_set_down_prefetch(int rows);
+    GGML_BACKEND_API int  ggml_cpu_moe_get_down_prefetch(void);
+    GGML_BACKEND_API void ggml_cpu_moe_set_reuse_rows(bool enabled);
+    GGML_BACKEND_API bool ggml_cpu_moe_get_reuse_rows(void);
+    GGML_BACKEND_API void ggml_cpu_moe_set_multi_row(bool enabled);
+    GGML_BACKEND_API bool ggml_cpu_moe_get_multi_row(void);
+    GGML_BACKEND_API void ggml_cpu_moe_set_fused_gate_up(bool enabled);
+    GGML_BACKEND_API bool ggml_cpu_moe_get_fused_gate_up(void);
+    typedef bool (*ggml_cpu_moe_transient_gate_up_claim_fn)(
+            int layer, int expert, int token, int64_t n_ff);
+    typedef bool (*ggml_cpu_moe_transient_gate_up_fetch_fn)(
+            int layer, int expert, int token, float * gate, float * up, int64_t n_ff);
+    GGML_BACKEND_API void ggml_cpu_moe_set_transient_gate_up(
+            ggml_cpu_moe_transient_gate_up_claim_fn claim,
+            ggml_cpu_moe_transient_gate_up_fetch_fn fetch);
+    GGML_BACKEND_API void ggml_cpu_moe_set_transient_gate_up_verify(bool enabled);
+    // Experimental: execute a graph split consisting only of GGML_OP_MOE_COLD
+    // on a persistent coordinator thread. The backend synchronization point
+    // joins the job before its output is consumed.
+    GGML_BACKEND_API void ggml_cpu_moe_set_async(bool enabled);
+    GGML_BACKEND_API bool ggml_cpu_moe_get_async(void);
+    GGML_BACKEND_API void ggml_cpu_moe_async_stats_reset(void);
+    GGML_BACKEND_API void ggml_cpu_moe_async_stats_get(
+            uint64_t * jobs, uint64_t * wait_us);
+
     //
     // CPU backend
     //

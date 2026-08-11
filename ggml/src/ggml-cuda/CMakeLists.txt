@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
+option(GGML_CUDA_TURBO4_KQ_DP4A "ggml: experimental DP4A Turbo4 K/Q dot product" OFF)
+option(GGML_CUDA_TURBO4_F16_PREFILL "ggml: experimental FP16 prefill kernels for Turbo4 K" OFF)
+option(GGML_CUDA_PASCAL_MMVQ_TUNING "ggml: experimental two-warp single-token MMVQ tuning for Pascal DP4A GPUs" OFF)
+set(GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH 32 CACHE STRING
+    "Minimum query batch size for experimental Turbo4 FP16 prefill")
+
 find_package(CUDAToolkit)
 
 if (CUDAToolkit_FOUND)
@@ -121,6 +127,9 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-f16-f16.cu
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
+            template-instances/fattn-vec-instance-turbo4_k-q8_0.cu
+            template-instances/fattn-vec-instance-turbo4_k-turbo4_k.cu
+            template-instances/fattn-vec-instance-q8_0-turbo4_k.cu
             template-instances/fattn-vec-instance-bf16-bf16.cu)
     endif()
 
@@ -137,6 +146,24 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_FORCE_MMQ)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
+    endif()
+
+    if (GGML_CUDA_TURBO4_KQ_DP4A)
+        add_compile_definitions(GGML_CUDA_TURBO4_KQ_DP4A)
+    endif()
+
+    if (GGML_CUDA_PASCAL_MMVQ_TUNING)
+        add_compile_definitions(GGML_CUDA_PASCAL_MMVQ_TUNING)
+    endif()
+
+    if (GGML_CUDA_TURBO4_F16_PREFILL)
+        if (NOT GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH MATCHES "^[1-9][0-9]*$")
+            message(FATAL_ERROR
+                "GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH must be a positive integer")
+        endif()
+        add_compile_definitions(GGML_CUDA_TURBO4_F16_PREFILL)
+        add_compile_definitions(
+            GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH=${GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH})
     endif()
 
     if (GGML_CUDA_FORCE_CUBLAS)

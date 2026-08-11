@@ -1,3 +1,7 @@
+// The experimental Turbo4 V specialization is adapted from the MIT-licensed
+// TheTom/llama-cpp-turboquant implementation at commit 284ffc73181f.
+// It has been modified for GGML_TYPE_TURBO4_K and wackMall's 68-byte block.
+
 #include "common.cuh"
 #include "fattn-common.cuh"
 
@@ -83,18 +87,30 @@ static __global__ void flash_attn_ext_vec(
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #endif // GGML_USE_HIP
 
-    constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
-    constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
+    constexpr int nthreads     = ggml_cuda_fattn_vec_get_nthreads_device();
+    constexpr bool V_is_turbo4 = type_V == GGML_TYPE_TURBO4_K;
+    constexpr bool K_uses_float_query = type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16
+#ifndef GGML_CUDA_TURBO4_KQ_DP4A
+        || type_K == GGML_TYPE_TURBO4_K
+#endif
+        ;
+    constexpr int nthreads_KQ = K_uses_float_query ? 128 / cpy_nb : nthreads_KQ_q;
+    // Turbo4 V dequantization is scalar nibble decoding. Fewer cooperating
+    // threads give each lane adjacent values and allow reuse of one scaled
+    // centroid table across the full 128-value block.
+    constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb :
+                                V_is_turbo4 ? (nthreads_V_q / 8 < 1 ? 1 : nthreads_V_q / 8) :
+                                nthreads_V_q;
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
+    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || V_is_turbo4) ?
+                                      2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    constexpr bool Q_q8_1 = !K_uses_float_query;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -360,17 +376,53 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 KQ_k[j] = KQ[j*nthreads + k];
             }
+            if constexpr (V_is_turbo4) {
+                const block_turbo4_k * vb = (const block_turbo4_k *) (V + k*nb21);
+                int prev_ib = -1;
+                float scaled_centroids[16];
+
 #pragma unroll
-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
-                float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                    const int i0 = 2*i_VKQ_0 + (threadIdx.x % nthreads_V)*V_rows_per_thread;
+                    const int ib = i0 / QK_TURBO4_K;
+                    const int j0 = i0 % QK_TURBO4_K;
+
+                    if (ib != prev_ib) {
+                        prev_ib = ib;
+                        const float norm = __half2float(vb[ib].norm);
 #pragma unroll
-                for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
-#pragma unroll
+                        for (int c = 0; c < 16; ++c) {
+                            scaled_centroids[c] = norm*turbo4_k_centroids_cuda[c];
+                        }
+                    }
+
+                    const uint8_t packed0 = vb[ib].qs[j0/2 + 0];
+                    const uint8_t packed1 = vb[ib].qs[j0/2 + 1];
+                    const uint8_t idx0 =  packed0       & 0x0f;
+                    const uint8_t idx1 = (packed0 >> 4) & 0x0f;
+                    const uint8_t idx2 =  packed1       & 0x0f;
+                    const uint8_t idx3 = (packed1 >> 4) & 0x0f;
+
                     for (int j = 0; j < ncols; ++j) {
-                        VKQ[j][i_VKQ_0/nthreads_V + i_VKQ_1].x += tmp[i_VKQ_1].x*KQ_k[j];
-                        VKQ[j][i_VKQ_0/nthreads_V + i_VKQ_1].y += tmp[i_VKQ_1].y*KQ_k[j];
+                        VKQ[j][i_VKQ_0/nthreads_V + 0].x += scaled_centroids[idx0]*KQ_k[j];
+                        VKQ[j][i_VKQ_0/nthreads_V + 0].y += scaled_centroids[idx1]*KQ_k[j];
+                        VKQ[j][i_VKQ_0/nthreads_V + 1].x += scaled_centroids[idx2]*KQ_k[j];
+                        VKQ[j][i_VKQ_0/nthreads_V + 1].y += scaled_centroids[idx3]*KQ_k[j];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                    float2 tmp[V_rows_per_thread/2];
+                    dequantize_V(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+#pragma unroll
+                    for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+#pragma unroll
+                        for (int j = 0; j < ncols; ++j) {
+                            VKQ[j][i_VKQ_0/nthreads_V + i_VKQ_1].x += tmp[i_VKQ_1].x*KQ_k[j];
+                            VKQ[j][i_VKQ_0/nthreads_V + i_VKQ_1].y += tmp[i_VKQ_1].y*KQ_k[j];
+                        }
                     }
                 }
             }
@@ -609,3 +661,10 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_K, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_K, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_K, GGML_TYPE_TURBO4_K);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_K, GGML_TYPE_TURBO4_K);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_K);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_K);
