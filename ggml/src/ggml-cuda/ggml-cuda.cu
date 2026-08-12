@@ -3747,6 +3747,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+        // Turbo4 GET_ROWS is currently used by the sparse KV-cache RoPE-shift
+        // path.  Those graphs are transient (their row count and addresses
+        // change with every prefix-reuse operation), so retaining a CUDA graph
+        // executable for them only consumes VRAM and can prevent the regular
+        // decode graph from being instantiated on memory-constrained GPUs.
+        if (node->op == GGML_OP_GET_ROWS &&
+            node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_TURBO4_K) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs for transient Turbo4 row gather\n", __func__);
+#endif
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -6193,6 +6206,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_TURBO4_K:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:

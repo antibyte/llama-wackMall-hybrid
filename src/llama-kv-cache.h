@@ -314,6 +314,7 @@ private:
     struct kvflash_cell_page {
         std::vector<llama_pos> pos;
         std::vector<llama_kv_cell_ext> ext;
+        std::vector<llama_pos> shift;
         llama_pos pos_min = -1;
         llama_pos pos_max = -1;
     };
@@ -329,8 +330,14 @@ private:
     void kvflash_clear_block(int block, int chunk_tokens);
     void kvflash_index_page(const kvflash_cell_page & page);
     void kvflash_unindex_page(const kvflash_cell_page & page);
+    void kvflash_recompute_page_bounds(kvflash_cell_page & page) const;
+    bool kvflash_capture_page(int block, int chunk_tokens, kvflash_cell_page & page) const;
+    bool kvflash_restore_page(int block, int chunk_tokens, const kvflash_cell_page & page);
     bool kvflash_page_out_cells(int chunk, int block, int chunk_tokens);
     bool kvflash_page_in_cells(int chunk, int block, int chunk_tokens);
+    bool kvflash_repack_after_shift();
+    void kvflash_state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const;
+    void kvflash_state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t total_size() const;
 
@@ -344,6 +351,7 @@ private:
                     ggml_tensor * cur,
                     ggml_tensor * shift,
                     ggml_tensor * rot,
+                    ggml_tensor * rows,
                     ggml_tensor * factors,
                           float   freq_base,
                           float   freq_scale,

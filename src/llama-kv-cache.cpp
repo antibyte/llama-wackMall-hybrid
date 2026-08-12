@@ -561,19 +561,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                         }
                         page.pos[i] = -1;
                         page.ext[i].reset();
+                        page.shift[i] = 0;
                         changed = true;
                     }
                 }
             }
             if (changed) {
-                page.pos_min = -1;
-                page.pos_max = -1;
-                for (llama_pos pos : page.pos) {
-                    if (pos >= 0) {
-                        page.pos_min = page.pos_min < 0 ? pos : std::min(page.pos_min, pos);
-                        page.pos_max = std::max(page.pos_max, pos);
-                    }
-                }
+                kvflash_recompute_page_bounds(page);
                 kvflash_index_page(page);
             }
         }
@@ -712,15 +706,13 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (other) {
         return;
     }
-    if (kvflash) {
-        if (shift != 0) {
-            LLAMA_LOG_WARN("%s: KVFlash does not support KV position shifts\n", __func__);
-        }
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    GGML_ASSERT((hparams.n_pos_per_embd() == 1 || kvflash) &&
+            "seq_add() is only supported for n_pos_per_embd() == 1 outside KVFlash");
+    if (kvflash && seq_id != 0) {
+        LLAMA_LOG_WARN("%s: KVFlash supports only sequence 0\n", __func__);
         return;
     }
-
-    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -744,16 +736,113 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    // A scalar cache shift is valid for M-RoPE text because its temporal,
+    // height and width coordinates are identical and Qwen's fourth section is
+    // empty.  Multimodal coordinates are not translation-equivalent, so reject
+    // them before changing any resident or paged metadata.
+    const bool mrope_text_shift = hparams.n_pos_per_embd() > 1;
+    if (mrope_text_shift) {
+        if (!kvflash || hparams.n_pos_per_embd() != 4 || hparams.rope_sections[3] != 0) {
+            LLAMA_LOG_ERROR("%s: unsupported multi-axis KV position shift\n", __func__);
+            return;
+        }
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.pos_in(i, p0, p1) || !cells.seq_has(i, seq_id)) {
+                continue;
+            }
+            const llama_pos pos = cells.pos_get(i);
+            const llama_kv_cell_ext ext = cells.ext_get(i);
+            const int64_t shifted = (int64_t) pos + shift;
+            if (ext.x != pos || ext.y != pos ||
+                shifted > std::numeric_limits<llama_pos>::max()) {
+                LLAMA_LOG_ERROR("%s: KVFlash M-RoPE cache shift is only valid for text positions\n", __func__);
+                return;
+            }
+        }
+        for (const auto & entry : kvflash_cells) {
+            const auto & page = entry.second;
+            if (page.pos.size() != page.ext.size() || page.pos.size() != page.shift.size()) {
+                LLAMA_LOG_ERROR("%s: invalid KVFlash host metadata\n", __func__);
+                return;
+            }
+            for (size_t i = 0; i < page.pos.size(); ++i) {
+                const llama_pos pos = page.pos[i];
+                if (pos < p0 || pos >= p1) {
+                    continue;
+                }
+                const int64_t shifted = (int64_t) pos + shift;
+                if (page.ext[i].x != pos || page.ext[i].y != pos ||
+                    shifted > std::numeric_limits<llama_pos>::max()) {
+                    LLAMA_LOG_ERROR("%s: KVFlash M-RoPE cache shift is only valid for text positions\n", __func__);
+                    return;
+                }
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (!cells.pos_in(i, p0, p1)) {
             continue;
         }
 
         if (cells.seq_has(i, seq_id)) {
-            if (cells.pos_add(i, shift)) {
+            const llama_kv_cell_ext ext = cells.ext_get(i);
+            const bool removed = cells.pos_add(i, shift);
+            if (!removed && mrope_text_shift) {
+                llama_kv_cell_ext shifted_ext = ext;
+                shifted_ext.x += shift;
+                shifted_ext.y += shift;
+                cells.ext_set(i, shifted_ext);
+            }
+            if (removed) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
+            }
+        }
+    }
+
+    if (kvflash) {
+        for (auto & entry : kvflash_cells) {
+            auto & page = entry.second;
+            if (page.pos.size() != page.shift.size()) {
+                LLAMA_LOG_ERROR("%s: invalid KVFlash host metadata\n", __func__);
+                continue;
+            }
+            bool changed = false;
+            for (size_t i = 0; i < page.pos.size(); ++i) {
+                if (page.pos[i] < p0 || page.pos[i] >= p1) {
+                    continue;
+                }
+                if (!changed) {
+                    kvflash_unindex_page(page);
+                    changed = true;
+                }
+                const int64_t pos = (int64_t) page.pos[i] + shift;
+                const int64_t pending = (int64_t) page.shift[i] + shift;
+                if (pos < 0) {
+                    page.pos[i] = -1;
+                    page.ext[i].reset();
+                    page.shift[i] = 0;
+                } else if (pos > std::numeric_limits<llama_pos>::max() ||
+                           pending < std::numeric_limits<llama_pos>::min() ||
+                           pending > std::numeric_limits<llama_pos>::max()) {
+                    LLAMA_LOG_ERROR("%s: KVFlash position shift overflow\n", __func__);
+                    page.pos[i] = -1;
+                    page.ext[i].reset();
+                    page.shift[i] = 0;
+                } else {
+                    page.pos[i] = (llama_pos) pos;
+                    page.shift[i] = (llama_pos) pending;
+                    if (mrope_text_shift) {
+                        page.ext[i].x += shift;
+                        page.ext[i].y += shift;
+                    }
+                }
+            }
+            if (changed) {
+                kvflash_recompute_page_bounds(page);
+                kvflash_index_page(page);
             }
         }
     }
@@ -1044,8 +1133,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
 
-        // apply K-shift if needed
-        if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+        auto apply_shift_graph = [&]() -> bool {
+            if (hparams.rope_type == LLAMA_ROPE_TYPE_NONE) {
+                return true;
+            }
             ggml_backend_sched_reset(sched);
 
             auto * res = lctx->get_gf_res_reserve();
@@ -1055,23 +1146,81 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             auto * gf = build_graph_shift(res, lctx);
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                return updated;
+                return false;
             }
 
             res->set_inputs(nullptr);
 
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
-                return updated;
+                return false;
             }
 
             updated = true;
-        }
+            return true;
+        };
 
-        for (uint32_t s = 0; s < n_stream; ++s) {
-            auto & cells = v_cells[s];
+        if (kvflash) {
+            while (true) {
+                auto & cells = v_cells[0];
+                bool resident_shifted = false;
+                for (uint32_t i = 0; i < cells.size(); ++i) {
+                    resident_shifted |= !cells.is_empty(i) && cells.get_shift(i) != 0;
+                }
+                if (resident_shifted) {
+                    if (!apply_shift_graph()) {
+                        return updated;
+                    }
+                }
+                if (cells.get_has_shift()) {
+                    cells.reset_shift();
+                }
 
-            cells.reset_shift();
+                std::vector<int> cold_shifted;
+                for (const auto & entry : kvflash_cells) {
+                    const auto & shifts = entry.second.shift;
+                    if (std::any_of(shifts.begin(), shifts.end(),
+                            [](llama_pos value) { return value != 0; })) {
+                        cold_shifted.push_back(entry.first);
+                    }
+                }
+                if (cold_shifted.empty()) {
+                    break;
+                }
+                std::sort(cold_shifted.begin(), cold_shifted.end());
+
+                common_kvflash::KvFlashState state;
+                if (!kvflash->state_export(state)) {
+                    LLAMA_LOG_ERROR("%s: failed to synchronize KVFlash before K-shift\n", __func__);
+                    return updated;
+                }
+                const int n_blocks = state.pool_tokens / state.chunk_tokens;
+                const int batch_pages = std::max(1,
+                        n_blocks - state.sink_chunks - state.tail_window_chunks - 1);
+                if ((int) cold_shifted.size() > batch_pages) {
+                    cold_shifted.resize((size_t) batch_pages);
+                }
+                if (!kvflash->page_in_chunks(cold_shifted)) {
+                    LLAMA_LOG_ERROR("%s: failed to page in KVFlash chunks for K-shift\n", __func__);
+                    return updated;
+                }
+            }
+
+            if (!kvflash_repack_after_shift()) {
+                LLAMA_LOG_ERROR("%s: failed to repack KVFlash after K-shift\n", __func__);
+                return updated;
+            }
+            updated = true;
+        } else {
+            if (!apply_shift_graph()) {
+                return updated;
+            }
+
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                auto & cells = v_cells[s];
+
+                cells.reset_shift();
+            }
         }
     }
 
@@ -1431,15 +1580,17 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    if (kvflash) {
-        return false;
-    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
     if (hparams.n_pos_per_embd() > 1) {
-        return false;
+        // KVFlash validates at seq_add() time that every shifted position is a
+        // text-like M-RoPE coordinate.  The scalar NEOX shift graph is then
+        // equivalent for Qwen's three equal, non-empty position sections.
+        if (!kvflash || hparams.n_pos_per_embd() != 4 || hparams.rope_sections[3] != 0) {
+            return false;
+        }
     }
     // shifting would leave k_idx stale
     for (const auto & layer : layers) {
@@ -1461,13 +1612,25 @@ uint32_t llama_kv_cache::get_n_stream() const {
 }
 
 bool llama_kv_cache::get_has_shift() const {
-    bool result = false;
-
     for (uint32_t s = 0; s < n_stream; ++s) {
-        result |= v_cells[s].get_has_shift();
+        const auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.get_shift(i) != 0) {
+                return true;
+            }
+        }
     }
 
-    return result;
+    if (kvflash) {
+        for (const auto & entry : kvflash_cells) {
+            const auto & shift = entry.second.shift;
+            if (std::any_of(shift.begin(), shift.end(), [](llama_pos value) { return value != 0; })) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
 }
 
 ggml_type llama_kv_cache::type_k() const {
@@ -1619,8 +1782,20 @@ void llama_kv_cache::kvflash_unindex_page(const kvflash_cell_page & page) {
     }
 }
 
-bool llama_kv_cache::kvflash_page_out_cells(int chunk, int block, int chunk_tokens) {
-    if (n_stream != 1 || chunk < 0 || block < 0 || chunk_tokens <= 0) {
+void llama_kv_cache::kvflash_recompute_page_bounds(kvflash_cell_page & page) const {
+    page.pos_min = -1;
+    page.pos_max = -1;
+    for (llama_pos pos : page.pos) {
+        if (pos < 0) {
+            continue;
+        }
+        page.pos_min = page.pos_min < 0 ? pos : std::min(page.pos_min, pos);
+        page.pos_max = std::max(page.pos_max, pos);
+    }
+}
+
+bool llama_kv_cache::kvflash_capture_page(int block, int chunk_tokens, kvflash_cell_page & page) const {
+    if (n_stream != 1 || block < 0 || chunk_tokens <= 0) {
         return false;
     }
     const auto & cells = v_cells[0];
@@ -1628,9 +1803,10 @@ bool llama_kv_cache::kvflash_page_out_cells(int chunk, int block, int chunk_toke
     if (first > cells.size() || (uint32_t) chunk_tokens > cells.size() - first) {
         return false;
     }
-    kvflash_cell_page page;
+    page = {};
     page.pos.assign((size_t) chunk_tokens, -1);
     page.ext.resize((size_t) chunk_tokens);
+    page.shift.assign((size_t) chunk_tokens, 0);
     for (int i = 0; i < chunk_tokens; ++i) {
         const uint32_t cell = first + (uint32_t) i;
         if (cells.is_empty(cell)) {
@@ -1642,8 +1818,60 @@ bool llama_kv_cache::kvflash_page_out_cells(int chunk, int block, int chunk_toke
         const llama_pos pos = cells.pos_get(cell);
         page.pos[(size_t) i] = pos;
         page.ext[(size_t) i] = cells.ext_get(cell);
-        page.pos_min = page.pos_min < 0 ? pos : std::min(page.pos_min, pos);
-        page.pos_max = std::max(page.pos_max, pos);
+        page.shift[(size_t) i] = cells.get_shift(cell);
+    }
+    kvflash_recompute_page_bounds(page);
+    return true;
+}
+
+bool llama_kv_cache::kvflash_restore_page(int block, int chunk_tokens, const kvflash_cell_page & page) {
+    if (n_stream != 1 || block < 0 || chunk_tokens <= 0 ||
+        page.pos.size() != (size_t) chunk_tokens ||
+        page.ext.size() != (size_t) chunk_tokens ||
+        page.shift.size() != (size_t) chunk_tokens) {
+        return false;
+    }
+    auto & cells = v_cells[0];
+    const uint32_t first = (uint32_t) block * (uint32_t) chunk_tokens;
+    if (first > cells.size() || (uint32_t) chunk_tokens > cells.size() - first) {
+        return false;
+    }
+    for (int i = 0; i < chunk_tokens; ++i) {
+        if (!cells.is_empty(first + (uint32_t) i)) {
+            return false;
+        }
+    }
+    for (int i = 0; i < chunk_tokens; ++i) {
+        const llama_pos pos = page.pos[(size_t) i];
+        const llama_pos shift = page.shift[(size_t) i];
+        if (pos < 0) {
+            if (shift != 0) {
+                return false;
+            }
+            continue;
+        }
+        const int64_t original_pos = (int64_t) pos - (int64_t) shift;
+        if (original_pos < 0 || original_pos > std::numeric_limits<llama_pos>::max()) {
+            return false;
+        }
+        const uint32_t cell = first + (uint32_t) i;
+        cells.pos_set(cell, (llama_pos) original_pos);
+        cells.ext_set(cell, page.ext[(size_t) i]);
+        cells.seq_add(cell, 0);
+        if (shift != 0 && cells.pos_add(cell, shift)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::kvflash_page_out_cells(int chunk, int block, int chunk_tokens) {
+    if (chunk < 0) {
+        return false;
+    }
+    kvflash_cell_page page;
+    if (!kvflash_capture_page(block, chunk_tokens, page)) {
+        return false;
     }
     const auto old = kvflash_cells.find(chunk);
     if (old != kvflash_cells.end()) {
@@ -1664,31 +1892,328 @@ bool llama_kv_cache::kvflash_page_in_cells(int chunk, int block, int chunk_token
     }
     const kvflash_cell_page & page = it->second;
     if (page.pos.size() != (size_t) chunk_tokens ||
-        page.ext.size() != (size_t) chunk_tokens) {
+        page.ext.size() != (size_t) chunk_tokens ||
+        page.shift.size() != (size_t) chunk_tokens) {
         return false;
     }
-    auto & cells = v_cells[0];
-    const uint32_t first = (uint32_t) block * (uint32_t) chunk_tokens;
-    if (first > cells.size() || (uint32_t) chunk_tokens > cells.size() - first) {
+    if (!kvflash_restore_page(block, chunk_tokens, page)) {
         return false;
-    }
-    for (int i = 0; i < chunk_tokens; ++i) {
-        if (!cells.is_empty(first + (uint32_t) i)) {
-            return false;
-        }
-    }
-    for (int i = 0; i < chunk_tokens; ++i) {
-        const llama_pos pos = page.pos[(size_t) i];
-        if (pos < 0) {
-            continue;
-        }
-        const uint32_t cell = first + (uint32_t) i;
-        cells.pos_set(cell, pos);
-        cells.ext_set(cell, page.ext[(size_t) i]);
-        cells.seq_add(cell, 0);
     }
     kvflash_unindex_page(page);
     kvflash_cells.erase(it);
+    return true;
+}
+
+bool llama_kv_cache::kvflash_repack_after_shift() {
+    if (!kvflash || n_stream != 1) {
+        return false;
+    }
+
+    common_kvflash::KvFlashState old_state;
+    if (!kvflash->state_export(old_state) || old_state.chunk_tokens <= 0 ||
+        old_state.pool_tokens <= 0 || old_state.chunk_bytes > std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+
+    struct source_page {
+        common_kvflash::KvFlashStateChunk state;
+        kvflash_cell_page page;
+    };
+    std::vector<source_page> sources;
+    sources.reserve(old_state.chunks.size());
+    for (const auto & chunk : old_state.chunks) {
+        source_page source;
+        source.state = chunk;
+        if (chunk.block >= 0) {
+            if (!kvflash_capture_page(chunk.block, old_state.chunk_tokens, source.page)) {
+                return false;
+            }
+        } else {
+            const auto it = kvflash_cells.find(chunk.chunk);
+            if (it == kvflash_cells.end()) {
+                return false;
+            }
+            source.page = it->second;
+        }
+        if (source.page.pos.size() != (size_t) old_state.chunk_tokens ||
+            source.page.ext.size() != (size_t) old_state.chunk_tokens ||
+            source.page.shift.size() != (size_t) old_state.chunk_tokens ||
+            std::any_of(source.page.shift.begin(), source.page.shift.end(),
+                [](llama_pos value) { return value != 0; })) {
+            return false;
+        }
+        sources.push_back(std::move(source));
+    }
+
+    struct target_page {
+        kvflash_cell_page page;
+        uint64_t last_use = 0;
+        bool resident_source = false;
+        int old_block = -1;
+        size_t payload_offset = 0;
+    };
+    std::map<int, target_page> targets;
+
+    for (const auto & source : sources) {
+        for (int row = 0; row < old_state.chunk_tokens; ++row) {
+            const llama_pos pos = source.page.pos[(size_t) row];
+            if (pos < 0) {
+                continue;
+            }
+            if ((old_state.max_context_tokens > 0 && pos >= old_state.max_context_tokens) ||
+                pos > std::numeric_limits<int>::max()) {
+                return false;
+            }
+            const int chunk = pos / old_state.chunk_tokens;
+            const int target_row = pos % old_state.chunk_tokens;
+            auto result = targets.try_emplace(chunk);
+            target_page & target = result.first->second;
+            if (result.second) {
+                target.page.pos.assign((size_t) old_state.chunk_tokens, -1);
+                target.page.ext.resize((size_t) old_state.chunk_tokens);
+                target.page.shift.assign((size_t) old_state.chunk_tokens, 0);
+            }
+            if (target.page.pos[(size_t) target_row] >= 0) {
+                LLAMA_LOG_ERROR("%s: duplicate logical KVFlash position %d after shift\n", __func__, pos);
+                return false;
+            }
+            target.page.pos[(size_t) target_row] = pos;
+            target.page.ext[(size_t) target_row] = source.page.ext[(size_t) row];
+            target.last_use = std::max(target.last_use, source.state.last_use);
+            target.resident_source |= source.state.block >= 0;
+            if (source.state.chunk == chunk && source.state.block >= 0) {
+                target.old_block = source.state.block;
+            }
+        }
+    }
+
+    if (targets.empty()) {
+        clear(false);
+        return true;
+    }
+
+    size_t segment_offset = 0;
+    std::vector<size_t> row_bytes;
+    std::vector<size_t> segment_offsets;
+    row_bytes.reserve(old_state.tensors.size());
+    segment_offsets.reserve(old_state.tensors.size());
+    for (const auto & tensor : old_state.tensors) {
+        if (tensor.segment_bytes % (uint64_t) old_state.chunk_tokens != 0 ||
+            tensor.segment_bytes > (uint64_t) std::numeric_limits<size_t>::max() ||
+            segment_offset > (size_t) old_state.chunk_bytes ||
+            (size_t) tensor.segment_bytes > (size_t) old_state.chunk_bytes - segment_offset) {
+            return false;
+        }
+        segment_offsets.push_back(segment_offset);
+        row_bytes.push_back((size_t) tensor.segment_bytes / (size_t) old_state.chunk_tokens);
+        segment_offset += (size_t) tensor.segment_bytes;
+    }
+    if (segment_offset != (size_t) old_state.chunk_bytes ||
+        targets.size() > std::numeric_limits<size_t>::max() /
+            std::max<size_t>(1, (size_t) old_state.chunk_bytes)) {
+        return false;
+    }
+
+    const size_t payload_bytes = targets.size() * (size_t) old_state.chunk_bytes;
+    std::vector<uint8_t> payload;
+    std::vector<uint8_t> scratch;
+    try {
+        payload.assign(payload_bytes, 0);
+        scratch.resize((size_t) old_state.chunk_bytes);
+    } catch (const std::bad_alloc &) {
+        LLAMA_LOG_ERROR("%s: cannot allocate %zu bytes for KVFlash repack\n", __func__, payload_bytes);
+        return false;
+    }
+
+    size_t target_offset = 0;
+    for (auto & entry : targets) {
+        entry.second.payload_offset = target_offset;
+        kvflash_recompute_page_bounds(entry.second.page);
+        target_offset += (size_t) old_state.chunk_bytes;
+    }
+
+    std::vector<common_kvflash::KvFlashStateSpan> spans;
+    for (const auto & source : sources) {
+        if (!kvflash->state_spans(source.state.chunk, spans)) {
+            return false;
+        }
+        size_t copied = 0;
+        for (const auto & span : spans) {
+            if (span.payload_offset != copied || copied > scratch.size() ||
+                span.size > scratch.size() - copied) {
+                return false;
+            }
+            if (span.tensor) {
+                ggml_backend_tensor_get(span.tensor, scratch.data() + copied,
+                        span.tensor_offset, span.size);
+            } else if (span.host) {
+                std::memcpy(scratch.data() + copied, span.host, span.size);
+            } else if (span.size != 0) {
+                return false;
+            }
+            copied += span.size;
+        }
+        if (copied != scratch.size()) {
+            return false;
+        }
+
+        for (int row = 0; row < old_state.chunk_tokens; ++row) {
+            const llama_pos pos = source.page.pos[(size_t) row];
+            if (pos < 0) {
+                continue;
+            }
+            const int chunk = pos / old_state.chunk_tokens;
+            const int target_row = pos % old_state.chunk_tokens;
+            const auto target_it = targets.find(chunk);
+            if (target_it == targets.end()) {
+                return false;
+            }
+            uint8_t * dst_page = payload.data() + target_it->second.payload_offset;
+            for (size_t tensor = 0; tensor < row_bytes.size(); ++tensor) {
+                const size_t row_size = row_bytes[tensor];
+                const size_t segment = segment_offsets[tensor];
+                std::memcpy(
+                    dst_page + segment + (size_t) target_row * row_size,
+                    scratch.data() + segment + (size_t) row * row_size,
+                    row_size);
+            }
+        }
+    }
+
+    common_kvflash::KvFlashState new_state = old_state;
+    new_state.chunks.clear();
+    new_state.cur_chunk = targets.rbegin()->first;
+
+    const int n_blocks = old_state.pool_tokens / old_state.chunk_tokens;
+    std::vector<int> candidates;
+    candidates.reserve(targets.size());
+    for (const auto & entry : targets) {
+        candidates.push_back(entry.first);
+    }
+    const int tail_first = std::max(0, new_state.cur_chunk - old_state.tail_window_chunks);
+    std::stable_sort(candidates.begin(), candidates.end(), [&](int a, int b) {
+        const target_page & pa = targets.at(a);
+        const target_page & pb = targets.at(b);
+        const bool protected_a = a < old_state.sink_chunks || a >= tail_first;
+        const bool protected_b = b < old_state.sink_chunks || b >= tail_first;
+        if (protected_a != protected_b) {
+            return protected_a > protected_b;
+        }
+        if (pa.resident_source != pb.resident_source) {
+            return pa.resident_source > pb.resident_source;
+        }
+        if (pa.last_use != pb.last_use) {
+            return pa.last_use > pb.last_use;
+        }
+        return a < b;
+    });
+    if ((int) candidates.size() > n_blocks) {
+        candidates.resize((size_t) n_blocks);
+    }
+    std::set<int> resident_chunks(candidates.begin(), candidates.end());
+    std::vector<uint8_t> used_blocks((size_t) n_blocks, 0);
+    std::map<int, int> block_for;
+
+    for (int chunk : resident_chunks) {
+        const int block = targets.at(chunk).old_block;
+        if (block >= 0 && block < n_blocks && !used_blocks[(size_t) block]) {
+            block_for[chunk] = block;
+            used_blocks[(size_t) block] = 1;
+        }
+    }
+    for (int chunk : resident_chunks) {
+        if (block_for.count(chunk) == 0 && chunk >= 0 && chunk < n_blocks &&
+            !used_blocks[(size_t) chunk]) {
+            block_for[chunk] = chunk;
+            used_blocks[(size_t) chunk] = 1;
+        }
+    }
+    int next_block = 0;
+    for (int chunk : resident_chunks) {
+        if (block_for.count(chunk) != 0) {
+            continue;
+        }
+        while (next_block < n_blocks && used_blocks[(size_t) next_block]) {
+            ++next_block;
+        }
+        if (next_block >= n_blocks) {
+            return false;
+        }
+        block_for[chunk] = next_block;
+        used_blocks[(size_t) next_block] = 1;
+    }
+
+    for (const auto & entry : targets) {
+        const int chunk = entry.first;
+        const auto block_it = block_for.find(chunk);
+        new_state.chunks.push_back({
+            chunk,
+            block_it == block_for.end() ? -1 : block_it->second,
+            entry.second.last_use,
+        });
+    }
+
+    if (!kvflash->state_import(new_state)) {
+        clear(true);
+        return false;
+    }
+
+    v_cells[0].reset();
+    v_heads[0] = 0;
+    kvflash_cells.clear();
+    kvflash_pos_mins.clear();
+    kvflash_pos_maxs.clear();
+
+    for (const auto & chunk : new_state.chunks) {
+        const auto target_it = targets.find(chunk.chunk);
+        if (target_it == targets.end()) {
+            clear(true);
+            return false;
+        }
+        const target_page & target = target_it->second;
+        if (chunk.block >= 0) {
+            if (!kvflash_restore_page(chunk.block, new_state.chunk_tokens, target.page)) {
+                clear(true);
+                return false;
+            }
+        } else {
+            auto result = kvflash_cells.emplace(chunk.chunk, target.page);
+            if (!result.second) {
+                clear(true);
+                return false;
+            }
+            kvflash_index_page(result.first->second);
+        }
+
+        if (!kvflash->state_spans(chunk.chunk, spans)) {
+            clear(true);
+            return false;
+        }
+        size_t copied = 0;
+        const uint8_t * src_page = payload.data() + target.payload_offset;
+        for (const auto & span : spans) {
+            if (span.payload_offset != copied || copied > (size_t) new_state.chunk_bytes ||
+                span.size > (size_t) new_state.chunk_bytes - copied) {
+                clear(true);
+                return false;
+            }
+            if (span.tensor) {
+                ggml_backend_tensor_set(span.tensor, src_page + copied,
+                        span.tensor_offset, span.size);
+            } else if (span.host) {
+                std::memcpy(span.host, src_page + copied, span.size);
+            } else if (span.size != 0) {
+                clear(true);
+                return false;
+            }
+            copied += span.size;
+        }
+        if (copied != new_state.chunk_bytes) {
+            clear(true);
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -2371,6 +2896,7 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                 ggml_tensor * cur,
                 ggml_tensor * shift,
                 ggml_tensor * rot,
+                ggml_tensor * rows,
                 ggml_tensor * factors,
                       float   freq_base,
                       float   freq_scale,
@@ -2406,7 +2932,12 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         // rotate fwd
         tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
 
-        tmp = ggml_cpy(ctx, tmp, cur);
+        // CUDA CPY supports requantization to the standard Q4/Q8 formats, but
+        // Turbo4 is intentionally quantized by SET_ROWS. Reuse that optimized
+        // kernel with identity row indices for in-place K-cache rotation.
+        tmp = cur->type == GGML_TYPE_TURBO4_K ?
+                ggml_set_rows(ctx, cur, tmp, rows) :
+                ggml_cpy(ctx, tmp, cur);
     } else {
         // we rotate only the first n_rot dimensions
         tmp = ggml_rope_ext_inplace(ctx, cur,
@@ -2425,9 +2956,16 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * k_shift; // I32 [kv_size*n_stream]
+    ggml_tensor * k_idxs = nullptr; // I32 [n_shift], KVFlash sparse path
+
+    std::vector<int32_t> sparse_idxs;
+    std::vector<int32_t> sparse_shifts;
 
     // note: assumes k_rot^2 == I
     ggml_tensor * k_rot = nullptr;
+
+    // identity head-row indices used to requantize F32 -> Turbo4 via SET_ROWS
+    std::vector<ggml_tensor *> k_rows;
 
     const llama_kv_cache * kv_self;
 };
@@ -2435,12 +2973,29 @@ public:
 void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    if (k_shift) {
+    if (k_shift && !k_idxs) {
         kv_self->set_input_k_shift(k_shift);
+    }
+
+    if (k_idxs) {
+        GGML_ASSERT(k_shift && sparse_idxs.size() == sparse_shifts.size());
+        GGML_ASSERT((int64_t) sparse_idxs.size() == k_idxs->ne[0]);
+        GGML_ASSERT(ggml_backend_buffer_is_host(k_idxs->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(k_shift->buffer));
+        std::memcpy(k_idxs->data, sparse_idxs.data(), sparse_idxs.size() * sizeof(sparse_idxs[0]));
+        std::memcpy(k_shift->data, sparse_shifts.data(), sparse_shifts.size() * sizeof(sparse_shifts[0]));
     }
 
     if (k_rot) {
         kv_self->set_input_k_rot(k_rot);
+    }
+
+    for (ggml_tensor * rows : k_rows) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(rows->buffer));
+        int32_t * data = (int32_t *) rows->data;
+        for (int64_t i = 0; i < rows->ne[0]; ++i) {
+            data[i] = (int32_t) i;
+        }
     }
 }
 
@@ -2453,12 +3008,69 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
-    ggml_set_input(inp->k_shift);
+    const bool has_turbo4 = std::any_of(layers.begin(), layers.end(), [](const auto & layer) {
+        return layer.k && layer.k->type == GGML_TYPE_TURBO4_K;
+    });
+    const bool sparse_shift = n_stream == 1 && (kvflash || has_turbo4);
+    if (sparse_shift) {
+        const auto & cells = v_cells[0];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.get_shift(i) != 0) {
+                inp->sparse_idxs.push_back((int32_t) i);
+                inp->sparse_shifts.push_back((int32_t) cells.get_shift(i));
+            }
+        }
+        GGML_ASSERT(!inp->sparse_idxs.empty());
+        inp->k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) inp->sparse_idxs.size());
+        inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) inp->sparse_shifts.size());
+        ggml_set_input(inp->k_idxs);
+        ggml_set_input(inp->k_shift);
+    } else {
+        inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+        ggml_set_input(inp->k_shift);
+    }
 
     inp->k_rot = build_input_k_rot(ctx);
 
     const auto & cparams = lctx->get_cparams();
+
+    if (sparse_shift) {
+        for (const auto & layer : layers) {
+            const uint32_t il = layer.il;
+            const int64_t n_head_kv = hparams.n_head_kv(il);
+            const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
+            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+            GGML_ASSERT(n_embd_head_k * n_head_kv == n_embd_k_gqa);
+            GGML_ASSERT(layer.k->ne[0] == n_embd_k_gqa);
+
+            ggml_tensor * cur = ggml_get_rows(ctx, layer.k, inp->k_idxs);
+
+            cur = ggml_reshape_3d(ctx, cur,
+                    n_embd_head_k, n_head_kv, (int64_t) inp->sparse_idxs.size());
+            if (inp->k_rot) {
+                cur = llama_mul_mat_hadamard(ctx, cur, inp->k_rot);
+            }
+
+            ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
+            const float freq_base_l = model.get_rope_freq_base(cparams, il);
+            const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+            cur = build_rope_shift(cparams, ctx, cur, inp->k_shift, nullptr, nullptr,
+                    rope_factors, freq_base_l, freq_scale_l, il);
+
+            if (inp->k_rot) {
+                cur = llama_mul_mat_hadamard(ctx, cur, inp->k_rot);
+            }
+            cur = ggml_reshape_2d(ctx, cur, n_embd_k_gqa, (int64_t) inp->sparse_idxs.size());
+
+            const uint32_t flags = q4_weighted_scale_k && layer.k->type == GGML_TYPE_Q4_0 ?
+                    GGML_SET_ROWS_FLAG_Q4_0_WEIGHTED_SCALE : GGML_SET_ROWS_FLAG_NONE;
+            ggml_build_forward_expand(gf,
+                    ggml_set_rows_ext(ctx, layer.k, cur, inp->k_idxs, flags));
+        }
+
+        res->add_input(std::move(inp));
+        return gf;
+    }
 
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
@@ -2475,14 +3087,29 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
+        ggml_tensor * rows = nullptr;
+        if (layer.k->type == GGML_TYPE_TURBO4_K) {
+            rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_head_kv);
+            ggml_set_input(rows);
+            inp->k_rows.push_back(rows);
+        }
+
+        // Standard block quantizers can update only the RoPE prefix. Turbo4's
+        // 128-value transform couples the entire quantization block, so its
+        // shift must dequantize and requantize the complete key head while
+        // ggml_rope_ext still rotates only the first n_rot values.
+        const int64_t n_embd_shift = layer.k->type == GGML_TYPE_TURBO4_K ?
+                n_embd_head_k : n_rot;
+
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_embd_shift, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
 
-        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
+        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rows,
+                rope_factors, freq_base_l, freq_scale_l, il);
 
         ggml_build_forward_expand(gf, cur);
     }
@@ -2492,14 +3119,251 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+void llama_kv_cache::kvflash_state_write(
+        llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    GGML_UNUSED(flags);
+
+    if (!kvflash || n_stream != 1 || (seq_id != -1 && seq_id != 0)) {
+        throw std::runtime_error("invalid KVFlash state serialization request");
+    }
+
+    common_kvflash::KvFlashState state;
+    if (!kvflash->state_export(state)) {
+        throw std::runtime_error("failed to synchronize KVFlash state");
+    }
+
+    std::vector<kvflash_cell_page> pages;
+    pages.reserve(state.chunks.size());
+    for (const auto & chunk : state.chunks) {
+        kvflash_cell_page page;
+        if (chunk.block >= 0) {
+            if (!kvflash_capture_page(chunk.block, state.chunk_tokens, page)) {
+                throw std::runtime_error("failed to capture resident KVFlash metadata");
+            }
+        } else {
+            const auto it = kvflash_cells.find(chunk.chunk);
+            if (it == kvflash_cells.end()) {
+                throw std::runtime_error("missing host KVFlash metadata");
+            }
+            page = it->second;
+        }
+        if (page.pos.size() != (size_t) state.chunk_tokens ||
+            page.ext.size() != (size_t) state.chunk_tokens ||
+            page.shift.size() != (size_t) state.chunk_tokens) {
+            throw std::runtime_error("invalid KVFlash metadata page");
+        }
+        pages.push_back(std::move(page));
+    }
+
+    constexpr uint32_t magic = 0x5346564b; // "KVFS", little-endian
+    constexpr uint32_t version = 1;
+    const uint32_t tensor_count = (uint32_t) state.tensors.size();
+    const uint32_t chunk_count = (uint32_t) state.chunks.size();
+
+    io.write(&magic,                    sizeof(magic));
+    io.write(&version,                  sizeof(version));
+    io.write(&state.chunk_tokens,       sizeof(state.chunk_tokens));
+    io.write(&state.pool_tokens,        sizeof(state.pool_tokens));
+    io.write(&state.max_context_tokens, sizeof(state.max_context_tokens));
+    io.write(&state.sink_chunks,        sizeof(state.sink_chunks));
+    io.write(&state.tail_window_chunks, sizeof(state.tail_window_chunks));
+    io.write(&state.cur_chunk,          sizeof(state.cur_chunk));
+    io.write(&state.clock,              sizeof(state.clock));
+    io.write(&state.chunk_bytes,        sizeof(state.chunk_bytes));
+    io.write(&tensor_count,             sizeof(tensor_count));
+    io.write(&chunk_count,              sizeof(chunk_count));
+
+    for (const auto & tensor : state.tensors) {
+        io.write(&tensor.type,          sizeof(tensor.type));
+        io.write(&tensor.segment_bytes, sizeof(tensor.segment_bytes));
+    }
+    for (const auto & chunk : state.chunks) {
+        io.write(&chunk.chunk,    sizeof(chunk.chunk));
+        io.write(&chunk.block,    sizeof(chunk.block));
+        io.write(&chunk.last_use, sizeof(chunk.last_use));
+    }
+    for (const auto & page : pages) {
+        io.write(page.pos.data(),   page.pos.size()   * sizeof(page.pos[0]));
+        io.write(page.ext.data(),   page.ext.size()   * sizeof(page.ext[0]));
+        io.write(page.shift.data(), page.shift.size() * sizeof(page.shift[0]));
+    }
+
+    std::vector<common_kvflash::KvFlashStateSpan> spans;
+    for (const auto & chunk : state.chunks) {
+        if (!kvflash->state_spans(chunk.chunk, spans)) {
+            throw std::runtime_error("failed to locate KVFlash state payload");
+        }
+        size_t payload_size = 0;
+        for (const auto & span : spans) {
+            if (span.payload_offset != payload_size || payload_size > (size_t) state.chunk_bytes ||
+                span.size > (size_t) state.chunk_bytes - payload_size) {
+                throw std::runtime_error("invalid KVFlash state payload layout");
+            }
+            if (span.tensor) {
+                io.write_tensor(span.tensor, span.tensor_offset, span.size);
+            } else if (span.host) {
+                io.write(span.host, span.size);
+            } else if (span.size != 0) {
+                throw std::runtime_error("missing KVFlash state payload storage");
+            }
+            payload_size += span.size;
+        }
+        if (payload_size != state.chunk_bytes) {
+            throw std::runtime_error("incomplete KVFlash state payload");
+        }
+    }
+}
+
+void llama_kv_cache::kvflash_state_read(
+        llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    GGML_UNUSED(flags);
+
+    if (!kvflash || n_stream != 1 || (seq_id != -1 && seq_id != 0)) {
+        throw std::runtime_error("invalid KVFlash state restoration request");
+    }
+
+    common_kvflash::KvFlashState expected;
+    if (!kvflash->state_export(expected)) {
+        throw std::runtime_error("failed to synchronize KVFlash before restoration");
+    }
+
+    constexpr uint32_t expected_magic = 0x5346564b;
+    constexpr uint32_t expected_version = 1;
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t tensor_count = 0;
+    uint32_t chunk_count = 0;
+    common_kvflash::KvFlashState state;
+
+    io.read(&magic,                    sizeof(magic));
+    io.read(&version,                  sizeof(version));
+    io.read(&state.chunk_tokens,       sizeof(state.chunk_tokens));
+    io.read(&state.pool_tokens,        sizeof(state.pool_tokens));
+    io.read(&state.max_context_tokens, sizeof(state.max_context_tokens));
+    io.read(&state.sink_chunks,        sizeof(state.sink_chunks));
+    io.read(&state.tail_window_chunks, sizeof(state.tail_window_chunks));
+    io.read(&state.cur_chunk,          sizeof(state.cur_chunk));
+    io.read(&state.clock,              sizeof(state.clock));
+    io.read(&state.chunk_bytes,        sizeof(state.chunk_bytes));
+    io.read(&tensor_count,             sizeof(tensor_count));
+    io.read(&chunk_count,              sizeof(chunk_count));
+
+    const uint64_t max_chunks = state.chunk_tokens > 0 && state.max_context_tokens > 0 ?
+        ((uint64_t) state.max_context_tokens + (uint64_t) state.chunk_tokens - 1) /
+            (uint64_t) state.chunk_tokens : 0;
+    if (magic != expected_magic || version != expected_version ||
+        state.chunk_tokens != expected.chunk_tokens ||
+        state.pool_tokens != expected.pool_tokens ||
+        state.max_context_tokens != expected.max_context_tokens ||
+        state.sink_chunks != expected.sink_chunks ||
+        state.tail_window_chunks != expected.tail_window_chunks ||
+        state.chunk_bytes != expected.chunk_bytes ||
+        tensor_count != expected.tensors.size() ||
+        (max_chunks > 0 && chunk_count > max_chunks)) {
+        throw std::runtime_error("incompatible KVFlash state");
+    }
+
+    state.tensors.resize(tensor_count);
+    for (auto & tensor : state.tensors) {
+        io.read(&tensor.type,          sizeof(tensor.type));
+        io.read(&tensor.segment_bytes, sizeof(tensor.segment_bytes));
+    }
+    state.chunks.resize(chunk_count);
+    for (auto & chunk : state.chunks) {
+        io.read(&chunk.chunk,    sizeof(chunk.chunk));
+        io.read(&chunk.block,    sizeof(chunk.block));
+        io.read(&chunk.last_use, sizeof(chunk.last_use));
+    }
+
+    std::vector<kvflash_cell_page> pages(chunk_count);
+    for (auto & page : pages) {
+        page.pos.resize((size_t) state.chunk_tokens);
+        page.ext.resize((size_t) state.chunk_tokens);
+        page.shift.resize((size_t) state.chunk_tokens);
+        io.read(page.pos.data(),   page.pos.size()   * sizeof(page.pos[0]));
+        io.read(page.ext.data(),   page.ext.size()   * sizeof(page.ext[0]));
+        io.read(page.shift.data(), page.shift.size() * sizeof(page.shift[0]));
+        for (size_t i = 0; i < page.pos.size(); ++i) {
+            const llama_pos pos = page.pos[i];
+            const llama_pos shift = page.shift[i];
+            const int64_t original_pos = (int64_t) pos - (int64_t) shift;
+            if (pos < -1 || (pos == -1 && shift != 0) ||
+                (state.max_context_tokens > 0 && pos >= state.max_context_tokens) ||
+                (pos >= 0 && (original_pos < 0 ||
+                    original_pos > std::numeric_limits<llama_pos>::max() ||
+                    (state.max_context_tokens > 0 && original_pos >= state.max_context_tokens)))) {
+                throw std::runtime_error("invalid KVFlash cell metadata");
+            }
+        }
+        kvflash_recompute_page_bounds(page);
+    }
+
+    if (!kvflash->state_import(state)) {
+        clear(true);
+        throw std::runtime_error("failed to import KVFlash pager state");
+    }
+
+    try {
+        v_cells[0].reset();
+        v_heads[0] = 0;
+        kvflash_cells.clear();
+        kvflash_pos_mins.clear();
+        kvflash_pos_maxs.clear();
+
+        for (size_t i = 0; i < state.chunks.size(); ++i) {
+            const auto & chunk = state.chunks[i];
+            const auto & page = pages[i];
+            if (chunk.block >= 0) {
+                if (!kvflash_restore_page(chunk.block, state.chunk_tokens, page)) {
+                    throw std::runtime_error("failed to restore resident KVFlash metadata");
+                }
+            } else {
+                auto result = kvflash_cells.emplace(chunk.chunk, page);
+                if (!result.second) {
+                    throw std::runtime_error("duplicate KVFlash host metadata");
+                }
+                kvflash_index_page(result.first->second);
+            }
+        }
+
+        std::vector<common_kvflash::KvFlashStateSpan> spans;
+        for (const auto & chunk : state.chunks) {
+            if (!kvflash->state_spans(chunk.chunk, spans)) {
+                throw std::runtime_error("failed to locate restored KVFlash payload");
+            }
+            size_t payload_size = 0;
+            for (const auto & span : spans) {
+                if (span.payload_offset != payload_size || payload_size > (size_t) state.chunk_bytes ||
+                    span.size > (size_t) state.chunk_bytes - payload_size) {
+                    throw std::runtime_error("invalid restored KVFlash payload layout");
+                }
+                if (span.tensor) {
+                    io.read_tensor(span.tensor, span.tensor_offset, span.size);
+                } else if (span.host) {
+                    io.read(span.host, span.size);
+                } else if (span.size != 0) {
+                    throw std::runtime_error("missing restored KVFlash payload storage");
+                }
+                payload_size += span.size;
+            }
+            if (payload_size != state.chunk_bytes) {
+                throw std::runtime_error("incomplete restored KVFlash payload");
+            }
+        }
+    } catch (...) {
+        clear(true);
+        throw;
+    }
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
     if (kvflash) {
-        throw std::runtime_error(
-                "KVFlash attention state serialization is not supported yet");
+        kvflash_state_write(io, seq_id, flags);
+        return;
     }
 
     GGML_UNUSED(flags);
@@ -2572,8 +3436,8 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         return;
     }
     if (kvflash) {
-        throw std::runtime_error(
-                "KVFlash attention state restoration is not supported yet");
+        kvflash_state_read(io, seq_id, flags);
+        return;
     }
 
     GGML_UNUSED(flags);
