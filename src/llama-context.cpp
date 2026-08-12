@@ -15,6 +15,9 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#include "kvflash_pager.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -676,6 +679,70 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_outputs_max = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_sampling_outputs_per_seq_max = %u\n", __func__, cparams.n_sampling_outputs_per_seq_max);
 
+    // KVFlash: LLAMA_KVFLASH=N|auto|0 - resident full-attn pool (hybrid models).
+    {
+        common_kvflash::KvFlashConfig kcfg;
+        kcfg.chunk_tokens       = 64;
+        kcfg.sink_chunks        = 1;
+        kcfg.tail_window_chunks = 4;
+        cparams.kvflash_pool = 0;
+        cparams.kvflash_tau  = 64;
+        if (const char * stats = std::getenv("LLAMA_KVFLASH_STATS")) {
+            kvflash_stats_enabled = std::strcmp(stats, "0") != 0;
+        }
+
+        const char * kvflash_env = std::getenv("LLAMA_KVFLASH");
+        const bool kvflash_requested = kvflash_env && kvflash_env[0] != '\0' &&
+                std::strcmp(kvflash_env, "0") != 0;
+        const bool kvflash_supported =
+                llm_arch_is_hybrid(model.arch) &&
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+                cparams.n_seq_max == 1 &&
+                hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
+                (hparams.n_pos_per_embd() == 1 || hparams.n_pos_per_embd() == 4) &&
+                cparams.flash_attn &&
+                cparams.causal_attn;
+        if (kvflash_supported) {
+            const int pool = common_kvflash::kvflash_pool_from_env(
+                    (int) cparams.n_ctx_seq, kcfg, /*scorer_expected=*/false);
+            if (pool > 0 && (uint32_t) pool < cparams.n_ctx_seq) {
+                cparams.kvflash_pool = (uint32_t) pool;
+            } else if (pool > 0) {
+                LLAMA_LOG_INFO("%s: KVFlash pool covers the full context; using the normal full cache\n", __func__);
+            }
+        } else if (kvflash_requested) {
+            LLAMA_LOG_WARN("%s: KVFlash requires Flash Attention and a causal, single-sequence, supported-position, non-SWA hybrid target context; disabling\n",
+                    __func__);
+        }
+        if (const char * t = std::getenv("LLAMA_KVFLASH_TAU")) {
+            const int64_t value = std::strtoll(t, nullptr, 10);
+            cparams.kvflash_tau = (uint32_t) std::min<int64_t>(
+                    std::numeric_limits<uint32_t>::max(), std::max<int64_t>(1, value));
+        }
+        if (cparams.kvflash_pool > 0) {
+            if (const char * policy = std::getenv("LLAMA_KVFLASH_POLICY")) {
+                if (policy[0] != '\0' && std::strcmp(policy, "lru") != 0) {
+                    LLAMA_LOG_WARN("%s: KVFlash policy '%s' is not implemented; using LRU\n",
+                            __func__, policy);
+                }
+            }
+            const uint32_t n_blocks = cparams.kvflash_pool / (uint32_t) kcfg.chunk_tokens;
+            const uint32_t n_reserved = (uint32_t) kcfg.sink_chunks + 1u;
+            const uint32_t max_ubatch =
+                    (n_blocks > n_reserved ? n_blocks - n_reserved : 1u) *
+                    (uint32_t) kcfg.chunk_tokens;
+            if (cparams.n_ubatch > max_ubatch) {
+                LLAMA_LOG_WARN("%s: KVFlash limits n_ubatch from %u to %u to keep each micro-batch resident\n",
+                        __func__, cparams.n_ubatch, max_ubatch);
+                cparams.n_ubatch = max_ubatch;
+                runtime_n_ubatch = max_ubatch;
+            }
+            LLAMA_LOG_INFO("%s: kvflash_pool  = %u (env LLAMA_KVFLASH)\n",
+                    __func__, cparams.kvflash_pool);
+            LLAMA_LOG_INFO("%s: kvflash_tau   = %u\n", __func__, cparams.kvflash_tau);
+        }
+    }
+
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
@@ -781,6 +848,21 @@ llama_context::llama_context(
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            if (auto * attn = hybrid->get_mem_attn()) {
+                if (auto * pager = attn->get_kvflash()) {
+                    if (!pager->bind_backends(backend_ptrs)) {
+                        throw std::runtime_error("failed to bind KVFlash tensors to their backends");
+                    }
+                    kvflash_pager = pager;
+                    LLAMA_LOG_INFO("%s: KVFlash paging copies: %s\n", __func__,
+                            pager->has_async_paging() ?
+                            "backend-ordered asynchronous copies" :
+                            "host or synchronous backend copies");
+                }
+            }
+        }
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
@@ -1013,6 +1095,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fa) {
         resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
         cparams.auto_fa = false;
+    }
+    if (kvflash_pager && !cparams.flash_attn) {
+        throw std::runtime_error(
+                "KVFlash requires Flash Attention, but the backend probe disabled it");
     }
 
     if (cparams.auto_fgdn) {
@@ -2562,6 +2648,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // Pure LRU evicts on demand. Tau reselection is useful only after a
+        // relevance scorer has been attached.
+        if (cparams.kvflash_pool > 0 && memory) {
+            if (kvflash_pager && kvflash_pager->has_score_hook()) {
+                kvflash_tokens_since_reselect += ubatch.n_tokens;
+                if (kvflash_tokens_since_reselect >= cparams.kvflash_tau) {
+                    const int ev = kvflash_pager->reselect();
+                    if (ev < 0) {
+                        LLAMA_LOG_ERROR("%s: KVFlash reselect failed\n", __func__);
+                        return -3;
+                    }
+                    if (ev > 0) {
+                        LLAMA_LOG_DEBUG("%s: kvflash reselect events=%d page_outs=%lld page_ins=%lld\n",
+                                __func__, ev,
+                                (long long) kvflash_pager->stats().page_outs,
+                                (long long) kvflash_pager->stats().page_ins);
+                    }
+                    kvflash_tokens_since_reselect = 0;
+                }
+            }
+        }
+
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
@@ -2746,6 +2854,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (kvflash_stats_enabled && kvflash_pager) {
+        const auto & stats = kvflash_pager->stats();
+        if (stats.page_outs != kvflash_page_outs_reported) {
+            // LLAMA_KVFLASH_STATS is an explicit output request, so use the
+            // unfiltered log level instead of hiding it at the default error
+            // verbosity used by llama-cli.
+            LLAMA_LOG("%s: KVFlash page_outs=%lld page_ins=%lld host_used=%.2f MiB host_allocated=%.2f MiB moved=%.2f MiB resident=%d/%d blocks host_slabs=%zu\n",
+                    __func__,
+                    (long long) stats.page_outs,
+                    (long long) stats.page_ins,
+                    stats.host_bytes / (1024.0 * 1024.0),
+                    stats.host_allocated_bytes / (1024.0 * 1024.0),
+                    stats.moved_bytes / (1024.0 * 1024.0),
+                    kvflash_pager->resident_blocks(),
+                    kvflash_pager->pool_tokens() / kvflash_pager->chunk_tokens(),
+                    kvflash_pager->host_slab_count());
+            kvflash_page_outs_reported = stats.page_outs;
+        }
+    }
 
     dflash_scope.success = true;
     return 0;

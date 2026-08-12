@@ -2280,15 +2280,34 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
+                    // KVFlash: shrink full-attention KV allocation to the resident
+                    // pool. Logical context remains cparams.n_ctx_seq (RoPE/pos).
+                    uint32_t attn_kv_size = cparams.n_ctx_seq;
+                    if (cparams.kvflash_pool > 0) {
+                        if (cparams.n_seq_max != 1) {
+                            LLAMA_LOG_WARN("%s: KVFlash requires n_seq_max=1; disabling (pool=%u)\n",
+                                    __func__, cparams.kvflash_pool);
+                        } else {
+                            attn_kv_size = std::min(cparams.n_ctx_seq, cparams.kvflash_pool);
+                            LLAMA_LOG_INFO("%s: KVFlash pool: attn_kv_size=%u (logical n_ctx_seq=%u)\n",
+                                    __func__, attn_kv_size, cparams.n_ctx_seq);
+                        }
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
+                        // KVFlash + hybrid-iswa: not yet supported (pager is base cache only).
+                        if (cparams.kvflash_pool > 0) {
+                            LLAMA_LOG_WARN("%s: KVFlash not supported with SWA hybrid; using full cache\n", __func__);
+                            attn_kv_size = cparams.n_ctx_seq;
+                        }
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_swa_full     */ params.swa_full,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
@@ -2306,7 +2325,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
@@ -2319,6 +2338,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+
+                        // Attach pager when pool is active (base hybrid only).
+                        if (cparams.kvflash_pool > 0 && attn_kv_size < cparams.n_ctx_seq) {
+                            auto * hyb = dynamic_cast<llama_memory_hybrid *>(res);
+                            if (!hyb || !hyb->get_mem_attn() ||
+                                !hyb->get_mem_attn()->init_kvflash(
+                                        attn_kv_size, cparams.n_ctx_seq, /*chunk=*/64)) {
+                                delete res;
+                                throw std::runtime_error("failed to initialize KVFlash pager");
+                            }
+                        }
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
