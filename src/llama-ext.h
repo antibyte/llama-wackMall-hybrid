@@ -96,6 +96,28 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 LLAMA_API bool llama_set_runtime_ubatch(struct llama_context * ctx, uint32_t n_ubatch);
 LLAMA_API uint32_t llama_get_runtime_ubatch(const struct llama_context * ctx);
 
+// Configure a single-sequence tree verification batch. The context copies and
+// validates both inputs. Pass nullptr to clear tree mode.
+LLAMA_API bool llama_set_tree_parent_ids(
+        struct llama_context * ctx,
+        const int32_t * parent_ids,
+        int32_t n_tokens);
+LLAMA_API bool llama_set_tree_visibility(
+        struct llama_context * ctx,
+        const uint8_t * visibility,
+        int32_t n_nodes);
+
+// Keep the KV cells and recurrent snapshot of an accepted root-to-node path
+// from the most recently decoded tree batch.
+LLAMA_API bool llama_can_commit_tree_path(
+        const struct llama_context * ctx,
+        int32_t n_tokens);
+LLAMA_API bool llama_commit_tree_path(
+        struct llama_context * ctx,
+        llama_seq_id seq_id,
+        const int32_t * path,
+        int32_t n_path);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

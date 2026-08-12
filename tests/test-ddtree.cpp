@@ -1,4 +1,4 @@
-// Unit tests for common/ddtree — Diffusion Draft Tree (Lucebox port).
+// Unit tests for common/ddtree - Diffusion Draft Tree (Lucebox port).
 // Pure CPU; no model load required.
 
 #include "ddtree.h"
@@ -7,6 +7,7 @@
 #undef NDEBUG
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -31,21 +32,23 @@ static void test_extract_topk_argmax() {
     // log-probs descending within each position
     assert(lp[0] >= lp[1] && lp[1] >= lp[2]);
     assert(lp[K] >= lp[K + 1] && lp[K + 1] >= lp[K + 2]);
-    // softmax sums to ~1
     float s0 = 0.f, s1 = 0.f;
     for (int k = 0; k < K; k++) {
         s0 += std::exp(lp[k]);
         s1 += std::exp(lp[K + k]);
     }
-    // only top-K mass, so sum < 1; but top-1 should dominate
+    // Top-K retains exact full-vocabulary normalization.
+    const float z0 = std::exp(0.1f) + std::exp(0.2f) + std::exp(0.0f) + std::exp(5.0f) + std::exp(0.3f);
+    assert(std::abs(std::exp(lp[0]) - std::exp(5.0f) / z0) < 1e-6f);
+    assert(s0 > 0.0f && s0 < 1.0f);
+    assert(s1 > 0.0f && s1 < 1.0f);
     assert(std::exp(lp[0]) > 0.5f);
     assert(std::exp(lp[K]) > 0.5f);
-    (void) s0; (void) s1;
     std::printf("ok extract_topk_argmax\n");
 }
 
 static void test_build_chain_seed() {
-    // L=4, K=2, budget=4 → full top-1 chain of length 4
+    // L=4, K=2, budget=4 gives a full top-1 chain of length 4.
     const int L = 4, K = 2, budget = 4;
     std::vector<float>   lp(L * K);
     std::vector<int32_t> ids(L * K);
@@ -76,14 +79,11 @@ static void test_build_chain_seed() {
     assert(tree.visibility[(size_t) 3 * N + 3] == 1);
     assert(tree.visibility[(size_t) 3 * N + 4] == 0); // not yet / sibling
 
-    auto chain = common_ddtree_top1_chain(lp.data(), ids.data(), L, K, L);
-    assert(chain.size() == (size_t) L);
-    assert(chain[0] == 100 && chain[3] == 103);
     std::printf("ok build_chain_seed\n");
 }
 
 static void test_build_expands_siblings() {
-    // budget > L → siblings get inserted after the chain
+    // budget > L adds siblings after the chain.
     const int L = 3, K = 3, budget = 8;
     std::vector<float>   lp(L * K, -5.0f);
     std::vector<int32_t> ids(L * K, 0);
@@ -110,6 +110,19 @@ static void test_build_expands_siblings() {
     }
     assert(found_sib);
     std::printf("ok build_expands_siblings nodes=%d\n", tree.n_nodes);
+}
+
+static void test_budget_is_hard_limit() {
+    const int L = 5, K = 2, budget = 3;
+    std::vector<float> lp(L * K, -1.0f);
+    std::vector<int32_t> ids(L * K);
+    for (int i = 0; i < L * K; ++i) {
+        ids[(size_t) i] = 100 + i;
+    }
+    const common_ddtree tree = common_ddtree_build(lp.data(), ids.data(), L, K, budget, true);
+    assert(tree.n_nodes == budget);
+    assert(*std::max_element(tree.depths.begin(), tree.depths.end()) <= budget);
+    std::printf("ok budget_is_hard_limit\n");
 }
 
 static void test_follow_verified() {
@@ -146,30 +159,40 @@ static void test_follow_verified() {
     std::printf("ok follow_verified\n");
 }
 
-static void test_paths() {
-    const int L = 3, K = 2, budget = 6;
-    std::vector<float>   lp(L * K, -1.0f);
+static void test_positions_follow_depth() {
+    const int L = 3, K = 3, budget = 8;
+    std::vector<float>   lp(L * K, -3.0f);
     std::vector<int32_t> ids(L * K);
-    for (int d = 0; d < L; d++) {
-        ids[d * K + 0] = 10 + d;
-        ids[d * K + 1] = 50 + d;
-        lp [d * K + 0] = -0.1f;
-        lp [d * K + 1] = -0.5f;
+    for (int d = 0; d < L; ++d) {
+        for (int k = 0; k < K; ++k) {
+            ids[d * K + k] = 100 + d * 10 + k;
+        }
+        lp[d * K] = -0.1f;
     }
-    common_ddtree tree = common_ddtree_build(lp.data(), ids.data(), L, K, budget, true);
-    auto paths = common_ddtree_paths(tree, lp.data(), ids.data(), L, K, /*max_paths=*/4);
-    assert(!paths.empty());
-    // first path should start with top-1 first token
-    assert(paths[0][0] == 10);
-    std::printf("ok paths n=%zu first_len=%zu\n", paths.size(), paths[0].size());
+
+    const common_ddtree tree = common_ddtree_build(lp.data(), ids.data(), L, K, budget, true);
+    const auto positions = common_ddtree_positions(tree, 42);
+    assert(positions.size() == (size_t) tree.n_nodes + 1);
+    assert(positions[0] == 42);
+    assert(std::is_sorted(positions.begin(), positions.end()));
+    for (int i = 0; i < tree.n_nodes; ++i) {
+        assert(positions[(size_t) i + 1] == 42 + tree.depths[(size_t) i]);
+        const int32_t parent = tree.parents[(size_t) i + 1];
+        assert(parent >= 0 && parent <= i);
+        if (parent > 0) {
+            assert(tree.depths[(size_t) parent - 1] + 1 == tree.depths[(size_t) i]);
+        }
+    }
+    std::printf("ok positions_follow_depth\n");
 }
 
 int main() {
     test_extract_topk_argmax();
     test_build_chain_seed();
     test_build_expands_siblings();
+    test_budget_is_hard_limit();
     test_follow_verified();
-    test_paths();
+    test_positions_follow_depth();
     std::printf("all ddtree tests passed\n");
     return 0;
 }

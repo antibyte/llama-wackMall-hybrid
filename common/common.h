@@ -395,18 +395,7 @@ struct common_params_speculative {
         if (!needs_rs_seq) {
             return 0u;
         }
-        // Tree-attention verify can accept a path deeper/wider than n_max
-        // (siblings at budget). Commit re-decode needs RS slots for the path.
-        uint32_t n = (uint32_t) draft.n_max;
-        if (const char * tv = std::getenv("LLAMA_DFLASH_TREE_VERIFY");
-                tv && tv[0] != '\0' && tv[0] != '0') {
-            int budget = 22;
-            if (const char * v = std::getenv("LLAMA_DFLASH_DDTREE_BUDGET")) {
-                budget = std::max(1, std::atoi(v));
-            }
-            n = std::max(n, (uint32_t) budget);
-        }
-        return n;
+        return (uint32_t) draft.n_max;
     }
 };
 

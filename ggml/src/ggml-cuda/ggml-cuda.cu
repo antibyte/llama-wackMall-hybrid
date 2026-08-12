@@ -3885,7 +3885,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output
-    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] != nullptr || gdn->type != GGML_TYPE_F32 ||
         (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
@@ -4286,6 +4286,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
         const ggml_tensor * add      = cgraph->nodes[node_idx+1];
         const ggml_tensor * silu     = cgraph->nodes[node_idx+2];
+        if (ssm_conv->src[2] != nullptr) {
+            return false;
+        }
         if (ggml_get_unary_op(silu) != unary_ops.begin()[0]) {
             return false;
         }
@@ -6416,7 +6419,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
-            return op->src[0]->ne[1] % 128 == 0;
+            if (op->src[0]->ne[1] % 128 != 0) {
+                return false;
+            }
+            return op->src[2] == nullptr ||
+                (op->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[2]) &&
+                 ggml_nelements(op->src[2]) == op->ne[1] * op->ne[2]);
         }
         case GGML_OP_CONT:
             return true;
@@ -6480,7 +6488,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #ifdef GGML_USE_MUSA
             return false;
 #else
-            return true;
+            return op->src[6] == nullptr ||
+                (ggml_get_op_params_i32(op, 0) == 1 &&
+                 op->src[6]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[6]) &&
+                 ggml_nelements(op->src[6]) == op->src[2]->ne[2] * op->src[2]->ne[3]);
 #endif // GGML_USE_MUSA
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&

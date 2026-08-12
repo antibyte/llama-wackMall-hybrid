@@ -1,4 +1,4 @@
-// DDTree — Diffusion Draft Tree for DFlash speculative decoding.
+// DDTree - Diffusion Draft Tree for DFlash speculative decoding.
 //
 // Port of build_ddtree from Lucebox (liranringel/ddtree / dflash::common::ddtree).
 // Builds a best-first tree from per-position top-K log-probability distributions
@@ -9,18 +9,17 @@
 #pragma once
 
 #include <cstdint>
-#include <queue>
 #include <unordered_map>
 #include <vector>
 
 // A flat tree built from the draft's top-K softmax distributions.
 // Slot 0 is the tree root (previous bonus / last accepted token);
-// slots 1..n_nodes are the tree nodes (DFS / insertion order).
+// slots 1..n_nodes are the tree nodes in stable depth order.
 struct common_ddtree {
     int                         n_nodes = 0; // excludes root
     std::vector<int32_t>        token_ids;   // size n_nodes
     std::vector<int>            depths;      // size n_nodes (1..L)
-    std::vector<int>            parents;     // size n_nodes + 1
+    std::vector<int32_t>        parents;     // size n_nodes + 1
     std::vector<std::unordered_map<int32_t, int>> child_maps; // size n_nodes + 1
     // (1 + n_nodes)^2 row-major: visibility[i*N+j] = 1 if j is ancestor of i (incl. self)
     std::vector<uint8_t>        visibility;
@@ -51,6 +50,12 @@ common_ddtree common_ddtree_build(
         int budget,
         bool chain_seed = true);
 
+// Return positions for a flat verification batch containing the root followed
+// by all tree nodes. Siblings share a position; descendants advance by depth.
+std::vector<int32_t> common_ddtree_positions(
+        const common_ddtree & tree,
+        int32_t root_pos);
+
 // Walk tree following target posterior argmax at each node.
 // Returns accepted node indices (starting with root 0).
 // out_next_token: first rejected / bonus token from posterior
@@ -60,23 +65,3 @@ std::vector<int> common_ddtree_follow(
         const int32_t * posterior,
         int & out_next_token,
         int * out_node_idx = nullptr);
-
-// Extract the top-1 chain tokens (depth 1..max_depth) from a built tree.
-// Returns token ids along the rank-0 path, length <= max_depth.
-std::vector<int32_t> common_ddtree_top1_chain(
-        const float * top_log_probs,
-        const int32_t * top_token_ids,
-        int L,
-        int K,
-        int max_depth);
-
-// Enumerate root-to-leaf paths as linear token sequences (for multi-seq verify).
-// Each path is tokens from depth 1..end (excludes root).
-// Paths sorted by cumulative log-prob descending. At most max_paths returned.
-std::vector<std::vector<int32_t>> common_ddtree_paths(
-        const common_ddtree & tree,
-        const float * top_log_probs,
-        const int32_t * top_token_ids,
-        int L,
-        int K,
-        int max_paths);

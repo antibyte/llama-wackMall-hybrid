@@ -191,6 +191,10 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    virtual bool process_tree_path(
+            const llama_batch & /*batch*/,
+            const std::vector<int32_t> & /*rows*/) { return true; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -429,7 +433,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 // Deferred boundary (MTP doesn't have this issue):
 //   Within a single process() call with n_tokens, we can only write decoder KV for
 //   training pos 0..n_tokens-2. The last training pos (n_tokens-1) needs t_{n_tokens}
-//   which lies *outside* this batch — it is the token target will sample next or the first token from next ubatch.
+//   which lies *outside* this batch - it is the token target will sample next or the first token from next ubatch.
 //   So the last training pos of each process() call is *deferred* to whichever next call has
 //   the missing token in hand:
 //     - multi-ubatch prefill: the next process()'s first token completes the pair
@@ -438,10 +442,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 //                              (target's freshest sample) to complete the pair
 //
 // Per-seq carry-over state:
-//   pending_g_last    [n_embd_dec]  ┐  the deferred boundary's (g, pos). Set by
-//   pending_pos_last  llama_pos     ┘  process() at end of ubatch (= last row);
+//   pending_g_last    [n_embd_dec]     the deferred boundary's (g, pos). Set by
+//   pending_pos_last  llama_pos        process() at end of ubatch (= last row);
 //                                       rebased by accept() to first-non-accepted pos.
-//   verify_g          [N × n_embd_dec] snapshot of process()'s encoder output;
+//   verify_g          [N x n_embd_dec] snapshot of process()'s encoder output;
 //   verify_pos_first  llama_pos         consumed by accept() to recover the right
 //   verify_g_rows     int32_t           pending_g_last row for any n_accepted value.
 //
@@ -475,8 +479,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     // [per-seq] snapshot of the most recent process()'s encoder output
     std::vector<std::vector<float>> verify_g;         // [n_seq][n_rows * n_embd_dec]
-    std::vector<llama_pos>          verify_pos_first; // [n_seq] — pos of verify_g[seq][0]
-    std::vector<int32_t>            verify_g_rows;    // [n_seq] — number of rows
+    std::vector<llama_pos>          verify_pos_first; // [n_seq] - pos of verify_g[seq][0]
+    std::vector<int32_t>            verify_g_rows;    // [n_seq] - number of rows
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -585,7 +589,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
         if (pos_max < N - 2) {
-            SPC_WRN("ctx_dft pos_max=%d < N-2=%d — process() did not run on every prefill ubatch. "
+            SPC_WRN("ctx_dft pos_max=%d < N-2=%d - process() did not run on every prefill ubatch. "
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 2);
         }
@@ -679,12 +683,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // (token[P+1], g_embd[P]). This shifts the token index "left by one" relative to g_embd.
         //
         // Per seq, in order:
-        //   (a) cross-ubatch bridge — when applicable, write the previously-deferred
+        //   (a) cross-ubatch bridge - when applicable, write the previously-deferred
         //       pos using this ubatch's first token + pending_g_last.
-        //   (b) main write loop — for k in [beg, end-1], write (token[k+1], g_embd[k])
+        //   (b) main write loop - for k in [beg, end-1], write (token[k+1], g_embd[k])
         //       at pos[k]. The last training pos (k=end) is left unwritten = new
         //       deferred boundary, completed by the next process() or draft() call.
-        //   (c) refresh deferred state — stash this ubatch's full g_embd into verify_g,
+        //   (c) refresh deferred state - stash this ubatch's full g_embd into verify_g,
         //       update pending_g_last / pending_pos_last to the last row.
         common_batch_clear(batch);
 
@@ -695,7 +699,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 continue;
             }
 
-            // cross-ubatch bridge — complete the prior ubatch's deferred boundary.
+            // cross-ubatch bridge - complete the prior ubatch's deferred boundary.
             // Fires iff all three preconditions hold:
             //   1) pending_pos_last >= 0
             //   2) pending_pos_last + 1 == pos[beg]
@@ -944,25 +948,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool combined_graph = false;
 
-    // DDTree mode (env LLAMA_DFLASH_DDTREE=1):
-    // Extract per-position top-K from draft logits, build a best-first tree
-    // (Lucebox build_ddtree), emit the top-1 chain (+ optional multi-path).
-    // Multi-path (PATHS>1) enables multi-seq tree verify via seq_cp branches.
-    // Full tree-attention + GDN parent_ids (Lucebox) is not yet ported.
+    // DDTree mode (env LLAMA_DFLASH_DDTREE=1).
+    // Extract exact per-position top-K log-probabilities, build a best-first
+    // tree, and emit the top-1 chain.
     bool  ddtree_mode       = false;
     bool  ddtree_full_chain = true;  // ignore p_min early-exit when building chain
     bool  ddtree_chain_seed = true;
     int   ddtree_k          = 8;
-    int   ddtree_budget     = 22;
-    int   ddtree_n_paths    = 1;     // 1 = chain only; >1 multi-path tree verify
+    int   ddtree_budget     = 12;
     float ddtree_temp       = 1.0f;
 
-    // Last top-K tables per seq for rescue telemetry (size L*K).
-    std::vector<std::vector<float>>   ddtree_top_lp;  // [n_seq][L*K]
-    std::vector<std::vector<int32_t>> ddtree_top_ids; // [n_seq][L*K]
-    std::vector<int>                  ddtree_L;       // [n_seq] last L
-    // Multi-path drafts per seq (path 0 is primary / top-1 chain).
-    std::vector<std::vector<llama_tokens>> ddtree_paths;
     // Last built trees per seq (for tree-attention verify).
     std::vector<common_ddtree> ddtree_last;
 
@@ -1052,9 +1047,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (const char * v = std::getenv("LLAMA_DFLASH_DDTREE_FULL_CHAIN")) {
                 ddtree_full_chain = !(v[0] == '0');
             }
-            if (const char * v = std::getenv("LLAMA_DFLASH_DDTREE_PATHS")) {
-                ddtree_n_paths = std::max(1, std::atoi(v));
-            }
         }
 
         LOG_INF("%s: adding speculative implementation 'draft-dflash'\n", __func__);
@@ -1063,11 +1055,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 (int) this->params.backend_sampling);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
         if (ddtree_mode) {
-            LOG_INF("%s: - ddtree=ON K=%d budget=%d temp=%.2f chain_seed=%d full_chain=%d paths=%d "
-                    "(multi-path tree verify when paths>1 + n_seq_max enough; "
-                    "Lucebox tree-attn/GDN parent_ids not ported)\n",
+            LOG_INF("%s: - ddtree=ON K=%d budget=%d temp=%.2f chain_seed=%d full_chain=%d\n",
                     __func__, ddtree_k, ddtree_budget, ddtree_temp,
-                    (int) ddtree_chain_seed, (int) ddtree_full_chain, ddtree_n_paths);
+                    (int) ddtree_chain_seed, (int) ddtree_full_chain);
         }
 
         // DFlash input is [id_last, <mask> * (block_size-1)], so it can draft at most block_size-1 tokens per step
@@ -1081,10 +1071,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
 
-        ddtree_top_lp.resize(n_seq);
-        ddtree_top_ids.resize(n_seq);
-        ddtree_L.assign(n_seq, 0);
-        ddtree_paths.resize(n_seq);
         ddtree_last.resize(n_seq);
 
         smpls.resize(n_seq);
@@ -1097,10 +1083,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
-        // offload the top-k reduction for every mask output to the backend
+        // Offload classic-chain top-k reduction to the backend. DDTree needs
+        // full-vocabulary logits to retain probability mass across depths.
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
-            const int backend_k = ddtree_mode ? std::max(10, ddtree_k) : 10;
+        if (this->params.backend_sampling && !ddtree_mode) {
+            const int backend_k = 10;
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(backend_k));
@@ -1112,6 +1099,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 backend_chains[seq_id] = chain;
             }
+        } else if (this->params.backend_sampling && ddtree_mode) {
+            LOG_INF("%s: - backend sampling disabled for exact DDTree probabilities\n", __func__);
         }
 
         // turn on extraction of the target layers' input embeddings
@@ -1123,21 +1112,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
 
         combined_graph = llama_attach_dflash(ctx_tgt, ctx_dft);
-        if (ddtree_mode && ddtree_n_paths > 1) {
-            LOG_INF("%s: - ddtree multi-path: need n_seq_max >= %d (n_parallel + %d aux); "
-                    "combined_graph=%d (must be 0 for multi-seq)\n",
-                    __func__, ddtree_n_paths, ddtree_n_paths - 1, (int) combined_graph);
-        }
-    }
-
-    // Expose last multi-path drafts for a sequence (used by server tree verify).
-    bool get_tree_paths(llama_seq_id seq_id, std::vector<llama_tokens> & paths_out) const {
-        paths_out.clear();
-        if (seq_id < 0 || seq_id >= (llama_seq_id) ddtree_paths.size()) {
-            return false;
-        }
-        paths_out = ddtree_paths[(size_t) seq_id];
-        return !paths_out.empty();
     }
 
     const common_ddtree * get_tree(llama_seq_id seq_id) const {
@@ -1147,8 +1121,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const auto & t = ddtree_last[(size_t) seq_id];
         return t.n_nodes > 0 ? &t : nullptr;
     }
-
-    int n_tree_paths_cfg() const { return ddtree_n_paths; }
 
     ~common_speculative_impl_draft_dflash() override {
         if (combined_graph && this->params.ctx_tgt) {
@@ -1192,6 +1164,72 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
+    bool process_rows(
+            const llama_batch & batch_in,
+            llama_seq_id seq_id,
+            const std::vector<int32_t> & rows) {
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        for (int32_t offset = 0; offset < (int32_t) rows.size(); offset += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, (int32_t) rows.size() - offset);
+
+            features_buf.resize((size_t) n_chunk * n_embd_enc);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layer) {
+                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                }
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    const int32_t row = rows[(size_t) offset + i];
+                    float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                    const float * src = layer + (size_t) row * n_embd_tgt;
+                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                }
+            }
+
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ n_chunk,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ features_buf.data(),
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+
+            int32_t rc = llama_encode(ctx_dft, enc_batch);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
+            }
+
+            const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+            batch_inject.n_tokens = n_chunk;
+            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                const int32_t row = rows[(size_t) offset + i];
+                batch_inject.pos[i]       = batch_in.pos[row];
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = seq_id;
+                batch_inject.logits[i]    = false;
+            }
+            rc = llama_decode(ctx_dft, batch_inject);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
             return true;
@@ -1207,93 +1245,44 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         n_process_standalone++;
-
-        const int32_t n_tokens = batch_in.n_tokens;
-
-        // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
-        std::vector<int32_t> i_batch_beg(n_seq, -1);
-        std::vector<int32_t> i_batch_end(n_seq, -1);
-        for (int32_t k = 0; k < n_tokens; ++k) {
+        std::vector<std::vector<int32_t>> rows((size_t) n_seq);
+        for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
             GGML_ASSERT(batch_in.n_seq_id[k] == 1);
             const llama_seq_id seq_id = batch_in.seq_id[k][0];
-            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-                continue;
-            }
-            i_batch_end[seq_id] = k;
-            if (i_batch_beg[seq_id] < 0) {
-                i_batch_beg[seq_id] = k;
+            if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+                rows[(size_t) seq_id].push_back(k);
             }
         }
-
-        auto * ctx_tgt = this->params.ctx_tgt;
-        auto * ctx_dft = this->params.ctx_dft;
-
-        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
-
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_beg[seq_id] < 0) {
-                continue;
-            }
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-
-            for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
-                const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
-
-                // gather this chunk's target features, interleaved by extract layer
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
-                    }
-                }
-
-                // fuse extracted features through DFlash encoder
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
-
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
-
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
-
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                    batch_inject.n_seq_id[i]  = 1;
-                    batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = false;
-                }
-                rc = llama_decode(ctx_dft, batch_inject);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
+            if (!rows[(size_t) seq_id].empty() && !process_rows(batch_in, seq_id, rows[(size_t) seq_id])) {
+                return false;
             }
         }
-
         return true;
+    }
+
+    bool process_tree_path(
+            const llama_batch & batch_in,
+            const std::vector<int32_t> & rows) override {
+        if (rows.empty() || batch_in.n_tokens <= 0 ||
+                (batch_in.token == nullptr) == (batch_in.embd == nullptr)) {
+            return false;
+        }
+        const int32_t first = rows[0];
+        if (first < 0 || first >= batch_in.n_tokens || batch_in.n_seq_id[first] != 1) {
+            return false;
+        }
+        const llama_seq_id seq_id = batch_in.seq_id[first][0];
+        llama_pos prev = -1;
+        for (int32_t row : rows) {
+            if (row < 0 || row >= batch_in.n_tokens || batch_in.n_seq_id[row] != 1 ||
+                    batch_in.seq_id[row][0] != seq_id || (prev >= 0 && batch_in.pos[row] != prev + 1)) {
+                return false;
+            }
+            prev = batch_in.pos[row];
+        }
+        n_process_standalone++;
+        return process_rows(batch_in, seq_id, rows);
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -1377,108 +1366,53 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             result.clear();
 
             if (ddtree_mode && L > 0 && n_vocab > 0) {
-                // ── DDTree path: sampler top-K per mask pos → build tree → top-1 chain ──
-                // Use the same common_sampler path as classic chain (proven accept rates).
-                // Full-vocab CPU extract was tried first but can disagree with the
-                // sampler/backend path and collapse acceptance to ~0 on this stack.
-                const int K = std::max(1, std::min(ddtree_k, n_vocab));
-                const int budget = std::max(L, ddtree_budget); // at least the chain
+                const int budget = std::max(1, ddtree_budget);
+                const int draft_depth = std::min(L, budget);
+                const int K = std::max(1, std::min({ ddtree_k, n_vocab, budget }));
 
-                top_lp_buf.assign((size_t) L * (size_t) K, -1e30f);
-                top_ids_buf.assign((size_t) L * (size_t) K, 0);
+                logits_buf.resize((size_t) L * (size_t) n_vocab);
+                top_lp_buf.resize((size_t) L * (size_t) K);
+                top_ids_buf.resize((size_t) L * (size_t) K);
+
+                llama_synchronize(ctx_dft);
+                if (t_after_first_sample < 0) {
+                    t_after_first_sample = ggml_time_us();
+                }
 
                 for (int32_t i = 0; i < L; ++i) {
-                    common_sampler_sample(smpl, ctx_dft, beg + 1 + i, true);
-                    if (t_after_first_sample < 0) {
-                        t_after_first_sample = ggml_time_us();
+                    const float * logits = llama_get_logits_ith(ctx_dft, beg + 1 + i);
+                    if (logits == nullptr) {
+                        throw std::runtime_error("DFlash DDTree logits are unavailable");
                     }
-
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
-                    if (cur_p == nullptr || cur_p->size == 0) {
-                        LOG_WRN("%s: ddtree: empty candidates seq=%d pos=%d\n",
-                                __func__, (int) seq_id, (int) i);
-                        continue;
-                    }
-
-                    const int n_cand = (int) cur_p->size;
-                    // Build a small heap of top-K by probability (candidates may be unsorted).
-                    struct Cand { float p; int32_t id; };
-                    std::vector<Cand> best;
-                    best.reserve((size_t) K);
-                    for (int c = 0; c < n_cand; ++c) {
-                        const float p  = cur_p->data[c].p;
-                        const int32_t id = cur_p->data[c].id;
-                        if ((int) best.size() < K) {
-                            best.push_back({p, id});
-                            if ((int) best.size() == K) {
-                                std::make_heap(best.begin(), best.end(),
-                                    [](const Cand & a, const Cand & b) { return a.p > b.p; });
-                            }
-                        } else if (p > best.front().p) {
-                            std::pop_heap(best.begin(), best.end(),
-                                [](const Cand & a, const Cand & b) { return a.p > b.p; });
-                            best.back() = {p, id};
-                            std::push_heap(best.begin(), best.end(),
-                                [](const Cand & a, const Cand & b) { return a.p > b.p; });
-                        }
-                    }
-                    std::sort(best.begin(), best.end(),
-                        [](const Cand & a, const Cand & b) { return a.p > b.p; });
-
-                    // Convert probs → log-probs (clamp). Pad missing ranks with tiny mass.
-                    float mass = 0.0f;
-                    for (const auto & b : best) mass += std::max(b.p, 0.0f);
-                    if (mass <= 0.0f) mass = 1.0f;
-                    for (int k = 0; k < K; ++k) {
-                        if (k < (int) best.size()) {
-                            const float p = std::max(best[(size_t) k].p / mass, 1e-30f);
-                            top_lp_buf[(size_t) i * (size_t) K + (size_t) k] = std::log(p);
-                            top_ids_buf[(size_t) i * (size_t) K + (size_t) k] = best[(size_t) k].id;
-                        } else {
-                            top_lp_buf[(size_t) i * (size_t) K + (size_t) k] = -30.0f;
-                            top_ids_buf[(size_t) i * (size_t) K + (size_t) k] =
-                                best.empty() ? 0 : best.back().id;
-                        }
-                    }
-
-                    for (int k = 0; k < std::min(3, (int) best.size()); ++k) {
-                        LOG_DBG(" - seq_id %d, ddtree cand %3d, pos %3d: %6d (%8.3f)\n",
-                                seq_id, k, i, best[(size_t) k].id, best[(size_t) k].p);
-                    }
+                    std::memcpy(
+                            logits_buf.data() + (size_t) i * n_vocab,
+                            logits,
+                            (size_t) n_vocab * sizeof(float));
                 }
 
                 const int64_t t_tree0 = ggml_time_us();
-                const common_ddtree tree = common_ddtree_build(
+                common_ddtree_extract_topk(
+                        logits_buf.data(), L, n_vocab, K,
+                        top_lp_buf.data(), top_ids_buf.data(), ddtree_temp);
+                common_ddtree tree = common_ddtree_build(
                         top_lp_buf.data(), top_ids_buf.data(),
                         L, K, budget, ddtree_chain_seed);
                 t_ddtree_local += ggml_time_us() - t_tree0;
 
-                n_ddtree_builds++;
-                n_ddtree_nodes += (size_t) tree.n_nodes;
-
-                // Persist top-K and tree for tree-verify / rescue telemetry
-                ddtree_top_lp[(size_t) seq_id]  = top_lp_buf;
-                ddtree_top_ids[(size_t) seq_id] = top_ids_buf;
-                ddtree_L[(size_t) seq_id]       = L;
-                ddtree_last[(size_t) seq_id]    = tree;
-
-                // Enumerate multi-path candidates for multi-seq tree verify.
-                auto & paths_out = ddtree_paths[(size_t) seq_id];
-                paths_out.clear();
-                if (ddtree_n_paths > 1 && tree.n_nodes > 0) {
-                    auto raw = common_ddtree_paths(
-                            tree, top_lp_buf.data(), top_ids_buf.data(),
-                            L, K, ddtree_n_paths);
-                    for (auto & pth : raw) {
-                        if ((int) pth.size() >= params.n_min) {
-                            paths_out.push_back(std::move(pth));
-                        }
+                for (int32_t i = 0; i < L; ++i) {
+                    for (int k = 0; k < std::min(3, K); ++k) {
+                        const size_t idx = (size_t) i * K + k;
+                        LOG_DBG(" - seq_id %d, ddtree cand %3d, pos %3d: %6d (%8.3f)\n",
+                                seq_id, k, i, top_ids_buf[idx], std::exp(top_lp_buf[idx]));
                     }
                 }
 
+                n_ddtree_builds++;
+                n_ddtree_nodes += (size_t) tree.n_nodes;
+
                 // Emit top-1 chain (rank-0 path). Optionally early-exit on p_min
                 // unless full_chain is set (Lucebox always drafts the full block).
-                for (int d = 0; d < L; ++d) {
+                for (int d = 0; d < draft_depth; ++d) {
                     const int32_t id = top_ids_buf[(size_t) d * (size_t) K + 0];
                     const float   lp = top_lp_buf[(size_t) d * (size_t) K + 0];
                     const float   p  = std::exp(lp);
@@ -1496,29 +1430,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
-                    paths_out.clear();
-                } else if (paths_out.empty()) {
-                    // Always expose at least the primary chain as path 0.
-                    paths_out.push_back(result);
-                } else {
-                    // Ensure path 0 is exactly the emitted primary chain.
-                    paths_out[0] = result;
-                    // Drop duplicates of the primary chain
-                    std::vector<llama_tokens> uniq;
-                    uniq.push_back(paths_out[0]);
-                    for (size_t pi = 1; pi < paths_out.size(); ++pi) {
-                        if (paths_out[pi] != paths_out[0]) {
-                            uniq.push_back(std::move(paths_out[pi]));
-                        }
-                    }
-                    paths_out = std::move(uniq);
                 }
 
-                LOG_DBG("%s: ddtree seq=%d L=%d K=%d budget=%d nodes=%d chain_len=%zu n_paths=%zu\n",
-                        __func__, (int) seq_id, L, K, budget, tree.n_nodes, result.size(),
-                        paths_out.size());
+                LOG_DBG("%s: ddtree seq=%d L=%d K=%d budget=%d nodes=%d chain_len=%zu\n",
+                        __func__, (int) seq_id, L, K, budget, tree.n_nodes, result.size());
+                ddtree_last[(size_t) seq_id] = std::move(tree);
             } else {
-                // ── Classic chain path: greedy sample with optional p_min early-exit ──
+                // Classic chain path: greedy sample with optional p_min early-exit.
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     common_sampler_sample(smpl, ctx_dft, beg + i, true);
                     if (t_after_first_sample < 0) {
@@ -1548,8 +1466,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.clear();
                 }
 
-                ddtree_L[(size_t) seq_id] = 0;
-                ddtree_paths[(size_t) seq_id].clear();
+                ddtree_last[(size_t) seq_id] = {};
             }
 
             n_draft_out_tok += result.size();
@@ -1885,7 +1802,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < n_past
-            // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
+            // (prompt + accepted prefix) - nothing in the draft region yet. so reset the
             // draft region (the seq_rm lower bound is n_past, leaving the prompt KV intact)
             // and select head i so it rebuilds its own layer's KV there; decoding just the
             // latest token would leave its attention reading cells only another head wrote.
@@ -2992,6 +2909,23 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     return result;
 }
 
+bool common_speculative_process_tree_path(
+        common_speculative * spec,
+        const llama_batch & batch,
+        const std::vector<int32_t> & rows) {
+    if (spec == nullptr) {
+        return true;
+    }
+
+    bool result = true;
+    for (auto & impl : spec->impls) {
+        common_time_meas tm(impl->t_process_us, !impl->gen_perf);
+        result = result && impl->process_tree_path(batch, rows);
+        impl->n_call_process++;
+    }
+    return result;
+}
+
 bool common_speculative_need_embd(common_speculative * spec) {
     if (spec == nullptr) {
         return false;
@@ -3234,12 +3168,11 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_process_combined, impl->n_process_standalone,
                 impl->n_draft_blocks, mean_block, mean_out);
             if (impl->n_ddtree_builds > 0) {
-                SPC_INF("dflash ddtree: builds=%zu mean_nodes=%.1f total_tree_ms=%.1f "
-                        "(enable LLAMA_DFLASH_TREE_VERIFY=1 for tree-attn verify)\n",
+                SPC_DBG("dflash ddtree: builds=%zu mean_nodes=%.1f total_tree_ms=%.1f\n",
                         impl->n_ddtree_builds, mean_nodes, tree_ms);
             }
             SPC_INF("%s",
-                "dflash timing note: with LLAMA_DFLASH_COMBINED=1, inject≈take+sync after target "
+                "dflash timing note: with LLAMA_DFLASH_COMBINED=1, inject~=take+sync after target "
                 "decode (fused K/V write is inside verify, timed on the server as verify_ms)\n");
         }
     }
@@ -3285,50 +3218,6 @@ bool common_speculative_get_perf(
     out.n_process_combined   = impl->n_process_combined;
     out.n_process_standalone = impl->n_process_standalone;
     return true;
-}
-
-// ── DDTree multi-path helpers ────────────────────────────────────────────────
-
-static int32_t ddtree_env_n_paths() {
-    const char * en = std::getenv("LLAMA_DFLASH_DDTREE");
-    if (!en || en[0] == '\0' || en[0] == '0') {
-        return 1;
-    }
-    if (const char * v = std::getenv("LLAMA_DFLASH_DDTREE_PATHS")) {
-        return std::max(1, std::atoi(v));
-    }
-    return 1;
-}
-
-int32_t common_speculative_ddtree_n_paths() {
-    return ddtree_env_n_paths();
-}
-
-int32_t common_speculative_ddtree_n_aux_seqs() {
-    // Aux sequences for multi-path tree verify when a single slot owns the
-    // request (n_parallel==1). Callers should add this to n_seq_max.
-    const int32_t np = ddtree_env_n_paths();
-    return np > 1 ? (np - 1) : 0;
-}
-
-bool common_speculative_get_tree_paths(
-        common_speculative * spec,
-        llama_seq_id seq_id,
-        std::vector<llama_tokens> & paths_out) {
-    paths_out.clear();
-    if (spec == nullptr) {
-        return false;
-    }
-    for (auto & impl : spec->impls) {
-        if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
-            continue;
-        }
-        auto * dflash = dynamic_cast<common_speculative_impl_draft_dflash *>(impl.get());
-        if (dflash && dflash->get_tree_paths(seq_id, paths_out)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool common_speculative_get_tree(

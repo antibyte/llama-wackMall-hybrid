@@ -28,6 +28,11 @@ class llama_kv_cache_dsv4_raw_context;
 class llama_kv_cache_dsv4_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
+
+std::vector<int32_t> llm_tree_conv_state_indices(
+        const int32_t * parents,
+        int64_t n_tokens,
+        int64_t d_conv);
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
@@ -256,19 +261,41 @@ public:
     const llm_arch arch;
 };
 
-// DDTree: upload parent_ids[n_tokens*n_seqs] i32 for tree GDN/SSM kernels.
+// DDTree: upload parent_ids[n_tokens] i32 for tree GDN/SSM kernels.
 class llm_graph_input_tree_parent : public llm_graph_input_i {
 public:
-    llm_graph_input_tree_parent(const llama_cparams & cparams) : cparams(cparams) {}
+    llm_graph_input_tree_parent(const llama_cparams & cparams) {
+        if (cparams.tree_parent_ids != nullptr && cparams.tree_n_tokens > 0) {
+            values.assign(cparams.tree_parent_ids, cparams.tree_parent_ids + cparams.tree_n_tokens);
+        }
+    }
     virtual ~llm_graph_input_tree_parent() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * parent_ids = nullptr; // I32 [n_tokens * n_seqs]
+    ggml_tensor * parent_ids = nullptr; // I32 [n_tokens]
+    std::vector<int32_t> values;
+};
 
-    const llama_cparams cparams;
+class llm_graph_input_tree_conv : public llm_graph_input_i {
+public:
+    llm_graph_input_tree_conv(const llama_cparams & cparams, int64_t d_conv, int64_t channels);
+    virtual ~llm_graph_input_tree_conv() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * indices = nullptr; // I32 [(d_conv - 1) * n_tokens]
+
+private:
+    bool update(const llama_cparams & cparams);
+
+    int64_t d_conv;
+    int64_t channels;
+    std::vector<int32_t> values;
 };
 
 class llm_graph_input_rs : public llm_graph_input_i {
@@ -341,6 +368,12 @@ public:
         cparams(cparams),
         mctx(mctx),
         use_mctx_draft(use_mctx_draft) {
+        if (cparams.tree_visibility != nullptr && cparams.tree_n_nodes > 0) {
+            tree_visibility.assign(
+                    cparams.tree_visibility,
+                    cparams.tree_visibility + (size_t) cparams.tree_n_nodes * cparams.tree_n_nodes);
+            tree_n_nodes = cparams.tree_n_nodes;
+        }
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -371,6 +404,9 @@ public:
 
     const llama_kv_cache_context * mctx;
     const bool use_mctx_draft;
+
+    std::vector<uint8_t> tree_visibility;
+    int32_t tree_n_nodes = 0;
 };
 
 // V-less input for the KV cache
@@ -812,6 +848,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            (cparams.tree_parent_ids != nullptr) == (other.cparams.tree_parent_ids != nullptr) &&
             dflash == other.dflash &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -860,6 +897,12 @@ public:
     void set_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
 
+    void set_dflash_inject_built(bool value) { dflash_inject_built = value; }
+    bool get_dflash_inject_built() const { return dflash_inject_built; }
+
+    void add_tree_state_copy(int32_t node, ggml_tensor * src, ggml_tensor * dst);
+    bool commit_tree_state(int32_t node);
+
     // try to update the existing graph result using the new graph parameters in order to reuse it
     // this can only be done if we determine that the resulting graph using the new graph parameters
     //   would be identical to the existing graph. in that case, we simply have to update the memory
@@ -897,6 +940,9 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::vector<llm_graph_lookahead_trace> lookahead_traces;
+    std::vector<std::vector<std::pair<ggml_tensor *, ggml_tensor *>>> tree_state_copies;
+
+    bool dflash_inject_built = false;
 
     ggml_context_ptr ctx_compute;
 
@@ -1259,6 +1305,9 @@ struct llm_graph_context {
 
     // Shared parent_ids input for DDTree (nullptr if tree mode off).
     ggml_tensor * build_tree_parent_ids() const;
+
+    // Indices that gather one convolution-history snapshot per flat tree node.
+    ggml_tensor * build_tree_conv_state_idxs(int64_t d_conv, int64_t channels) const;
 
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,

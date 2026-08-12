@@ -1266,13 +1266,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_SSM_CONV:
+            return op->src[2] == nullptr && has_simdgroup_reduction;
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+            return op->src[6] == nullptr && has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:

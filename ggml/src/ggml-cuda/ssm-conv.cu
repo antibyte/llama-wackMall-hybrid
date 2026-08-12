@@ -124,7 +124,7 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 }
 
 
-// dflash DDTree: tree-mode ssm_conv — walk parent chain for conv window.
+// DFlash DDTree: tree-mode SSM convolution follows parents for its window.
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_tree_f32(
         const float * __restrict__ src0,
@@ -168,6 +168,9 @@ static __global__ void ssm_conv_tree_f32(
             int next;
             if (prev >= 0) {
                 next = parent_ids_seq[prev];
+                if (next < -1 || next >= prev) {
+                    next = -1;
+                }
             } else {
                 next = prev - 1;
             }

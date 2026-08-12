@@ -119,8 +119,10 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
-    void set_tree_parent_ids(const int32_t * parent_ids, int32_t n_tokens);
-    void set_tree_visibility(const uint8_t * visibility, int32_t n_nodes, int32_t n_past);
+    bool set_tree_parent_ids(const int32_t * parent_ids, int32_t n_tokens);
+    bool set_tree_visibility(const uint8_t * visibility, int32_t n_nodes);
+    bool can_commit_tree_path(int32_t n_tokens) const;
+    bool commit_tree_path(llama_seq_id seq_id, const int32_t * path, int32_t n_path);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -295,6 +297,17 @@ private:
     llama_cparams cparams;
     uint32_t runtime_n_ubatch = 0;
 
+    std::vector<int32_t> tree_parent_ids;
+    std::vector<uint8_t> tree_visibility;
+
+    struct tree_commit_state {
+        llama_seq_id seq_id = -1;
+        bool ready = false;
+        std::vector<int32_t> parents;
+        std::vector<llama_pos> positions;
+        std::vector<uint32_t> kv_cells;
+    } tree_commit;
+
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 
@@ -379,7 +392,9 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_tree;
     llm_graph_result_ptr gf_res_reserve;
+    llm_graph_result * gf_res_active = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

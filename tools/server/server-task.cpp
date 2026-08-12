@@ -259,6 +259,9 @@ json result_timings::to_json() const {
     if (draft_n > 0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
+        if (draft_tree_nodes > 0) {
+            base["draft_tree_nodes"] = draft_tree_nodes;
+        }
     }
 
     if (n_draft_calls > 0 || n_verify_calls > 0 || n_inject_calls > 0) {

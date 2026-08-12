@@ -209,6 +209,30 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }
 
+bool llama_memory_hybrid::can_commit_tree(
+        llama_seq_id seq_id,
+        const std::vector<uint32_t> & tree_cells,
+        const std::vector<int32_t> & path,
+        llama_pos pos) const {
+    return !path.empty() &&
+        mem_recr->can_commit_tree(seq_id, 0, pos) &&
+        mem_attn->can_commit_tree(seq_id, tree_cells, path);
+}
+
+bool llama_memory_hybrid::commit_tree(
+        llama_seq_id seq_id,
+        const std::vector<uint32_t> & tree_cells,
+        const std::vector<int32_t> & path,
+        llama_pos pos) {
+    if (!can_commit_tree(seq_id, tree_cells, path, pos)) {
+        return false;
+    }
+    if (!mem_attn->commit_tree(seq_id, tree_cells, path)) {
+        return false;
+    }
+    return mem_recr->commit_tree(seq_id, 0, pos);
+}
+
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :

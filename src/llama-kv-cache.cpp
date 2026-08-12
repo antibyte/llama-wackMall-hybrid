@@ -1376,6 +1376,74 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+bool llama_kv_cache::can_commit_tree(
+        llama_seq_id seq_id,
+        const std::vector<uint32_t> & tree_cells,
+        const std::vector<int32_t> & path) const {
+    if (other || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() ||
+            tree_cells.empty() || path.empty() || path[0] != 0) {
+        return false;
+    }
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    std::vector<uint8_t> seen_cells(cells.size(), 0);
+    for (uint32_t idx : tree_cells) {
+        if (idx >= cells.size() || seen_cells[idx] || cells.is_empty(idx) || !cells.seq_has(idx, seq_id)) {
+            return false;
+        }
+        seen_cells[idx] = 1;
+    }
+
+    std::vector<uint8_t> kept(tree_cells.size(), 0);
+    llama_pos prev = -1;
+    for (int32_t flat : path) {
+        if (flat < 0 || (size_t) flat >= tree_cells.size() || kept[(size_t) flat]) {
+            return false;
+        }
+        kept[(size_t) flat] = 1;
+        const llama_pos pos = cells.pos_get(tree_cells[(size_t) flat]);
+        if (prev >= 0 && pos != prev + 1) {
+            return false;
+        }
+        prev = pos;
+    }
+
+    return true;
+}
+
+bool llama_kv_cache::commit_tree(
+        llama_seq_id seq_id,
+        const std::vector<uint32_t> & tree_cells,
+        const std::vector<int32_t> & path) {
+    if (!can_commit_tree(seq_id, tree_cells, path)) {
+        return false;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    auto & cells = v_cells[stream];
+    auto & head = v_heads[stream];
+    std::vector<uint8_t> kept(tree_cells.size(), 0);
+    for (int32_t flat : path) {
+        kept[(size_t) flat] = 1;
+    }
+
+    uint32_t new_head = cells.size();
+    for (size_t i = 0; i < tree_cells.size(); ++i) {
+        if (kept[i]) {
+            continue;
+        }
+        const uint32_t idx = tree_cells[i];
+        if (cells.seq_rm(idx, seq_id)) {
+            new_head = std::min(new_head, idx);
+        }
+    }
+    if (new_head < cells.size() && new_head < head) {
+        head = new_head;
+    }
+
+    return true;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -2871,6 +2939,11 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+const llama_kv_cache::slot_info & llama_kv_cache_context::get_slot_info() const {
+    GGML_ASSERT(i_cur < sinfos.size());
+    return sinfos[i_cur];
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

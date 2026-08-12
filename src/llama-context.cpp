@@ -9,6 +9,7 @@
 #include "llama-expert-lookahead.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -152,6 +153,7 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
         if (!enabled || draft.memory == nullptr || batch.n_tokens <= 0 ||
                 batch.n_tokens > (int32_t) target.runtime_n_ubatch ||
                 batch.n_tokens > (int32_t) max_combined_tokens() ||
+                target.cparams.tree_parent_ids != nullptr ||
                 target.cparams.n_seq_max != 1 || draft.cparams.n_seq_max != 1) {
             return false;
         }
@@ -302,6 +304,10 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
         return graph_supported;
     }
 
+    void restore_graph_state(bool supported) {
+        graph_supported = supported;
+    }
+
     bool build(llm_graph_context & graph) override {
         graph_supported = false;
         const auto * mctx = current_mctx();
@@ -311,7 +317,7 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
             return false;
         }
 
-        // Prefer blocked FC (Σ W_k x_k) for dense weights; quantized GGUF weights
+        // Prefer blocked FC (sum W_k x_k) for dense weights; quantized GGUF weights
         // cannot be safely sliced by view_2d, so keep the concat path there.
         const auto & ids = draft.model.target_layer_ids;
         const int64_t n_tokens = graph.ubatch.n_tokens;
@@ -456,6 +462,9 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
+    }
+    if (const char * value = std::getenv("LLAMA_DFLASH_TREE_DIRECT_COMMIT")) {
+        cparams.tree_direct_commit = value[0] != '\0' && value[0] != '0';
     }
 
     cparams.n_threads               = params.n_threads;
@@ -1063,7 +1072,9 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
+    gf_res_tree.reset();
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    gf_res_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
@@ -1312,6 +1323,10 @@ bool llama_context::memory_update(bool optimize) {
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
+        if (gf_res_tree) {
+            gf_res_tree->reset();
+        }
+        gf_res_active = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1684,31 +1699,119 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
-void llama_context::set_tree_parent_ids(const int32_t * parent_ids, int32_t n_tokens) {
-    cparams.tree_parent_ids = parent_ids;
-    cparams.tree_n_tokens   = parent_ids ? n_tokens : 0;
-}
-
-void llama_set_tree_parent_ids(llama_context * ctx, const int32_t * parent_ids, int32_t n_tokens) {
-    if (ctx) {
-        ctx->set_tree_parent_ids(parent_ids, n_tokens);
+bool llama_context::set_tree_parent_ids(const int32_t * parent_ids, int32_t n_tokens) {
+    if (parent_ids == nullptr) {
+        tree_parent_ids.clear();
+        tree_visibility.clear();
+        cparams.tree_parent_ids = nullptr;
+        cparams.tree_n_tokens = 0;
+        cparams.tree_visibility = nullptr;
+        cparams.tree_n_nodes = 0;
+        return true;
     }
+    if (n_tokens <= 0 || n_tokens > (int32_t) cparams.n_batch || n_tokens > (int32_t) cparams.n_ubatch || parent_ids[0] != -1) {
+        return false;
+    }
+    for (int32_t i = 1; i < n_tokens; ++i) {
+        if (parent_ids[i] < 0 || parent_ids[i] >= i) {
+            return false;
+        }
+    }
+
+    tree_visibility.clear();
+    cparams.tree_visibility = nullptr;
+    cparams.tree_n_nodes = 0;
+    tree_parent_ids.assign(parent_ids, parent_ids + n_tokens);
+    cparams.tree_parent_ids = tree_parent_ids.data();
+    cparams.tree_n_tokens = n_tokens;
+    return true;
 }
 
-void llama_context::set_tree_visibility(const uint8_t * visibility, int32_t n_nodes, int32_t n_past) {
-    cparams.tree_visibility = visibility;
-    cparams.tree_n_nodes    = visibility ? n_nodes : 0;
-    cparams.tree_n_past     = visibility ? n_past : 0;
+bool llama_set_tree_parent_ids(llama_context * ctx, const int32_t * parent_ids, int32_t n_tokens) {
+    return ctx && ctx->set_tree_parent_ids(parent_ids, n_tokens);
 }
 
-void llama_set_tree_visibility(
+bool llama_context::set_tree_visibility(const uint8_t * visibility, int32_t n_nodes) {
+    if (visibility == nullptr) {
+        tree_visibility.clear();
+        cparams.tree_visibility = nullptr;
+        cparams.tree_n_nodes = 0;
+        return true;
+    }
+    if (n_nodes <= 0 || n_nodes != (int32_t) tree_parent_ids.size()) {
+        return false;
+    }
+    for (int32_t i = 0; i < n_nodes; ++i) {
+        for (int32_t j = 0; j < n_nodes; ++j) {
+            const bool expected = i == j || (j < i && i > 0 && visibility[(size_t) tree_parent_ids[(size_t) i] * n_nodes + j] != 0);
+            if ((visibility[(size_t) i * n_nodes + j] != 0) != expected) {
+                return false;
+            }
+        }
+    }
+
+    tree_visibility.assign(visibility, visibility + (size_t) n_nodes * n_nodes);
+    cparams.tree_visibility = tree_visibility.data();
+    cparams.tree_n_nodes = n_nodes;
+    return true;
+}
+
+bool llama_set_tree_visibility(
         llama_context * ctx,
         const uint8_t * visibility,
-        int32_t n_nodes,
-        int32_t n_past) {
-    if (ctx) {
-        ctx->set_tree_visibility(visibility, n_nodes, n_past);
+        int32_t n_nodes) {
+    return ctx && ctx->set_tree_visibility(visibility, n_nodes);
+}
+
+bool llama_context::can_commit_tree_path(int32_t n_tokens) const {
+    return tree_commit.ready && n_tokens > 0 &&
+        tree_commit.parents.size() == (size_t) n_tokens &&
+        tree_commit.positions.size() == (size_t) n_tokens &&
+        tree_commit.kv_cells.size() == (size_t) n_tokens &&
+        cparams.tree_direct_commit && gf_res_tree != nullptr &&
+        dynamic_cast<llama_memory_hybrid *>(memory.get()) != nullptr;
+}
+
+bool llama_context::commit_tree_path(
+        llama_seq_id seq_id,
+        const int32_t * path,
+        int32_t n_path) {
+    if (!path || n_path <= 0 || !can_commit_tree_path((int32_t) tree_commit.parents.size()) ||
+            seq_id != tree_commit.seq_id || path[0] != 0) {
+        return false;
     }
+
+    std::vector<int32_t> accepted(path, path + n_path);
+    for (int32_t i = 0; i < n_path; ++i) {
+        const int32_t flat = accepted[(size_t) i];
+        if (flat < 0 || (size_t) flat >= tree_commit.parents.size() ||
+                (i > 0 && tree_commit.parents[(size_t) flat] != accepted[(size_t) i - 1])) {
+            return false;
+        }
+    }
+
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    const llama_pos pos = tree_commit.positions[(size_t) accepted.back()];
+    if (!hybrid->can_commit_tree(seq_id, tree_commit.kv_cells, accepted, pos) ||
+            !gf_res_tree->commit_tree_state(accepted.back()) ||
+            !hybrid->commit_tree(seq_id, tree_commit.kv_cells, accepted, pos)) {
+        return false;
+    }
+
+    tree_commit.ready = false;
+    return true;
+}
+
+bool llama_can_commit_tree_path(const llama_context * ctx, int32_t n_tokens) {
+    return ctx && ctx->can_commit_tree_path(n_tokens);
+}
+
+bool llama_commit_tree_path(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        const int32_t * path,
+        int32_t n_path) {
+    return ctx && ctx->commit_tree_path(seq_id, path, n_path);
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1855,10 +1958,29 @@ bool llama_context::set_adapter_cvec(
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     llama_expert_tier::graph_guard tier_graph_guard;
 
+    const bool tree_mode = cparams.tree_parent_ids != nullptr;
+    tree_commit.ready = false;
+    tree_commit.parents.clear();
+    tree_commit.positions.clear();
+    tree_commit.kv_cells.clear();
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    if (tree_mode) {
+        const auto * hybrid_ctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx);
+        if (hybrid_ctx && ubatch.n_seqs_unq == 1 && ubatch.n_tokens == (uint32_t) cparams.tree_n_tokens) {
+            const auto & sinfo = hybrid_ctx->get_attn()->get_slot_info();
+            if (sinfo.n_stream() == 1 && sinfo.size() == ubatch.n_tokens && ubatch.n_seq_id[0] == 1) {
+                tree_commit.seq_id = ubatch.seq_id[0][0];
+                tree_commit.parents.assign(cparams.tree_parent_ids, cparams.tree_parent_ids + cparams.tree_n_tokens);
+                tree_commit.positions.assign(ubatch.pos, ubatch.pos + ubatch.n_tokens);
+                tree_commit.kv_cells = sinfo.idxs[0];
+            }
+        }
     }
     if (dflash != nullptr && !dflash->apply(ubatch)) {
         LLAMA_LOG_ERROR("%s: failed to apply DFlash memory context\n", __func__);
@@ -1866,7 +1988,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
+    if (cparams.tree_parent_ids != nullptr && !gf_res_tree) {
+        gf_res_tree.reset(new llm_graph_result(gf_res_prev->get_max_nodes()));
+    }
+    auto * res = cparams.tree_parent_ids != nullptr ? gf_res_tree.get() : gf_res_prev.get();
     auto * gf  = res->get_gf();
 
     const int64_t t_pu0 = (dflash != nullptr) ? ggml_time_us() : 0;
@@ -1875,7 +2000,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && gf_res_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1885,15 +2010,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
         }
 
+        if (dflash != nullptr) {
+            dflash->restore_graph_state(res->get_dflash_inject_built());
+        }
+
         n_reused++;
         if (dflash != nullptr) {
             dflash->n_graph_reuse++;
         }
     } else {
         const int64_t t_rb0 = (dflash != nullptr) ? ggml_time_us() : 0;
+        if (gf_res_active != nullptr && gf_res_active != res) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
+        gf_res_active = nullptr;
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
@@ -1908,6 +2041,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        res->set_dflash_inject_built(dflash != nullptr && dflash->last_inject_built());
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1918,6 +2053,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             dflash->t_graph_rebuild_us += ggml_time_us() - t_rb0;
         }
     }
+
+    gf_res_active = res;
 
     // set the input data for the input tensors
     {
@@ -1941,6 +2078,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (tree_mode && !tree_commit.parents.empty() &&
+            tree_commit.parents.size() == tree_commit.kv_cells.size()) {
+        tree_commit.ready = true;
     }
 
     if (dflash != nullptr) {
@@ -2934,6 +3076,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
+    if (gf_res_tree) {
+        gf_res_tree->reset();
+    }
+    gf_res_active = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this

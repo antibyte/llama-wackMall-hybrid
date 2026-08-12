@@ -72,6 +72,12 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// Inject only the accepted rows of a previously processed flat tree batch.
+bool common_speculative_process_tree_path(
+        common_speculative * spec,
+        const llama_batch & batch,
+        const std::vector<int32_t> & rows);
+
 // true if any implementation requires target post-norm embeddings to be extracted
 bool common_speculative_need_embd(common_speculative * spec);
 
@@ -83,24 +89,6 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
-
-// DDTree multi-path tree-verify helpers (env LLAMA_DFLASH_DDTREE / _PATHS).
-// When PATHS>1 the draft builds a tree and stores several root→leaf token
-// sequences. The server can then multi-seq verify them (seq_cp branches) —
-// the practical tree-verify path for hybrid GDN/SSM models that lack
-// Lucebox-style tree-attention kernels.
-//
-// n_paths: configured max paths (1 = chain only). n_aux_seqs: extra seqs
-// beyond n_parallel that the context must reserve (0 unless n_parallel==1).
-int32_t common_speculative_ddtree_n_paths();
-int32_t common_speculative_ddtree_n_aux_seqs();
-
-// After draft(), return multi-path drafts for seq_id (path 0 == primary result).
-// Empty if tree multi-path is off or no draft was produced.
-bool common_speculative_get_tree_paths(
-        common_speculative * spec,
-        llama_seq_id seq_id,
-        std::vector<llama_tokens> & paths_out);
 
 // After draft() in DDTree mode: return the last built tree for seq_id.
 // out_tree is a pointer into speculative-owned storage (valid until next draft).

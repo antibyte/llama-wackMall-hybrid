@@ -83,6 +83,17 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    bool can_commit_tree(
+            llama_seq_id seq_id,
+            const std::vector<uint32_t> & tree_cells,
+            const std::vector<int32_t> & path,
+            llama_pos pos) const;
+    bool commit_tree(
+            llama_seq_id seq_id,
+            const std::vector<uint32_t> & tree_cells,
+            const std::vector<int32_t> & path,
+            llama_pos pos);
+
 private:
     const llama_hparams & hparams;
 

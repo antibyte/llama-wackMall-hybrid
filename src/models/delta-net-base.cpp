@@ -485,7 +485,33 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    const bool tree_mode =
+        cparams.tree_parent_ids != nullptr && cparams.tree_n_tokens == (int32_t) ubatch.n_seq_tokens;
+    const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+    const bool tree_snapshots = cparams.tree_direct_commit && tree_mode && n_seqs == 1;
+
+    if (tree_snapshots) {
+        ggml_tensor * indices = build_tree_conv_state_idxs(conv_kernel_size, conv_channels);
+        GGML_ASSERT(indices);
+
+        ggml_tensor * by_time = ggml_cont(ctx0, ggml_permute(ctx0, conv_input, 1, 0, 2, 3));
+        ggml_tensor * gathered = ggml_get_rows(ctx0, by_time, indices);
+        gathered = ggml_reshape_3d(ctx0, gathered,
+                conv_channels, conv_kernel_size - 1, ubatch.n_seq_tokens);
+        ggml_tensor * snapshots = ggml_cont_3d(ctx0,
+                ggml_permute(ctx0, gathered, 1, 0, 2, 3),
+                row_count, n_seqs, ubatch.n_seq_tokens);
+        cb(snapshots, "conv_tree_snapshots", il);
+
+        ggml_build_forward_expand(gf, snapshots);
+        for (int64_t t = 0; t < ubatch.n_seq_tokens; ++t) {
+            ggml_tensor * src = ggml_view_2d(ctx0, snapshots,
+                    row_count, n_seqs, snapshots->nb[1], (size_t) t * row_size);
+            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                    row_count, n_seqs, conv_states_all->nb[1], (size_t) kv_head * row_size);
+            res->add_tree_state_copy((int32_t) t, src, dst);
+        }
+    } else if (cparams.n_rs_seq == 0 || tree_mode) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -507,8 +533,6 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
-
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -571,11 +595,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
+    const bool tree_mode =
+        cparams.tree_parent_ids != nullptr && cparams.tree_n_tokens == (int32_t) n_seq_tokens;
 
-    // Tree verify forces the tree GDN path (K=1 layout + intermediates).
-    // Chain keep_rs multi-slot snapshots are not used under tree mode.
+    // Tree verify forces the tree GDN path (final state + per-token intermediates).
+    // Chain keep_rs multi-slot snapshots are a different layout and must not be used.
     ggml_tensor * gdn_out = nullptr;
-    if (cparams.tree_parent_ids != nullptr && cparams.tree_n_tokens == (int32_t) n_seq_tokens) {
+    if (tree_mode) {
         ggml_tensor * parent_ids = build_tree_parent_ids();
         GGML_ASSERT(parent_ids);
         gdn_out = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, parent_ids);
@@ -602,8 +628,28 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
-    // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    const bool tree_snapshots = cparams.tree_direct_commit && tree_mode && n_seqs == 1;
+    if (tree_snapshots) {
+        ggml_tensor * snapshots = ggml_view_3d(ctx0, gdn_out,
+                D, n_seqs, n_seq_tokens,
+                ggml_row_size(gdn_out->type, D),
+                ggml_row_size(gdn_out->type, state_size_per_snap),
+                ggml_row_size(gdn_out->type, attn_score_elems + state_size_per_snap));
+        cb(snapshots, "gdn_tree_snapshots", il);
+        ggml_build_forward_expand(gf, snapshots);
+        for (int64_t t = 0; t < n_seq_tokens; ++t) {
+            ggml_tensor * src = ggml_view_2d(ctx0, snapshots,
+                    D, n_seqs,
+                    snapshots->nb[1],
+                    (size_t) t * row_size);
+            ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all,
+                    D, n_seqs, ssm_states_all->nb[1], (size_t) kv_head * row_size);
+            res->add_tree_state_copy((int32_t) t, src, dst);
+        }
+        return output;
+    }
+
+    const int64_t n_written = tree_mode ? 1 : std::min<int64_t>(n_seq_tokens, K);
 
     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
     ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,

@@ -78,6 +78,9 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    bool can_commit_tree(llama_seq_id seq_id, uint32_t snapshot, llama_pos pos) const;
+    bool commit_tree(llama_seq_id seq_id, uint32_t snapshot, llama_pos pos);
+
     // computed before each graph build
     uint32_t n = 0;
 

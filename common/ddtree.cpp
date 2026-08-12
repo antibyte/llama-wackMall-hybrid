@@ -1,6 +1,7 @@
 #include "ddtree.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <queue>
@@ -14,6 +15,11 @@ void common_ddtree_extract_topk(
         float * out_log_probs,
         int32_t * out_token_ids,
         float temperature) {
+    if (logits == nullptr || out_log_probs == nullptr || out_token_ids == nullptr ||
+            n_positions <= 0 || vocab <= 0 || K <= 0) {
+        return;
+    }
+
     struct Entry {
         float   logit;
         int32_t id;
@@ -23,27 +29,19 @@ void common_ddtree_extract_topk(
     };
 
     const float inv_t = 1.0f / std::max(1e-3f, temperature);
-    K = std::max(1, std::min(K, vocab));
+    K = std::min(K, vocab);
+    std::vector<Entry> heap;
+    heap.reserve((size_t) K);
 
     for (int i = 0; i < n_positions; i++) {
         const float * li = logits + (size_t) i * (size_t) vocab;
-        std::vector<Entry> heap;
-        heap.reserve((size_t) K);
+        heap.clear();
 
-        float running_max     = -std::numeric_limits<float>::infinity();
-        float running_sum_exp = 0.0f;
+        float max_logit = -std::numeric_limits<float>::infinity();
         for (int j = 0; j < vocab; j++) {
-            const float l = li[j] * inv_t;
-
-            if (l > running_max) {
-                if (running_max > -std::numeric_limits<float>::infinity()) {
-                    running_sum_exp *= std::exp(running_max - l);
-                }
-                running_sum_exp += 1.0f;
-                running_max = l;
-            } else {
-                running_sum_exp += std::exp(l - running_max);
-            }
+            const float scaled = li[j] * inv_t;
+            const float l = std::isfinite(scaled) ? scaled : -std::numeric_limits<float>::infinity();
+            max_logit = std::max(max_logit, l);
 
             if ((int) heap.size() < K) {
                 heap.push_back({l, (int32_t) j});
@@ -54,7 +52,18 @@ void common_ddtree_extract_topk(
                 std::push_heap(heap.begin(), heap.end(), cmp_greater);
             }
         }
-        const float log_z = running_max + std::log(std::max(running_sum_exp, 1e-30f));
+
+        float sum_exp = 0.0f;
+        if (std::isfinite(max_logit)) {
+            for (int j = 0; j < vocab; ++j) {
+                const float scaled = li[j] * inv_t;
+                if (std::isfinite(scaled)) {
+                    sum_exp += std::exp(scaled - max_logit);
+                }
+            }
+        }
+        const float log_z = std::isfinite(max_logit) ?
+            max_logit + std::log(std::max(sum_exp, 1e-30f)) : 0.0f;
 
         // sort_heap + cmp_greater => descending order (no reverse)
         std::sort_heap(heap.begin(), heap.end(), cmp_greater);
@@ -82,7 +91,6 @@ common_ddtree common_ddtree_build(
 
     struct HeapEntry {
         float            neg_logw;
-        std::vector<int> ranks;
         int              parent_index;
         int              depth;
         int              rank;
@@ -123,7 +131,6 @@ common_ddtree common_ddtree_build(
                     + top_log_probs[(size_t) (d - 1) * (size_t) K + 1];
                 heap.push({
                     -sibling_logw,
-                    {1},
                     prev_idx,
                     d,
                     1,
@@ -136,7 +143,6 @@ common_ddtree common_ddtree_build(
         const float root_logw = top_log_probs[0];
         heap.push({
             -root_logw,
-            {0},
             0,
             1,
             0,
@@ -164,11 +170,8 @@ common_ddtree common_ddtree_build(
             const float sibling_logw = top.logw
                 - top_log_probs[(size_t) depth_minus_1 * (size_t) K + (size_t) rank]
                 + top_log_probs[(size_t) depth_minus_1 * (size_t) K + (size_t) rank + 1];
-            std::vector<int> sibling_ranks = top.ranks;
-            sibling_ranks.back() = rank + 1;
             heap.push({
                 -sibling_logw,
-                std::move(sibling_ranks),
                 top.parent_index,
                 top.depth,
                 rank + 1,
@@ -179,17 +182,53 @@ common_ddtree common_ddtree_build(
         if (top.depth < L) {
             const float child_logw = top.logw
                 + top_log_probs[(size_t) top.depth * (size_t) K + 0];
-            std::vector<int> child_ranks = top.ranks;
-            child_ranks.push_back(0);
             heap.push({
                 -child_logw,
-                std::move(child_ranks),
                 current_index,
                 top.depth + 1,
                 0,
                 child_logw,
             });
         }
+    }
+
+    // llama_batch requires nondecreasing positions for each sequence. Store
+    // nodes in stable depth order and remap all flat tree indices accordingly.
+    std::vector<int32_t> order((size_t) tree.n_nodes);
+    for (int32_t i = 0; i < tree.n_nodes; ++i) {
+        order[(size_t) i] = i + 1;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+        return tree.depths[(size_t) a - 1] < tree.depths[(size_t) b - 1];
+    });
+
+    std::vector<int32_t> old_to_new((size_t) tree.n_nodes + 1, -1);
+    old_to_new[0] = 0;
+    for (int32_t i = 0; i < tree.n_nodes; ++i) {
+        old_to_new[(size_t) order[(size_t) i]] = i + 1;
+    }
+
+    std::vector<int32_t> token_ids;
+    std::vector<int> depths;
+    std::vector<int32_t> parents;
+    token_ids.reserve((size_t) tree.n_nodes);
+    depths.reserve((size_t) tree.n_nodes);
+    parents.reserve((size_t) tree.n_nodes + 1);
+    parents.push_back(-1);
+    for (int32_t old_index : order) {
+        const int32_t old_parent = tree.parents[(size_t) old_index];
+        const int32_t new_parent = old_to_new[(size_t) old_parent];
+        assert(new_parent >= 0);
+        token_ids.push_back(tree.token_ids[(size_t) old_index - 1]);
+        depths.push_back(tree.depths[(size_t) old_index - 1]);
+        parents.push_back(new_parent);
+    }
+    tree.token_ids = std::move(token_ids);
+    tree.depths = std::move(depths);
+    tree.parents = std::move(parents);
+    tree.child_maps.assign((size_t) tree.n_nodes + 1, {});
+    for (int32_t i = 1; i <= tree.n_nodes; ++i) {
+        tree.child_maps[(size_t) tree.parents[(size_t) i]][tree.token_ids[(size_t) i - 1]] = i;
     }
 
     // Ancestor-only visibility mask (tree attention).
@@ -206,6 +245,18 @@ common_ddtree common_ddtree_build(
     }
 
     return tree;
+}
+
+std::vector<int32_t> common_ddtree_positions(
+        const common_ddtree & tree,
+        int32_t root_pos) {
+    std::vector<int32_t> positions;
+    positions.reserve((size_t) tree.n_nodes + 1);
+    positions.push_back(root_pos);
+    for (int i = 0; i < tree.n_nodes; ++i) {
+        positions.push_back(root_pos + tree.depths[(size_t) i]);
+    }
+    return positions;
 }
 
 std::vector<int> common_ddtree_follow(
@@ -234,97 +285,4 @@ std::vector<int> common_ddtree_follow(
         *out_node_idx = current_index;
     }
     return accepted;
-}
-
-std::vector<int32_t> common_ddtree_top1_chain(
-        const float * /*top_log_probs*/,
-        const int32_t * top_token_ids,
-        int L,
-        int K,
-        int max_depth) {
-    std::vector<int32_t> chain;
-    const int depth = std::min(L, max_depth);
-    chain.reserve((size_t) depth);
-    for (int d = 0; d < depth; d++) {
-        chain.push_back(top_token_ids[(size_t) d * (size_t) K + 0]);
-    }
-    return chain;
-}
-
-std::vector<std::vector<int32_t>> common_ddtree_paths(
-        const common_ddtree & tree,
-        const float * top_log_probs,
-        const int32_t * top_token_ids,
-        int L,
-        int K,
-        int max_paths) {
-    std::vector<std::vector<int32_t>> paths;
-    if (tree.n_nodes <= 0 || max_paths <= 0) {
-        return paths;
-    }
-
-    // Collect leaves (nodes with no children)
-    std::vector<int> leaves;
-    for (int i = 1; i <= tree.n_nodes; i++) {
-        if (tree.child_maps[(size_t) i].empty()) {
-            leaves.push_back(i);
-        }
-    }
-    if (leaves.empty()) {
-        // no leaves? take deepest nodes
-        for (int i = 1; i <= tree.n_nodes; i++) {
-            leaves.push_back(i);
-        }
-    }
-
-    struct ScoredPath {
-        float score;
-        std::vector<int32_t> tokens;
-    };
-    std::vector<ScoredPath> scored;
-    scored.reserve(leaves.size());
-
-    for (int leaf : leaves) {
-        // walk to root
-        std::vector<int> nodes;
-        int cur = leaf;
-        while (cur > 0) {
-            nodes.push_back(cur);
-            cur = tree.parents[(size_t) cur];
-        }
-        std::reverse(nodes.begin(), nodes.end());
-
-        std::vector<int32_t> toks;
-        float score = 0.0f;
-        for (int ni : nodes) {
-            const int depth = tree.depths[(size_t) (ni - 1)]; // depths indexed as node-1 for token_ids
-            toks.push_back(tree.token_ids[(size_t) (ni - 1)]);
-            // approximate path score: sum top-1 logp at each depth (independence)
-            // better: use actual rank logp if we stored ranks; use top1 as proxy
-            if (depth >= 1 && depth <= L) {
-                score += top_log_probs[(size_t) (depth - 1) * (size_t) K + 0];
-            }
-            (void) top_token_ids;
-        }
-        scored.push_back({score, std::move(toks)});
-    }
-
-    std::sort(scored.begin(), scored.end(), [](const ScoredPath & a, const ScoredPath & b) {
-        return a.score > b.score;
-    });
-
-    for (size_t i = 0; i < scored.size() && (int) paths.size() < max_paths; i++) {
-        // dedupe identical token sequences
-        bool dup = false;
-        for (const auto & p : paths) {
-            if (p == scored[i].tokens) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup) {
-            paths.push_back(std::move(scored[i].tokens));
-        }
-    }
-    return paths;
 }

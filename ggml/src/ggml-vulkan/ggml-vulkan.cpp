@@ -17944,6 +17944,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return true; // all inputs are contiguous, see ggml.c
         case GGML_OP_GATED_DELTA_NET:
             {
+                if (op->src[6] != nullptr) {
+                    return false;
+                }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;
@@ -17994,7 +17997,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return true;
             }
         case GGML_OP_SSM_CONV:
-            return op->src[0]->type == GGML_TYPE_F32;
+            return op->src[2] == nullptr && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:

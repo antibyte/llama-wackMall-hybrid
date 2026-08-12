@@ -164,6 +164,15 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    bool can_commit_tree(
+            llama_seq_id seq_id,
+            const std::vector<uint32_t> & tree_cells,
+            const std::vector<int32_t> & path) const;
+    bool commit_tree(
+            llama_seq_id seq_id,
+            const std::vector<uint32_t> & tree_cells,
+            const std::vector<int32_t> & path);
+
     //
     // graph_build API
     //
@@ -375,6 +384,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    const llama_kv_cache::slot_info & get_slot_info() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

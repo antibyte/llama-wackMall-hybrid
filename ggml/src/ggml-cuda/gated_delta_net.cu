@@ -80,14 +80,14 @@ gated_delta_net_cuda(const float * q,
         if constexpr (TREE_MODE) {
             if (t > 0) {
                 const int parent_t = parent_ids_seq[t];
-                if (parent_t == GGML_GDN_TREE_ROOT_PARENT || parent_t < 0) {
+                if (parent_t == GGML_GDN_TREE_ROOT_PARENT || parent_t < 0 || parent_t >= t) {
 #pragma unroll
                     for (int r = 0; r < rows_per_lane; r++) {
                         const int i = r * warp_size + lane;
                         s_shard[r] = curr_state[i];
                     }
                 } else if (parent_t != t - 1) {
-                    const float * parent_base = inter_base + (int64_t) parent_t * S_v * S_v;
+                    const float * parent_base = inter_base + (int64_t) parent_t * H * S_v * S_v;
 #pragma unroll
                     for (int r = 0; r < rows_per_lane; r++) {
                         const int i = r * warp_size + lane;
@@ -161,7 +161,7 @@ gated_delta_net_cuda(const float * q,
 
         if constexpr (TREE_MODE) {
             // Write intermediate state for this token (tree branch reloads).
-            float * inter_t = inter_base + (int64_t) t * S_v * S_v;
+            float * inter_t = inter_base + (int64_t) t * H * S_v * S_v;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;

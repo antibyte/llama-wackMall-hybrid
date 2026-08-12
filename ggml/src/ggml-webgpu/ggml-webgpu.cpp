@@ -4423,7 +4423,7 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                           (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
             break;
         case GGML_OP_SSM_CONV:
-            supports_op = op->type == GGML_TYPE_F32;
+            supports_op = op->src[2] == nullptr && op->type == GGML_TYPE_F32;
             break;
         case GGML_OP_SSM_SCAN:
             supports_op = op->type == GGML_TYPE_F32 &&
@@ -4432,7 +4432,7 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_GATED_DELTA_NET:
             {
                 const uint32_t s_v = (uint32_t) src2->ne[0];
-                supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                supports_op = op->src[6] == nullptr && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                               src2->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                               op->src[4]->type == GGML_TYPE_F32 && op->src[5]->type == GGML_TYPE_F32 &&
                               s_v <= ctx->webgpu_global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;

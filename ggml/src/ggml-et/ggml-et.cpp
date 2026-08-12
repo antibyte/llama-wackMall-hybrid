@@ -1387,7 +1387,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
             break;
         case GGML_OP_SSM_CONV:
-            supported = op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->src[1] &&
+            supported = op->src[2] == nullptr && op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->src[1] &&
                         op->src[1]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) &&
                         op->src[1]->nb[0] == sizeof(float) && op->src[0]->nb[1] == op->src[0]->ne[0] * sizeof(float) &&
                         op->src[1]->nb[1] == op->src[1]->ne[0] * sizeof(float) && ggml_is_contiguous(op) &&
@@ -1515,7 +1515,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
             // F32, S_v must be multiple of 8 for vectorization
             // q, k, v may be row-contiguous with strided higher dimensions.
             // g, beta, state stay contiguous.
-            if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&  // q
+            if (op->src[6] == nullptr && op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&  // q
                 op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&                               // k
                 op->src[2] && op->src[2]->type == GGML_TYPE_F32 &&                               // v
                 op->src[3] && op->src[3]->type == GGML_TYPE_F32 &&                               // g

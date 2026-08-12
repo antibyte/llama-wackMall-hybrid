@@ -396,6 +396,32 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
 }
 
+bool llama_memory_recurrent::can_commit_tree(
+        llama_seq_id seq_id,
+        uint32_t snapshot,
+        llama_pos pos) const {
+    if (seq_id < 0 || (size_t) seq_id >= rs_idx.size() || snapshot > n_rs_seq || pos < 0 ||
+            (size_t) seq_id >= cells.size()) {
+        return false;
+    }
+    const int32_t tail = cells[(size_t) seq_id].tail;
+    return tail >= 0 && (size_t) tail < cells.size() &&
+        cells[(size_t) tail].has_seq_id(seq_id) && pos <= cells[(size_t) tail].pos;
+}
+
+bool llama_memory_recurrent::commit_tree(
+        llama_seq_id seq_id,
+        uint32_t snapshot,
+        llama_pos pos) {
+    if (!can_commit_tree(seq_id, snapshot, pos)) {
+        return false;
+    }
+    const int32_t tail = cells[(size_t) seq_id].tail;
+    set_rs_idx(seq_id, snapshot);
+    cells[(size_t) tail].pos = pos;
+    return true;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
@@ -631,15 +657,29 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     // update the pos of the used seqs
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const uint32_t i = s*n_seq_tokens;
+        const llama_pos first_pos = ubatch.pos[i];
         const llama_pos last_pos = ubatch.pos[i + n_seq_tokens - 1];
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        // Tree batches are depth ordered and repeat positions for siblings.
+        bool linear_positions = true;
+        bool tree_positions = false;
+        for (uint32_t t = 1; t < n_seq_tokens; ++t) {
+            const llama_pos delta = ubatch.pos[i + t] - ubatch.pos[i + t - 1];
+            linear_positions = linear_positions && delta == 1;
+            tree_positions = tree_positions || delta == 0;
+            if (delta < 0 || delta > 1) {
+                tree_positions = false;
+                break;
+            }
+        }
+
+        if (cell.pos >= 0 && (first_pos != cell.pos + 1 || (!linear_positions && !tree_positions))) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
-            LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
-                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+            LLAMA_LOG_WARN("%s: non-consecutive token positions %d..%d after %d for sequence %d with %u new tokens\n",
+                __func__, first_pos, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
         cell.seq_id.clear();

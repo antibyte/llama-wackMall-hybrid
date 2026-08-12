@@ -79,6 +79,15 @@ SPEC_DRAFT_N_MIN="0"  # DFlash minimum accepted draft length
 SPEC_DRAFT_P_MIN="0.75"  # DFlash confidence threshold in [0, 1]
 SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash backend sampling
 DFLASH_COMBINED="1"  # fuse target feature projection + draft KV injection
+# DDTree tree-attention verification is experimental on this recurrent hybrid model.
+LLAMA_DFLASH_DDTREE="1"  # 1 enables top-K extraction and best-first tree construction
+LLAMA_DFLASH_TREE_VERIFY="1"  # 1 enables tree-attention verification; requires DDTree
+LLAMA_DFLASH_TREE_DIRECT_COMMIT="1"  # retain the accepted tree KV and recurrent snapshots
+LLAMA_DFLASH_DDTREE_K="2"  # top-K per draft position
+LLAMA_DFLASH_DDTREE_BUDGET="4"  # fixed best-first tree budget for Pascal
+LLAMA_DFLASH_DDTREE_TEMP="1.0"  # temperature for top-K logprobs
+LLAMA_DFLASH_DDTREE_CHAIN_SEED="1"  # spend the fixed budget on best-first branches
+LLAMA_DFLASH_DDTREE_FULL_CHAIN="1"  # ignore p_min early-exit when building chain
 DRAFT_NGL="all"  # DFlash is small (~6 layers); all on GPU
 REASONING="auto"  # let the model template select reasoning mode
 REASONING_BUDGET="512"  # measured quality/latency compromise on GTX1080
@@ -88,10 +97,10 @@ OFFLINE="1"  # prevent network model/template downloads when set to 1
 JINJA="1"  # use the model's Jinja chat template when set to 1
 FLASH_ATTN="on"  # required for Turbo4
 KV_OFFLOAD="1"  # place KV cache on the GPU when set to 1
-THREADS="5"  # measured winner on i7-4770 versus 8 SMT workers
-THREADS_BATCH="5"  # match the four physical cores for prompt processing
-DRAFT_THREADS="5"  # measured GTX1080 draft-context baseline
-DRAFT_THREADS_BATCH="5"  # avoid SMT oversubscription during draft prefill
+THREADS="4"  # measured winner on i7-4770 versus 8 SMT workers
+THREADS_BATCH="4"  # match the four physical cores for prompt processing
+DRAFT_THREADS="4"  # measured GTX1080 draft-context baseline
+DRAFT_THREADS_BATCH="4"  # avoid SMT oversubscription during draft prefill
 THREADS_HTTP=""  # HTTP worker count; empty uses the server default
 TARGET_BACKEND_SAMPLING="1"  # target sampling on CUDA; 0 provides an A/B control
 DRAFT_BACKEND_SAMPLING="1"  # MTP draft sampling on the backend when SPEC_MODE=mtp
@@ -124,7 +133,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots in the prompt cache when set to 1
 # DFlash weights (~225 MiB) -> draft KV. Autofit/reserve do NOT know about DFlash.
 # dflash-opt: S=58 beat S=62 on 3x512 with n_max=8 turbo4 draft; S=65 unstable.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="58"  # dflash-opt-20260811 3x512 winner (stable headroom for DFlash n_max=8)
+LLAMA_EXPERT_S="58"  # dflash-opt-20260811 production winner with tree verification off
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
@@ -158,7 +167,7 @@ LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT="2"  # maximum simultaneous expert copies
 # Extra reserve beyond graphs: DFlash weights ~225 MiB + draft KV/compute. Expert
 # sizing only subtracts this from free BEFORE draft load; S still needs to be low
 # enough that target KV after experts leaves room (see LLAMA_EXPERT_S above).
-LLAMA_EXPERT_VRAM_RESERVE_MIB="512"  # was 256; draft sidecar needs post-expert free VRAM
+LLAMA_EXPERT_VRAM_RESERVE_MIB="640"  # draft + tree-verify RS/output headroom on 8 GiB
 LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL="0"  # retain the MTP warmcache correctness guard
 LLAMA_EXPERT_STATIC_NO_SYNC="1"  # safe here: adaptation, stats, timing, usage, and W are disabled
 
@@ -245,6 +254,17 @@ case "$MTP_N" in 0|1|2|3) ;; *) die "MTP_N muss 0, 1, 2 oder 3 sein." ;; esac
 [[ "$SPEC_DRAFT_P_MIN" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] || die "SPEC_DRAFT_P_MIN muss zwischen 0 und 1 liegen."
 case "$SPEC_DRAFT_BACKEND_SAMPLING" in 0|1) ;; *) die "SPEC_DRAFT_BACKEND_SAMPLING muss 0 oder 1 sein." ;; esac
 case "$DFLASH_COMBINED" in 0|1) ;; *) die "DFLASH_COMBINED muss 0 oder 1 sein." ;; esac
+case "$LLAMA_DFLASH_DDTREE" in 0|1) ;; *) die "LLAMA_DFLASH_DDTREE muss 0 oder 1 sein." ;; esac
+case "$LLAMA_DFLASH_TREE_VERIFY" in 0|1) ;; *) die "LLAMA_DFLASH_TREE_VERIFY muss 0 oder 1 sein." ;; esac
+case "$LLAMA_DFLASH_TREE_DIRECT_COMMIT" in 0|1) ;; *) die "LLAMA_DFLASH_TREE_DIRECT_COMMIT muss 0 oder 1 sein." ;; esac
+case "$LLAMA_DFLASH_DDTREE_CHAIN_SEED" in 0|1) ;; *) die "LLAMA_DFLASH_DDTREE_CHAIN_SEED muss 0 oder 1 sein." ;; esac
+case "$LLAMA_DFLASH_DDTREE_FULL_CHAIN" in 0|1) ;; *) die "LLAMA_DFLASH_DDTREE_FULL_CHAIN muss 0 oder 1 sein." ;; esac
+[[ "$LLAMA_DFLASH_DDTREE_K" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_DFLASH_DDTREE_K muss eine positive Ganzzahl sein."
+[[ "$LLAMA_DFLASH_DDTREE_BUDGET" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_DFLASH_DDTREE_BUDGET muss eine positive Ganzzahl sein."
+[[ "$LLAMA_DFLASH_DDTREE_TEMP" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "LLAMA_DFLASH_DDTREE_TEMP muss eine positive Zahl sein."
+if [[ "$LLAMA_DFLASH_TREE_VERIFY" == 1 && "$LLAMA_DFLASH_DDTREE" != 1 ]]; then
+    die "LLAMA_DFLASH_TREE_VERIFY=1 benoetigt LLAMA_DFLASH_DDTREE=1."
+fi
 case "$TARGET_BACKEND_SAMPLING" in 0|1) ;; *) die "TARGET_BACKEND_SAMPLING muss 0 oder 1 sein." ;; esac
 case "$DRAFT_BACKEND_SAMPLING" in 0|1) ;; *) die "DRAFT_BACKEND_SAMPLING muss 0 oder 1 sein." ;; esac
 case "$REASONING_PRESERVE" in 0|1) ;; *) die "REASONING_PRESERVE muss 0 oder 1 sein." ;; esac
@@ -482,6 +502,14 @@ env_args=(
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
     "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"
     "LLAMA_DFLASH_COMBINED=$DFLASH_COMBINED"
+    "LLAMA_DFLASH_DDTREE=$LLAMA_DFLASH_DDTREE"
+    "LLAMA_DFLASH_TREE_VERIFY=$LLAMA_DFLASH_TREE_VERIFY"
+    "LLAMA_DFLASH_TREE_DIRECT_COMMIT=$LLAMA_DFLASH_TREE_DIRECT_COMMIT"
+    "LLAMA_DFLASH_DDTREE_K=$LLAMA_DFLASH_DDTREE_K"
+    "LLAMA_DFLASH_DDTREE_BUDGET=$LLAMA_DFLASH_DDTREE_BUDGET"
+    "LLAMA_DFLASH_DDTREE_TEMP=$LLAMA_DFLASH_DDTREE_TEMP"
+    "LLAMA_DFLASH_DDTREE_CHAIN_SEED=$LLAMA_DFLASH_DDTREE_CHAIN_SEED"
+    "LLAMA_DFLASH_DDTREE_FULL_CHAIN=$LLAMA_DFLASH_DDTREE_FULL_CHAIN"
 )
 
 # Draft path/n_min/p_min/n_max are CLI-only when dflash (avoids "env overwritten by CLI" warns).
@@ -560,6 +588,7 @@ llama-wackMall-hybrid GTX1080 start
   spec mode:    $SPEC_MODE ($SPEC_TYPE)
   MTP fallback: $MTP_N
   DFlash:       n=$SPEC_DRAFT_N_MIN..$SPEC_DRAFT_N_MAX p-min=$SPEC_DRAFT_P_MIN backend-sampling=$SPEC_DRAFT_BACKEND_SAMPLING combined=$DFLASH_COMBINED
+  DDTree:       on=$LLAMA_DFLASH_DDTREE tree-verify=$LLAMA_DFLASH_TREE_VERIFY direct=$LLAMA_DFLASH_TREE_DIRECT_COMMIT K=$LLAMA_DFLASH_DDTREE_K budget=$LLAMA_DFLASH_DDTREE_BUDGET full-chain=$LLAMA_DFLASH_DDTREE_FULL_CHAIN
   DFlash target override: ${DFLASH_TARGET_TENSOR_OVERRIDE:-none}
   server argv:  ${server_args[*]}
   KV target:    $TARGET_TYPE_K/$TARGET_TYPE_V
