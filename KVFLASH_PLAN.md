@@ -1,148 +1,102 @@
-# KVFlash port plan (llama-wackMall-hybrid)
+# KVFlash implementation status (llama-wackMall-hybrid)
 
-Based on [Lucebox KVFlash](https://github.com/Luce-Org/lucebox/tree/main/optimizations/kvflash)
-(FlashMemory-style decode-time KV paging, arXiv 2606.09079).
+The implementation is based on the design in
+[Lucebox KVFlash](https://github.com/Luce-Org/lucebox/tree/main/optimizations/kvflash),
+adapted to llama.cpp's hybrid attention/recurrent memory split.
 
-**Goal:** hard O(pool) VRAM for full-attention KV on Qwen3.6 hybrid, with bit-exact
-host recall of cold 64-token chunks. GDN/SSM recurrent state is never paged.
+## Goal
 
-**Non-goal (P0–P2):** tree-verify + pool, multi-seq concurrent pool, pflash BSA.
+Keep the full-attention K/V cache at a fixed device-resident size while the
+logical context grows. Cold 64-token chunks are copied bit-exactly to host
+memory. Recurrent GDN/SSM state remains managed by the normal hybrid cache and
+is never paged.
 
----
+## Implemented architecture
 
-## PR stack
+- Logical token positions map to fixed-size physical blocks in the resident
+  attention cache.
+- K/V data is copied as opaque packed rows, including quantized cache types.
+- Paging uses the context's real backends. All layer copies for a page batch are
+  queued before one synchronization, preserving graph/copy ordering.
+- Host snapshots use pooled slabs (up to 64 pages or 64 MiB per allocation)
+  instead of one pinned allocation per page.
+- llama.cpp cell metadata is snapshotted together with each cold chunk and
+  restored before the chunk becomes visible to the graph.
+- Each micro-batch is mapped immediately before its graph runs. Requested
+  chunks are pinned as one transaction while victims are selected.
+- Pure LRU eviction is demand-driven. With no scorer installed, the periodic
+  reselect path is a no-op and causes no additional page traffic.
+- Victim selection, resident masks, and identity checks scan the resident pool,
+  not the complete logical context. The normal decode hot path is O(pool).
+- Host-page position bounds use incremental ordered indices, so the batch
+  allocator does not rescan all cold metadata on each decode.
+- Sink and recent-tail chunks are structurally protected.
 
-| PR | Name | Deliverable | Gate |
-|----|------|-------------|------|
-| **PR1** | Pager core | `common/kvflash_pager.h` (+ scorer iface), unit tests, no model | `test-kvflash` green |
-| **PR2** | Pool-sized hybrid KV | Allocate attn tensors at `pool_tokens` when enabled; logical `n_ctx` unchanged; recurrent full size | Load Qwen3.6-35B hybrid, pool=2048, generate short text without crash |
-| **PR3** | Slot map + mask | Wire `slot_for` into `set_rows` idxs / FA span; slot-validity mask (or zero free slots) | Teacher-forced argmax flip ≤1% vs full cache on 2k tokens (small model or forced) |
-| **PR4** | Live LRU paging | Eviction under pool≪prompt+gen; host D2H/H2D; decode continues | Page stats >0, coherent completion, VRAM peak ~pool |
-| **PR5** | Chunked prefill | Prompt > pool: chunked prefill with live eviction | 32k prompt fits 4k pool; linear time |
-| **PR6** | DFlash chain on pool | Spec verify slot-mapped; rejected draft slots validity-excluded | Accept rate ±1% abs vs pool-off |
-| **PR7** | Scorers | Drafter / target-QK reselect τ; CLI `--kvflash` | NIAH light: drafter ≥ LRU on mid-depth needles |
+## Supported scope and guardrails
 
-**Default off** until PR4 gates pass. Env: `LLAMA_KVFLASH` (tokens|auto|0).
+KVFlash is enabled only for a causal hybrid target context with all of the
+following properties:
 
----
+- Flash Attention remains enabled after backend probing.
+- Exactly one sequence and one stream are used.
+- Positions use either the normal 1D layout or llama.cpp's 4-channel M-RoPE
+  layout. The primary position must remain the unique sequential token index;
+  the additional cell metadata is paged with the K/V rows.
+- The model does not use SWA.
+- The resident pool is smaller than the logical context.
 
-## Architecture mapping
+Unsupported configurations are disabled with a warning. Position shifts,
+position division, cross-sequence cache copies, and attention-cache state
+serialization fail explicitly instead of silently corrupting the page table.
+Partial hybrid state operations that serialize only recurrent state remain
+available.
 
-| Lucebox | wackMall hybrid |
-|---------|-----------------|
-| `KvFlashPager` | `common/kvflash_pager.h` → `common_kvflash_pager` |
-| `create_target_cache(pool)` | `llama_kv_cache` ctor / hybrid: pass `n_kv = pool` for attn layers only |
-| `kv_write_rows` physical slot | `llama_kv_cache::*_set_rows` idxs from pager |
-| `positions` logical | existing `ubatch.pos` (RoPE) — unchanged |
-| Slot mask | tighten in `llm_graph_input_attn_kv::set_input` (same pattern as tree visibility) |
-| Recurrent | `llama_memory_recurrent` — no change |
-| Drafter scorer | later: DFlash draft ctx as indexer (optional) |
+## Configuration
 
-### Why relocation is legal
-- RoPE is baked into K at write from logical `pos`.
-- Attention sees only resident pool slots via mask (or zeroed free slots).
-- Quantized / turbo4 rows copy as opaque bytes.
-
-### Hybrid MoE notes (1660 Ti)
-- Pool shrinks attn KV VRAM → more headroom for expert S / larger logical ctx.
-- Prefer **masked** path first (exact); maskless+zero is the qwen35moe Spark approximation.
-- CUDA graphs: FA span clamps to pool once filled → fewer rebuilds after warmup.
-- PCIe: P0 uses sync `ggml_backend_tensor_get/set`; async DMA is a follow-up.
-
----
-
-## CLI / env (target surface)
-
-```
---kvflash N|auto|0          # resident pool tokens (multiple of 256)
---kvflash-tau N             # reselect interval floor (default 64)
---kvflash-policy lru|drafter|qk
-LLAMA_KVFLASH=...
-LLAMA_KVFLASH_TAU=...
-LLAMA_KVFLASH_POLICY=...
-LLAMA_KVFLASH_MAX_POOL=16384
+```text
+LLAMA_KVFLASH=N|auto|0
+LLAMA_KVFLASH_MAX_POOL=N
+LLAMA_KVFLASH_TAU=N
+LLAMA_KVFLASH_POLICY=lru
+LLAMA_KVFLASH_STATS=1
 ```
 
-`auto`: half free VRAM after weights (minus reserve), density-converted, capped by speed knee and `n_ctx`.
+- `N` is rounded to a cache-safe alignment and clamped to the logical context.
+- `auto` currently uses a conservative context-derived fallback because the
+  context does not yet provide a post-weight free-VRAM budget to the pager.
+- `LLAMA_KVFLASH_POLICY` currently supports only `lru`; other values warn and
+  fall back to LRU.
+- `LLAMA_KVFLASH_TAU` becomes active only when a relevance scorer is attached.
+- `LLAMA_KVFLASH_STATS=1` reports page-ins, page-outs, used and allocated host
+  bytes, transferred bytes, resident blocks, and host-slab count when paging
+  activity changes.
 
----
+## Verification completed
 
-## File touch list (by PR)
+- CPU pager tests: mapping, exact/partial masks, LRU, callback ordering,
+  transactional attach, invalid inputs, and K/V byte roundtrip.
+- CUDA pager byte roundtrip on an NVIDIA GTX 1660 Ti.
+- AddressSanitizer test run (LeakSanitizer is unavailable under the runner's
+  ptrace supervision).
+- A 1M-token map-only LRU test with a 512-token resident pool; the complete unit
+  suite runs in about 0.06 seconds on the test host.
+- Qwen3.6-35B-A3B M-RoPE hybrid integration with a 1024-token logical context,
+  a 512-token resident pool, and a 651-token prompt. Runtime statistics showed
+  three page-outs, 1.05 MiB transferred, 1.05 MiB of used snapshots in one
+  5.62 MiB host slab, and all eight blocks resident. Prompt processing was about
+  23.7 tokens/s on the GTX 1660 Ti test system. A same-command smoke run with
+  KVFlash disabled also measured about 23.7 tokens/s; this is a parity smoke
+  check, not a statistically rigorous benchmark.
 
-### PR1 (this slice)
-- `common/kvflash_pager.h` — ported pager (sync I/O, optional empty tensors)
-- `common/kvflash_scorer.h` — scorer interface
-- `tests/test-kvflash.cpp` — mapping, LRU eviction, reselect, mask, identity
-- `tests/CMakeLists.txt`, `common/CMakeLists.txt` if needed
+## Remaining work
 
-### PR2–PR3
-- `src/llama-kv-cache.{h,cpp}` — optional pool capacity
-- `src/llama-memory-hybrid.{h,cpp}` — wire pager lifetime to ctx
-- `src/llama-context.{h,cpp}` — cparams + public set/get
-- `src/llama-graph.cpp` — mask tighten when pager active
-- `include/llama.h` — API if needed
-- `common/arg.cpp` / server — flags
-
-### PR4–PR7
-- prefill paths in server/context
-- speculative / DFlash verify idxs
-- scorer implementations + benches
-
----
-
-## Test matrix
-
-| ID | Test | When |
-|----|------|------|
-| A | Unit: slot map + LRU eviction | PR1 |
-| B | Unit: reselect score_hook | PR1 |
-| C | Unit: mask / fill_slot_pos | PR1 |
-| D | Relocation teacher-force (shuffled blocks) | PR3 |
-| E | Live paging smoke n_predict=256 pool=1024 | PR4 |
-| F | Prefill 16k–32k / pool 2k–4k | PR5 |
-| G | DFlash accept parity pool on/off | PR6 |
-| H | NIAH 8k/32k residency 9–25% | PR7 |
-
----
-
-## Risks
-
-1. **Cell allocator mismatch** — llama.cpp cells ≠ Lucebox dense pool rows; may need a “dense pool mode” that disables defrag assumptions.
-2. **Checkpoints** — refuse or serialize page table once `page_outs > 0`.
-3. **Tree-verify** — requires identity prefix; refuse tree path when non-identity.
-4. **Multi-seq** — P0–P6 single sequence only (`n_parallel=1`).
-5. **Quality** — LRU alone fails mid-context NIAH; document until scorer lands.
-
----
-
-## Success criteria (product)
-
-On GTX 1660 Ti (6 GiB), Qwen3.6-35B-A3B hybrid + DFlash:
-
-- Logical context ≥ 32k–64k with resident pool 2k–4k.
-- Decode tok/s within ~15% of full-cache short-ctx baseline at same pool span.
-- Peak VRAM drops enough to raise expert S or context vs today (~24k @ ~5.5 GiB).
-- Chain DFlash still works (PR6).
-
----
-
-## Status
-
-- [x] Feasibility review
-- [x] PR plan (this doc)
-- [x] PR1 pager + unit tests (`common/kvflash_*.h`, `tests/test-kvflash.cpp`)
-- [x] PR2 wiring:
-  - `cparams.kvflash_pool` from `LLAMA_KVFLASH`
-  - hybrid `attn_kv_size` = pool when enabled
-  - `llama_kv_cache::init_kvflash` + `find_slot` physical map
-  - cell clear on block eviction; FA `n_kv` = used_max (full pool only after page_outs)
-  - smoke (2026-08-12): base/kvf × ±dflash all HTTP 200, **identical sha** short gen
-- [x] Fixes after first smoke:
-  - same-pos re-apply skips purge (double apply no longer wipes sequence)
-  - permanent prepare restored for KVFlash (pager can't dry-run page_out)
-  - vocab `token_to_piece` guards NULL/OOB (DFlash crash on cache.at(-1))
-  - packed-row page copy for llama KV layout; default LRU reselect
-  - τ-reselect after decode (`LLAMA_KVFLASH_TAU`, default 64)
-- [x] Live eviction smoke: pool=320, n_predict=700, ignore_eos → HTTP 200 ~21 tok/s (must page)
-- [ ] PR7 scorer (drafter / target-QK) + NIAH suite
-- [ ] Async DMA page stream; pooled snapshots
+1. Add and evaluate a real relevance scorer (drafter or target-QK). LRU alone
+   can lose important middle-context chunks and is not a quality replacement
+   for relevance-based selection.
+2. Feed an actual post-load device-memory budget into `auto` sizing.
+3. Define a page-table-aware state serialization format.
+4. Run long-context quality suites (including NIAH), 32K+ prefill stress tests,
+   and DFlash acceptance-parity tests.
+5. Evaluate double-buffered page-in/page-out overlap. The current implementation
+   batches asynchronous copies but synchronizes at each required residency
+   transition for correctness.
