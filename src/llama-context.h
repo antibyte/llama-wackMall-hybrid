@@ -17,6 +17,10 @@
 struct llama_model;
 class llama_batch_allocr;
 
+namespace common_kvflash {
+class KvFlashPager;
+}
+
 class llama_io_read_i;
 class llama_io_write_i;
 
@@ -302,8 +306,11 @@ private:
 
     llama_memory_ptr memory;
 
-    // KVFlash: tokens processed since last reselect() (FlashMemory τ loop)
+    // Non-owning pointer into the hybrid attention cache.
+    common_kvflash::KvFlashPager * kvflash_pager = nullptr;
     uint32_t kvflash_tokens_since_reselect = 0;
+    int64_t kvflash_page_outs_reported = 0;
+    bool kvflash_stats_enabled = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

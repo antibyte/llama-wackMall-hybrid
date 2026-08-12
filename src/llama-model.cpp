@@ -2289,11 +2289,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     __func__, cparams.kvflash_pool);
                         } else {
                             attn_kv_size = std::min(cparams.n_ctx_seq, cparams.kvflash_pool);
-                            // Round pool to 256 for FA graph stability / pager floor.
-                            attn_kv_size = (attn_kv_size / 256u) * 256u;
-                            if (attn_kv_size < 512) {
-                                attn_kv_size = 512;
-                            }
                             LLAMA_LOG_INFO("%s: KVFlash pool: attn_kv_size=%u (logical n_ctx_seq=%u)\n",
                                     __func__, attn_kv_size, cparams.n_ctx_seq);
                         }
@@ -2347,8 +2342,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         // Attach pager when pool is active (base hybrid only).
                         if (cparams.kvflash_pool > 0 && attn_kv_size < cparams.n_ctx_seq) {
                             auto * hyb = dynamic_cast<llama_memory_hybrid *>(res);
-                            if (hyb && hyb->get_mem_attn()) {
-                                hyb->get_mem_attn()->init_kvflash(attn_kv_size, /*chunk=*/64);
+                            if (!hyb || !hyb->get_mem_attn() ||
+                                !hyb->get_mem_attn()->init_kvflash(
+                                        attn_kv_size, cparams.n_ctx_seq, /*chunk=*/64)) {
+                                delete res;
+                                throw std::runtime_error("failed to initialize KVFlash pager");
                             }
                         }
                     }

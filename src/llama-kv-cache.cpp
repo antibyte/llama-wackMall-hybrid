@@ -439,9 +439,9 @@ void llama_kv_cache::clear(bool data) {
 
     if (kvflash) {
         kvflash->reset();
-        if (data) {
-            kvflash->zero_free_blocks();
-        }
+        kvflash_cells.clear();
+        kvflash_pos_mins.clear();
+        kvflash_pos_maxs.clear();
     }
 
     if (data) {
@@ -549,12 +549,48 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    if (kvflash) {
+        for (auto & entry : kvflash_cells) {
+            auto & page = entry.second;
+            bool changed = false;
+            if (seq_id == -1 || seq_id == 0) {
+                for (size_t i = 0; i < page.pos.size(); ++i) {
+                    if (page.pos[i] >= p0 && page.pos[i] < p1) {
+                        if (!changed) {
+                            kvflash_unindex_page(page);
+                        }
+                        page.pos[i] = -1;
+                        page.ext[i].reset();
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) {
+                page.pos_min = -1;
+                page.pos_max = -1;
+                for (llama_pos pos : page.pos) {
+                    if (pos >= 0) {
+                        page.pos_min = page.pos_min < 0 ? pos : std::min(page.pos_min, pos);
+                        page.pos_max = std::max(page.pos_max, pos);
+                    }
+                }
+                kvflash_index_page(page);
+            }
+        }
+    }
+
     return true;
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        return;
+    }
+    if (kvflash) {
+        if (seq_id_src != 0 || seq_id_dst != 0) {
+            LLAMA_LOG_WARN("%s: KVFlash supports only sequence 0\n", __func__);
+        }
         return;
     }
 
@@ -676,6 +712,12 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (other) {
         return;
     }
+    if (kvflash) {
+        if (shift != 0) {
+            LLAMA_LOG_WARN("%s: KVFlash does not support KV position shifts\n", __func__);
+        }
+        return;
+    }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
@@ -726,6 +768,12 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     if (other) {
         return;
     }
+    if (kvflash) {
+        if (d != 1) {
+            LLAMA_LOG_WARN("%s: KVFlash does not support KV position division\n", __func__);
+        }
+        return;
+    }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
@@ -769,8 +817,12 @@ llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     const auto & cells = v_cells[seq_to_stream[seq_id]];
-
-    return cells.seq_pos_min(seq_id);
+    llama_pos result = cells.seq_pos_min(seq_id);
+    if (seq_id == 0 && !kvflash_pos_mins.empty()) {
+        const llama_pos pos = *kvflash_pos_mins.begin();
+        result = result < 0 ? pos : std::min(result, pos);
+    }
+    return result;
 }
 
 llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
@@ -782,8 +834,11 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     const auto & cells = v_cells[seq_to_stream[seq_id]];
-
-    return cells.seq_pos_max(seq_id);
+    llama_pos result = cells.seq_pos_max(seq_id);
+    if (seq_id == 0 && !kvflash_pos_maxs.empty()) {
+        result = std::max(result, *kvflash_pos_maxs.rbegin());
+    }
+    return result;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
@@ -855,17 +910,22 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
-    // KVFlash: pager state cannot be rolled back cheaply after page_out.
-    // Apply permanently here; real apply() re-sets the same slots (same-pos
-    // overwrite skips the purge path — see apply_ubatch).
+    // KVFlash maps each micro-batch immediately before its graph runs. Mapping
+    // all micro-batches here could evict slots that an earlier graph has not
+    // written yet when a prompt is larger than the resident pool.
     if (kvflash) {
+        res.reserve(ubatches.size());
         for (const auto & ubatch : ubatches) {
-            const auto sinfo_new = find_slot(ubatch, false);
-            if (sinfo_new.empty()) {
+            std::vector<int64_t> positions;
+            positions.reserve(ubatch.n_tokens);
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                positions.push_back(ubatch.pos[i]);
+            }
+            if (!kvflash->can_map_positions(positions)) {
+                LLAMA_LOG_ERROR("%s: KVFlash micro-batch cannot fit safely in the resident pool\n", __func__);
                 return {};
             }
-            apply_ubatch(sinfo_new, ubatch);
-            res.push_back(sinfo_new);
+            res.emplace_back();
         }
         return res;
     }
@@ -1163,16 +1223,22 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         // find_slot is const but pager mutates residency; use mutable cast.
         if (kvflash) {
             auto * pager = const_cast<common_kvflash::KvFlashPager *>(kvflash.get());
+            std::vector<int64_t> positions;
+            positions.reserve(n_tokens);
             for (uint32_t ii = 0; ii < n_tokens; ++ii) {
                 const llama_pos pos = ubatch.pos[s * n_tokens + ii];
-                if (pos < 0) {
-                    LLAMA_LOG_ERROR("%s: KVFlash: invalid pos %d\n", __func__, pos);
-                    return {};
-                }
-                const int phys = pager->slot_for(pos);
+                positions.push_back(pos);
+            }
+            if (!pager->alloc_positions(positions)) {
+                LLAMA_LOG_ERROR("%s: KVFlash: cannot allocate %u logical positions (pool=%d)\n",
+                        __func__, n_tokens, pager->pool_tokens());
+                return {};
+            }
+            for (int64_t pos : positions) {
+                const int phys = pager->slot_of(pos);
                 if (phys < 0 || (uint32_t) phys >= cells.size()) {
-                    LLAMA_LOG_ERROR("%s: KVFlash: no pool slot for pos %d (pool=%d)\n",
-                            __func__, pos, pager->pool_tokens());
+                    LLAMA_LOG_ERROR("%s: KVFlash: no pool slot for pos %lld (pool=%d)\n",
+                            __func__, (long long) pos, pager->pool_tokens());
                     return {};
                 }
                 res.idxs[s].push_back((uint32_t) phys);
@@ -1309,10 +1375,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 const llama_seq_id seq_id = cells.seq_get(idx);
                 const llama_pos    pos    = cells.pos_get(idx);
 
-                // Same-pos re-apply (prepare dry-run restore + real apply, or
-                // KVFlash permanent prepare + apply) must NOT trigger the
-                // [pos_min, overwritten] purge — that wiped the whole sequence
-                // and produced garbage logits.
+                // Same-pos re-apply must not trigger the [pos_min, overwritten]
+                // purge. That can happen after a dry-run restore or when a
+                // paged chunk is recalled before overwriting the same position.
                 if (pos != ubatch.pos[i]) {
                     seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
                 }
@@ -1366,6 +1431,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    if (kvflash) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1433,24 +1501,27 @@ ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
     return layers[ikv].v;
 }
 
-bool llama_kv_cache::init_kvflash(uint32_t pool_tokens, int chunk_tokens) {
+bool llama_kv_cache::init_kvflash(uint32_t pool_tokens, uint32_t max_context_tokens, int chunk_tokens) {
     if (pool_tokens == 0 || get_size() != pool_tokens) {
         LLAMA_LOG_ERROR("%s: pool_tokens=%u must match kv size=%u\n",
                 __func__, pool_tokens, get_size());
         return false;
     }
-    if (n_stream != 1) {
-        LLAMA_LOG_ERROR("%s: KVFlash requires a single stream (kv_unified / n_parallel=1)\n", __func__);
+    const uint32_t n_pos = hparams.n_pos_per_embd();
+    if (n_stream != 1 || n_seq_max != 1 || (n_pos != 1 && n_pos != 4)) {
+        LLAMA_LOG_ERROR("%s: KVFlash requires exactly one sequence, one stream, and 1D or M-RoPE positions\n", __func__);
         return false;
     }
 
     common_kvflash::KvFlashConfig cfg;
     cfg.chunk_tokens       = chunk_tokens;
     cfg.pool_tokens        = (int) pool_tokens;
+    cfg.max_context_tokens = max_context_tokens;
     cfg.sink_chunks        = 1;
     // ~128-token protected tail (2 chunks @ 64). Smaller tail leaves more
     // pool for pageable history (important on 6 GiB with pool 512–1024).
     cfg.tail_window_chunks = std::max(1, 128 / chunk_tokens);
+    cfg.zero_freed_blocks  = false;
 
     // Collect per-layer K/V storages for bit-exact host paging.
     std::vector<ggml_tensor *> ks;
@@ -1462,11 +1533,22 @@ bool llama_kv_cache::init_kvflash(uint32_t pool_tokens, int chunk_tokens) {
         }
     }
 
+    const bool have_data = ks.size() == layers.size() && !ks.empty() &&
+            std::all_of(ks.begin(), ks.end(), [](const ggml_tensor * t) {
+                return t && t->data && t->buffer;
+            }) &&
+            std::all_of(vs.begin(), vs.end(), [](const ggml_tensor * t) {
+                return t && t->data && t->buffer;
+            });
+    if (!have_data && !hparams.no_alloc) {
+        LLAMA_LOG_ERROR("%s: KVFlash requires allocated K/V storage for every attention layer\n", __func__);
+        return false;
+    }
+
     auto pager = std::make_unique<common_kvflash::KvFlashPager>();
-    // Attach with tensors if buffers already have data pointers; else map-only.
-    const bool have_data = !ks.empty() && ks[0]->data != nullptr;
-    if (!pager->attach(cfg, have_data ? ks : std::vector<ggml_tensor *>{},
-                            have_data ? vs : std::vector<ggml_tensor *>{})) {
+    if (!pager->attach(cfg,
+            have_data ? ks : std::vector<ggml_tensor *>{},
+            have_data ? vs : std::vector<ggml_tensor *>{})) {
         LLAMA_LOG_ERROR("%s: KvFlashPager::attach failed (pool=%u chunk=%d)\n",
                 __func__, pool_tokens, chunk_tokens);
         return false;
@@ -1474,6 +1556,12 @@ bool llama_kv_cache::init_kvflash(uint32_t pool_tokens, int chunk_tokens) {
 
     pager->on_block_evicted = [this, chunk_tokens](int block) {
         this->kvflash_clear_block(block, chunk_tokens);
+    };
+    pager->on_block_paged_out = [this, chunk_tokens](int chunk, int block) {
+        return this->kvflash_page_out_cells(chunk, block, chunk_tokens);
+    };
+    pager->on_block_paged_in = [this, chunk_tokens](int chunk, int block) {
+        return this->kvflash_page_in_cells(chunk, block, chunk_tokens);
     };
 
     kvflash = std::move(pager);
@@ -1483,8 +1571,7 @@ bool llama_kv_cache::init_kvflash(uint32_t pool_tokens, int chunk_tokens) {
 
     LLAMA_LOG_INFO("%s: KVFlash ON pool=%u chunk=%d layers=%zu tail_chunks=%d (%s)\n",
             __func__, pool_tokens, chunk_tokens, layers.size(),
-            cfg.tail_window_chunks,
-            have_data ? "tensor paging" : "map-only until buffers ready");
+            cfg.tail_window_chunks, have_data ? "tensor paging" : "allocation sizing");
     return true;
 }
 
@@ -1508,6 +1595,101 @@ void llama_kv_cache::kvflash_clear_block(int block, int chunk_tokens) {
             cells.rm(i);
         }
     }
+}
+
+void llama_kv_cache::kvflash_index_page(const kvflash_cell_page & page) {
+    if (page.pos_min >= 0) {
+        kvflash_pos_mins.insert(page.pos_min);
+    }
+    if (page.pos_max >= 0) {
+        kvflash_pos_maxs.insert(page.pos_max);
+    }
+}
+
+void llama_kv_cache::kvflash_unindex_page(const kvflash_cell_page & page) {
+    if (page.pos_min >= 0) {
+        const auto it = kvflash_pos_mins.find(page.pos_min);
+        GGML_ASSERT(it != kvflash_pos_mins.end());
+        kvflash_pos_mins.erase(it);
+    }
+    if (page.pos_max >= 0) {
+        const auto it = kvflash_pos_maxs.find(page.pos_max);
+        GGML_ASSERT(it != kvflash_pos_maxs.end());
+        kvflash_pos_maxs.erase(it);
+    }
+}
+
+bool llama_kv_cache::kvflash_page_out_cells(int chunk, int block, int chunk_tokens) {
+    if (n_stream != 1 || chunk < 0 || block < 0 || chunk_tokens <= 0) {
+        return false;
+    }
+    const auto & cells = v_cells[0];
+    const uint32_t first = (uint32_t) block * (uint32_t) chunk_tokens;
+    if (first > cells.size() || (uint32_t) chunk_tokens > cells.size() - first) {
+        return false;
+    }
+    kvflash_cell_page page;
+    page.pos.assign((size_t) chunk_tokens, -1);
+    page.ext.resize((size_t) chunk_tokens);
+    for (int i = 0; i < chunk_tokens; ++i) {
+        const uint32_t cell = first + (uint32_t) i;
+        if (cells.is_empty(cell)) {
+            continue;
+        }
+        if (cells.seq_count(cell) != 1 || !cells.seq_has(cell, 0)) {
+            return false;
+        }
+        const llama_pos pos = cells.pos_get(cell);
+        page.pos[(size_t) i] = pos;
+        page.ext[(size_t) i] = cells.ext_get(cell);
+        page.pos_min = page.pos_min < 0 ? pos : std::min(page.pos_min, pos);
+        page.pos_max = std::max(page.pos_max, pos);
+    }
+    const auto old = kvflash_cells.find(chunk);
+    if (old != kvflash_cells.end()) {
+        kvflash_unindex_page(old->second);
+    }
+    auto result = kvflash_cells.insert_or_assign(chunk, std::move(page));
+    kvflash_index_page(result.first->second);
+    return true;
+}
+
+bool llama_kv_cache::kvflash_page_in_cells(int chunk, int block, int chunk_tokens) {
+    if (n_stream != 1 || chunk < 0 || block < 0 || chunk_tokens <= 0) {
+        return false;
+    }
+    auto it = kvflash_cells.find(chunk);
+    if (it == kvflash_cells.end()) {
+        return false;
+    }
+    const kvflash_cell_page & page = it->second;
+    if (page.pos.size() != (size_t) chunk_tokens ||
+        page.ext.size() != (size_t) chunk_tokens) {
+        return false;
+    }
+    auto & cells = v_cells[0];
+    const uint32_t first = (uint32_t) block * (uint32_t) chunk_tokens;
+    if (first > cells.size() || (uint32_t) chunk_tokens > cells.size() - first) {
+        return false;
+    }
+    for (int i = 0; i < chunk_tokens; ++i) {
+        if (!cells.is_empty(first + (uint32_t) i)) {
+            return false;
+        }
+    }
+    for (int i = 0; i < chunk_tokens; ++i) {
+        const llama_pos pos = page.pos[(size_t) i];
+        if (pos < 0) {
+            continue;
+        }
+        const uint32_t cell = first + (uint32_t) i;
+        cells.pos_set(cell, pos);
+        cells.ext_set(cell, page.ext[(size_t) i]);
+        cells.seq_add(cell, 0);
+    }
+    kvflash_unindex_page(page);
+    kvflash_cells.erase(it);
+    return true;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -2315,6 +2497,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     if (other) {
         return;
     }
+    if (kvflash) {
+        throw std::runtime_error(
+                "KVFlash attention state serialization is not supported yet");
+    }
 
     GGML_UNUSED(flags);
 
@@ -2384,6 +2570,10 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
+    }
+    if (kvflash) {
+        throw std::runtime_error(
+                "KVFlash attention state restoration is not supported yet");
     }
 
     GGML_UNUSED(flags);
@@ -2998,6 +3188,14 @@ bool llama_kv_cache_context::apply() {
         kv->update(lctx, do_shift, sc_info);
 
         return true;
+    }
+
+    if (kv->has_kvflash()) {
+        auto sinfo = kv->find_slot(ubatches[i_cur], false);
+        if (sinfo.empty()) {
+            return false;
+        }
+        sinfos[i_cur] = std::move(sinfo);
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);

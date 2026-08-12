@@ -7,6 +7,7 @@
 #include "kvflash_pager.h"
 
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -168,9 +169,7 @@ public:
     ggml_tensor * get_v_storage(int32_t il) const;
 
     // KVFlash: bind a resident pool pager. pool_tokens must match get_size().
-    // Empty tensor attach (map-only) is used until layer storages are ready;
-    // call again after buffers exist to enable host paging of quantized rows.
-    bool init_kvflash(uint32_t pool_tokens, int chunk_tokens = 64);
+    bool init_kvflash(uint32_t pool_tokens, uint32_t max_context_tokens, int chunk_tokens = 64);
     common_kvflash::KvFlashPager * get_kvflash() const;
     bool has_kvflash() const;
 
@@ -312,8 +311,26 @@ private:
     // physical pool slots and may page cold chunks to host.
     std::unique_ptr<common_kvflash::KvFlashPager> kvflash; // complete type via kvflash_pager.h
 
+    struct kvflash_cell_page {
+        std::vector<llama_pos> pos;
+        std::vector<llama_kv_cell_ext> ext;
+        llama_pos pos_min = -1;
+        llama_pos pos_max = -1;
+    };
+
+    // Compact cell metadata for host-backed chunks. KVFlash is single-sequence,
+    // so storing a full llama_kv_cells object per chunk would waste substantial
+    // memory on unused per-sequence indices.
+    std::unordered_map<int, kvflash_cell_page> kvflash_cells;
+    std::multiset<llama_pos> kvflash_pos_mins;
+    std::multiset<llama_pos> kvflash_pos_maxs;
+
     // Clear cell metadata for physical slots of a pool block (stream 0).
     void kvflash_clear_block(int block, int chunk_tokens);
+    void kvflash_index_page(const kvflash_cell_page & page);
+    void kvflash_unindex_page(const kvflash_cell_page & page);
+    bool kvflash_page_out_cells(int chunk, int block, int chunk_tokens);
+    bool kvflash_page_in_cells(int chunk, int block, int chunk_tokens);
 
     size_t total_size() const;
 
