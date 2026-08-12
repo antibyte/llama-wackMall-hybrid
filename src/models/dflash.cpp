@@ -77,7 +77,8 @@ bool llama_model_dflash::build_dflash_injection(
         llm_graph_context              & graph,
         ggml_tensor                    * features,
         const llama_cparams            & cparams_draft,
-        const llama_memory_context_i * mctx_draft) const {
+        const llama_memory_context_i * mctx_draft,
+        bool                             features_projected) const {
     if (features == nullptr || mctx_draft == nullptr) {
         return false;
     }
@@ -86,7 +87,11 @@ bool llama_model_dflash::build_dflash_injection(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     const int64_t n_head_kv   = hparams.n_head_kv();
 
-    GGML_ASSERT(features->ne[0] == hparams.n_embd_inp_enc());
+    if (features_projected) {
+        GGML_ASSERT(features->ne[0] == hparams.n_embd);
+    } else {
+        GGML_ASSERT(features->ne[0] == hparams.n_embd_inp_enc());
+    }
     GGML_ASSERT(features->ne[1] == n_tokens);
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -128,8 +133,11 @@ bool llama_model_dflash::build_dflash_injection(
         inp_attn = static_cast<llm_graph_input_attn_kv *>(graph.res->add_input(std::move(inp)));
     }
 
-    ggml_tensor * cur = ggml_mul_mat(graph.ctx0, fc, features);
-    graph.cb(cur, "dflash_fc", -1);
+    ggml_tensor * cur = features;
+    if (!features_projected) {
+        cur = ggml_mul_mat(graph.ctx0, fc, features);
+        graph.cb(cur, "dflash_fc", -1);
+    }
 
     cur = ggml_rms_norm(graph.ctx0, cur, hparams.f_norm_rms_eps);
     cur = ggml_mul(graph.ctx0, cur, output_norm_enc);

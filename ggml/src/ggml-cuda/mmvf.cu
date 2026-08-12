@@ -809,13 +809,19 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                // Ampere+ keeps the historical MMVF vs cuBLAS split (MMA F32
+                // is available via mmf for many shapes).
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
                 }
-                if (cc >= GGML_CUDA_CC_TURING) {
-                    return ne11 <= 4;
-                }
-                return ne11 <= 3;
+                // Pre-Ampere (Turing/Pascal/…): prefer MMVF for the full vector
+                // batch range. DFlash/MTP multi-token graphs often use n=5
+                // (1 target + n_max draft). On GTX 1660 Ti (driver 595),
+                // cublasSgemm has returned cudaErrorInvalidValue for both:
+                //   - shared_expert_gate: m=1,  n=5, k=2048
+                //   - ssm_alpha:          m=32, n=5, k=2048
+                // Routing those through MMVF avoids the broken cuBLAS path.
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
                     return ne11 <= 3;

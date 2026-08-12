@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "common.h"
+#include "ddtree.h"
 
 struct common_speculative;
 
@@ -83,12 +84,71 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// DDTree multi-path tree-verify helpers (env LLAMA_DFLASH_DDTREE / _PATHS).
+// When PATHS>1 the draft builds a tree and stores several root→leaf token
+// sequences. The server can then multi-seq verify them (seq_cp branches) —
+// the practical tree-verify path for hybrid GDN/SSM models that lack
+// Lucebox-style tree-attention kernels.
+//
+// n_paths: configured max paths (1 = chain only). n_aux_seqs: extra seqs
+// beyond n_parallel that the context must reserve (0 unless n_parallel==1).
+int32_t common_speculative_ddtree_n_paths();
+int32_t common_speculative_ddtree_n_aux_seqs();
+
+// After draft(), return multi-path drafts for seq_id (path 0 == primary result).
+// Empty if tree multi-path is off or no draft was produced.
+bool common_speculative_get_tree_paths(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        std::vector<llama_tokens> & paths_out);
+
+// After draft() in DDTree mode: return the last built tree for seq_id.
+// out_tree is a pointer into speculative-owned storage (valid until next draft).
+// Returns false if no tree was built.
+bool common_speculative_get_tree(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const common_ddtree ** out_tree);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+// Aggregate wall-clock timings collected by speculative implementations.
+// Times are microseconds (matching ggml_time_us). Zero when unused.
+struct common_speculative_perf {
+    common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
+
+    // outer API call counts / totals
+    size_t  n_call_draft   = 0;
+    size_t  n_call_process = 0;
+    int64_t t_draft_us     = 0; // common_speculative_draft() wall time
+    int64_t t_process_us   = 0; // common_speculative_process() wall time (inject / combined take)
+
+    // draft-dflash internal split (0 for other types)
+    int64_t t_draft_decode_us = 0; // llama_decode of the noise block
+    int64_t t_draft_sample_us = 0; // host/backend sampling of mask positions
+    int64_t t_ddtree_us       = 0; // top-K extract + tree build (DDTree mode)
+    size_t  n_draft_blocks    = 0; // number of noise-block decodes
+    size_t  n_draft_block_tok = 0; // sum of noise-block token counts (id_last + masks)
+    size_t  n_draft_out_tok   = 0; // sum of draft tokens actually returned
+    size_t  n_ddtree_builds   = 0; // number of DDTree builds
+    size_t  n_ddtree_nodes    = 0; // sum of tree non-root nodes
+
+    // process path classification (draft-dflash)
+    size_t n_process_combined   = 0; // fused inject already done in target graph
+    size_t n_process_standalone = 0; // host feature gather + encode + inject decode
+};
+
+// Fill perf for the first implementation matching `type`, or the first impl if type is NONE.
+// Returns false if no matching implementation exists.
+bool common_speculative_get_perf(
+        const common_speculative * spec,
+        common_speculative_type type,
+        common_speculative_perf & out);
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }

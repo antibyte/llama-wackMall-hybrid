@@ -41,6 +41,20 @@ struct llama_cparams {
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
+
+    // DDTree verify: host pointer to parent_ids[n_tokens] (or n_tokens*n_seqs),
+    // i32. When non-null, linear-attn layers use tree GDN/SSM kernels.
+    // Lifetime must cover graph build + compute of the current ubatch.
+    const int32_t * tree_parent_ids = nullptr;
+    int32_t         tree_n_tokens   = 0; // tokens in parent_ids per sequence
+
+    // Tree attention visibility: n_nodes×n_nodes row-major uint8 (1 = visible).
+    // Tree batch tokens use pos = tree_n_past + dfs_index (unique slots).
+    // Queries with tree_n_past <= pos < tree_n_past+n_nodes use this mask among
+    // themselves and full visibility to the committed prefix (pos < tree_n_past).
+    const uint8_t * tree_visibility = nullptr;
+    int32_t         tree_n_nodes    = 0; // incl. root (= tree_n_tokens when one seq)
+    int32_t         tree_n_past     = 0; // first tree-token absolute position
     bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;

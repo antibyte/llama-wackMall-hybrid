@@ -15,6 +15,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
@@ -391,7 +392,21 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+        // Tree-attention verify can accept a path deeper/wider than n_max
+        // (siblings at budget). Commit re-decode needs RS slots for the path.
+        uint32_t n = (uint32_t) draft.n_max;
+        if (const char * tv = std::getenv("LLAMA_DFLASH_TREE_VERIFY");
+                tv && tv[0] != '\0' && tv[0] != '0') {
+            int budget = 22;
+            if (const char * v = std::getenv("LLAMA_DFLASH_DDTREE_BUDGET")) {
+                budget = std::max(1, std::atoi(v));
+            }
+            n = std::max(n, (uint32_t) budget);
+        }
+        return n;
     }
 };
 

@@ -1274,7 +1274,8 @@ struct llama_model_dflash : public llama_model_base {
             llm_graph_context              & graph,
             ggml_tensor                    * features,
             const llama_cparams            & cparams_draft,
-            const llama_memory_context_i * mctx_draft) const override;
+            const llama_memory_context_i * mctx_draft,
+            bool                             features_projected = false) const override;
 };
 
 

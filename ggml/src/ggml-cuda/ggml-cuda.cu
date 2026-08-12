@@ -2711,13 +2711,33 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
+    //
+    // Also: on GTX 1660 Ti (Turing / driver 595) cublasSgemm has been observed
+    // to fail with CUBLAS_STATUS_INVALID_VALUE (as cudaErrorInvalidValue) for
+    // multi-token DFlash/MTP shapes, e.g.:
+    //   shared_expert_gate  m=1  n=5 k=2048
+    //   ssm_alpha           m=32 n=5 k=2048
+    // Prefer MMVF for those batch widths (see ggml_cuda_should_use_mmvf). If
+    // cuBLAS is still selected, retry with GemmEx before aborting.
     if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
-        const cublasStatus_t status = cublasSgemm(
+        cublasStatus_t status = cublasSgemm(
                 ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
                 ne01, ne11, ne10,
                 (const float *) alpha, (const float *) src0_ptr, s01,
                                        (const float *) src1_ptr, s11,
                 (const float *) beta,  (float       *) dst_ptr, ne0);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            GGML_LOG_WARN("cublasSgemm failed (status=%d, m=%lld n=%lld k=%lld); retrying cublasGemmEx for %s x %s → %s\n",
+                    (int) status, (long long) ne01, (long long) ne11, (long long) ne10,
+                    src0->name, src1->name, dst->name);
+            status = cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    alpha, src0_ptr, CUDA_R_32F, s01,
+                           src1_ptr, CUDA_R_32F, s11,
+                    beta,   dst_ptr, CUDA_R_32F, ne0,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT);
+        }
         if (status != CUBLAS_STATUS_SUCCESS) {
             GGML_LOG_ERROR("cublasSgemm tensor diagnostic: src0='%s' type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ptr=%p converted=%p; "
                     "src1='%s' type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ptr=%p converted=%p; "

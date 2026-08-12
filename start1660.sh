@@ -63,13 +63,13 @@ N_PREDICT="8192"  # CLI/server generation limit; API requests may impose a lower
 # Nur die beiden folgenden Zeilen aendern; die passenden Turbo4-Guards duerfen auf 1 bleiben.
 TARGET_TYPE_K="turbo4_k"  # experimental DFlash target K cache
 TARGET_TYPE_V="turbo4_k"  # experimental DFlash target V cache; requires Flash Attention
-DRAFT_TYPE_K="q4_0"  # speculative draft K cache for MTP or DFlash
-DRAFT_TYPE_V="q4_0"  # speculative draft V cache for MTP or DFlash; requires Flash Attention
+DRAFT_TYPE_K="turbo4_k"  # speculative draft K cache for MTP or DFlash
+DRAFT_TYPE_V="turbo4_k"  # speculative draft V cache for MTP or DFlash; requires Flash Attention
 LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy used by the measured DFlash winner
 LLAMA_TURBO4_V_EXPERIMENTAL="1"  # required guard for Turbo4 target V; 0 rejects this configuration
 LLAMA_TURBO4_MTP_EXPERIMENTAL="1"  # required guard for target Turbo4 with draft-mtp
 LLAMA_TURBO4_DFLASH_EXPERIMENTAL="1"  # required guard for target Turbo4 with draft-dflash
-LLAMA_TURBO4_DRAFT_EXPERIMENTAL="0"  # required guard for Turbo4 in the MTP draft context
+LLAMA_TURBO4_DRAFT_EXPERIMENTAL="1"  # required guard for Turbo4 in the MTP draft context
 LLAMA_TURBO4_Q8_FALLBACK_LAYERS=""  # optional comma/range list of target K layers kept at Q8, e.g. 23,35,27
 GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH="2"  # tested MTP-2 crossover: multi-token verify/prefill uses the FP16 FA path
 GGML_CUDA_TURBO4_FAST_F16_CONVERT="0"  # generic converter is the SM75 winner; 1/2 were slower experiments
@@ -77,8 +77,8 @@ GGML_CUDA_TURBO4_WHT_SHUFFLE="0"  # original WHT is the SM75 winner; shuffle-fir
 MTP_N="2"  # inactive DFlash fallback; used only after switching SPEC_MODE to mtp
 LLAMA_MTP_REQUANTIZE_OUTPUT="none"  # none is the 6-GiB winner; q4_K/q5_K add a draft-only LM head but consume 273/334 MiB VRAM
 LLAMA_MTP_HEAD_TRACE="0"  # 1 prints the selected MTP-head source/type once; diagnostic only
-SPEC_DRAFT_N_MAX="2"  # DFlash-only draft block size
-SPEC_DRAFT_N_MIN="0"  # DFlash-only minimum accepted draft length
+SPEC_DRAFT_N_MAX="5"  # DFlash-only draft block size
+SPEC_DRAFT_N_MIN="2"  # DFlash-only minimum accepted draft length
 SPEC_DRAFT_P_MIN="0.75"  # DFlash-only confidence threshold in [0, 1]
 SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash-only backend sampling switch
 DFLASH_COMBINED="1"  # fuse target feature projection and draft KV injection into the target graph
@@ -108,14 +108,14 @@ CMOE_BATCH="64"  # DFlash decode batch used by the measured 6-GiB winner
 CMOE_UBATCH="64"  # physical decode ubatch; keep equal to CMOE_BATCH
 # DFlash reserves independently at the decode geometry. These values only size
 # the target prompt graph; DFlash processes larger prompts in 64-token chunks.
-CMOE_PREFILL_BATCH="768"  # measured fast target prompt-processing batch
-CMOE_PREFILL_UBATCH="768"  # physical target prompt ubatch
+CMOE_PREFILL_BATCH="1024"  # measured fast target prompt-processing batch
+CMOE_PREFILL_UBATCH="1024"  # physical target prompt ubatch
 CMOE_DECODE_BATCH=""  # optional logical batch used only during token generation
 CMOE_DECODE_UBATCH=""  # optional physical ubatch used only during token generation
 
 # Prompt-cache controls
 CTX_CHECKPOINTS="4"  # keep up to four host-side context checkpoints
-CACHE_RAM="1024"  # host-side prompt-cache budget (MiB); does not replace a safe GPU ubatch
+CACHE_RAM="2048"  # host-side prompt-cache budget (MiB); does not replace a safe GPU ubatch
 CACHE_PROMPT="1"  # enable prompt-prefix reuse when set to 1
 CACHE_REUSE="16"  # minimum reusable prompt tokens/threshold for server cache logic
 KV_UNIFIED="1"  # share one unified KV buffer between slots when set to 1
@@ -123,7 +123,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots in the prompt cache when set to 1
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="33"  # leaves production headroom for CUDA graph instances
+LLAMA_EXPERT_S="26"  # leaves production headroom for CUDA graph instances
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file

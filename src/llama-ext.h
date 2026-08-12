@@ -129,6 +129,20 @@ LLAMA_API void llama_detach_dflash(struct llama_context * ctx, struct llama_cont
 // Consume the result of the most recent target decode.
 LLAMA_API bool llama_take_dflash_injected(struct llama_context * ctx);
 
+// Host-side breakdown of DFlash-assisted target verify (llama_decode).
+struct llama_dflash_verify_timers {
+    double begin_batch_ms;
+    double process_ubatch_ms;
+    double graph_rebuild_ms;
+    int32_t n_begin_batch;
+    int32_t n_process_ubatch;
+    int32_t n_graph_reuse;
+    int32_t n_graph_rebuild;
+};
+
+LLAMA_API bool llama_dflash_get_verify_timers(struct llama_context * ctx, struct llama_dflash_verify_timers * out);
+LLAMA_API void llama_dflash_clear_verify_timers(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //

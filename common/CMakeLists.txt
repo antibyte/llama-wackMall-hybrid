@@ -71,6 +71,8 @@ add_library(${TARGET}
     console.h
     debug.cpp
     debug.h
+    ddtree.cpp
+    ddtree.h
     download.cpp
     download.h
     fit.cpp

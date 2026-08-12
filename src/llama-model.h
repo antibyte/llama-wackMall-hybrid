@@ -693,11 +693,14 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // features_projected: when true, `features` is already the draft-embd projection
+    // (n_embd x n_tokens) and the fc mul is skipped (blocked-FC path).
     virtual bool build_dflash_injection(
             llm_graph_context              & graph,
             ggml_tensor                    * features,
             const llama_cparams            & cparams_draft,
-            const llama_memory_context_i * mctx_draft) const;
+            const llama_memory_context_i * mctx_draft,
+            bool                             features_projected = false) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;

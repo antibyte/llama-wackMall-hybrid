@@ -276,6 +276,22 @@ struct result_timings {
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
 
+    // Speculative phase timings (ms). Populated for draft-dflash / when measured.
+    // verify_ms: target llama_decode wall time during generation (GPU may complete in inject when async).
+    // draft_ms / inject_ms: from common_speculative_perf (noise-block draft + process/inject).
+    // With combined DFlash, fused K/V injection is inside the target graph → counted under verify
+    // once the process() sync waits for it; inject_ms is then mostly that take+sync.
+    double draft_ms  = 0.0;
+    double inject_ms = 0.0;
+    double verify_ms = 0.0;
+    double draft_decode_ms = 0.0;
+    double draft_sample_ms = 0.0;
+    int32_t n_draft_calls   = 0;
+    int32_t n_inject_calls  = 0;
+    int32_t n_verify_calls  = 0;
+    int32_t n_process_combined   = 0;
+    int32_t n_process_standalone = 0;
+
     json to_json() const;
 };
 

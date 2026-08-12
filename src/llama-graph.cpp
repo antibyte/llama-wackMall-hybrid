@@ -325,6 +325,39 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_tree_parent::set_input(const llama_ubatch * ubatch) {
+    if (!parent_ids || !cparams.tree_parent_ids || cparams.tree_n_tokens <= 0) {
+        return;
+    }
+    const int64_t n_tok  = ubatch ? ubatch->n_tokens : cparams.tree_n_tokens;
+    const int64_t n_need = (int64_t) cparams.tree_n_tokens; // per-seq length; batch may be 1 seq
+    GGML_ASSERT(n_tok == n_need || n_tok % n_need == 0);
+    const size_t nbytes = (size_t) ggml_nelements(parent_ids) * sizeof(int32_t);
+    // Host parent_ids may be one sequence; tile if n_seqs > 1.
+    if ((int64_t) ggml_nelements(parent_ids) == n_need) {
+        ggml_backend_tensor_set(parent_ids, cparams.tree_parent_ids, 0, nbytes);
+    } else {
+        // tile across sequences
+        std::vector<int32_t> tiled((size_t) ggml_nelements(parent_ids));
+        const int64_t n_seqs = ggml_nelements(parent_ids) / n_need;
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            std::memcpy(tiled.data() + s * n_need, cparams.tree_parent_ids, (size_t) n_need * sizeof(int32_t));
+        }
+        ggml_backend_tensor_set(parent_ids, tiled.data(), 0, nbytes);
+    }
+}
+
+bool llm_graph_input_tree_parent::can_reuse(const llm_graph_params & params) {
+    if (!parent_ids) {
+        return params.cparams.tree_parent_ids == nullptr;
+    }
+    if (!params.cparams.tree_parent_ids) {
+        return false;
+    }
+    return parent_ids->ne[0] == (int64_t) params.cparams.tree_n_tokens *
+            std::max<int64_t>(1, params.ubatch.n_seqs);
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -474,6 +507,50 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+        // DDTree: tighten attention among tree batch tokens to ancestor-only
+        // visibility. Tree tokens use pos = tree_n_past + dfs_index.
+        if (cparams.tree_visibility && cparams.tree_n_nodes > 0 && self_k_idxs &&
+                ggml_backend_buffer_is_host(self_kq_mask->buffer) &&
+                ggml_backend_buffer_is_host(self_k_idxs->buffer)) {
+            const int32_t n_nodes = cparams.tree_n_nodes;
+            const int32_t n_past  = cparams.tree_n_past;
+            const int64_t n_kv    = self_kq_mask->ne[0];
+            const int64_t n_tok   = ubatch->n_tokens;
+            const int32_t * k_idxs = (const int32_t *) self_k_idxs->data;
+
+            auto apply = [&](auto * data) {
+                using T = std::remove_reference_t<decltype(*data)>;
+                const T drop = llama_cast<T>(-INFINITY);
+                for (int64_t qi = 0; qi < n_tok; ++qi) {
+                    const llama_pos pq = ubatch->pos[qi];
+                    if (pq < n_past || pq >= n_past + n_nodes) {
+                        continue;
+                    }
+                    const int qdfs = (int) (pq - n_past);
+                    for (int64_t kj = 0; kj < n_tok; ++kj) {
+                        const llama_pos pk = ubatch->pos[kj];
+                        if (pk < n_past || pk >= n_past + n_nodes) {
+                            continue;
+                        }
+                        const int kdfs = (int) (pk - n_past);
+                        if (cparams.tree_visibility[(size_t) qdfs * (size_t) n_nodes + (size_t) kdfs]) {
+                            continue; // already keep from causal fill (or keep)
+                        }
+                        const int32_t cell = k_idxs[kj];
+                        if (cell >= 0 && cell < n_kv) {
+                            data[qi * n_kv + cell] = drop;
+                        }
+                    }
+                }
+            };
+
+            if (self_kq_mask->type == GGML_TYPE_F16) {
+                apply((ggml_fp16_t *) self_kq_mask->data);
+            } else {
+                apply((float *) self_kq_mask->data);
+            }
+        }
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -1256,11 +1333,17 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         ggml_set_output(t_h_nextn);
     }
     {
+        // Combined DFlash inject consumes layer inputs in-graph. Marking them OUTPUT
+        // forces materialization and blocks buffer reuse on the verify critical path.
+        const bool dflash_keeps_layer_inp =
+            params.dflash != nullptr && params.dflash->last_inject_built();
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
-                ggml_set_output(t_layer_inp[il]);
+                if (!dflash_keeps_layer_inp) {
+                    ggml_set_output(t_layer_inp[il]);
+                }
             }
         }
     }
@@ -3295,6 +3378,20 @@ llm_graph_input_rs * llm_graph_context::build_rs_inp() const {
     auto inp = build_rs_inp_impl(ctx0, ubatch, mctx_cur);
 
     return (llm_graph_input_rs *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_tree_parent_ids() const {
+    if (!cparams.tree_parent_ids || cparams.tree_n_tokens <= 0) {
+        return nullptr;
+    }
+    const int64_t n_tok  = cparams.tree_n_tokens;
+    const int64_t n_seqs = std::max<int64_t>(1, ubatch.n_seqs);
+    auto inp = std::make_unique<llm_graph_input_tree_parent>(cparams);
+    inp->parent_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tok * n_seqs);
+    ggml_set_input(inp->parent_ids);
+    ggml_tensor * t = inp->parent_ids;
+    res->add_input(std::move(inp));
+    return t;
 }
 
 ggml_tensor * llm_graph_context::build_rs(

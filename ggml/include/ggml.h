@@ -2538,6 +2538,15 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // Tree-mode ssm_conv for DDTree verify: parent_ids i32 [n_tokens, n_seqs]
+    // (or flat n_tokens*n_seqs). parent_ids[t] = parent token index, or -1 if
+    // the parent is before the current block (uses old conv state).
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * parent_ids);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2669,6 +2678,20 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // Tree-mode GDN for DDTree verify. parent_ids i32 [n_tokens * n_seqs]:
+    // parent_ids[t] is the DFS parent of token t, or -1 for a root (reload s0).
+    // Output packs: attention scores | final state | per-token intermediates
+    // (n_tokens * S_v*S_v*H*n_seqs) for branch reloads / rollback.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * parent_ids);
 
     // DSA lightning indexer
     //

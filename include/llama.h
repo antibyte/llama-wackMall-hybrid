@@ -996,6 +996,21 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // DDTree verify: set per-token tree parent indices for the next decode ubatch.
+    // parent_ids[t] = DFS parent of token t, or -1 if the parent is before the block.
+    // n_tokens must match the number of tokens in the upcoming decode batch (per sequence).
+    // Pass parent_ids=nullptr to return to chain mode. Lifetime must cover graph compute.
+    LLAMA_API void llama_set_tree_parent_ids(struct llama_context * ctx, const int32_t * parent_ids, int32_t n_tokens);
+
+    // DDTree verify: set ancestor visibility mask for attention layers.
+    // visibility: n_nodes*n_nodes row-major uint8 (1=visible). Tree batch tokens
+    // must use pos = n_past + dfs_index. Pass visibility=nullptr to clear.
+    LLAMA_API void llama_set_tree_visibility(
+            struct llama_context * ctx,
+            const uint8_t * visibility,
+            int32_t n_nodes,
+            int32_t n_past);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //
