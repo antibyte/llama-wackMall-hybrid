@@ -43,6 +43,38 @@ struct KvFlashStats {
     int64_t moved_bytes          = 0;
 };
 
+struct KvFlashStateTensor {
+    int32_t type = -1;
+    uint64_t segment_bytes = 0;
+};
+
+struct KvFlashStateChunk {
+    int32_t chunk = -1;
+    int32_t block = -1;
+    uint64_t last_use = 0;
+};
+
+struct KvFlashState {
+    int32_t chunk_tokens = 0;
+    int32_t pool_tokens = 0;
+    int64_t max_context_tokens = 0;
+    int32_t sink_chunks = 0;
+    int32_t tail_window_chunks = 0;
+    int32_t cur_chunk = 0;
+    uint64_t clock = 0;
+    uint64_t chunk_bytes = 0;
+    std::vector<KvFlashStateTensor> tensors;
+    std::vector<KvFlashStateChunk> chunks;
+};
+
+struct KvFlashStateSpan {
+    ggml_tensor * tensor = nullptr;
+    uint8_t * host = nullptr;
+    size_t tensor_offset = 0;
+    size_t payload_offset = 0;
+    size_t size = 0;
+};
+
 class KvFlashPager {
 public:
     KvFlashPager() = default;
@@ -405,6 +437,34 @@ public:
         return allocate_pinned_chunks();
     }
 
+    bool page_in_chunks(const std::vector<int> & chunks) {
+        if (paging_failed_ || chunks.empty()) {
+            return !paging_failed_;
+        }
+        allocation_pins_ = chunks;
+        std::sort(allocation_pins_.begin(), allocation_pins_.end());
+        allocation_pins_.erase(
+                std::unique(allocation_pins_.begin(), allocation_pins_.end()),
+                allocation_pins_.end());
+        if ((int) allocation_pins_.size() >
+            std::max(1, n_blocks_ - cfg_.sink_chunks - 1)) {
+            allocation_pins_.clear();
+            return false;
+        }
+        for (int chunk : allocation_pins_) {
+            if (chunk < 0 || chunk >= (int) chunks_.size()) {
+                allocation_pins_.clear();
+                return false;
+            }
+            const ChunkState & state = chunks_[(size_t) chunk];
+            if (state.block < 0 && !state.on_host) {
+                allocation_pins_.clear();
+                return false;
+            }
+        }
+        return allocate_pinned_chunks();
+    }
+
     bool synchronize_paging() {
         for (size_t i = 0; i < page_backends_.size(); ++i) {
             if (i < backend_used_.size() && backend_used_[i]) {
@@ -500,6 +560,175 @@ public:
 
     uint64_t epoch() const {
         return epoch_;
+    }
+
+    bool state_export(KvFlashState & out) {
+        if (paging_failed_ || !synchronize_paging()) {
+            return false;
+        }
+
+        out = {};
+        out.chunk_tokens = cfg_.chunk_tokens;
+        out.pool_tokens = cfg_.pool_tokens;
+        out.max_context_tokens = cfg_.max_context_tokens;
+        out.sink_chunks = cfg_.sink_chunks;
+        out.tail_window_chunks = cfg_.tail_window_chunks;
+        out.cur_chunk = cur_chunk_;
+        out.clock = clock_;
+        out.chunk_bytes = chunk_bytes_;
+        out.tensors.reserve(bindings_.size());
+        for (const TensorBinding & binding : bindings_) {
+            out.tensors.push_back({
+                (int32_t) binding.tensor->type,
+                (uint64_t) binding.segment_bytes,
+            });
+        }
+        for (int chunk = 0; chunk < (int) chunks_.size(); ++chunk) {
+            const ChunkState & state = chunks_[(size_t) chunk];
+            if (state.block < 0 && !state.on_host) {
+                continue;
+            }
+            out.chunks.push_back({
+                chunk,
+                state.block,
+                state.last_use,
+            });
+        }
+        return true;
+    }
+
+    bool state_import(const KvFlashState & in) {
+        if (paging_failed_ || !synchronize_paging() ||
+            in.chunk_tokens != cfg_.chunk_tokens ||
+            in.pool_tokens != cfg_.pool_tokens ||
+            in.max_context_tokens != cfg_.max_context_tokens ||
+            in.sink_chunks != cfg_.sink_chunks ||
+            in.tail_window_chunks != cfg_.tail_window_chunks ||
+            in.chunk_bytes != chunk_bytes_ ||
+            in.tensors.size() != bindings_.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < bindings_.size(); ++i) {
+            if (in.tensors[i].type != (int32_t) bindings_[i].tensor->type ||
+                in.tensors[i].segment_bytes != bindings_[i].segment_bytes) {
+                return false;
+            }
+        }
+
+        int max_chunk = -1;
+        uint64_t max_last_use = 0;
+        std::vector<uint8_t> seen_blocks((size_t) n_blocks_, 0);
+        int resident = 0;
+        int previous_chunk = -1;
+        for (const KvFlashStateChunk & chunk : in.chunks) {
+            const int64_t start = (int64_t) chunk.chunk * cfg_.chunk_tokens;
+            if (chunk.chunk < 0 || chunk.chunk <= previous_chunk ||
+                !position_valid(start) || chunk.block < -1 ||
+                chunk.block >= n_blocks_) {
+                return false;
+            }
+            previous_chunk = chunk.chunk;
+            max_chunk = chunk.chunk;
+            max_last_use = std::max(max_last_use, chunk.last_use);
+            if (chunk.block >= 0) {
+                if (seen_blocks[(size_t) chunk.block]) {
+                    return false;
+                }
+                seen_blocks[(size_t) chunk.block] = 1;
+                ++resident;
+            }
+        }
+        const int64_t cur_chunk_start = (int64_t) in.cur_chunk * cfg_.chunk_tokens;
+        if (resident > n_blocks_ || in.cur_chunk < 0 ||
+            !position_valid(cur_chunk_start) ||
+            (max_chunk >= 0 && in.cur_chunk < max_chunk)) {
+            return false;
+        }
+
+        auto saved_score_hook = std::move(score_hook);
+        release_host_slabs();
+        chunks_.assign(max_chunk >= 0 ? (size_t) max_chunk + 1 : 0, {});
+        block_to_chunk_.assign((size_t) n_blocks_, -1);
+        free_blocks_.clear();
+        allocation_pins_.clear();
+        stats_ = {};
+        paging_failed_ = false;
+
+        for (const KvFlashStateChunk & chunk : in.chunks) {
+            ChunkState & state = chunks_[(size_t) chunk.chunk];
+            state.block = chunk.block;
+            state.last_use = chunk.last_use;
+            if (chunk.block >= 0) {
+                block_to_chunk_[(size_t) chunk.block] = chunk.chunk;
+            } else {
+                if (!allocate_host_backing(state)) {
+                    paging_failed_ = true;
+                    score_hook = std::move(saved_score_hook);
+                    return false;
+                }
+                state.on_host = true;
+            }
+        }
+        for (int block = n_blocks_ - 1; block >= 0; --block) {
+            if (!seen_blocks[(size_t) block]) {
+                free_blocks_.push_back(block);
+            }
+        }
+
+        cur_chunk_ = in.cur_chunk;
+        clock_ = std::max(in.clock, max_last_use);
+        identity_ = true;
+        for (int block = 0; block < n_blocks_; ++block) {
+            const int chunk = block_to_chunk_[(size_t) block];
+            if (chunk >= 0 && chunk != block) {
+                identity_ = false;
+                break;
+            }
+        }
+        score_hook = std::move(saved_score_hook);
+        ++epoch_;
+        return true;
+    }
+
+    bool state_spans(int chunk, std::vector<KvFlashStateSpan> & spans) const {
+        spans.clear();
+        if (chunk < 0 || chunk >= (int) chunks_.size()) {
+            return false;
+        }
+        const ChunkState & state = chunks_[(size_t) chunk];
+        if (state.block < 0 && !state.on_host) {
+            return false;
+        }
+        if (!has_tensor_storage()) {
+            return chunk_bytes_ == 0;
+        }
+        if (state.block < 0) {
+            if (!state.host_ptr) {
+                return false;
+            }
+            spans.push_back({
+                nullptr,
+                state.host_ptr,
+                0,
+                0,
+                chunk_bytes_,
+            });
+            return true;
+        }
+
+        size_t payload_offset = 0;
+        spans.reserve(bindings_.size());
+        for (const TensorBinding & binding : bindings_) {
+            spans.push_back({
+                binding.tensor,
+                nullptr,
+                (size_t) state.block * cfg_.chunk_tokens * binding.tensor->nb[1],
+                payload_offset,
+                binding.segment_bytes,
+            });
+            payload_offset += binding.segment_bytes;
+        }
+        return payload_offset == chunk_bytes_;
     }
 
     void fill_slot_mask(uint16_t * dst) const {

@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -134,6 +135,69 @@ static void test_page_in_out_map() {
     assert(p.is_resident(1));
     assert(p.stats().page_ins == 1);
     std::printf("  ok page_out/page_in map-only\n");
+}
+
+static void test_pager_state_roundtrip_map() {
+    KvFlashPager pager;
+    KvFlashConfig cfg = cfg_pool(256, 64, 1, 1);
+    cfg.max_context_tokens = 1024;
+    assert(pager.attach(cfg, {}, {}));
+    assert(pager.alloc_span(0, 320));
+
+    KvFlashState saved;
+    assert(pager.state_export(saved));
+    assert(saved.chunk_tokens == cfg.chunk_tokens);
+    assert(saved.pool_tokens == cfg.pool_tokens);
+    assert(saved.max_context_tokens == cfg.max_context_tokens);
+    assert(saved.chunks.size() == 5);
+    assert(saved.chunk_bytes == 0);
+
+    std::vector<int> resident;
+    int cold = -1;
+    for (const auto & chunk : saved.chunks) {
+        if (chunk.block >= 0) {
+            resident.push_back(chunk.chunk);
+        } else {
+            cold = chunk.chunk;
+        }
+    }
+    assert(resident.size() == 4);
+    assert(cold >= 0);
+
+    assert(!pager.page_in_chunks({-1}));
+    assert(!pager.page_in_chunks({saved.cur_chunk + 100}));
+
+    KvFlashState invalid = saved;
+    const int first_block = invalid.chunks[(size_t) resident[0]].block;
+    invalid.chunks[(size_t) resident[1]].block = first_block;
+    assert(!pager.state_import(invalid));
+
+    invalid = saved;
+    invalid.cur_chunk = (int32_t) (cfg.max_context_tokens / cfg.chunk_tokens);
+    assert(!pager.state_import(invalid));
+
+    assert(pager.slot_for(384) >= 0);
+    pager.score_hook = [](int chunk) { return (float) chunk; };
+    assert(pager.state_import(saved));
+    assert(pager.has_score_hook());
+
+    KvFlashState restored;
+    assert(pager.state_export(restored));
+    assert(restored.cur_chunk == saved.cur_chunk);
+    assert(restored.clock == saved.clock);
+    assert(restored.chunks.size() == saved.chunks.size());
+    for (size_t i = 0; i < saved.chunks.size(); ++i) {
+        assert(restored.chunks[i].chunk == saved.chunks[i].chunk);
+        assert(restored.chunks[i].block == saved.chunks[i].block);
+        assert(restored.chunks[i].last_use == saved.chunks[i].last_use);
+        std::vector<KvFlashStateSpan> spans;
+        assert(pager.state_spans(restored.chunks[i].chunk, spans));
+        assert(spans.empty());
+    }
+
+    assert(pager.page_in_chunks({cold, cold}));
+    assert(pager.is_resident(cold));
+    std::printf("  ok pager state roundtrip (map-only)\n");
 }
 
 static void test_paging_callbacks() {
@@ -410,6 +474,34 @@ static void test_tensor_roundtrip(ggml_backend_dev_t device) {
     assert(pager.bind_backends({backend.get()}));
     assert(pager.alloc_span(0, pool));
     assert(pager.page_out(1));
+
+    KvFlashState saved;
+    assert(pager.state_export(saved));
+    assert(saved.tensors.size() == 2);
+    assert(saved.tensors[0].type == GGML_TYPE_F32);
+    assert(saved.tensors[1].type == GGML_TYPE_F32);
+    assert(saved.chunks.size() == 4);
+
+    std::vector<std::vector<uint8_t>> saved_payloads(saved.chunks.size());
+    for (size_t i = 0; i < saved.chunks.size(); ++i) {
+        std::vector<KvFlashStateSpan> spans;
+        assert(pager.state_spans(saved.chunks[i].chunk, spans));
+        saved_payloads[i].resize((size_t) saved.chunk_bytes);
+        size_t copied = 0;
+        for (const auto & span : spans) {
+            assert(span.payload_offset == copied);
+            if (span.tensor) {
+                ggml_backend_tensor_get(span.tensor, saved_payloads[i].data() + copied,
+                        span.tensor_offset, span.size);
+            } else {
+                assert(span.host || span.size == 0);
+                std::memcpy(saved_payloads[i].data() + copied, span.host, span.size);
+            }
+            copied += span.size;
+        }
+        assert(copied == saved.chunk_bytes);
+    }
+
     assert(pager.slot_for(256) == chunk);
 
     std::vector<float> marker((size_t) width * chunk, 42.0f);
@@ -438,12 +530,157 @@ static void test_tensor_roundtrip(ggml_backend_dev_t device) {
     assert(pager.stats().host_allocated_bytes >= pager.stats().host_bytes);
     assert(pager.host_slab_count() == 1);
 
+    assert(pager.state_import(saved));
+    for (size_t i = 0; i < saved.chunks.size(); ++i) {
+        std::vector<KvFlashStateSpan> spans;
+        assert(pager.state_spans(saved.chunks[i].chunk, spans));
+        size_t copied = 0;
+        for (const auto & span : spans) {
+            assert(span.payload_offset == copied);
+            if (span.tensor) {
+                ggml_backend_tensor_set(span.tensor, saved_payloads[i].data() + copied,
+                        span.tensor_offset, span.size);
+            } else {
+                assert(span.host || span.size == 0);
+                std::memcpy(span.host, saved_payloads[i].data() + copied, span.size);
+            }
+            copied += span.size;
+        }
+        assert(copied == saved.chunk_bytes);
+    }
+
+    for (int logical_chunk = 0; logical_chunk < pool / chunk; ++logical_chunk) {
+        assert(pager.slot_for(logical_chunk * chunk) >= 0);
+        assert(pager.synchronize_paging());
+        const size_t offset = (size_t) pager.block_of(logical_chunk) * chunk * k->nb[1];
+        ggml_backend_tensor_get(k, got_k.data(), offset, segment_bytes);
+        ggml_backend_tensor_get(v, got_v.data(), offset, segment_bytes);
+        const auto expected_k = k_data.begin() + (size_t) logical_chunk * chunk * width;
+        const auto expected_v = v_data.begin() + (size_t) logical_chunk * chunk * width;
+        assert(std::equal(got_k.begin(), got_k.end(), expected_k));
+        assert(std::equal(got_v.begin(), got_v.end(), expected_v));
+    }
+
     pager.reset();
     assert(pager.host_slab_count() == 0);
     assert(pager.stats().host_bytes == 0);
     assert(pager.stats().host_allocated_bytes == 0);
 
     std::printf("  ok tensor roundtrip on %s\n", ggml_backend_dev_name(device));
+}
+
+static std::vector<float> turbo4_test_source() {
+    constexpr int width = 128;
+    constexpr int rows = 3;
+    std::vector<float> result((size_t) width * rows);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const float x = (float) (row * width + col);
+            result[(size_t) row * width + col] =
+                    std::sin(0.071f * x) + 0.37f * std::cos(0.193f * x) + 0.1f * row;
+        }
+    }
+    return result;
+}
+
+static std::vector<float> run_turbo4_get_rows(ggml_backend_dev_t device) {
+    assert(device);
+    ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
+    assert(backend);
+
+    constexpr int width = 128;
+    constexpr int rows = 3;
+    constexpr int gather_rows = 4;
+    constexpr int graph_nodes = 16;
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_nodes, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    assert(ctx);
+
+    ggml_tensor * source = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, rows);
+    ggml_tensor * storage = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_TURBO4_K, width, rows);
+    ggml_tensor * set_rows = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, rows);
+    ggml_tensor * get_rows = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, gather_rows);
+    ggml_tensor * quantized = ggml_set_rows(ctx.get(), storage, source, set_rows);
+    ggml_tensor * output = ggml_get_rows(ctx.get(), quantized, get_rows);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+    ggml_build_forward_expand(graph, output);
+    assert(ggml_backend_dev_supports_op(device, quantized));
+    assert(ggml_backend_dev_supports_op(device, output));
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+    assert(buffer);
+
+    const std::vector<float> source_data = turbo4_test_source();
+    const int32_t set_data[rows] = {0, 1, 2};
+    const int32_t get_data[gather_rows] = {2, 0, 2, 1};
+    ggml_backend_tensor_set(source, source_data.data(), 0, ggml_nbytes(source));
+    ggml_backend_tensor_set(set_rows, set_data, 0, sizeof(set_data));
+    ggml_backend_tensor_set(get_rows, get_data, 0, sizeof(get_data));
+
+    assert(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> result((size_t) width * gather_rows);
+    ggml_backend_tensor_get(output, result.data(), 0, ggml_nbytes(output));
+    return result;
+}
+
+static void assert_turbo4_get_rows_semantics(const std::vector<float> & output) {
+    constexpr int width = 128;
+    constexpr int gather_rows = 4;
+    const int source_rows[gather_rows] = {2, 0, 2, 1};
+    const std::vector<float> source = turbo4_test_source();
+    double error = 0.0;
+    double signal = 0.0;
+    for (int row = 0; row < gather_rows; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const float expected = source[(size_t) source_rows[row] * width + col];
+            const float actual = output[(size_t) row * width + col];
+            const double delta = (double) actual - expected;
+            error += delta * delta;
+            signal += (double) expected * expected;
+        }
+    }
+    assert(signal > 0.0);
+    assert(error / signal < 0.05);
+}
+
+static void test_cpu_turbo4_get_rows() {
+    const auto output = run_turbo4_get_rows(
+            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+    assert_turbo4_get_rows_semantics(output);
+    std::printf("  ok Turbo4 GET_ROWS semantics on CPU\n");
+}
+
+static void test_gpu_turbo4_get_rows_if_requested() {
+    if (!std::getenv("KVFLASH_TEST_GPU")) {
+        std::printf("  skip GPU Turbo4 GET_ROWS (set KVFLASH_TEST_GPU=1)\n");
+        return;
+    }
+    ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!device) {
+        std::printf("  skip GPU Turbo4 GET_ROWS (no GPU backend)\n");
+        return;
+    }
+
+    const auto cpu = run_turbo4_get_rows(
+            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+    const auto gpu = run_turbo4_get_rows(device);
+    assert_turbo4_get_rows_semantics(gpu);
+    assert(cpu.size() == gpu.size());
+    double error = 0.0;
+    double signal = 0.0;
+    for (size_t i = 0; i < cpu.size(); ++i) {
+        const double delta = (double) cpu[i] - gpu[i];
+        error += delta * delta;
+        signal += (double) cpu[i] * cpu[i];
+    }
+    assert(signal > 0.0);
+    assert(error / signal < 1e-4);
+    std::printf("  ok Turbo4 GET_ROWS CPU/GPU roundtrip\n");
 }
 
 static void test_cpu_tensor_roundtrip() {
@@ -514,6 +751,7 @@ int main() {
     test_identity_append();
     test_lru_eviction();
     test_page_in_out_map();
+    test_pager_state_roundtrip_map();
     test_paging_callbacks();
     test_reselect();
     test_reselect_protection_and_lru_noop();
@@ -526,7 +764,9 @@ int main() {
     test_live_eviction_past_pool();
     test_long_context_lru();
     test_cpu_tensor_roundtrip();
+    test_cpu_turbo4_get_rows();
     test_gpu_tensor_roundtrip_if_requested();
+    test_gpu_turbo4_get_rows_if_requested();
     std::printf("all kvflash unit tests passed\n");
     return 0;
 }

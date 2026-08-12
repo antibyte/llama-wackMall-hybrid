@@ -66,6 +66,11 @@ TARGET_TYPE_V="turbo4_k"  # experimental DFlash target V cache; requires Flash A
 DRAFT_TYPE_K="turbo4_k"  # speculative draft K cache for MTP or DFlash
 DRAFT_TYPE_V="turbo4_k"  # speculative draft V cache for MTP or DFlash; requires Flash Attention
 LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy used by the measured DFlash winner
+LLAMA_KVFLASH="12288"  # resident target-KV tokens; this is a token count, not a boolean switch
+LLAMA_KVFLASH_MAX_POOL="12288"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
+LLAMA_KVFLASH_TAU="64"  # scorer reselection interval; inert while the current LRU policy has no scorer
+LLAMA_KVFLASH_POLICY="lru"  # only supported KVFlash replacement policy
+LLAMA_KVFLASH_STATS="0"  # production default; set to 1 to report paging and host-memory counters
 LLAMA_TURBO4_V_EXPERIMENTAL="1"  # required guard for Turbo4 target V; 0 rejects this configuration
 LLAMA_TURBO4_MTP_EXPERIMENTAL="1"  # required guard for target Turbo4 with draft-mtp
 LLAMA_TURBO4_DFLASH_EXPERIMENTAL="1"  # required guard for target Turbo4 with draft-dflash
@@ -77,8 +82,8 @@ GGML_CUDA_TURBO4_WHT_SHUFFLE="0"  # original WHT is the SM75 winner; shuffle-fir
 MTP_N="2"  # inactive DFlash fallback; used only after switching SPEC_MODE to mtp
 LLAMA_MTP_REQUANTIZE_OUTPUT="none"  # none is the 6-GiB winner; q4_K/q5_K add a draft-only LM head but consume 273/334 MiB VRAM
 LLAMA_MTP_HEAD_TRACE="0"  # 1 prints the selected MTP-head source/type once; diagnostic only
-SPEC_DRAFT_N_MAX="5"  # DFlash-only draft block size
-SPEC_DRAFT_N_MIN="2"  # DFlash-only minimum accepted draft length
+SPEC_DRAFT_N_MAX="6"  # DFlash-only draft block size
+SPEC_DRAFT_N_MIN="1"  # DFlash-only minimum accepted draft length
 SPEC_DRAFT_P_MIN="0.75"  # DFlash-only confidence threshold in [0, 1]
 SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash-only backend sampling switch
 DFLASH_COMBINED="1"  # fuse target feature projection and draft KV injection into the target graph
@@ -104,8 +109,8 @@ DRAFT_BACKEND_SAMPLING="1"  # MTP draft sampling on the backend; 0 forces CPU dr
 # values are empty by default; setting them enables the experimental prefill /
 # decode switch implemented in common/arg.cpp.
 GPU_ARCH="auto"  # architecture used to choose an auto batch default
-CMOE_BATCH="64"  # DFlash decode batch used by the measured 6-GiB winner
-CMOE_UBATCH="64"  # physical decode ubatch; keep equal to CMOE_BATCH
+CMOE_BATCH="128"  # DFlash decode batch used by the measured 6-GiB winner
+CMOE_UBATCH="128"  # physical decode ubatch; keep equal to CMOE_BATCH
 # DFlash reserves independently at the decode geometry. These values only size
 # the target prompt graph; DFlash processes larger prompts in 64-token chunks.
 CMOE_PREFILL_BATCH="1024"  # measured fast target prompt-processing batch
@@ -115,15 +120,15 @@ CMOE_DECODE_UBATCH=""  # optional physical ubatch used only during token generat
 
 # Prompt-cache controls
 CTX_CHECKPOINTS="4"  # keep up to four host-side context checkpoints
-CACHE_RAM="2048"  # host-side prompt-cache budget (MiB); does not replace a safe GPU ubatch
+CACHE_RAM="2048"  # host-side full-state prompt-cache budget (MiB), including KVFlash host pages
 CACHE_PROMPT="1"  # enable prompt-prefix reuse when set to 1
-CACHE_REUSE="16"  # minimum reusable prompt tokens/threshold for server cache logic
+CACHE_REUSE="16"  # minimum matching chunk size for position-safe KVFlash cache reuse
 KV_UNIFIED="1"  # share one unified KV buffer between slots when set to 1
-CACHE_IDLE_SLOTS="1"  # retain idle slots in the prompt cache when set to 1
+CACHE_IDLE_SLOTS="1"  # retain idle slots through the full-state RAM prompt cache
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="26"  # leaves production headroom for CUDA graph instances
+LLAMA_EXPERT_S="30"  # leaves production headroom for CUDA graph instances
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
@@ -271,6 +276,27 @@ case "$LLAMA_TURBO4_MTP_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_MTP_EXPERI
 case "$LLAMA_TURBO4_DFLASH_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_DFLASH_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_DRAFT_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_DRAFT_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_KV_Q4_SCALE" in legacy|weighted|weighted-k|weighted-v) ;; *) die "LLAMA_KV_Q4_SCALE muss legacy, weighted, weighted-k oder weighted-v sein." ;; esac
+[[ "$LLAMA_KVFLASH" == 0 || "$LLAMA_KVFLASH" == auto || "$LLAMA_KVFLASH" =~ ^[1-9][0-9]*$ ]] || \
+    die "LLAMA_KVFLASH muss 0, auto oder eine positive Ganzzahl sein."
+if [[ "$LLAMA_KVFLASH" =~ ^[1-9][0-9]*$ ]] && (( LLAMA_KVFLASH < 512 )); then
+    die "LLAMA_KVFLASH ist eine Tokenanzahl (mindestens 512), kein Boolean; fuer diese Konfiguration 12288 verwenden."
+fi
+[[ "$LLAMA_KVFLASH_MAX_POOL" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_KVFLASH_MAX_POOL muss eine positive Ganzzahl sein."
+[[ "$LLAMA_KVFLASH_TAU" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_KVFLASH_TAU muss eine positive Ganzzahl sein."
+case "$LLAMA_KVFLASH_POLICY" in lru) ;; *) die "LLAMA_KVFLASH_POLICY muss lru sein." ;; esac
+case "$LLAMA_KVFLASH_STATS" in 0|1) ;; *) die "LLAMA_KVFLASH_STATS muss 0 oder 1 sein." ;; esac
+[[ "$CTX_CHECKPOINTS" =~ ^[0-9]+$ ]] || die "CTX_CHECKPOINTS muss eine nichtnegative Ganzzahl sein."
+[[ "$CACHE_RAM" =~ ^(-1|[0-9]+)$ ]] || die "CACHE_RAM muss -1 oder eine nichtnegative Ganzzahl sein."
+case "$CACHE_PROMPT" in 0|1) ;; *) die "CACHE_PROMPT muss 0 oder 1 sein." ;; esac
+[[ "$CACHE_REUSE" =~ ^[0-9]+$ ]] || die "CACHE_REUSE muss eine nichtnegative Ganzzahl sein."
+case "$KV_UNIFIED" in 0|1) ;; *) die "KV_UNIFIED muss 0 oder 1 sein." ;; esac
+case "$CACHE_IDLE_SLOTS" in 0|1) ;; *) die "CACHE_IDLE_SLOTS muss 0 oder 1 sein." ;; esac
+if [[ "$CACHE_IDLE_SLOTS" == 1 && "$CACHE_RAM" == 0 ]]; then
+    die "CACHE_IDLE_SLOTS=1 benoetigt CACHE_RAM ungleich 0."
+fi
+if [[ "$CACHE_REUSE" != 0 && "$CACHE_PROMPT" != 1 ]]; then
+    die "CACHE_REUSE groesser 0 benoetigt CACHE_PROMPT=1."
+fi
 case "$LLAMA_MTP_REQUANTIZE_OUTPUT" in none|q4_K|q4_k|q5_K|q5_k) ;; *) die "LLAMA_MTP_REQUANTIZE_OUTPUT muss none, q4_K oder q5_K sein." ;; esac
 case "$LLAMA_MTP_HEAD_TRACE" in 0|1) ;; *) die "LLAMA_MTP_HEAD_TRACE muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_TURBO4_FAST_F16_CONVERT" in 0|1|2) ;; *) die "GGML_CUDA_TURBO4_FAST_F16_CONVERT muss 0, 1 oder 2 sein." ;; esac
@@ -313,6 +339,12 @@ if [[ "$TARGET_TYPE_V" == turbo4_k && "$LLAMA_TURBO4_V_EXPERIMENTAL" != 1 ]]; th
 fi
 if [[ ( "$TARGET_TYPE_K" == turbo4_k || "$TARGET_TYPE_V" == turbo4_k ) && "$FLASH_ATTN" != on ]]; then
     die "Turbo4-KV benötigt FLASH_ATTN=on."
+fi
+if [[ "$LLAMA_KVFLASH" != 0 && "$FLASH_ATTN" != on ]]; then
+    die "KVFlash benoetigt FLASH_ATTN=on."
+fi
+if [[ "$LLAMA_KVFLASH" != 0 && "$N_PARALLEL" != 1 ]]; then
+    die "KVFlash benoetigt N_PARALLEL=1."
 fi
 if [[ "$SPEC_MODE" == mtp && "$MTP_N" != 0 && ( "$TARGET_TYPE_K" == turbo4_k || "$TARGET_TYPE_V" == turbo4_k ) && "$LLAMA_TURBO4_MTP_EXPERIMENTAL" != 1 ]]; then
     die "Target-Turbo4 mit MTP benötigt LLAMA_TURBO4_MTP_EXPERIMENTAL=1."
@@ -397,6 +429,11 @@ env_args=(
     "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K=$DRAFT_TYPE_K"
     "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V=$DRAFT_TYPE_V"
     "LLAMA_KV_Q4_SCALE=$LLAMA_KV_Q4_SCALE"
+    "LLAMA_KVFLASH=$LLAMA_KVFLASH"
+    "LLAMA_KVFLASH_MAX_POOL=$LLAMA_KVFLASH_MAX_POOL"
+    "LLAMA_KVFLASH_TAU=$LLAMA_KVFLASH_TAU"
+    "LLAMA_KVFLASH_POLICY=$LLAMA_KVFLASH_POLICY"
+    "LLAMA_KVFLASH_STATS=$LLAMA_KVFLASH_STATS"
     "LLAMA_TURBO4_V_EXPERIMENTAL=$LLAMA_TURBO4_V_EXPERIMENTAL"
     "LLAMA_TURBO4_MTP_EXPERIMENTAL=$LLAMA_TURBO4_MTP_EXPERIMENTAL"
     "LLAMA_TURBO4_DFLASH_EXPERIMENTAL=$LLAMA_TURBO4_DFLASH_EXPERIMENTAL"
@@ -574,6 +611,8 @@ llama-wackMall-hybrid start
   KV target:    $TARGET_TYPE_K/$TARGET_TYPE_V
   KV draft:     $DRAFT_TYPE_K/$DRAFT_TYPE_V
   Q4 scale:     $LLAMA_KV_Q4_SCALE
+  KVFlash:      $LLAMA_KVFLASH (max=$LLAMA_KVFLASH_MAX_POOL policy=$LLAMA_KVFLASH_POLICY tau=$LLAMA_KVFLASH_TAU stats=$LLAMA_KVFLASH_STATS)
+  prompt cache: ram=$CACHE_RAM MiB prompt=$CACHE_PROMPT reuse=$CACHE_REUSE idle=$CACHE_IDLE_SLOTS checkpoints=$CTX_CHECKPOINTS
   Turbo4:       V-guard=$LLAMA_TURBO4_V_EXPERIMENTAL MTP-guard=$LLAMA_TURBO4_MTP_EXPERIMENTAL DFlash-guard=$LLAMA_TURBO4_DFLASH_EXPERIMENTAL draft-guard=$LLAMA_TURBO4_DRAFT_EXPERIMENTAL FP16-threshold=$GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH convert=$GGML_CUDA_TURBO4_FAST_F16_CONVERT wht-shuffle=$GGML_CUDA_TURBO4_WHT_SHUFFLE Q8-layers=${LLAMA_TURBO4_Q8_FALLBACK_LAYERS:-none}
   MTP head:     $LLAMA_MTP_REQUANTIZE_OUTPUT (trace=$LLAMA_MTP_HEAD_TRACE)
   CMoE batch:   $CMOE_BATCH/$CMOE_UBATCH
