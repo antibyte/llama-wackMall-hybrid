@@ -4,7 +4,9 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "kvflash_pager.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -163,6 +165,14 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
+
+    // KVFlash: bind a resident pool pager. pool_tokens must match get_size().
+    // Empty tensor attach (map-only) is used until layer storages are ready;
+    // call again after buffers exist to enable host paging of quantized rows.
+    bool init_kvflash(uint32_t pool_tokens, int chunk_tokens = 64);
+    common_kvflash::KvFlashPager * get_kvflash() const;
+    bool has_kvflash() const;
 
     //
     // graph_build API
@@ -297,6 +307,13 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // Optional KVFlash pager (owned). When set, find_slot maps logical pos →
+    // physical pool slots and may page cold chunks to host.
+    std::unique_ptr<common_kvflash::KvFlashPager> kvflash; // complete type via kvflash_pager.h
+
+    // Clear cell metadata for physical slots of a pool block (stream 0).
+    void kvflash_clear_block(int block, int chunk_tokens);
 
     size_t total_size() const;
 

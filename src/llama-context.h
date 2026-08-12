@@ -302,6 +302,9 @@ private:
 
     llama_memory_ptr memory;
 
+    // KVFlash: tokens processed since last reselect() (FlashMemory τ loop)
+    uint32_t kvflash_tokens_since_reselect = 0;
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
