@@ -5736,6 +5736,23 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+// Tree-mode SSM conv (same op; parent_ids in src[2] switches the CUDA kernel).
+struct ggml_tensor * ggml_ssm_conv_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * parent_ids) {
+    struct ggml_tensor * result = ggml_ssm_conv(ctx, sx, c);
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(parent_ids));
+    const int64_t n_t = result->ne[1];
+    const int64_t n_s = result->ne[2];
+    GGML_ASSERT(ggml_nelements(parent_ids) == n_t * n_s);
+    result->src[2] = parent_ids;
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6462,6 +6479,70 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// Tree-mode GDN: larger output (attn + final state + per-token intermediates).
+struct ggml_tensor * ggml_gated_delta_net_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * parent_ids) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(parent_ids));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+    GGML_ASSERT(state->ne[0] == S_v);
+    GGML_ASSERT(state->ne[1] == S_v);
+    GGML_ASSERT(state->ne[2] == H);
+    GGML_ASSERT(state->ne[3] == n_seqs);
+    GGML_ASSERT(ggml_nelements(parent_ids) == n_tokens * n_seqs);
+
+    // attn scores (n_tokens * n_seqs rows of S_v*H)
+    // + final state (1 * S_v*S_v*H*n_seqs as S_v*H rows? hybrid packs as:
+    //   ne[0]=S_v*H, ne[1]=n_tokens*n_seqs + state_rows
+    // For tree: state_rows = 1 (final) + n_tokens (intermediates), each as S_v*S_v*H*n_seqs / (S_v*H) = S_v * n_seqs rows
+    const int64_t state_block_rows = S_v * n_seqs; // one full state as rows of S_v*H
+    const int64_t state_rows = state_block_rows * (1 + n_tokens); // final + per-token inter
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    // K=1: tree path does not use hybrid keep_rs slot mapping
+    ggml_set_op_params_i32(result, 0, 1);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = parent_ids;
 
     return result;
 }

@@ -2448,11 +2448,13 @@ bool llama_model::build_dflash_injection(
         llm_graph_context              & graph,
         ggml_tensor                    * features,
         const llama_cparams            & cparams_draft,
-        const llama_memory_context_i * mctx_draft) const {
+        const llama_memory_context_i * mctx_draft,
+        bool                             features_projected) const {
     GGML_UNUSED(graph);
     GGML_UNUSED(features);
     GGML_UNUSED(cparams_draft);
     GGML_UNUSED(mctx_draft);
+    GGML_UNUSED(features_projected);
     return false;
 }
 

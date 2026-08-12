@@ -261,6 +261,28 @@ json result_timings::to_json() const {
         base["draft_n_accepted"] = draft_n_accepted;
     }
 
+    if (n_draft_calls > 0 || n_verify_calls > 0 || n_inject_calls > 0) {
+        base["draft_ms"]  = draft_ms;
+        base["inject_ms"] = inject_ms;
+        base["verify_ms"] = verify_ms;
+        base["draft_decode_ms"] = draft_decode_ms;
+        base["draft_sample_ms"] = draft_sample_ms;
+        base["n_draft_calls"]  = n_draft_calls;
+        base["n_inject_calls"] = n_inject_calls;
+        base["n_verify_calls"] = n_verify_calls;
+        base["n_process_combined"]   = n_process_combined;
+        base["n_process_standalone"] = n_process_standalone;
+        if (n_draft_calls > 0) {
+            base["draft_ms_per_call"]  = draft_ms  / n_draft_calls;
+        }
+        if (n_inject_calls > 0) {
+            base["inject_ms_per_call"] = inject_ms / n_inject_calls;
+        }
+        if (n_verify_calls > 0) {
+            base["verify_ms_per_call"] = verify_ms / n_verify_calls;
+        }
+    }
+
     return base;
 }
 

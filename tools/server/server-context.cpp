@@ -50,6 +50,16 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Lucebox-style single-batch tree-attention verify (env LLAMA_DFLASH_TREE_VERIFY=1).
+// Requires DDTree draft (LLAMA_DFLASH_DDTREE=1) and hybrid tree GDN/SSM + KQ mask.
+static bool llama_dflash_tree_verify_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_DFLASH_TREE_VERIFY");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 static bool server_nsys_trace_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_NSYS_TRACE");
@@ -87,8 +97,24 @@ static common_speculative_output_limits server_output_limits(const common_params
         return { params.n_batch, 1 };
     }
 
+    int32_t n_draft = common_speculative_n_max(&params.speculative);
+
+    // Tree-attention verify packs root + up to BUDGET DFS nodes, all with logits.
+    // Size backend-sampling / output buffers for the full tree batch.
+    if (llama_dflash_tree_verify_enabled()) {
+        int32_t budget = 22;
+        if (const char * v = std::getenv("LLAMA_DFLASH_DDTREE_BUDGET")) {
+            budget = std::max(1, std::atoi(v));
+        }
+        // root + budget nodes
+        n_draft = std::max(n_draft, budget);
+    }
+
     auto result = common_speculative_get_output_limits(
-            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+            params.n_batch, params.n_parallel, n_draft);
+
+    // Sequential tree-path fallback re-decodes one path at a time on the main
+    // sequence; tree-verify expands per_seq above via n_draft=budget.
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -215,6 +241,15 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    // DDTree multi-path tree verify (path 0 on slot.id; aux paths on free seqs).
+    std::vector<llama_tokens>         spec_paths;
+    std::vector<std::vector<int32_t>> spec_path_i_batch;
+    std::vector<llama_seq_id>         spec_path_seqs;
+    // True tree-attention verify (single batch, ancestor mask + GDN parent_ids).
+    bool                  spec_tree_verify = false;
+    common_ddtree         spec_tree;
+    std::vector<int32_t>  spec_tree_parent_ids; // size 1+n_nodes, [0]=-1
+    llama_pos             spec_tree_n_past = 0; // pos of root (= sampled) in batch
     common_prompt_checkpoint spec_ckpt;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -333,6 +368,11 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // Generation-phase target verify wall time (us). Accumulated around llama_decode
+    // when this slot is generating. Does not include process()/inject by itself.
+    int64_t t_verify_us = 0;
+    int32_t n_verify_calls = 0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -349,6 +389,13 @@ struct server_slot {
         if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
+            spec_paths.clear();
+            spec_path_i_batch.clear();
+            spec_path_seqs.clear();
+            spec_tree_verify = false;
+            spec_tree = {};
+            spec_tree_parent_ids.clear();
+            spec_tree_n_past = 0;
             spec_ckpt.clear();
         }
         generated_tokens.clear();
@@ -360,6 +407,8 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+        t_verify_us = 0;
+        n_verify_calls = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -484,7 +533,38 @@ struct server_slot {
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
-        if (spec_draft.empty()) {
+        if (spec_tree_verify && spec_tree.n_nodes > 0) {
+            // Lucebox-style tree batch: flat DFS [root=sampled, node1..nodeN]
+            // at unique positions n_past + dfs_index. Parent_ids + visibility
+            // are applied on the context before llama_decode.
+            SLT_DBG(*this, "generate_tree: id=%d, n_nodes=%d, pos_next=%d\n",
+                    sampled, spec_tree.n_nodes, prompt.tokens.pos_next());
+
+            GGML_ASSERT(spec_i_batch.empty());
+            GGML_ASSERT((int) spec_tree_parent_ids.size() == 1 + spec_tree.n_nodes);
+            GGML_ASSERT((int) spec_tree.token_ids.size() == spec_tree.n_nodes);
+
+            const llama_pos pos0 = prompt.tokens.pos_next();
+            spec_tree_n_past = pos0;
+
+            // Root (sampled)
+            spec_i_batch.push_back(batch.size());
+            add_ok &= batch.add(id, sampled, pos0, true);
+
+            // Tree nodes (DFS order = insertion order)
+            for (int i = 0; i < spec_tree.n_nodes; i++) {
+                spec_i_batch.push_back(batch.size());
+                add_ok &= batch.add(this->id, spec_tree.token_ids[i], pos0 + 1 + i, true);
+            }
+
+            // Optimistic prompt insert for size bookkeeping (rolled back after follow).
+            prompt.tokens.push_back(sampled);
+            for (int i = 0; i < spec_tree.n_nodes; i++) {
+                prompt.tokens.push_back(spec_tree.token_ids[i]);
+            }
+            // Keep spec_draft = all tree node tokens for n_draft accounting.
+            spec_draft.assign(spec_tree.token_ids.begin(), spec_tree.token_ids.end());
+        } else if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
 
@@ -492,7 +572,14 @@ struct server_slot {
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
+
+            prompt.tokens.push_back(sampled);
         } else {
+            // Chain / sequential tree-path verify (single sequence).
+            // Multi-seq simultaneous path verify is disabled for hybrid GDN:
+            // seq_cp + partial RS rollback left residual state that crashed on
+            // the next step. Alternate paths are tried sequentially on zero
+            // accept (see accept loop).
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
@@ -509,12 +596,12 @@ struct server_slot {
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true);
             }
+
+            prompt.tokens.push_back(sampled);
+            prompt.tokens.insert(spec_draft);
         }
 
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
-
-        prompt.tokens.push_back(sampled);
-        prompt.tokens.insert(spec_draft);
     }
 
     void release() {
@@ -558,6 +645,28 @@ struct server_slot {
         if (n_draft_total > 0) {
             timings.draft_n          = n_draft_total;
             timings.draft_n_accepted = n_draft_accepted;
+        }
+
+        if (n_verify_calls > 0) {
+            timings.verify_ms      = t_verify_us / 1000.0;
+            timings.n_verify_calls = n_verify_calls;
+        }
+
+        if (spec) {
+            common_speculative_perf perf;
+            const bool have_perf =
+                common_speculative_get_perf(spec, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, perf) ||
+                common_speculative_get_perf(spec, COMMON_SPECULATIVE_TYPE_NONE, perf);
+            if (have_perf) {
+                timings.draft_ms             = perf.t_draft_us / 1000.0;
+                timings.inject_ms            = perf.t_process_us / 1000.0;
+                timings.draft_decode_ms      = perf.t_draft_decode_us / 1000.0;
+                timings.draft_sample_ms      = perf.t_draft_sample_us / 1000.0;
+                timings.n_draft_calls        = (int32_t) perf.n_call_draft;
+                timings.n_inject_calls       = (int32_t) perf.n_call_process;
+                timings.n_process_combined   = (int32_t) perf.n_process_combined;
+                timings.n_process_standalone = (int32_t) perf.n_process_standalone;
+            }
         }
 
         return timings;
@@ -668,6 +777,41 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+        }
+
+        if (n_verify_calls > 0 || n_draft_total > 0) {
+            const double verify_ms = t_verify_us / 1000.0;
+            const double n_ver     = (double) std::max(n_verify_calls, 1);
+            SLT_INF(*this,
+                    "spec verify time = %10.2f ms / %5d calls (%8.2f ms per verify step)\n",
+                    verify_ms, n_verify_calls, verify_ms / n_ver);
+
+            common_speculative_perf perf;
+            if (spec && common_speculative_get_perf(spec, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, perf)) {
+                const double draft_ms  = perf.t_draft_us / 1000.0;
+                const double inject_ms = perf.t_process_us / 1000.0;
+                const double n_d       = (double) std::max<size_t>(perf.n_call_draft, 1);
+                const double n_i       = (double) std::max<size_t>(perf.n_call_process, 1);
+                const double step_ms   = (draft_ms / n_d) + (verify_ms / n_ver) + (inject_ms / n_i);
+                SLT_INF(*this,
+                        "spec phase ms/step ≈ draft %5.2f + verify %5.2f + inject %5.2f = %5.2f  "
+                        "(combined_inject=%zu standalone_inject=%zu)\n",
+                        draft_ms / n_d, verify_ms / n_ver, inject_ms / n_i, step_ms,
+                        perf.n_process_combined, perf.n_process_standalone);
+            }
+
+            llama_dflash_verify_timers vt {};
+            if (llama_dflash_get_verify_timers(ctx_tgt, &vt) && vt.n_process_ubatch > 0) {
+                const double n_pu = (double) std::max(vt.n_process_ubatch, 1);
+                const double n_rb = (double) std::max(vt.n_graph_rebuild, 1);
+                SLT_INF(*this,
+                        "spec verify host = begin_batch %5.2f ms/call  process_ubatch %5.2f ms/call  "
+                        "rebuild %5.2f ms/rebuild  reuse/rebuild = %d/%d\n",
+                        vt.begin_batch_ms / std::max(vt.n_begin_batch, 1),
+                        vt.process_ubatch_ms / n_pu,
+                        vt.graph_rebuild_ms / n_rb,
+                        vt.n_graph_reuse, vt.n_graph_rebuild);
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -3177,12 +3321,62 @@ private:
             common_speculative_draft(spec.get());
         }
 
+        // Pull multi-path tree drafts (if DDTree PATHS>1 produced them)
+        // and/or full tree for single-batch tree-attention verify.
+        iterate(drafting, [&](server_slot & slot) {
+            slot.spec_paths.clear();
+            slot.spec_path_i_batch.clear();
+            slot.spec_path_seqs.clear();
+            slot.spec_tree_verify = false;
+            slot.spec_tree = {};
+            slot.spec_tree_parent_ids.clear();
+            slot.spec_tree_n_past = 0;
+            if (slot.spec_draft.empty() || !spec) {
+                return;
+            }
+
+            // Prefer true tree-attention verify when enabled and a tree exists.
+            if (llama_dflash_tree_verify_enabled()) {
+                const common_ddtree * tree = nullptr;
+                if (common_speculative_get_tree(spec.get(), slot.id, &tree) &&
+                        tree != nullptr && tree->n_nodes > 0) {
+                    slot.spec_tree = *tree; // copy: draft storage is reused next round
+                    const int N = 1 + slot.spec_tree.n_nodes;
+                    slot.spec_tree_parent_ids.resize((size_t) N);
+                    slot.spec_tree_parent_ids[0] = -1;
+                    for (int i = 1; i < N; i++) {
+                        slot.spec_tree_parent_ids[i] = (int32_t) slot.spec_tree.parents[(size_t) i];
+                    }
+                    // visibility must be N×N
+                    GGML_ASSERT((int) slot.spec_tree.visibility.size() == N * N);
+                    slot.spec_tree_verify = true;
+                    SLT_INF(slot, "ddtree tree-verify: n_nodes=%d budget_parent=%d\n",
+                            slot.spec_tree.n_nodes, N);
+                    return;
+                }
+            }
+
+            std::vector<llama_tokens> paths;
+            if (common_speculative_get_tree_paths(spec.get(), slot.id, paths) && paths.size() > 1) {
+                slot.spec_paths = std::move(paths);
+                // Keep primary chain consistent with path 0.
+                if (!slot.spec_paths.empty()) {
+                    slot.spec_draft = slot.spec_paths[0];
+                }
+                SLT_INF(slot, "ddtree multi-path: %zu paths (primary len=%zu)\n",
+                        slot.spec_paths.size(), slot.spec_draft.size());
+            }
+        });
+
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
-            slot.n_draft_total += draft.size();
+            // Tree verify drafts all non-root nodes; chain drafts the linear sequence.
+            slot.n_draft_total += slot.spec_tree_verify
+                ? (int32_t) slot.spec_tree.n_nodes
+                : (int32_t) draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3195,12 +3389,19 @@ private:
                 common_context_seq_rm(ctx_dft, slot.id, ckpt.pos_max + 1, -1);
             }
 
-            if (!draft.empty()) {
+            if (!draft.empty() || slot.spec_tree_verify) {
+                // Tree-attention verify always needs a full target checkpoint:
+                // GDN TREE_MODE writes the last-DFS state, so after follow we
+                // restore and re-decode the accepted path as a chain.
+                // Sequential tree-path fallback also needs a full checkpoint.
+                const bool need_tree_path_ckpt = slot.spec_paths.size() > 1 || slot.spec_tree_verify;
                 const bool use_ckpt_tgt =
+                    need_tree_path_ckpt ||
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
 
                 const bool use_ckpt_dft =
+                   need_tree_path_ckpt ||
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
@@ -3783,7 +3984,49 @@ private:
             n_empty_consecutive = 0;
         }
 
+        // Attribute generation-phase target decode wall time to active generating slots.
+        // With combined DFlash the fused inject runs in this graph; process() may only sync later.
+        const bool any_generating = std::any_of(slots.begin(), slots.end(), [](const server_slot & s) {
+            return s.state == SLOT_STATE_GENERATING;
+        });
+        const int64_t t_dec0 = any_generating ? ggml_time_us() : 0;
+
+        // Apply tree-attention parent_ids + visibility for the (at most one)
+        // slot that packed a DFS tree batch. Cleared immediately after decode.
+        server_slot * tree_slot = nullptr;
+        for (auto & slot : slots) {
+            if (slot.spec_tree_verify && !slot.spec_i_batch.empty() &&
+                    !slot.spec_tree_parent_ids.empty()) {
+                tree_slot = &slot;
+                break;
+            }
+        }
+        if (tree_slot) {
+            const int32_t n_tree = (int32_t) tree_slot->spec_tree_parent_ids.size();
+            llama_set_tree_parent_ids(ctx_tgt, tree_slot->spec_tree_parent_ids.data(), n_tree);
+            llama_set_tree_visibility(
+                    ctx_tgt,
+                    tree_slot->spec_tree.visibility.data(),
+                    n_tree,
+                    tree_slot->spec_tree_n_past);
+        }
+
         const int ret = llama_decode(ctx_tgt, batch_view);
+
+        if (tree_slot) {
+            llama_set_tree_parent_ids(ctx_tgt, nullptr, 0);
+            llama_set_tree_visibility(ctx_tgt, nullptr, 0, 0);
+        }
+
+        if (any_generating && ret == 0) {
+            const int64_t dt = ggml_time_us() - t_dec0;
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    slot.t_verify_us += dt;
+                    slot.n_verify_calls++;
+                }
+            }
+        }
 
         metrics.on_decoded(slots);
 
@@ -3885,6 +4128,15 @@ private:
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
+                }
+            }
+            for (const auto & path_idxs : slot.spec_path_i_batch) {
+                for (auto i : path_idxs) {
+                    if (!is_inside_view(i)) {
+                        throw std::runtime_error(string_format(
+                            "tree-verify batch index %d is not inside the current sub-batch [%d, %d)",
+                            i, off, off + n_batch_tokens));
+                    }
                 }
             }
         });
@@ -3996,7 +4248,138 @@ private:
                 return;
             }
 
-            // save the original draft size
+            // ── Tree-attention verify: walk DFS logits, commit accepted path ──
+            if (slot.spec_tree_verify && slot.spec_tree.n_nodes > 0) {
+                const int N = 1 + slot.spec_tree.n_nodes;
+                GGML_ASSERT((int) slot.spec_i_batch.size() == N);
+                GGML_ASSERT(!slot.spec_ckpt.empty());
+
+                // Live walk from root following target samples (matches greedy
+                // follow_verified_tree when temp=0; sampler-correct otherwise).
+                llama_tokens accepted;
+                accepted.reserve((size_t) N);
+                int current = 0;
+                while (true) {
+                    GGML_ASSERT(current >= 0 && current < N);
+                    const llama_token id = common_sampler_sample(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch[(size_t) current]);
+                    common_sampler_accept(slot.smpl.get(), id, true);
+                    accepted.push_back(id);
+                    const auto & children = slot.spec_tree.child_maps[(size_t) current];
+                    auto it = children.find(id);
+                    if (it == children.end()) {
+                        break; // first unmatched = bonus / reject
+                    }
+                    current = it->second;
+                }
+                GGML_ASSERT(!accepted.empty());
+
+                const size_t n_acc_draft = accepted.size() - 1; // excludes bonus
+                const llama_token root_tok = slot.sampled;
+
+                if (trace > 0) {
+                    SLT_INF(slot, "tree-verify: accepted %zu/%d draft tokens (N=%d)\n",
+                            n_acc_draft, slot.spec_tree.n_nodes, N);
+                }
+
+                // Tree GDN final state is the last DFS node — always restore
+                // pre-verify checkpoint and re-decode the accepted chain.
+                {
+                    const auto & ckpt = slot.spec_ckpt;
+                    ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
+                    if (slot.ctx_dft) {
+                        ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+                    }
+                    slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                }
+
+                // Commit: decode [root + accepted draft tokens] as a chain so
+                // hybrid GDN/SSM + KV match the accepted path. Bonus is not
+                // decoded here — it becomes slot.sampled for the next step.
+                {
+                    const int32_t n_commit = 1 + (int32_t) n_acc_draft;
+                    llama_batch commit = llama_batch_init(n_commit, 0, 1);
+                    common_batch_clear(commit);
+                    llama_pos pos = slot.prompt.tokens.pos_next();
+                    // Root always committed; logits only needed on last token if
+                    // we wanted a fresh sample (bonus already drawn from tree).
+                    common_batch_add(commit, root_tok, pos++, { slot.id }, n_acc_draft == 0);
+                    slot.prompt.tokens.push_back(root_tok);
+                    for (size_t i = 0; i < n_acc_draft; i++) {
+                        const bool last = (i + 1 == n_acc_draft);
+                        common_batch_add(commit, accepted[i], pos++, { slot.id }, last);
+                        slot.prompt.tokens.push_back(accepted[i]);
+                    }
+                    // Ensure tree mode is off for the commit decode.
+                    llama_set_tree_parent_ids(slot.ctx_tgt, nullptr, 0);
+                    llama_set_tree_visibility(slot.ctx_tgt, nullptr, 0, 0);
+                    const int rc = llama_decode(slot.ctx_tgt, commit);
+                    llama_batch_free(commit);
+                    if (rc != 0) {
+                        SLT_ERR(slot, "tree-verify commit decode failed rc=%d\n", rc);
+                        slot.spec_tree_verify = false;
+                        slot.spec_tree = {};
+                        slot.spec_tree_parent_ids.clear();
+                        slot.spec_i_batch.clear();
+                        slot.spec_draft.clear();
+                        return;
+                    }
+                }
+
+                common_speculative_accept(spec.get(), slot.id, (uint16_t) n_acc_draft);
+
+                // Trim draft-model memory past committed end.
+                common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+                if (slot.ctx_dft) {
+                    common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
+
+                const int64_t t_now = ggml_time_us();
+                slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
+                slot.n_draft_accepted += (int32_t) n_acc_draft;
+                slot.n_draft_verif_steps += 1;
+                if (slot.n_accepted_per_pos.empty()) {
+                    slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
+                }
+                for (size_t i = 0; i < n_acc_draft && i < slot.n_accepted_per_pos.size(); ++i) {
+                    slot.n_accepted_per_pos[i]++;
+                }
+
+                slot.sampled = accepted.back();
+
+                for (size_t i = 0; i < accepted.size(); ++i) {
+                    completion_token_output result;
+                    result.tok          = accepted[i];
+                    result.text_to_send = common_token_to_piece(
+                            slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                    result.prob         = 1.0f;
+                    slot.n_decoded += 1;
+                    if (!process_token(result, slot)) {
+                        slot.print_timings();
+                        send_final_response(slot);
+                        metrics.on_prediction(slot);
+                        slot.release();
+                        return;
+                    }
+                }
+
+                slot.print_timings_tg();
+                SLT_DBG(slot, "tree-verify done: accepted %zu/%d, new n_tokens=%d\n",
+                        n_acc_draft, slot.spec_tree.n_nodes, slot.prompt.n_tokens());
+
+                slot.spec_tree_verify = false;
+                slot.spec_tree = {};
+                slot.spec_tree_parent_ids.clear();
+                slot.spec_tree_n_past = 0;
+                slot.spec_i_batch.clear();
+                slot.spec_draft.clear();
+                slot.spec_paths.clear();
+                return;
+            }
+
+            // save the original draft size (optimistically inserted into prompt)
             const size_t n_draft = slot.spec_draft.size();
 
             GGML_ASSERT(n_draft > 0);
@@ -4006,12 +4389,85 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                auto accepted = common_sampler_sample_and_accept_n(
+                        slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 
-                const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+                // Sequential tree-path fallback (opt-in): if primary path accepted
+                // zero draft tokens and alternate DDTree paths remain, restore
+                // checkpoint and retry the next path on the same sequence.
+                // Off by default: full hybrid checkpoint restore per retry is too
+                // expensive / fragile on GDN. Enable with LLAMA_DFLASH_DDTREE_SEQ_RETRY=1.
+                static const bool kSeqRetry = []() {
+                    const char * v = std::getenv("LLAMA_DFLASH_DDTREE_SEQ_RETRY");
+                    return v && v[0] != '\0' && v[0] != '0';
+                }();
+                size_t path_try = 0;
+                while (kSeqRetry && accepted.size() <= 1 &&
+                       path_try + 1 < slot.spec_paths.size() &&
+                       !slot.spec_ckpt.empty()) {
+                    path_try++;
+                    const auto & alt = slot.spec_paths[path_try];
+                    if (alt.empty() || alt == slot.spec_draft) {
+                        continue;
+                    }
+                    SLT_INF(slot, "tree-verify: primary rejected; trying path %zu/%zu (len=%zu)\n",
+                            path_try, slot.spec_paths.size(), alt.size());
+
+                    // Restore pre-verify state.
+                    const auto & ckpt = slot.spec_ckpt;
+                    ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
+                    if (slot.ctx_dft) {
+                        ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+                    }
+                    // Host-only clone for alt-path scoring. Do not re-attach the
+                    // saved backend sampler chain (is_init assert on second set).
+                    slot.smpl = common_sampler_ptr(common_sampler_clone(smpl_save.get()));
+
+                    // Rebuild prompt optimistic insert for the alt path length.
+                    slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                    slot.prompt.tokens.push_back(slot.sampled);
+                    slot.prompt.tokens.insert(alt);
+
+                    // Decode [sampled + alt] on the main sequence.
+                    llama_batch replay = llama_batch_init((int32_t) alt.size() + 1, 0, 1);
+                    common_batch_clear(replay);
+                    llama_pos pos = slot.prompt.tokens.pos_next() - (llama_pos) (alt.size() + 1);
+                    std::vector<int32_t> idxs;
+                    idxs.reserve(alt.size() + 1);
+                    common_batch_add(replay, slot.sampled, pos++, { slot.id }, true);
+                    idxs.push_back(0);
+                    for (size_t i = 0; i < alt.size(); ++i) {
+                        common_batch_add(replay, alt[i], pos++, { slot.id }, true);
+                        idxs.push_back((int32_t) (i + 1));
+                    }
+                    const int rc = llama_decode(slot.ctx_tgt, replay);
+                    llama_batch_free(replay);
+                    if (rc != 0) {
+                        SLT_ERR(slot, "tree-verify alt path decode failed rc=%d\n", rc);
+                        break;
+                    }
+                    accepted = common_sampler_sample_and_accept_n(
+                            slot.smpl.get(), slot.ctx_tgt, idxs, alt);
+                    // Update n_draft-equivalent for keep_first: prompt currently has
+                    // sampled+alt, so rollback count uses alt.size().
+                    // We store alt as the active draft so keep_first uses correct size.
+                    slot.spec_draft = alt;
+                    SLT_INF(slot, "tree-verify: path %zu accepted %zu/%zu draft tokens\n",
+                            path_try, accepted.size() - 1, alt.size());
+                }
+                slot.spec_paths.clear();
+                slot.spec_path_i_batch.clear();
+                slot.spec_path_seqs.clear();
+
+                // Effective draft size currently inserted in the prompt.
+                const size_t n_draft_eff = slot.spec_draft.size();
+
+                const uint32_t n_rollback = (uint32_t) (n_draft_eff + 1 - accepted.size());
 
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
@@ -4021,7 +4477,8 @@ private:
                 if (n_rollback > 0) {
                     if (use_ckpt_tgt) {
                         if (trace > 0) {
-                            SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
+                            SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n",
+                                    accepted.size() - 1, n_draft_eff);
                         }
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
@@ -4056,12 +4513,26 @@ private:
                 }
 
                 if (trace > 0) {
-                    SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                    SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft_eff);
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+
+                // Stash for keep_first below (may differ from original n_draft if alt path used).
+                slot.n_draft_total += 0; // no-op; keep n_draft_eff via local
+                // Rebind for outer scope: use n_draft_eff for prompt rollback.
+                // (n_draft is const; overwrite by adjusting prompt with n_draft_eff.)
+                // Store in a slot-local? Use a captured variable via mutation of a ref —
+                // simplest: put n_draft_eff into a new local and use it after the block.
+                (void) n_draft;
+                // We need n_draft_eff outside — hoist via accepted size + bookkeeping:
+                // After this block, slot.spec_draft is `accepted`. The optimistic
+                // insert length is still in the prompt as n_draft_eff tokens of draft.
+                // Save it on the path vector size field we just cleared: reuse spec_path_seqs
+                // as a one-element length marker is ugly. Instead compute below from
+                // prompt size vs ckpt.
             }
 
             const int64_t t_now = ggml_time_us();
@@ -4081,12 +4552,22 @@ private:
                 slot.n_accepted_per_pos[i]++;
             }
 
+            // Optimistic draft length currently in the prompt: original n_draft,
+            // unless sequential alt-path rewrote the prompt to a different alt size.
+            // prompt currently = ... + sampled + draft(n_draft or alt).
+            // keep_first(n_tokens - draft_len) must remove exactly that draft.
+            // We track it as: prompt.n_tokens() - ckpt.n_tokens - 1 (the sampled).
+            size_t n_draft_in_prompt = n_draft;
+            if (!slot.spec_ckpt.empty() && slot.prompt.n_tokens() > slot.spec_ckpt.n_tokens + 1) {
+                n_draft_in_prompt = (size_t) (slot.prompt.n_tokens() - slot.spec_ckpt.n_tokens - 1);
+            }
+
             // add accepted tokens to the prompt
-            slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+            slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - (int32_t) n_draft_in_prompt);
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
             slot.sampled = ids.back(); // last accepted token
-            SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
+            SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft_in_prompt);
 
             common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
             if (slot.ctx_dft) {
@@ -4116,7 +4597,7 @@ private:
 
             slot.print_timings_tg();
 
-            SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+            SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft_in_prompt, slot.prompt.n_tokens());
         });
     }
 

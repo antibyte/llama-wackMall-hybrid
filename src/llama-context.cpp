@@ -53,8 +53,44 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
     bool any_injected = false;
     bool applied = false;
     bool last_injected = false;
+    // Set when draft may still have outstanding GPU work (draft noise decode).
+    // Cleared by draft_sync(). Avoids a full draft.synchronize() on every verify.
+    bool draft_gpu_pending = false;
+
+    // Micro-timers for verify host path (us), reset via clear_verify_timers().
+    int64_t t_begin_batch_us = 0;
+    int64_t t_process_ubatch_us = 0;
+    int64_t t_graph_reuse_us = 0;
+    int64_t t_graph_rebuild_us = 0;
+    int64_t n_begin_batch = 0;
+    int64_t n_process_ubatch = 0;
+    int64_t n_graph_reuse = 0;
+    int64_t n_graph_rebuild = 0;
 
     dflash_bridge(llama_context & target, llama_context & draft) : target(target), draft(draft) {
+    }
+
+    void clear_verify_timers() {
+        t_begin_batch_us = 0;
+        t_process_ubatch_us = 0;
+        t_graph_reuse_us = 0;
+        t_graph_rebuild_us = 0;
+        n_begin_batch = 0;
+        n_process_ubatch = 0;
+        n_graph_reuse = 0;
+        n_graph_rebuild = 0;
+    }
+
+    void mark_draft_pending() {
+        draft_gpu_pending = true;
+    }
+
+    void draft_sync() {
+        if (!draft_gpu_pending) {
+            return;
+        }
+        draft.synchronize();
+        draft_gpu_pending = false;
     }
 
     uint32_t max_combined_tokens() const {
@@ -104,6 +140,7 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
     }
 
     bool begin_batch(const llama_batch & batch) {
+        const int64_t t0 = ggml_time_us();
         last_injected = false;
         batch_active = false;
         current_injected = false;
@@ -119,7 +156,9 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
             return false;
         }
 
-        draft.synchronize();
+        // Only wait for draft if a noise-block decode may still be in flight.
+        // After sampling, draft_gpu_pending is usually false (sample already synced).
+        draft_sync();
         draft.memory_update(false);
 
         dummy_tokens.assign(batch.n_tokens, 0);
@@ -157,6 +196,8 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
         }
 
         batch_active = true;
+        t_begin_batch_us += ggml_time_us() - t0;
+        n_begin_batch++;
         return true;
     }
 
@@ -257,6 +298,10 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
                 (int32_t) il) != draft.model.target_layer_ids.end();
     }
 
+    bool last_inject_built() const override {
+        return graph_supported;
+    }
+
     bool build(llm_graph_context & graph) override {
         graph_supported = false;
         const auto * mctx = current_mctx();
@@ -266,22 +311,73 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
             return false;
         }
 
-        ggml_tensor * features = nullptr;
-        for (int32_t il : draft.model.target_layer_ids) {
+        // Prefer blocked FC (Σ W_k x_k) for dense weights; quantized GGUF weights
+        // cannot be safely sliced by view_2d, so keep the concat path there.
+        const auto & ids = draft.model.target_layer_ids;
+        const int64_t n_tokens = graph.ubatch.n_tokens;
+        ggml_tensor * first = nullptr;
+        for (int32_t il : ids) {
             if (il < 0 || (size_t) il >= graph.res->t_layer_inp.size()) {
                 return false;
             }
-            ggml_tensor * layer = graph.res->get_layer_inp(il);
-            if (layer == nullptr || layer->type != GGML_TYPE_F32 ||
-                    layer->ne[1] != (int64_t) graph.ubatch.n_tokens) {
-                return false;
+            first = graph.res->get_layer_inp(il);
+            if (first) {
+                break;
             }
-            features = features == nullptr ? layer : ggml_concat(graph.ctx0, features, layer, 0);
+        }
+        ggml_tensor * fc_w = draft.model.fc;
+        const bool use_blocked =
+            first != nullptr && fc_w != nullptr &&
+            (fc_w->type == GGML_TYPE_F32 || fc_w->type == GGML_TYPE_F16 || fc_w->type == GGML_TYPE_BF16) &&
+            first->ne[0] > 0 &&
+            fc_w->ne[0] == first->ne[0] * (int64_t) ids.size() &&
+            fc_w->ne[1] == draft.model.hparams.n_embd;
+
+        if (!use_blocked) {
+            ggml_tensor * features = nullptr;
+            for (int32_t il : ids) {
+                if (il < 0 || (size_t) il >= graph.res->t_layer_inp.size()) {
+                    return false;
+                }
+                ggml_tensor * layer = graph.res->get_layer_inp(il);
+                if (layer == nullptr || layer->type != GGML_TYPE_F32 ||
+                        layer->ne[1] != n_tokens) {
+                    return false;
+                }
+                features = features == nullptr ? layer : ggml_concat(graph.ctx0, features, layer, 0);
+            }
+            graph.cb(features, "dflash_features", -1);
+            graph_supported = draft.model.build_dflash_injection(
+                    graph, features, draft.cparams, mctx);
+            return graph_supported;
         }
 
-        graph.cb(features, "dflash_features", -1);
+        const int64_t n_embd_tgt = first->ne[0];
+        const int64_t n_embd_dec = draft.model.hparams.n_embd;
+        ggml_tensor * projected = nullptr;
+        for (size_t k = 0; k < ids.size(); ++k) {
+            const int32_t il = ids[k];
+            ggml_tensor * layer = graph.res->get_layer_inp(il);
+            if (layer == nullptr || layer->type != GGML_TYPE_F32 ||
+                    layer->ne[0] != n_embd_tgt || layer->ne[1] != n_tokens) {
+                return false;
+            }
+            ggml_tensor * fc_k = ggml_view_2d(
+                    graph.ctx0, fc_w,
+                    /*ne0=*/ n_embd_tgt,
+                    /*ne1=*/ n_embd_dec,
+                    /*nb1=*/ fc_w->nb[1],
+                    /*offset=*/ (size_t) k * (size_t) n_embd_tgt * fc_w->nb[0]);
+            if (!ggml_is_contiguous(fc_k)) {
+                fc_k = ggml_cont(graph.ctx0, fc_k);
+            }
+            ggml_tensor * part = ggml_mul_mat(graph.ctx0, fc_k, layer);
+            projected = projected == nullptr ? part : ggml_add(graph.ctx0, projected, part);
+        }
+        graph.cb(projected, "dflash_fc_blocked", -1);
+
         graph_supported = draft.model.build_dflash_injection(
-                graph, features, draft.cparams, mctx);
+                graph, projected, draft.cparams, mctx, /*features_projected=*/ true);
         return graph_supported;
     }
 };
@@ -810,9 +906,49 @@ bool llama_context::take_dflash_injected() {
     const bool result = dflash->last_injected;
     dflash->last_injected = false;
     if (result) {
+        // Combined inject writes draft K/V on the target backends; wait before draft().
         synchronize();
+        // Target owned the draft-KV writes; draft stream itself is idle.
+        dflash->draft_gpu_pending = false;
     }
     return result;
+}
+
+bool llama_context::get_dflash_verify_timers(
+        double * begin_batch_ms, double * process_ubatch_ms, double * graph_rebuild_ms,
+        int32_t * n_begin_batch, int32_t * n_process_ubatch,
+        int32_t * n_graph_reuse, int32_t * n_graph_rebuild) const {
+    if (dflash == nullptr) {
+        return false;
+    }
+    if (begin_batch_ms) {
+        *begin_batch_ms = dflash->t_begin_batch_us / 1000.0;
+    }
+    if (process_ubatch_ms) {
+        *process_ubatch_ms = dflash->t_process_ubatch_us / 1000.0;
+    }
+    if (graph_rebuild_ms) {
+        *graph_rebuild_ms = dflash->t_graph_rebuild_us / 1000.0;
+    }
+    if (n_begin_batch) {
+        *n_begin_batch = (int32_t) dflash->n_begin_batch;
+    }
+    if (n_process_ubatch) {
+        *n_process_ubatch = (int32_t) dflash->n_process_ubatch;
+    }
+    if (n_graph_reuse) {
+        *n_graph_reuse = (int32_t) dflash->n_graph_reuse;
+    }
+    if (n_graph_rebuild) {
+        *n_graph_rebuild = (int32_t) dflash->n_graph_rebuild;
+    }
+    return true;
+}
+
+void llama_context::clear_dflash_verify_timers() {
+    if (dflash != nullptr) {
+        dflash->clear_verify_timers();
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -1548,6 +1684,33 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_tree_parent_ids(const int32_t * parent_ids, int32_t n_tokens) {
+    cparams.tree_parent_ids = parent_ids;
+    cparams.tree_n_tokens   = parent_ids ? n_tokens : 0;
+}
+
+void llama_set_tree_parent_ids(llama_context * ctx, const int32_t * parent_ids, int32_t n_tokens) {
+    if (ctx) {
+        ctx->set_tree_parent_ids(parent_ids, n_tokens);
+    }
+}
+
+void llama_context::set_tree_visibility(const uint8_t * visibility, int32_t n_nodes, int32_t n_past) {
+    cparams.tree_visibility = visibility;
+    cparams.tree_n_nodes    = visibility ? n_nodes : 0;
+    cparams.tree_n_past     = visibility ? n_past : 0;
+}
+
+void llama_set_tree_visibility(
+        llama_context * ctx,
+        const uint8_t * visibility,
+        int32_t n_nodes,
+        int32_t n_past) {
+    if (ctx) {
+        ctx->set_tree_visibility(visibility, n_nodes, n_past);
+    }
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1706,6 +1869,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
+    const int64_t t_pu0 = (dflash != nullptr) ? ggml_time_us() : 0;
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
@@ -1721,7 +1886,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        if (dflash != nullptr) {
+            dflash->n_graph_reuse++;
+        }
     } else {
+        const int64_t t_rb0 = (dflash != nullptr) ? ggml_time_us() : 0;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1744,6 +1913,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (dflash != nullptr) {
+            dflash->n_graph_rebuild++;
+            dflash->t_graph_rebuild_us += ggml_time_us() - t_rb0;
+        }
     }
 
     // set the input data for the input tensors
@@ -1757,6 +1930,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (dflash != nullptr) {
+        dflash->t_process_ubatch_us += ggml_time_us() - t_pu0;
+        dflash->n_process_ubatch++;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         if (llama_expert_tier::requires_post_graph_sync()) {
             ggml_backend_sched_synchronize(sched.get());
@@ -4656,4 +4833,20 @@ void llama_detach_dflash(struct llama_context * ctx, struct llama_context * ctx_
 
 bool llama_take_dflash_injected(struct llama_context * ctx) {
     return ctx != nullptr && ctx->take_dflash_injected();
+}
+
+bool llama_dflash_get_verify_timers(struct llama_context * ctx, struct llama_dflash_verify_timers * out) {
+    if (ctx == nullptr || out == nullptr) {
+        return false;
+    }
+    return ctx->get_dflash_verify_timers(
+            &out->begin_batch_ms, &out->process_ubatch_ms, &out->graph_rebuild_ms,
+            &out->n_begin_batch, &out->n_process_ubatch,
+            &out->n_graph_reuse, &out->n_graph_rebuild);
+}
+
+void llama_dflash_clear_verify_timers(struct llama_context * ctx) {
+    if (ctx != nullptr) {
+        ctx->clear_dflash_verify_timers();
+    }
 }

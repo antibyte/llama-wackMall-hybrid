@@ -398,12 +398,21 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
-    // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
-    if (n_tokens == 1) {
-        res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
+    // Tree verify path: parent_ids switch the CUDA kernel into TREE_MODE.
+    ggml_tensor * result = nullptr;
+    if (cparams.tree_parent_ids != nullptr && cparams.tree_n_tokens == (int32_t) n_tokens) {
+        ggml_tensor * parent_ids = build_tree_parent_ids();
+        GGML_ASSERT(parent_ids);
+        result = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, parent_ids);
+        // Do not mark fused: tree intermediate layout differs from chain.
     } else {
-        res->add_fused_node({LLM_FUSED_OP_GDN_CH, result, il});
+        // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
+        result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+        if (n_tokens == 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, result, il});
+        }
     }
 
     ggml_tensor * output = ggml_view_4d(ctx0, result,
@@ -563,12 +572,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
-    if (n_seq_tokens > 1) {
-        res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+    // Tree verify forces the tree GDN path (K=1 layout + intermediates).
+    // Chain keep_rs multi-slot snapshots are not used under tree mode.
+    ggml_tensor * gdn_out = nullptr;
+    if (cparams.tree_parent_ids != nullptr && cparams.tree_n_tokens == (int32_t) n_seq_tokens) {
+        ggml_tensor * parent_ids = build_tree_parent_ids();
+        GGML_ASSERT(parent_ids);
+        gdn_out = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, parent_ids);
     } else {
-        res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+        gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
     }
 
     const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;

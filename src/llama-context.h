@@ -119,6 +119,8 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
+    void set_tree_parent_ids(const int32_t * parent_ids, int32_t n_tokens);
+    void set_tree_visibility(const uint8_t * visibility, int32_t n_nodes, int32_t n_past);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -258,6 +260,11 @@ public:
     bool attach_dflash(llama_context * ctx_draft);
     void detach_dflash(llama_context * ctx_draft);
     bool take_dflash_injected();
+    bool get_dflash_verify_timers(
+            double * begin_batch_ms, double * process_ubatch_ms, double * graph_rebuild_ms,
+            int32_t * n_begin_batch, int32_t * n_process_ubatch,
+            int32_t * n_graph_reuse, int32_t * n_graph_rebuild) const;
+    void clear_dflash_verify_timers();
 
 private:
     llm_graph_params graph_params(

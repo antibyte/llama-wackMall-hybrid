@@ -256,6 +256,21 @@ public:
     const llm_arch arch;
 };
 
+// DDTree: upload parent_ids[n_tokens*n_seqs] i32 for tree GDN/SSM kernels.
+class llm_graph_input_tree_parent : public llm_graph_input_i {
+public:
+    llm_graph_input_tree_parent(const llama_cparams & cparams) : cparams(cparams) {}
+    virtual ~llm_graph_input_tree_parent() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * parent_ids = nullptr; // I32 [n_tokens * n_seqs]
+
+    const llama_cparams cparams;
+};
+
 class llm_graph_input_rs : public llm_graph_input_i {
 public:
     llm_graph_input_rs(const llama_memory_recurrent_context * mctx) : mctx(mctx) {}
@@ -681,6 +696,10 @@ struct llm_graph_dflash_i {
     virtual ~llm_graph_dflash_i() = default;
 
     virtual bool build(llm_graph_context & graph) = 0;
+
+    // True when the last build() fused injection into the target graph.
+    // Used to skip host materialization of extract-layer tensors (they stay intermediate).
+    virtual bool last_inject_built() const { return false; }
 };
 
 struct llm_graph_params {
@@ -1237,6 +1256,9 @@ struct llm_graph_context {
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
     llm_graph_input_rs * build_rs_inp() const;
+
+    // Shared parent_ids input for DDTree (nullptr if tree mode off).
+    ggml_tensor * build_tree_parent_ids() const;
 
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,
