@@ -14,6 +14,9 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#include "kvflash_pager.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -666,6 +669,26 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_outputs_max = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_sampling_outputs_per_seq_max = %u\n", __func__, cparams.n_sampling_outputs_per_seq_max);
+
+    // KVFlash: LLAMA_KVFLASH=N|auto|0 — resident full-attn pool (hybrid models).
+    {
+        common_kvflash::KvFlashConfig kcfg;
+        kcfg.chunk_tokens       = 64;
+        kcfg.sink_chunks        = 1;
+        kcfg.tail_window_chunks = 4;
+        const int pool = common_kvflash::kvflash_pool_from_env(
+                (int) cparams.n_ctx_seq, kcfg, /*scorer_expected=*/false);
+        cparams.kvflash_pool = pool > 0 ? (uint32_t) pool : 0;
+        cparams.kvflash_tau  = 64;
+        if (const char * t = std::getenv("LLAMA_KVFLASH_TAU")) {
+            cparams.kvflash_tau = (uint32_t) std::max(1, std::atoi(t));
+        }
+        if (cparams.kvflash_pool > 0) {
+            LLAMA_LOG_INFO("%s: kvflash_pool  = %u (env LLAMA_KVFLASH)\n",
+                    __func__, cparams.kvflash_pool);
+            LLAMA_LOG_INFO("%s: kvflash_tau   = %u\n", __func__, cparams.kvflash_tau);
+        }
+    }
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
@@ -2417,6 +2440,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_ALLOC_FAILED: return -2;
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        // KVFlash τ-reselect: rebuild resident set by LRU (or score_hook) every
+        // tau tokens so cold chunks page out and hot host-backed chunks return.
+        if (cparams.kvflash_pool > 0 && memory) {
+            kvflash_tokens_since_reselect += ubatch.n_tokens;
+            if (kvflash_tokens_since_reselect >= cparams.kvflash_tau) {
+                if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                    if (auto * attn = hyb->get_mem_attn()) {
+                        if (auto * pager = attn->get_kvflash()) {
+                            const int ev = pager->reselect();
+                            if (ev > 0) {
+                                LLAMA_LOG_DEBUG("%s: kvflash reselect events=%d page_outs=%lld page_ins=%lld\n",
+                                        __func__, ev,
+                                        (long long) pager->stats().page_outs,
+                                        (long long) pager->stats().page_ins);
+                            }
+                        }
+                    }
+                }
+                kvflash_tokens_since_reselect = 0;
             }
         }
 

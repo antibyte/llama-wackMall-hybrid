@@ -3547,7 +3547,11 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
         const auto & cache = cache_token_to_piece;
 
         if (!cache.empty()) {
-            const auto & result = cache.at(token);
+            // Guard LLAMA_TOKEN_NULL / OOB (e.g. failed sample) — .at() would throw.
+            if (token < 0 || (size_t) token >= cache.size()) {
+                return 0;
+            }
+            const auto & result = cache[token];
             return _try_copy(result.data(), result.size());
         }
     }
@@ -3634,7 +3638,12 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
 }
 
 const std::string & llama_vocab::impl::token_to_piece(llama_token token) const {
-    return cache_token_to_piece.at(token);
+    // Never throw on NULL/OOB tokens — return empty cached string.
+    static const std::string k_empty;
+    if (token < 0 || (size_t) token >= cache_token_to_piece.size()) {
+        return k_empty;
+    }
+    return cache_token_to_piece[token];
 }
 
 int32_t llama_vocab::impl::detokenize(

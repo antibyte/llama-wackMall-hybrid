@@ -68,6 +68,15 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // KVFlash: full-attention KV resident pool size in tokens (0 = off).
+    // When > 0, hybrid models allocate attn KV at this size (not n_ctx_seq)
+    // and map logical positions via common_kvflash::KvFlashPager.
+    // Set from env LLAMA_KVFLASH (tokens|auto) at context init.
+    uint32_t kvflash_pool = 0;
+    // Reselect interval floor (tokens). Effective interval grows with history.
+    // Env: LLAMA_KVFLASH_TAU (default 64).
+    uint32_t kvflash_tau = 64;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

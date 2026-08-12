@@ -6,6 +6,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "kvflash_pager.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -435,6 +437,13 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    if (kvflash) {
+        kvflash->reset();
+        if (data) {
+            kvflash->zero_free_blocks();
+        }
+    }
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -846,6 +855,21 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
+    // KVFlash: pager state cannot be rolled back cheaply after page_out.
+    // Apply permanently here; real apply() re-sets the same slots (same-pos
+    // overwrite skips the purge path — see apply_ubatch).
+    if (kvflash) {
+        for (const auto & ubatch : ubatches) {
+            const auto sinfo_new = find_slot(ubatch, false);
+            if (sinfo_new.empty()) {
+                return {};
+            }
+            apply_ubatch(sinfo_new, ubatch);
+            res.push_back(sinfo_new);
+        }
+        return res;
+    }
+
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
 
@@ -1135,6 +1159,27 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             continue;
         }
 
+        // KVFlash: map logical positions to physical pool slots (may page-out).
+        // find_slot is const but pager mutates residency; use mutable cast.
+        if (kvflash) {
+            auto * pager = const_cast<common_kvflash::KvFlashPager *>(kvflash.get());
+            for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+                const llama_pos pos = ubatch.pos[s * n_tokens + ii];
+                if (pos < 0) {
+                    LLAMA_LOG_ERROR("%s: KVFlash: invalid pos %d\n", __func__, pos);
+                    return {};
+                }
+                const int phys = pager->slot_for(pos);
+                if (phys < 0 || (uint32_t) phys >= cells.size()) {
+                    LLAMA_LOG_ERROR("%s: KVFlash: no pool slot for pos %d (pool=%d)\n",
+                            __func__, pos, pager->pool_tokens());
+                    return {};
+                }
+                res.idxs[s].push_back((uint32_t) phys);
+            }
+            continue;
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
@@ -1264,7 +1309,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 const llama_seq_id seq_id = cells.seq_get(idx);
                 const llama_pos    pos    = cells.pos_get(idx);
 
-                seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
+                // Same-pos re-apply (prepare dry-run restore + real apply, or
+                // KVFlash permanent prepare + apply) must NOT trigger the
+                // [pos_min, overwritten] purge — that wiped the whole sequence
+                // and produced garbage logits.
+                if (pos != ubatch.pos[i]) {
+                    seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
+                }
 
                 cells.rm(idx);
             }
@@ -1376,17 +1427,113 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].v;
+}
+
+bool llama_kv_cache::init_kvflash(uint32_t pool_tokens, int chunk_tokens) {
+    if (pool_tokens == 0 || get_size() != pool_tokens) {
+        LLAMA_LOG_ERROR("%s: pool_tokens=%u must match kv size=%u\n",
+                __func__, pool_tokens, get_size());
+        return false;
+    }
+    if (n_stream != 1) {
+        LLAMA_LOG_ERROR("%s: KVFlash requires a single stream (kv_unified / n_parallel=1)\n", __func__);
+        return false;
+    }
+
+    common_kvflash::KvFlashConfig cfg;
+    cfg.chunk_tokens       = chunk_tokens;
+    cfg.pool_tokens        = (int) pool_tokens;
+    cfg.sink_chunks        = 1;
+    // ~128-token protected tail (2 chunks @ 64). Smaller tail leaves more
+    // pool for pageable history (important on 6 GiB with pool 512–1024).
+    cfg.tail_window_chunks = std::max(1, 128 / chunk_tokens);
+
+    // Collect per-layer K/V storages for bit-exact host paging.
+    std::vector<ggml_tensor *> ks;
+    std::vector<ggml_tensor *> vs;
+    for (const auto & layer : layers) {
+        if (layer.k && layer.v) {
+            ks.push_back(layer.k);
+            vs.push_back(layer.v);
+        }
+    }
+
+    auto pager = std::make_unique<common_kvflash::KvFlashPager>();
+    // Attach with tensors if buffers already have data pointers; else map-only.
+    const bool have_data = !ks.empty() && ks[0]->data != nullptr;
+    if (!pager->attach(cfg, have_data ? ks : std::vector<ggml_tensor *>{},
+                            have_data ? vs : std::vector<ggml_tensor *>{})) {
+        LLAMA_LOG_ERROR("%s: KvFlashPager::attach failed (pool=%u chunk=%d)\n",
+                __func__, pool_tokens, chunk_tokens);
+        return false;
+    }
+
+    pager->on_block_evicted = [this, chunk_tokens](int block) {
+        this->kvflash_clear_block(block, chunk_tokens);
+    };
+
+    kvflash = std::move(pager);
+
+    // Zero the whole pool so free slots contribute ~0 if ever attended.
+    clear(/*data=*/true);
+
+    LLAMA_LOG_INFO("%s: KVFlash ON pool=%u chunk=%d layers=%zu tail_chunks=%d (%s)\n",
+            __func__, pool_tokens, chunk_tokens, layers.size(),
+            cfg.tail_window_chunks,
+            have_data ? "tensor paging" : "map-only until buffers ready");
+    return true;
+}
+
+common_kvflash::KvFlashPager * llama_kv_cache::get_kvflash() const {
+    return kvflash.get();
+}
+
+bool llama_kv_cache::has_kvflash() const {
+    return kvflash != nullptr;
+}
+
+void llama_kv_cache::kvflash_clear_block(int block, int chunk_tokens) {
+    if (n_stream < 1 || block < 0) {
+        return;
+    }
+    auto & cells = v_cells[0];
+    const uint32_t i0 = (uint32_t) block * (uint32_t) chunk_tokens;
+    const uint32_t i1 = i0 + (uint32_t) chunk_tokens;
+    for (uint32_t i = i0; i < i1 && i < cells.size(); ++i) {
+        if (!cells.is_empty(i)) {
+            cells.rm(i);
+        }
+    }
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
+    //
+    // KVFlash: used_max_p1 covers every occupied physical cell (including after
+    // relocation). Empty holes below used_max are mask-dropped via is_empty.
+    // After any page_out, also ensure we never shrink below the pool when the
+    // pager reports non-identity layout (holes can sit below a high used_max).
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+    }
+
+    if (kvflash && !kvflash->is_identity() && kvflash->stats().page_outs > 0) {
+        result = std::max(result, std::max(n_pad_cur, GGML_PAD((uint32_t) kvflash->pool_tokens(), n_pad_cur)));
+        result = std::min(result, (uint32_t) kvflash->pool_tokens());
+        // pad again within pool
+        result = std::max(n_pad_cur, GGML_PAD(result, n_pad_cur));
+        result = std::min(result, (uint32_t) get_size());
     }
 
     return result;
