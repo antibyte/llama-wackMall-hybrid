@@ -965,8 +965,6 @@ struct server_slot {
     }
 };
 
-
-
 //
 // server_metrics
 //
@@ -1100,6 +1098,7 @@ private:
     int32_t cmoe_decode_ubatch  = 0;
     int32_t cmoe_active_batch   = 0;
     int32_t cmoe_active_ubatch  = 0;
+    bool    cmoe_prefill_disabled = false;
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1188,6 +1187,10 @@ private:
             return;
         }
 
+        if (prefill && cmoe_prefill_disabled) {
+            prefill = false;
+        }
+
         const int32_t batch = prefill ? cmoe_prefill_batch : cmoe_decode_batch;
         const int32_t ubatch = prefill ? cmoe_prefill_ubatch : cmoe_decode_ubatch;
         const bool spec_dflash = std::find(params_base.speculative.types.begin(),
@@ -1214,13 +1217,29 @@ private:
     }
 
     bool cmoe_request_is_prefilling() const {
+        if (cmoe_prefill_disabled) {
+            return false;
+        }
         for (const auto & slot : slots) {
             if (!slot.is_processing()) {
                 continue;
             }
-            if (slot.state == SLOT_STATE_STARTED ||
-                    slot.state == SLOT_STATE_PROCESSING_PROMPT ||
-                    slot.state == SLOT_STATE_DONE_PROMPT) {
+            if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                continue;
+            }
+            if (slot.state != SLOT_STATE_STARTED &&
+                    slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+                continue;
+            }
+            if (!slot.task) {
+                continue;
+            }
+            // A wide prefill graph on top of an already-large KV OOMs on 6 GiB.
+            if (slot.prompt.n_tokens() >= 8192) {
+                continue;
+            }
+            const int32_t n_left = slot.task->n_tokens() - slot.prompt.n_tokens();
+            if (n_left > cmoe_decode_ubatch) {
                 return true;
             }
         }
@@ -4030,6 +4049,13 @@ private:
 
         if (tree_slot && ret == 0) {
             llama_synchronize(ctx_tgt);
+        }
+
+        if (cmoe_phase_prefill && !cmoe_prefill_disabled &&
+                llama_get_runtime_ubatch(ctx_tgt) < (uint32_t) cmoe_prefill_ubatch) {
+            cmoe_prefill_disabled = true;
+            SRV_WRN("cmoe prefill disabled: runtime ubatch=%u after graph reserve fallback\n",
+                    llama_get_runtime_ubatch(ctx_tgt));
         }
 
         if (tree_slot) {

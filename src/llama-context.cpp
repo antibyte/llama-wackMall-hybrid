@@ -1501,13 +1501,31 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_ubatch_cur = runtime_n_ubatch > 0 ? runtime_n_ubatch : cparams.n_ubatch;
+        uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_cur);
+        uint32_t n_outputs_cur = std::min(n_tokens, cparams.n_outputs_max);
 
-        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
-
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_cur, mctx.get());
+        if (!gf) {
+            const uint32_t fallbacks[] = { 128u, 8u };
+            for (uint32_t fallback : fallbacks) {
+                if (fallback >= n_tokens) {
+                    continue;
+                }
+                n_tokens = fallback;
+                n_outputs_cur = std::min(n_tokens, cparams.n_outputs_max);
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_cur, mctx.get());
+                if (gf) {
+                    LLAMA_LOG_WARN("%s: reserved fallback graph ubatch=%u after OOM (runtime was %u)\n",
+                            __func__, n_tokens, n_ubatch_cur);
+                    runtime_n_ubatch = n_tokens;
+                    break;
+                }
+            }
+        }
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+            return false;
         }
     }
 
