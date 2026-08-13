@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -19,6 +20,7 @@ class llama_batch_allocr;
 
 namespace common_kvflash {
 class KvFlashPager;
+class KvFlashTargetQkScorer;
 }
 
 class llama_io_read_i;
@@ -308,6 +310,7 @@ private:
 
     // Non-owning pointer into the hybrid attention cache.
     common_kvflash::KvFlashPager * kvflash_pager = nullptr;
+    std::unique_ptr<common_kvflash::KvFlashTargetQkScorer> kvflash_qk_scorer;
     uint32_t kvflash_tokens_since_reselect = 0;
     int64_t kvflash_page_outs_reported = 0;
     bool kvflash_stats_enabled = false;

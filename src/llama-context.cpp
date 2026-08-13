@@ -15,12 +15,14 @@
 #include "llama-sampler.h"
 #include "llama.h"
 #include "kvflash_pager.h"
+#include "kvflash_qk.h"
 #include "llama-memory-hybrid.h"
 #include "llama-kv-cache.h"
 
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -672,12 +674,10 @@ llama_context::llama_context(
 
     // KVFlash: LLAMA_KVFLASH=N|auto|0 - resident full-attn pool (hybrid models).
     {
-        common_kvflash::KvFlashConfig kcfg;
-        kcfg.chunk_tokens       = 64;
-        kcfg.sink_chunks        = 1;
-        kcfg.tail_window_chunks = 4;
-        cparams.kvflash_pool = 0;
-        cparams.kvflash_tau  = 64;
+        common_kvflash::KvFlashConfig kcfg = common_kvflash::kvflash_config_from_env();
+        cparams.kvflash_pool  = 0;
+        cparams.kvflash_chunk = (uint32_t) std::max(1, kcfg.chunk_tokens);
+        cparams.kvflash_tau   = 64;
         if (const char * stats = std::getenv("LLAMA_KVFLASH_STATS")) {
             kvflash_stats_enabled = std::strcmp(stats, "0") != 0;
         }
@@ -693,9 +693,39 @@ llama_context::llama_context(
                 (hparams.n_pos_per_embd() == 1 || hparams.n_pos_per_embd() == 4) &&
                 cparams.flash_attn &&
                 cparams.causal_attn;
+        bool scorer_expected = false;
+        if (const char * policy = std::getenv("LLAMA_KVFLASH_POLICY")) {
+            if (std::strcmp(policy, "qk") == 0) {
+                scorer_expected = true;
+                cparams.kvflash_qk = true;
+            }
+        }
         if (kvflash_supported) {
+            common_kvflash::KvFlashAutoBudget budget;
+            budget.reserve_bytes = common_kvflash::kvflash_reserve_bytes_from_env();
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                if (hparams.is_recr(il)) {
+                    continue;
+                }
+                budget.bytes_per_token += (int64_t) ggml_row_size(params.type_k, hparams.n_embd_k_gqa(il));
+                budget.bytes_per_token += (int64_t) ggml_row_size(params.type_v, hparams.n_embd_v_gqa(il));
+            }
+            if (!model.devices.empty()) {
+                size_t free_bytes = 0;
+                size_t total_bytes = 0;
+                ggml_backend_dev_memory(model.devices[0].dev, &free_bytes, &total_bytes);
+                budget.free_bytes = (int64_t) free_bytes;
+            }
             const int pool = common_kvflash::kvflash_pool_from_env(
-                    (int) cparams.n_ctx_seq, kcfg, /*scorer_expected=*/false);
+                    (int) cparams.n_ctx_seq, kcfg, scorer_expected, budget);
+            if (kvflash_env && std::strcmp(kvflash_env, "auto") == 0) {
+                LLAMA_LOG("%s: KVFlash auto: free=%.2f MiB reserve=%.2f MiB bytes/tok=%lld -> pool=%d\n",
+                        __func__,
+                        budget.free_bytes / (1024.0 * 1024.0),
+                        budget.reserve_bytes / (1024.0 * 1024.0),
+                        (long long) budget.bytes_per_token,
+                        pool);
+            }
             if (pool > 0 && (uint32_t) pool < cparams.n_ctx_seq) {
                 cparams.kvflash_pool = (uint32_t) pool;
             } else if (pool > 0) {
@@ -712,16 +742,17 @@ llama_context::llama_context(
         }
         if (cparams.kvflash_pool > 0) {
             if (const char * policy = std::getenv("LLAMA_KVFLASH_POLICY")) {
-                if (policy[0] != '\0' && std::strcmp(policy, "lru") != 0) {
+                if (policy[0] != '\0' && std::strcmp(policy, "lru") != 0 &&
+                    std::strcmp(policy, "qk") != 0) {
                     LLAMA_LOG_WARN("%s: KVFlash policy '%s' is not implemented; using LRU\n",
                             __func__, policy);
                 }
             }
-            const uint32_t n_blocks = cparams.kvflash_pool / (uint32_t) kcfg.chunk_tokens;
+            const uint32_t n_blocks = cparams.kvflash_pool / cparams.kvflash_chunk;
             const uint32_t n_reserved = (uint32_t) kcfg.sink_chunks + 1u;
             const uint32_t max_ubatch =
                     (n_blocks > n_reserved ? n_blocks - n_reserved : 1u) *
-                    (uint32_t) kcfg.chunk_tokens;
+                    cparams.kvflash_chunk;
             if (cparams.n_ubatch > max_ubatch) {
                 LLAMA_LOG_WARN("%s: KVFlash limits n_ubatch from %u to %u to keep each micro-batch resident\n",
                         __func__, cparams.n_ubatch, max_ubatch);
@@ -730,6 +761,7 @@ llama_context::llama_context(
             }
             LLAMA_LOG_INFO("%s: kvflash_pool  = %u (env LLAMA_KVFLASH)\n",
                     __func__, cparams.kvflash_pool);
+            LLAMA_LOG_INFO("%s: kvflash_chunk = %u\n", __func__, cparams.kvflash_chunk);
             LLAMA_LOG_INFO("%s: kvflash_tau   = %u\n", __func__, cparams.kvflash_tau);
         }
     }
@@ -851,6 +883,48 @@ llama_context::llama_context(
                             pager->has_async_paging() ?
                             "backend-ordered asynchronous copies" :
                             "host or synchronous backend copies");
+                    if (cparams.kvflash_qk) {
+                        std::vector<common_kvflash::KvFlashQkLayer> layers;
+                        bool types_ok = true;
+                        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                            if (hparams.is_recr(il)) {
+                                continue;
+                            }
+                            common_kvflash::KvFlashQkLayer layer;
+                            layer.model_il = (int32_t) il;
+                            layer.n_head = (int32_t) hparams.n_head(il);
+                            layer.n_head_kv = (int32_t) hparams.n_head_kv(il);
+                            layer.n_embd_head = (int32_t) hparams.n_embd_head_k(il);
+                            layer.type_k = params.type_k;
+                            layer.type_v = params.type_v;
+                            if (!common_kvflash::kvflash_qk_type_supported(layer.type_k) ||
+                                layer.n_head <= 0 || layer.n_head_kv <= 0 ||
+                                layer.n_head % layer.n_head_kv != 0) {
+                                types_ok = false;
+                                break;
+                            }
+                            layers.push_back(layer);
+                        }
+                        if (!types_ok || layers.empty()) {
+                            LLAMA_LOG_WARN("%s: KVFlash policy qk needs F16/F32/Q8_0/Q4_0 K and GQA-aligned heads; using LRU\n",
+                                    __func__);
+                            cparams.kvflash_qk = false;
+                        } else {
+                            kvflash_qk_scorer = std::make_unique<common_kvflash::KvFlashTargetQkScorer>();
+                            if (!kvflash_qk_scorer->configure(layers)) {
+                                kvflash_qk_scorer.reset();
+                                cparams.kvflash_qk = false;
+                                LLAMA_LOG_WARN("%s: KVFlash QK scorer configure failed; using LRU\n", __func__);
+                            } else {
+                                pager->score_hook = [this](int chunk) {
+                                    return kvflash_qk_scorer ? kvflash_qk_scorer->score_of(chunk) :
+                                            -std::numeric_limits<float>::infinity();
+                                };
+                                LLAMA_LOG("%s: KVFlash policy qk attached (%zu full-attn layers, type_k=%s)\n",
+                                        __func__, layers.size(), ggml_type_name(params.type_k));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2506,12 +2580,113 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        if (kvflash_pager) {
+            std::vector<int> written;
+            written.reserve(ubatch.n_tokens);
+            int previous_chunk = -1;
+            const int chunk_tokens = kvflash_pager->chunk_tokens();
+            if (chunk_tokens > 0) {
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const int chunk = (int) (ubatch.pos[i] / chunk_tokens);
+                    if (chunk != previous_chunk) {
+                        written.push_back(chunk);
+                        previous_chunk = chunk;
+                    }
+                }
+            }
+            kvflash_pager->mark_written(written);
+            if (kvflash_qk_scorer) {
+                for (int chunk : written) {
+                    kvflash_qk_scorer->invalidate_k(chunk);
+                }
+            }
+            if (kvflash_pager->snapshot_sealed() < 0) {
+                LLAMA_LOG_ERROR("%s: KVFlash snapshot failed\n", __func__);
+                return -3;
+            }
+        }
+
+        if (kvflash_qk_scorer && res && res->get_gf()) {
+            ggml_cgraph * gf = res->get_gf();
+            const auto & specs = kvflash_qk_scorer->layer_specs();
+            std::vector<float> q_last;
+            for (size_t li = 0; li < specs.size(); ++li) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "kvflash_q_%d", specs[li].model_il);
+                ggml_tensor * t = ggml_graph_get_tensor(gf, name);
+                if (!t || !t->data) {
+                    continue;
+                }
+                const int n = specs[li].n_head * specs[li].n_embd_head;
+                if (ggml_nelements(t) < n) {
+                    continue;
+                }
+                q_last.resize((size_t) n);
+                ggml_backend_tensor_get(t, q_last.data(), 0, (size_t) n * sizeof(float));
+                kvflash_qk_scorer->set_q_layer(li, q_last.data());
+            }
+        }
+
         // Pure LRU evicts on demand. Tau reselection is useful only after a
         // relevance scorer has been attached.
         if (cparams.kvflash_pool > 0 && memory) {
             if (kvflash_pager && kvflash_pager->has_score_hook()) {
                 kvflash_tokens_since_reselect += ubatch.n_tokens;
                 if (kvflash_tokens_since_reselect >= cparams.kvflash_tau) {
+                    if (kvflash_qk_scorer && !kvflash_qk_scorer->has_query()) {
+                        LLAMA_LOG_WARN("%s: KVFlash QK has no captured query; reselect will treat unread chunks as cold\n",
+                                __func__);
+                    }
+                    if (kvflash_qk_scorer) {
+                        if (!kvflash_pager->synchronize_paging()) {
+                            LLAMA_LOG_ERROR("%s: KVFlash host sync before QK reselect failed\n", __func__);
+                            return -3;
+                        }
+                        const auto & specs = kvflash_qk_scorer->layer_specs();
+                        const int chunk_tokens = kvflash_pager->chunk_tokens();
+                        std::vector<common_kvflash::KvFlashStateSpan> spans;
+                        std::vector<float> packed;
+                        for (int chunk = 0; chunk < kvflash_pager->n_chunks(); ++chunk) {
+                            if (!kvflash_pager->has_host_snapshot(chunk)) {
+                                continue;
+                            }
+                            if (!kvflash_pager->state_spans(chunk, spans) || spans.empty()) {
+                                continue;
+                            }
+                            const uint8_t * host = nullptr;
+                            if (spans.size() == 1 && spans[0].host) {
+                                host = spans[0].host;
+                            }
+                            if (!host || chunk_tokens <= 0) {
+                                continue;
+                            }
+                            packed.assign((size_t) kvflash_qk_scorer->k_dim(), 0.0f);
+                            size_t host_off = 0;
+                            size_t k_off = 0;
+                            bool ok = true;
+                            for (size_t li = 0; li < specs.size(); ++li) {
+                                const auto & layer = specs[li];
+                                const int n_gqa = layer.n_head_kv * layer.n_embd_head;
+                                const size_t k_bytes = ggml_row_size(layer.type_k, n_gqa) * (size_t) chunk_tokens;
+                                const size_t v_bytes = ggml_row_size(layer.type_v, hparams.n_embd_v_gqa((uint32_t) layer.model_il)) *
+                                        (size_t) chunk_tokens;
+                                std::vector<float> heads;
+                                if (!common_kvflash::kvflash_qk_pool_k_means(
+                                        layer.type_k, host + host_off, chunk_tokens, n_gqa,
+                                        layer.n_head_kv, layer.n_embd_head, heads) ||
+                                    k_off + heads.size() > packed.size()) {
+                                    ok = false;
+                                    break;
+                                }
+                                std::memcpy(packed.data() + k_off, heads.data(), heads.size() * sizeof(float));
+                                k_off += heads.size();
+                                host_off += k_bytes + v_bytes;
+                            }
+                            if (ok) {
+                                kvflash_qk_scorer->set_k_chunk(chunk, packed);
+                            }
+                        }
+                    }
                     const int ev = kvflash_pager->reselect();
                     if (ev < 0) {
                         LLAMA_LOG_ERROR("%s: KVFlash reselect failed\n", __func__);

@@ -73,9 +73,11 @@ struct llama_cparams {
     // and map logical positions via common_kvflash::KvFlashPager.
     // Set from env LLAMA_KVFLASH (tokens|auto) at context init.
     uint32_t kvflash_pool = 0;
+    uint32_t kvflash_chunk = 64;
     // Reselect interval floor (tokens). Effective interval grows with history.
     // Env: LLAMA_KVFLASH_TAU (default 64).
     uint32_t kvflash_tau = 64;
+    bool kvflash_qk = false;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

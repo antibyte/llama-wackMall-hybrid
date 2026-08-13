@@ -2,6 +2,7 @@
 
 #include "kvflash_pager.h"
 #include "kvflash_scorer.h"
+#include "kvflash_qk.h"
 
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
@@ -28,6 +29,20 @@ static KvFlashConfig cfg_pool(int pool, int chunk = 64, int sink = 1, int tail =
     c.sink_chunks        = sink;
     c.tail_window_chunks = tail;
     return c;
+}
+
+static bool fill_sequential(KvFlashPager & pager, int64_t start, int n_tok) {
+    const int chunk = pager.chunk_tokens();
+    if (chunk <= 0 || n_tok < 0) {
+        return false;
+    }
+    for (int off = 0; off < n_tok; off += chunk) {
+        const int n = std::min(chunk, n_tok - off);
+        if (!pager.alloc_span(start + off, n)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void test_min_pool() {
@@ -102,7 +117,7 @@ static void test_lru_eviction() {
     assert(p.attach(cfg_pool(256, 64, 1, 1), {}, {}));
 
     // Fill entire pool: chunks 0..3
-    assert(p.alloc_span(0, 256));
+    assert(fill_sequential(p, 0, 256));
     assert(p.resident_blocks() == 4);
     assert(p.stats().page_outs == 0);
 
@@ -126,7 +141,7 @@ static void test_lru_eviction() {
 static void test_page_in_out_map() {
     KvFlashPager p;
     assert(p.attach(cfg_pool(256, 64, 1, 1), {}, {}));
-    assert(p.alloc_span(0, 256));
+    assert(fill_sequential(p, 0, 256));
     assert(p.page_out(1));
     assert(!p.is_resident(1));
     assert(p.stats().page_outs == 1);
@@ -142,7 +157,7 @@ static void test_pager_state_roundtrip_map() {
     KvFlashConfig cfg = cfg_pool(256, 64, 1, 1);
     cfg.max_context_tokens = 1024;
     assert(pager.attach(cfg, {}, {}));
-    assert(pager.alloc_span(0, 320));
+    assert(fill_sequential(pager, 0, 320));
 
     KvFlashState saved;
     assert(pager.state_export(saved));
@@ -203,7 +218,7 @@ static void test_pager_state_roundtrip_map() {
 static void test_paging_callbacks() {
     KvFlashPager p;
     assert(p.attach(cfg_pool(256, 64, 1, 1), {}, {}));
-    assert(p.alloc_span(0, 256));
+    assert(fill_sequential(p, 0, 256));
 
     std::vector<int> events;
     int saved_chunk = -1;
@@ -238,7 +253,7 @@ static void test_paging_callbacks() {
 static void test_reselect() {
     KvFlashPager p;
     assert(p.attach(cfg_pool(256, 64, 1, 1), {}, {}));
-    assert(p.alloc_span(0, 320)); // chunks 0..4, one eviction already
+    assert(fill_sequential(p, 0, 320)); // chunks 0..4, one eviction already
     // Force known residency: page out 2 if resident
     if (p.is_resident(2)) {
         p.page_out(2);
@@ -259,7 +274,7 @@ static void test_reselect() {
 static void test_reselect_protection_and_lru_noop() {
     KvFlashPager p;
     assert(p.attach(cfg_pool(256, 64, 1, 1), {}, {}));
-    assert(p.alloc_span(0, 320));
+    assert(fill_sequential(p, 0, 320));
 
     const KvFlashStats before = p.stats();
     assert(p.reselect() == 0);
@@ -280,6 +295,8 @@ static void test_reselect_protection_and_lru_noop() {
     assert(p.is_resident(1));
     assert(p.is_resident(3));
     assert(p.is_resident(4));
+    p.reset();
+    assert(p.has_score_hook());
     std::printf("  ok structural protection + no-score reselect noop\n");
 }
 
@@ -370,7 +387,14 @@ static void test_env_pool() {
     assert(t % 256 == 0);
 
     setenv("LLAMA_KVFLASH", "auto", 1);
-    const int a = kvflash_pool_from_env(8192, c, /*scorer=*/false);
+    const int a0 = kvflash_pool_from_env(8192, c, /*scorer=*/false);
+    assert(a0 == 0);
+
+    KvFlashAutoBudget budget;
+    budget.free_bytes = 4ll * 1024 * 1024 * 1024;
+    budget.reserve_bytes = 512ll * 1024 * 1024;
+    budget.bytes_per_token = 2048;
+    const int a = kvflash_pool_from_env(8192, c, /*scorer=*/false, budget);
     assert(a > 0 && a <= 8192);
 
     setenv("LLAMA_KVFLASH", "256", 1);
@@ -385,6 +409,17 @@ static void test_env_pool() {
     assert(kvflash_pool_from_env(1536, c96) == 1536);
 
     unsetenv("LLAMA_KVFLASH");
+
+    unsetenv("LLAMA_KVFLASH_CHUNK");
+    KvFlashConfig from_env = kvflash_config_from_env();
+    assert(from_env.chunk_tokens == 64);
+    assert(from_env.tail_window_chunks == 2);
+    assert(KvFlashPager::min_pool_tokens(from_env) == 320);
+    setenv("LLAMA_KVFLASH_CHUNK", "128", 1);
+    from_env = kvflash_config_from_env();
+    assert(from_env.chunk_tokens == 128);
+    assert(from_env.tail_window_chunks == 1);
+    unsetenv("LLAMA_KVFLASH_CHUNK");
     std::printf("  ok env pool sizing\n");
 }
 
@@ -405,6 +440,101 @@ static void test_fill_rows_masks() {
     assert(!kvflash_fill_rows_and_masks(p, 0, -1, 256, 0, rows, &mfull, nullptr));
     assert(!kvflash_fill_rows_and_masks(p, 0, 4, -1, 0, rows, &mfull, nullptr));
     std::printf("  ok fill_rows_and_masks\n");
+}
+
+static void test_qk_score_math() {
+    KvFlashQkLayer layer;
+    layer.model_il = 0;
+    layer.n_head = 4;
+    layer.n_head_kv = 2;
+    layer.n_embd_head = 4;
+    layer.type_k = GGML_TYPE_F32;
+
+    KvFlashTargetQkScorer scorer;
+    assert(scorer.configure({layer}));
+
+    std::vector<float> k0(8, 0.0f);
+    k0[0] = 1.0f;
+    k0[4] = 1.0f;
+    std::vector<float> k1(8, 0.0f);
+    k1[1] = 1.0f;
+    k1[5] = 1.0f;
+    assert(scorer.set_k_chunk(0, k0));
+    assert(scorer.set_k_chunk(1, k1));
+
+    std::vector<float> q(16, 0.0f);
+    q[0] = 1.0f;
+    q[4] = 1.0f;
+    q[8] = 1.0f;
+    q[12] = 1.0f;
+    assert(scorer.set_q_layer(0, q.data()));
+    assert(scorer.score_of(0) > scorer.score_of(1));
+
+    std::vector<float> row(8, 0.0f);
+    row[0] = 2.0f;
+    row[4] = 2.0f;
+    std::vector<uint8_t> packed((size_t) 2 * 8 * sizeof(float));
+    std::memcpy(packed.data(), row.data(), 8 * sizeof(float));
+    std::memcpy(packed.data() + 8 * sizeof(float), row.data(), 8 * sizeof(float));
+    std::vector<float> means;
+    assert(kvflash_qk_pool_k_means(GGML_TYPE_F32, packed.data(), 2, 8, 2, 4, means));
+    assert(means.size() == 8);
+    float nrm = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        nrm += means[(size_t) i] * means[(size_t) i];
+    }
+    assert(std::fabs(nrm - 1.0f) < 1e-5f);
+
+    assert(kvflash_qk_type_supported(GGML_TYPE_Q4_0));
+    std::vector<uint8_t> q4((size_t) ggml_row_size(GGML_TYPE_Q4_0, 32), 0);
+    const ggml_fp16_t one = ggml_fp32_to_fp16(1.0f);
+    std::memcpy(q4.data(), &one, sizeof(one));
+    q4[sizeof(one)] = 0x09; // nibble 9 -> +1, high nibble 0 -> -8 at index 16
+    std::vector<float> q4_row(32, 0.0f);
+    assert(kvflash_qk_dequant_row(GGML_TYPE_Q4_0, q4.data(), q4_row.data(), 32));
+    assert(std::fabs(q4_row[0] - 1.0f) < 1e-5f);
+    assert(std::fabs(q4_row[16] + 8.0f) < 1e-5f);
+    std::printf("  ok qk score math\n");
+}
+
+static void test_alloc_span_transactional() {
+    KvFlashPager p;
+    assert(p.attach(cfg_pool(256, 64, 1, 1), {}, {}));
+    // 5 chunks cannot be pinned together (max = n_blocks - sink - 1 = 2)
+    assert(!p.alloc_span(0, 320));
+    assert(p.resident_blocks() == 0);
+    assert(p.alloc_span(0, 128));
+    assert(p.resident_blocks() == 2);
+    assert(p.is_resident(0));
+    assert(p.is_resident(1));
+    std::printf("  ok transactional alloc_span\n");
+}
+
+static void test_snapshot_and_dirty_skip() {
+    KvFlashPager p;
+    assert(p.attach(cfg_pool(256, 64, 1, 1), {}, {}));
+    assert(fill_sequential(p, 0, 256));
+    p.mark_written({0, 1, 2, 3});
+    const int snapped = p.snapshot_sealed();
+    assert(snapped == 3); // skips open tail cur_chunk=3
+    const int64_t after_snap = p.stats().moved_bytes;
+    assert(after_snap >= 0);
+
+    assert(p.page_out(1));
+    assert(!p.is_resident(1));
+    assert(p.stats().page_outs == 1);
+    assert(p.stats().moved_bytes == after_snap); // dirty-skip, already snapshotted
+
+    assert(p.page_in(1));
+    const int64_t after_in = p.stats().moved_bytes;
+    assert(p.page_out(1));
+    assert(p.stats().moved_bytes == after_in); // still clean
+
+    p.mark_written({2});
+    assert(p.is_resident(2));
+    assert(p.page_out(2));
+    assert(!p.is_resident(2));
+    std::printf("  ok snapshot + dirty-skip\n");
 }
 
 static void test_atomic_microbatch_mapping() {
@@ -472,7 +602,7 @@ static void test_tensor_roundtrip(ggml_backend_dev_t device) {
     KvFlashPager pager;
     assert(pager.attach(cfg, {k}, {v}));
     assert(pager.bind_backends({backend.get()}));
-    assert(pager.alloc_span(0, pool));
+    assert(fill_sequential(pager, 0, pool));
     assert(pager.page_out(1));
 
     KvFlashState saved;
@@ -565,6 +695,24 @@ static void test_tensor_roundtrip(ggml_backend_dev_t device) {
     assert(pager.host_slab_count() == 0);
     assert(pager.stats().host_bytes == 0);
     assert(pager.stats().host_allocated_bytes == 0);
+
+    assert(fill_sequential(pager, 0, pool));
+    ggml_backend_tensor_set(k, k_data.data(), 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data.data(), 0, ggml_nbytes(v));
+    pager.mark_written({0, 1, 2, 3});
+    assert(pager.snapshot_sealed() == 3);
+    const int64_t snap_bytes = pager.stats().moved_bytes;
+    assert(snap_bytes > 0);
+    assert(pager.page_out(1));
+    assert(pager.stats().moved_bytes == snap_bytes);
+    assert(pager.page_in(1));
+    const int64_t after_in = pager.stats().moved_bytes;
+    assert(pager.page_out(1));
+    assert(pager.stats().moved_bytes == after_in);
+    pager.mark_written({2});
+    assert(pager.page_out(2));
+    assert(pager.stats().moved_bytes > after_in);
+    assert(pager.synchronize_paging());
 
     std::printf("  ok tensor roundtrip on %s\n", ggml_backend_dev_name(device));
 }
@@ -760,6 +908,9 @@ int main() {
     test_shuffled_placement();
     test_env_pool();
     test_fill_rows_masks();
+    test_qk_score_math();
+    test_alloc_span_transactional();
+    test_snapshot_and_dirty_skip();
     test_atomic_microbatch_mapping();
     test_live_eviction_past_pool();
     test_long_context_lru();

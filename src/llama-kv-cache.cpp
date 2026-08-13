@@ -1171,6 +1171,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                     if (!apply_shift_graph()) {
                         return updated;
                     }
+                    kvflash->mark_all_resident_dirty();
                 }
                 if (cells.get_has_shift()) {
                     cells.reset_shift();

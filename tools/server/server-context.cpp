@@ -1152,10 +1152,26 @@ private:
 
         const int32_t max_batch  = (int32_t) llama_n_batch(ctx_tgt);
         const int32_t max_ubatch = (int32_t) llama_n_ubatch(ctx_tgt);
-        if (cmoe_prefill_batch > max_batch || cmoe_decode_batch > max_batch ||
-                cmoe_prefill_ubatch > max_ubatch || cmoe_decode_ubatch > max_ubatch) {
-            SRV_WRN("cmoe phase batching disabled: requested phase limit exceeds context reserve %d/%d\n",
-                    max_batch, max_ubatch);
+        auto clamp_phase = [&](const char * name, int32_t & batch, int32_t & ubatch) {
+            if (batch > max_batch) {
+                SRV_WRN("clamping cmoe %s batch from %d to %d (context reserve)\n",
+                        name, batch, max_batch);
+                batch = max_batch;
+            }
+            if (ubatch > max_ubatch) {
+                SRV_WRN("clamping cmoe %s ubatch from %d to %d (context reserve)\n",
+                        name, ubatch, max_ubatch);
+                ubatch = max_ubatch;
+            }
+            if (batch > ubatch) {
+                batch = ubatch;
+            }
+        };
+        clamp_phase("prefill", cmoe_prefill_batch, cmoe_prefill_ubatch);
+        clamp_phase("decode", cmoe_decode_batch, cmoe_decode_ubatch);
+        if (cmoe_prefill_batch <= 0 || cmoe_prefill_ubatch <= 0 ||
+                cmoe_decode_batch <= 0 || cmoe_decode_ubatch <= 0) {
+            SRV_WRN("%s", "cmoe phase batching disabled: invalid phase limit after clamp\n");
             return;
         }
 
