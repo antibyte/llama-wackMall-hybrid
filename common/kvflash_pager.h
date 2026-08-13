@@ -291,7 +291,6 @@ public:
         clock_ = 0;
         cur_chunk_ = 0;
         identity_ = true;
-        score_hook = nullptr;
         paging_failed_ = false;
         ++epoch_;
     }
@@ -370,14 +369,17 @@ public:
 
         const int first = (int) (kv_start / cfg_.chunk_tokens);
         const int last  = (int) ((end - 1) / cfg_.chunk_tokens);
+        allocation_pins_.clear();
+        allocation_pins_.reserve((size_t) (last - first + 1));
         for (int chunk = first; chunk <= last; ++chunk) {
-            allocation_pins_.clear();
             allocation_pins_.push_back(chunk);
-            if (!allocate_pinned_chunks()) {
-                return false;
-            }
         }
-        return true;
+        if ((int) allocation_pins_.size() >
+            std::max(1, n_blocks_ - cfg_.sink_chunks - 1)) {
+            allocation_pins_.clear();
+            return false;
+        }
+        return allocate_pinned_chunks();
     }
 
     bool alloc_positions(const std::vector<int64_t> & positions) {
@@ -472,7 +474,66 @@ public:
                 backend_used_[i] = 0;
             }
         }
+        for (ChunkState & state : chunks_) {
+            state.host_inflight = false;
+            state.device_inflight = false;
+        }
         return !paging_failed_;
+    }
+
+    bool ensure_host_ready(int chunk) {
+        if (paging_failed_) {
+            return false;
+        }
+        if (chunk < 0 || chunk >= (int) chunks_.size() ||
+            !chunks_[(size_t) chunk].host_inflight) {
+            return true;
+        }
+        return synchronize_paging();
+    }
+
+    void mark_written(const std::vector<int> & chunks) {
+        for (int chunk : chunks) {
+            if (chunk < 0 || chunk >= (int) chunks_.size()) {
+                continue;
+            }
+            ChunkState & state = chunks_[(size_t) chunk];
+            if (state.block < 0) {
+                continue;
+            }
+            state.dirty = true;
+            state.snapshot_valid = false;
+        }
+    }
+
+    void mark_all_resident_dirty() {
+        for (ChunkState & state : chunks_) {
+            if (state.block < 0) {
+                continue;
+            }
+            state.dirty = true;
+            state.snapshot_valid = false;
+        }
+    }
+
+    // Queue D2H for dirty resident chunks except the open tail. Does not evict.
+    // Call after the graph that wrote those rows, not from find_slot.
+    int snapshot_sealed() {
+        if (paging_failed_) {
+            return -1;
+        }
+        int snapped = 0;
+        for (int chunk = 0; chunk < (int) chunks_.size(); ++chunk) {
+            ChunkState & state = chunks_[(size_t) chunk];
+            if (state.block < 0 || !state.dirty || chunk == cur_chunk_) {
+                continue;
+            }
+            if (!snapshot_resident(chunk)) {
+                return -1;
+            }
+            ++snapped;
+        }
+        return snapped;
     }
 
     bool paging_ok() const {
@@ -482,6 +543,13 @@ public:
     bool is_resident(int chunk) const {
         return chunk >= 0 && chunk < (int) chunks_.size() &&
                 chunks_[(size_t) chunk].block >= 0;
+    }
+
+    bool has_host_snapshot(int chunk) const {
+        return chunk >= 0 && chunk < (int) chunks_.size() &&
+                chunks_[(size_t) chunk].on_host &&
+                chunks_[(size_t) chunk].snapshot_valid &&
+                chunks_[(size_t) chunk].host_ptr != nullptr;
     }
 
     bool is_identity() const {
@@ -660,6 +728,8 @@ public:
             state.last_use = chunk.last_use;
             if (chunk.block >= 0) {
                 block_to_chunk_[(size_t) chunk.block] = chunk.chunk;
+                state.dirty = false;
+                state.snapshot_valid = false;
             } else {
                 if (!allocate_host_backing(state)) {
                     paging_failed_ = true;
@@ -667,6 +737,8 @@ public:
                     return false;
                 }
                 state.on_host = true;
+                state.dirty = false;
+                state.snapshot_valid = true;
             }
         }
         for (int block = n_blocks_ - 1; block >= 0; --block) {
@@ -690,20 +762,23 @@ public:
         return true;
     }
 
-    bool state_spans(int chunk, std::vector<KvFlashStateSpan> & spans) const {
+    bool state_spans(int chunk, std::vector<KvFlashStateSpan> & spans) {
         spans.clear();
         if (chunk < 0 || chunk >= (int) chunks_.size()) {
             return false;
         }
-        const ChunkState & state = chunks_[(size_t) chunk];
+        ChunkState & state = chunks_[(size_t) chunk];
         if (state.block < 0 && !state.on_host) {
             return false;
         }
         if (!has_tensor_storage()) {
             return chunk_bytes_ == 0;
         }
+        if (state.device_inflight && !synchronize_paging()) {
+            return false;
+        }
         if (state.block < 0) {
-            if (!state.host_ptr) {
+            if (!ensure_host_ready(chunk) || !state.host_ptr) {
                 return false;
             }
             spans.push_back({
@@ -876,6 +951,10 @@ private:
     struct ChunkState {
         int block = -1;
         bool on_host = false;
+        bool dirty = false;
+        bool snapshot_valid = false;
+        bool host_inflight = false;
+        bool device_inflight = false;
         uint64_t last_use = 0;
         uint8_t * host_ptr = nullptr;
     };
@@ -982,7 +1061,6 @@ private:
 
         std::vector<int> assigned_blocks;
         assigned_blocks.reserve(missing.size());
-        bool copied_in = false;
         for (size_t i = 0; i < missing.size(); ++i) {
             const int block = free_blocks_[free_blocks_.size() - 1 - i];
             if (block < 0 || block >= n_blocks_ ||
@@ -1001,6 +1079,11 @@ private:
                 return false;
             }
             if (state.on_host) {
+                if (!ensure_host_ready(missing[i])) {
+                    cur_chunk_ = previous_cur;
+                    allocation_pins_.clear();
+                    return false;
+                }
                 if (!copy_chunk(state, block, false)) {
                     paging_failed_ = true;
                     synchronize_paging();
@@ -1008,13 +1091,8 @@ private:
                     allocation_pins_.clear();
                     return false;
                 }
-                copied_in = true;
+                state.device_inflight = true;
             }
-        }
-        if (copied_in && !synchronize_paging()) {
-            cur_chunk_ = previous_cur;
-            allocation_pins_.clear();
-            return false;
         }
 
         free_blocks_.resize(free_blocks_.size() - missing.size());
@@ -1028,6 +1106,8 @@ private:
             if (state.on_host) {
                 ++stats_.page_ins;
                 stats_.moved_bytes += (int64_t) chunk_bytes_;
+                state.dirty = false;
+                state.snapshot_valid = true;
             }
             ++epoch_;
         }
@@ -1131,14 +1211,21 @@ private:
 
         for (int chunk : unique) {
             ChunkState & state = chunks_[(size_t) chunk];
+            const bool have_snapshot = state.snapshot_valid && !state.dirty;
+            if (have_snapshot) {
+                continue;
+            }
             if (!copy_chunk(state, state.block, true)) {
                 paging_failed_ = true;
                 synchronize_paging();
                 return false;
             }
-        }
-        if (!synchronize_paging()) {
-            return false;
+            if (has_tensor_storage()) {
+                state.host_inflight = true;
+                stats_.moved_bytes += (int64_t) chunk_bytes_;
+            }
+            state.snapshot_valid = true;
+            state.dirty = false;
         }
 
         if (on_block_paged_out) {
@@ -1165,12 +1252,41 @@ private:
             free_blocks_.push_back(blocks[i]);
             identity_ = false;
             ++stats_.page_outs;
-            stats_.moved_bytes += (int64_t) chunk_bytes_;
             ++epoch_;
             if (on_block_evicted) {
                 on_block_evicted(blocks[i]);
             }
         }
+        return true;
+    }
+
+    bool snapshot_resident(int chunk) {
+        if (chunk < 0 || chunk >= (int) chunks_.size()) {
+            return false;
+        }
+        ChunkState & state = chunks_[(size_t) chunk];
+        if (state.block < 0) {
+            return false;
+        }
+        if (state.snapshot_valid && !state.dirty) {
+            return true;
+        }
+        if (!allocate_host_backing(state)) {
+            paging_failed_ = true;
+            return false;
+        }
+        if (has_tensor_storage()) {
+            if (!copy_chunk(state, state.block, true)) {
+                paging_failed_ = true;
+                synchronize_paging();
+                return false;
+            }
+            state.host_inflight = true;
+            stats_.moved_bytes += (int64_t) chunk_bytes_;
+        }
+        state.on_host = true;
+        state.snapshot_valid = true;
+        state.dirty = false;
         return true;
     }
 
@@ -1421,6 +1537,32 @@ struct KvFlashAutoBudget {
     int     speed_cap_tokens = 16384;
 };
 
+inline KvFlashConfig kvflash_config_from_env() {
+    KvFlashConfig cfg;
+    cfg.chunk_tokens = 64;
+    if (const char * chunk = std::getenv("LLAMA_KVFLASH_CHUNK")) {
+        const int64_t value = std::strtoll(chunk, nullptr, 10);
+        if (value > 0 && value <= std::numeric_limits<int>::max()) {
+            cfg.chunk_tokens = (int) value;
+        }
+    }
+    cfg.sink_chunks = 1;
+    cfg.tail_window_chunks = std::max(1, 128 / cfg.chunk_tokens);
+    cfg.zero_freed_blocks = false;
+    return cfg;
+}
+
+inline int64_t kvflash_reserve_bytes_from_env() {
+    int64_t mib = 512;
+    if (const char * value = std::getenv("LLAMA_KVFLASH_RESERVE_MIB")) {
+        mib = std::max<int64_t>(0, std::strtoll(value, nullptr, 10));
+    }
+    if (mib > std::numeric_limits<int64_t>::max() / (1024 * 1024)) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    return mib * 1024 * 1024;
+}
+
 inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {},
                                  bool scorer_expected = false,
                                  const KvFlashAutoBudget & budget = {}) {
@@ -1436,12 +1578,15 @@ inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {},
             speed_cap = std::max<int64_t>(256, std::strtoll(value, nullptr, 10));
         }
         if (budget.bytes_per_token > 0 && budget.free_bytes > 0) {
+            const int64_t denom = scorer_expected ? 4 : 2;
             const int64_t usable =
-                    std::max<int64_t>(0, budget.free_bytes - budget.reserve_bytes) / 2;
+                    std::max<int64_t>(0, budget.free_bytes - budget.reserve_bytes) / denom;
             tokens = std::min<int64_t>(usable / budget.bytes_per_token,
                     std::min<int64_t>(max_ctx, speed_cap));
         } else {
-            tokens = max_ctx / (scorer_expected ? 4 : 2);
+            std::fprintf(stderr,
+                    "[kvflash] auto requires a post-weight VRAM budget; disabling\n");
+            return 0;
         }
     } else {
         tokens = std::strtoll(env, nullptr, 10);

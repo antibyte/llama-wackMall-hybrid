@@ -2344,7 +2344,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             auto * hyb = dynamic_cast<llama_memory_hybrid *>(res);
                             if (!hyb || !hyb->get_mem_attn() ||
                                 !hyb->get_mem_attn()->init_kvflash(
-                                        attn_kv_size, cparams.n_ctx_seq, /*chunk=*/64)) {
+                                        attn_kv_size, cparams.n_ctx_seq,
+                                        (int) std::max(1u, cparams.kvflash_chunk))) {
                                 delete res;
                                 throw std::runtime_error("failed to initialize KVFlash pager");
                             }

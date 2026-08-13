@@ -433,6 +433,15 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     cb(Kcur, "Kcur", il);
     cb(Vcur, capture_values_active ? "Vcapture" : "Vcur", il);
 
+    if (cparams.kvflash_qk && n_tokens > 0) {
+        ggml_tensor * q_last = ggml_view_2d(ctx0, Qcur, n_embd_head, n_head,
+                Qcur->nb[1], (n_tokens - 1) * Qcur->nb[2]);
+        q_last = ggml_cont(ctx0, q_last);
+        ggml_format_name(q_last, "kvflash_q_%d", il);
+        ggml_set_output(q_last);
+        ggml_build_forward_expand(gf, q_last);
+    }
+
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
