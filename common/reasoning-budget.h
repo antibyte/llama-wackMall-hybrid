@@ -23,7 +23,8 @@ enum common_reasoning_budget_state {
 //   COUNTING:     counting down remaining tokens, watching for a natural end sequence
 //   WAITING_UTF8: budget exhausted, allowing tokens to complete a UTF-8 sequence
 //   FORCING:      forces forced_tokens token-by-token (all other logits -> -inf)
-//   DONE:         passthrough forever
+//   DONE:         passthrough; a new start tag re-arms COUNTING, unless the budget
+//                 was already exhausted, in which case the end sequence is forced again
 //
 // Parameters:
 //   vocab          - vocabulary (used for UTF-8 boundary detection; can be nullptr)
@@ -53,3 +54,13 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
 // Manually transition the reasoning budget sampler into the FORCING state.
 // Returns true if the transition occurred.
 bool common_reasoning_budget_force(struct llama_sampler * smpl);
+
+// Walk prompt tokens to decide whether generation starts inside a reasoning block.
+// Does not consume the budget. After the call:
+//   last think still open -> COUNTING (or FORCING if budget <= 0), remaining = budget
+//   otherwise             -> IDLE, remaining = budget
+// Matcher state is left so a partial start/end tag at the prompt boundary can finish.
+void common_reasoning_budget_prime(
+        struct llama_sampler * smpl,
+        const llama_token    * tokens,
+        size_t                 n_tokens);

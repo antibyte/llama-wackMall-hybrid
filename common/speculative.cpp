@@ -1158,8 +1158,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
-            LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
-                    "Drafts may degrade.\n",
+            LOG_INF("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
+                    "DFlash drafts will degrade (typical drop ~40 t/s -> ~30 t/s).\n",
                     __func__, (int) pos_max, N - 1);
         }
     }

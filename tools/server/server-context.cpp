@@ -431,15 +431,22 @@ struct server_slot {
         const int64_t t_start = ggml_time_us();
 
         int n_text = 0;
+        std::vector<llama_token> text_tokens;
+        text_tokens.reserve(prompt.tokens.size());
 
         for (int i = 0; i < (int) prompt.tokens.size(); i++) {
             const llama_token id = prompt.tokens[i];
 
             if (id != LLAMA_TOKEN_NULL) {
+                text_tokens.push_back(id);
                 common_sampler_accept(smpl.get(), id, false);
                 n_text++;
             }
         }
+
+        // Full prompt so a follow-up that already ends inside <think> still
+        // gets a fresh budget; accept() would spend it on the previous block.
+        common_sampler_prime_reasoning_budget(smpl.get(), text_tokens.data(), text_tokens.size());
 
         SLT_TRC(*this, "init sampler, took %0.2f ms, tokens: text = %d, total = %d\n",
                 (ggml_time_us() - t_start) / 1000.0, n_text, (int) prompt.tokens.size());
@@ -1216,6 +1223,32 @@ private:
         cmoe_active_ubatch = ubatch;
     }
 
+    // Hybrid GDN can only roll back n_rs_seq tokens. If LCP would need more,
+    // STARTED will drop n_past to 0 and rebuild like a cold prompt.
+    bool slot_will_keep_lcp(const server_slot & slot) const {
+        if (!slot.task || slot.prompt.n_tokens() <= 0) {
+            return false;
+        }
+        const int n_lcp = (int) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+        if (n_lcp <= 0) {
+            return false;
+        }
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+            return true;
+        }
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        const uint32_t n_rs = llama_n_rs_seq(ctx_tgt);
+        if (pos_max < 0) {
+            return true;
+        }
+        const llama_pos p0 = slot.prompt.tokens.pos_next(n_lcp);
+        if (p0 <= 0 || p0 > pos_max) {
+            return true;
+        }
+        const llama_pos rollback = pos_max - (p0 - 1);
+        return n_rs > 0 && rollback <= (llama_pos) n_rs;
+    }
+
     bool cmoe_request_is_prefilling() const {
         if (cmoe_prefill_disabled) {
             return false;
@@ -1234,11 +1267,12 @@ private:
             if (!slot.task) {
                 continue;
             }
-            // A wide prefill graph on top of an already-large KV OOMs on 6 GiB.
-            if (slot.prompt.n_tokens() >= 8192) {
-                continue;
-            }
-            const int32_t n_left = slot.task->n_tokens() - slot.prompt.n_tokens();
+            // If GDN cannot keep the prefix, STARTED will clear KV and rebuild.
+            // Count remaining from 0 in that case so we still arm prefill 1024.
+            const bool rebuild = slot.state == SLOT_STATE_STARTED &&
+                    slot.prompt.n_tokens() > 0 && !slot_will_keep_lcp(slot);
+            const int32_t n_have = rebuild ? 0 : slot.prompt.n_tokens();
+            const int32_t n_left = slot.task->n_tokens() - n_have;
             if (n_left > cmoe_decode_ubatch) {
                 return true;
             }
@@ -3745,6 +3779,25 @@ private:
                                 }
                             }
 
+                            // Hybrid GDN can only roll back n_rs_seq tokens (DFlash n_max).
+                            // Cancel mid-generation then LCP-reuse of the prefix needs a much
+                            // larger tail trim; seq_rm either aborts or leaves attn/recurrent
+                            // state inconsistent and the next prefill decode IMAs.
+                            if (n_past > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                                const llama_pos p0_rm = slot.prompt.tokens.pos_next(n_past);
+                                const uint32_t n_rs = llama_n_rs_seq(ctx_tgt);
+                                if (pos_max >= 0 && p0_rm > 0 && p0_rm <= pos_max) {
+                                    const llama_pos rollback = pos_max - (p0_rm - 1);
+                                    if (n_rs == 0 || rollback > (llama_pos) n_rs) {
+                                        SLT_INF(slot, "LCP n_past = %d needs recurrent rollback %d > n_rs_seq = %u; reprocessing prompt\n",
+                                                n_past, (int) rollback, n_rs);
+                                        pos_next = 0;
+                                        n_past = 0;
+                                    }
+                                }
+                            }
+
                             {
                                 // erase any checkpoints with pos_max > pos_next
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
@@ -3756,6 +3809,15 @@ private:
                                         ++it;
                                     }
                                 }
+                            }
+                        }
+
+                        if (n_past > 0 && ctx_dft) {
+                            const llama_pos dft_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id);
+                            if (dft_max >= 0 && dft_max < n_past - 1) {
+                                SLT_INF(slot, "draft KV pos_max = %d < n_past - 1 = %d; reprocessing so DFlash stays aligned\n",
+                                        (int) dft_max, n_past - 1);
+                                n_past = 0;
                             }
                         }
 

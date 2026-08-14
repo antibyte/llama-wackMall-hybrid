@@ -337,6 +337,86 @@ static void test_reasoning_budget_end_match() {
     fprintf(stderr, "  Test 'matched end sequence' passed\n");
 }
 
+static void test_reasoning_budget_prime() {
+    const std::vector<llama_token> start  = {100};
+    const std::vector<llama_token> end    = {101};
+    const std::vector<llama_token> forced = {102, 101};
+
+    // empty / no think -> IDLE, budget unused
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 2, REASONING_BUDGET_IDLE);
+        const llama_token toks[] = {1, 2, 3};
+        common_reasoning_budget_prime(sampler, toks, 3);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_IDLE);
+        llama_sampler_accept(sampler, 100);
+        llama_sampler_accept(sampler, 50);
+        llama_sampler_accept(sampler, 51);
+        GGML_ASSERT(get_forced_token(sampler, 102) == 102 && "prime must leave the full budget");
+        llama_sampler_free(sampler);
+    }
+
+    // prompt ends inside think (previous closed block must not spend the new budget)
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 2, REASONING_BUDGET_IDLE);
+        const llama_token toks[] = {100, 50, 51, 52, 101, 7, 100};
+        common_reasoning_budget_prime(sampler, toks, 7);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+        llama_sampler_accept(sampler, 60);
+        llama_sampler_accept(sampler, 61);
+        GGML_ASSERT(get_forced_token(sampler, 102) == 102 && "historical think tokens must not consume the new budget");
+        llama_sampler_free(sampler);
+    }
+
+    // prompt ends after a closed think -> IDLE, next start still gets a full window
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 2, REASONING_BUDGET_IDLE);
+        const llama_token toks[] = {100, 50, 101, 7};
+        common_reasoning_budget_prime(sampler, toks, 4);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_IDLE);
+        llama_sampler_accept(sampler, 100);
+        llama_sampler_accept(sampler, 60);
+        llama_sampler_accept(sampler, 61);
+        GGML_ASSERT(get_forced_token(sampler, 102) == 102);
+        llama_sampler_free(sampler);
+    }
+
+    // budget=0 while already inside think -> FORCING
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 0, REASONING_BUDGET_IDLE);
+        const llama_token toks[] = {100};
+        common_reasoning_budget_prime(sampler, toks, 1);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
+        GGML_ASSERT(common_reasoning_budget_get_forced_token(sampler) == 102);
+        llama_sampler_free(sampler);
+    }
+
+    fprintf(stderr, "  Test 'prime from prompt tokens' passed\n");
+}
+
+static void test_reasoning_budget_exhausted_rearm() {
+    const std::vector<llama_token> start  = {100};
+    const std::vector<llama_token> end    = {101};
+    const std::vector<llama_token> forced = {102, 101};
+
+    auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 2, REASONING_BUDGET_IDLE);
+
+    llama_sampler_accept(sampler, 100); // COUNTING rem=2
+    llama_sampler_accept(sampler, 50);  // rem=1
+    llama_sampler_accept(sampler, 51);  // rem=0 -> FORCING
+    GGML_ASSERT(get_forced_token(sampler, 102) == 102);
+    llama_sampler_accept(sampler, 102);
+    llama_sampler_accept(sampler, 101);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+    // a new <think> after the budget was spent must not get another full window
+    llama_sampler_accept(sampler, 100);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
+    GGML_ASSERT(common_reasoning_budget_get_forced_token(sampler) == 102);
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test 'exhausted re-arm forces immediately' passed\n");
+}
+
 // UTF-8 boundary detection unit test
 // Tests common_utf8_is_complete() from reasoning-budget.h
 static void test_utf8_boundary_detection() {
@@ -498,8 +578,10 @@ int main(void) {
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
+    test_reasoning_budget_prime();
+    test_reasoning_budget_exhausted_rearm();
 
-    printf("OK (12 tests passed)\n");
+    printf("OK (14 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

@@ -125,6 +125,9 @@ struct common_sampler {
         prev.clear();
 
         llama_sampler_reset(chain);
+        if (rbudget) {
+            llama_sampler_reset(rbudget);
+        }
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -304,10 +307,11 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             params.reasoning_budget_forced,
             params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
 
-        for (const auto & token : prefill_tokens) {
-            llama_sampler_accept(rbudget, token);
-            LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
-        }
+        // Detect an already-open think block without spending the budget on
+        // earlier closed <think>...</think> tokens in a multi-turn prompt.
+        common_reasoning_budget_prime(rbudget, prefill_tokens.data(), prefill_tokens.size());
+        LOG_DBG("%s: reasoning-budget primed from %zu generation-prompt tokens, state=%d\n",
+                __func__, prefill_tokens.size(), (int) common_reasoning_budget_get_state(rbudget));
     }
 
     if (params.has_logit_bias()) {
@@ -692,6 +696,14 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+void common_sampler_prime_reasoning_budget(struct common_sampler * gsmpl, const llama_token * tokens, size_t n_tokens) {
+    if (!gsmpl || !gsmpl->rbudget) {
+        return;
+    }
+
+    common_reasoning_budget_prime(gsmpl->rbudget, tokens, n_tokens);
 }
 
 // helpers

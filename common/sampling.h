@@ -90,6 +90,11 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
+// Set the reasoning budget sampler from prompt tokens without consuming the budget.
+// Used after reset() so a follow-up request that already ends inside <think> still
+// gets a fresh window instead of inheriting DONE from an earlier closed block.
+void common_sampler_prime_reasoning_budget(struct common_sampler * gsmpl, const llama_token * tokens, size_t n_tokens);
+
 // helpers
 
 // access the internal list of current candidate tokens
