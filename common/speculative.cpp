@@ -1158,8 +1158,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
-            LOG_INF("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
-                    "DFlash drafts will degrade (typical drop ~40 t/s -> ~30 t/s).\n",
+            LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - DFlash draft KV does not cover the prompt. "
+                    "Drafts will degrade (typical drop ~40 t/s -> ~30 t/s).\n",
                     __func__, (int) pos_max, N - 1);
         }
     }
@@ -1246,12 +1246,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         n_process_standalone++;
         std::vector<std::vector<int32_t>> rows((size_t) n_seq);
+        // Large prefill batches must not overwrite a kept DFlash prefix.
+        // Small verify batches still inject: draft() may have written noise
+        // at those positions that combined inject would have replaced.
+        const bool protect_prefix = batch_in.n_tokens > params.n_max + 1;
         for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
             GGML_ASSERT(batch_in.n_seq_id[k] == 1);
             const llama_seq_id seq_id = batch_in.seq_id[k][0];
-            if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
-                rows[(size_t) seq_id].push_back(k);
+            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+                continue;
             }
+            if (protect_prefix && batch_in.pos) {
+                const llama_pos dft_max = llama_memory_seq_pos_max(
+                        llama_get_memory(this->params.ctx_dft), seq_id);
+                if (batch_in.pos[k] <= dft_max) {
+                    continue;
+                }
+            }
+            rows[(size_t) seq_id].push_back(k);
         }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (!rows[(size_t) seq_id].empty() && !process_rows(batch_in, seq_id, rows[(size_t) seq_id])) {

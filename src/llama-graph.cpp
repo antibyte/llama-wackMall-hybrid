@@ -1429,6 +1429,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 if (!dflash_keeps_layer_inp) {
                     ggml_set_output(t_layer_inp[il]);
+                    // Standalone DFlash inject reads these from host. A flag
+                    // alone is not a graph sink; expand so the buffers stay live.
+                    if (gf != nullptr) {
+                        ggml_build_forward_expand(gf, t_layer_inp[il]);
+                    }
                 }
             }
         }

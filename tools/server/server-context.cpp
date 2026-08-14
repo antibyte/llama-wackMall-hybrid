@@ -250,6 +250,8 @@ struct server_slot {
     bool                  spec_tree_verify = false;
     common_ddtree         spec_tree;
     common_prompt_checkpoint spec_ckpt;
+    // When GDN cannot roll back the target, keep DFlash KV up to this pos.
+    llama_pos spec_dft_rm_pos = -1;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -393,6 +395,7 @@ struct server_slot {
             spec_tree_verify = false;
             spec_tree = {};
             spec_ckpt.clear();
+            spec_dft_rm_pos = -1;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -3371,7 +3374,7 @@ private:
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
+                            /* .n_past   = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
@@ -3551,6 +3554,8 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        int n_draft_keep = 0;
+                        slot.spec_dft_rm_pos = -1;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3783,6 +3788,8 @@ private:
                             // Cancel mid-generation then LCP-reuse of the prefix needs a much
                             // larger tail trim; seq_rm either aborts or leaves attn/recurrent
                             // state inconsistent and the next prefill decode IMAs.
+                            // Target KV must be rebuilt from 0, but DFlash draft KV can keep
+                            // the matching prefix so follow-up drafts stay at first-turn TPS.
                             if (n_past > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
                                 const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
                                 const llama_pos p0_rm = slot.prompt.tokens.pos_next(n_past);
@@ -3790,8 +3797,9 @@ private:
                                 if (pos_max >= 0 && p0_rm > 0 && p0_rm <= pos_max) {
                                     const llama_pos rollback = pos_max - (p0_rm - 1);
                                     if (n_rs == 0 || rollback > (llama_pos) n_rs) {
-                                        SLT_INF(slot, "LCP n_past = %d needs recurrent rollback %d > n_rs_seq = %u; reprocessing prompt\n",
+                                        SLT_INF(slot, "LCP n_past = %d needs recurrent rollback %d > n_rs_seq = %u; reprocessing target, keeping draft prefix\n",
                                                 n_past, (int) rollback, n_rs);
+                                        n_draft_keep = n_past;
                                         pos_next = 0;
                                         n_past = 0;
                                     }
@@ -3817,6 +3825,7 @@ private:
                             if (dft_max >= 0 && dft_max < n_past - 1) {
                                 SLT_INF(slot, "draft KV pos_max = %d < n_past - 1 = %d; reprocessing so DFlash stays aligned\n",
                                         (int) dft_max, n_past - 1);
+                                n_draft_keep = 0;
                                 n_past = 0;
                             }
                         }
@@ -3826,6 +3835,15 @@ private:
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                        }
+
+                        if (n_draft_keep <= 0) {
+                            n_draft_keep = n_past;
+                        }
+                        slot.spec_dft_rm_pos = slot.prompt.tokens.pos_next(n_draft_keep);
+                        if (n_draft_keep > n_past) {
+                            SLT_INF(slot, "keeping DFlash draft prefix n_draft_keep = %d pos = %d while target rebuilds from 0\n",
+                                    n_draft_keep, (int) slot.spec_dft_rm_pos);
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
@@ -3863,7 +3881,9 @@ private:
 
                     common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
                     if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft, slot.id, p0, -1);
+                        const llama_pos p0_dft = slot.spec_dft_rm_pos >= 0 ?
+                                std::max(p0, slot.spec_dft_rm_pos) : p0;
+                        common_context_seq_rm(ctx_dft, slot.id, p0_dft, -1);
                     }
 
                     // If using an alora, there may be uncached tokens that come

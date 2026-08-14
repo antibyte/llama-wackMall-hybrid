@@ -3260,6 +3260,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(nfloats % n_tokens == 0);
 
         const size_t row_floats = nfloats / n_tokens;
+        GGML_ASSERT(row_floats == (size_t) model.hparams.n_embd);
         const size_t dst_offset = token_offset * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
@@ -3295,15 +3296,8 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_layer_inp.size() > 0) {
-            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
-                if (embd_layer_inp[lid].size > 0) {
-                    for (uint64_t k = 0; k < n_embd; ++k) {
-                        std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
-                    }
-                }
-            }
-        }
+        // layer-inp rows stay in ubatch order for DFlash process_rows();
+        // output_swaps only pack logits / sampled rows.
 
         if (!sampling.samplers.empty()) {
             assert(sampling.logits.size > 0);
