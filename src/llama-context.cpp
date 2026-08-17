@@ -30,6 +30,10 @@
 #include <stdexcept>
 #include <string>
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 //
 // llama_context
 //
@@ -994,6 +998,19 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+#ifdef GGML_USE_CUDA
+    // Drop CUDA graphs before backend teardown. Destroying a live
+    // cudaGraphExec during SIGINT cleanup otherwise segfaults.
+    if (sched) {
+        synchronize();
+        for (ggml_backend_t backend : backend_ptrs) {
+            if (ggml_backend_is_cuda(backend)) {
+                ggml_backend_cuda_evict_graphs(backend);
+            }
+        }
+    }
+#endif
+
     if (dflash_target != nullptr) {
         dflash_target->detach_dflash(this);
     }
@@ -1008,12 +1025,17 @@ llama_context::~llama_context() {
 
             const size_t size_exp = backend_buf_exp_size[i];
             const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
-            if (size_exp == size_act) {
-                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
+            if (size_act > size_exp) {
+                // Unexpected growth past the init/peak reserve.
+                LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB exceeds expectation of %8.4f MiB\n",
+                    __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+            } else if (size_act < size_exp) {
+                // Phase-batch shrink (prefill -> decode) is intentional; not a leak.
+                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB (below peak expectation %8.4f MiB)\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
             } else {
-                LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
-                    __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation\n",
+                    __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0));
             }
         }
     }
@@ -1441,12 +1463,97 @@ uint32_t llama_context::n_threads_batch() const {
     return cparams.n_threads_batch;
 }
 
+bool llama_context::reserve_for_runtime_ubatch() {
+    if (!sched || !memory) {
+        // Context still constructing; init path will reserve at full size.
+        return true;
+    }
+
+    const auto mctx = memory->init_full();
+    if (!mctx) {
+        LLAMA_LOG_ERROR("%s: failed to initialize memory context for runtime ubatch reserve\n", __func__);
+        return false;
+    }
+
+    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_ubatch_cur = runtime_n_ubatch > 0 ? runtime_n_ubatch : cparams.n_ubatch;
+    uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_cur);
+
+    // Match init: large prefill graphs with DFlash attached only need ~n_seqs logits.
+    // Decode/verify must keep n_outputs_max so MTP/DFlash multi-token verify fits.
+    uint32_t n_outputs_cur;
+    if (dflash != nullptr && n_tokens > std::max(n_seqs, cparams.n_outputs_max)) {
+        n_outputs_cur = n_seqs;
+    } else {
+        n_outputs_cur = std::min(n_tokens, std::max(n_seqs, cparams.n_outputs_max));
+    }
+    n_outputs_cur = std::max(1u, n_outputs_cur);
+
+    auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_cur, mctx.get());
+    if (!gf) {
+        LLAMA_LOG_ERROR("%s: failed to reserve graph for runtime ubatch=%u outputs=%u\n",
+                __func__, n_ubatch_cur, n_outputs_cur);
+        return false;
+    }
+
+    // When DFlash is attached and we shrank to a decode-sized ubatch, also re-touch
+    // the verify-shaped reserve so gallocr has measured that topology after shrink.
+    if (dflash != nullptr && n_tokens <= std::max(n_seqs, cparams.n_outputs_max + 1u)) {
+        const uint32_t n_verify = std::min(n_tokens, std::max(n_seqs, cparams.n_outputs_max + 1u));
+        const uint32_t n_out_v  = std::min(n_verify, std::max(n_seqs, cparams.n_outputs_max));
+        if (!graph_reserve(n_verify, n_seqs, std::max(1u, n_out_v), mctx.get())) {
+            LLAMA_LOG_ERROR("%s: failed to reserve DFlash verify graph after runtime ubatch=%u\n",
+                    __func__, n_ubatch_cur);
+            return false;
+        }
+    }
+
+    // Keep destructor / memory-report expectations in sync after grow/shrink.
+    if (backend_buf_exp_size.size() == backend_ptrs.size()) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: reserved compute graph for runtime ubatch=%u n_tokens=%u n_outputs=%u\n",
+            __func__, n_ubatch_cur, n_tokens, n_outputs_cur);
+    return true;
+}
+
 bool llama_context::set_runtime_ubatch(uint32_t n_ubatch) {
     if (n_ubatch == 0 || n_ubatch > cparams.n_ubatch) {
         return false;
     }
+    if (n_ubatch == runtime_n_ubatch) {
+        return true;
+    }
+
+    const uint32_t prev = runtime_n_ubatch;
+
+#ifdef GGML_USE_CUDA
+    // CMOE 1024<->128 rebuilds the CUDA graph set. Keeping the previous
+    // topology's executables makes the next cudaGraphInstantiate OOM on 6 GiB.
+    synchronize();
+    for (ggml_backend_t backend : backend_ptrs) {
+        if (ggml_backend_is_cuda(backend)) {
+            ggml_backend_cuda_evict_graphs(backend);
+        }
+    }
+#endif
 
     runtime_n_ubatch = n_ubatch;
+
+    // Re-reserve so prefill→decode frees the large compute peak (gallocr can shrink).
+    // decode→prefill grows again on the next phase switch.
+    if (!reserve_for_runtime_ubatch()) {
+        runtime_n_ubatch = prev;
+        if (prev > 0) {
+            // Best-effort restore previous peak so the context stays usable.
+            (void) reserve_for_runtime_ubatch();
+        }
+        return false;
+    }
+
     return true;
 }
 

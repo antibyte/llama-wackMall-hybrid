@@ -3,6 +3,7 @@
 #include "common.h"
 #include "ddtree.h"
 #include "ggml.h"
+#include "ggml-cpp.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -1157,7 +1158,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
-        if (pos_max < N - 1) {
+        if (pos_max >= 0 && pos_max < N - 1) {
+            LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - clearing draft so combined inject can reseed\n",
+                    __func__, (int) pos_max, N - 1);
+            llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq_id, 0, -1);
+        } else if (pos_max < N - 1) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - DFlash draft KV does not cover the prompt. "
                     "Drafts will degrade (typical drop ~40 t/s -> ~30 t/s).\n",
                     __func__, (int) pos_max, N - 1);
@@ -1246,27 +1251,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         n_process_standalone++;
         std::vector<std::vector<int32_t>> rows((size_t) n_seq);
-        // Large prefill batches must not overwrite a kept DFlash prefix.
-        // Small verify batches still inject: draft() may have written noise
-        // at those positions that combined inject would have replaced.
-        const bool protect_prefix = batch_in.n_tokens > params.n_max + 1;
         for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
             GGML_ASSERT(batch_in.n_seq_id[k] == 1);
             const llama_seq_id seq_id = batch_in.seq_id[k][0];
-            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+                rows[(size_t) seq_id].push_back(k);
+            }
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (rows[(size_t) seq_id].empty()) {
                 continue;
             }
-            if (protect_prefix && batch_in.pos) {
-                const llama_pos dft_max = llama_memory_seq_pos_max(
-                        llama_get_memory(this->params.ctx_dft), seq_id);
-                if (batch_in.pos[k] <= dft_max) {
+            // llama_decode(ctx_dft) requires Y = X + 1. Skip a jump (stale
+            // draft after LCP). Consecutive leftover, including pos 0 into
+            // an empty draft, must still inject or DFlash has no prompt KV.
+            if (batch_in.pos) {
+                const llama_pos y = batch_in.pos[rows[(size_t) seq_id][0]];
+                const llama_pos x = llama_memory_seq_pos_max(llama_get_memory(this->params.ctx_dft), seq_id);
+                const llama_pos expect = x < 0 ? 0 : x + 1;
+                if (y != expect) {
+                    SPC_WRN("skip standalone inject seq %d: draft pos_max=%d token pos=%d\n",
+                            (int) seq_id, (int) x, (int) y);
                     continue;
                 }
             }
-            rows[(size_t) seq_id].push_back(k);
-        }
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (!rows[(size_t) seq_id].empty() && !process_rows(batch_in, seq_id, rows[(size_t) seq_id])) {
+            if (!process_rows(batch_in, seq_id, rows[(size_t) seq_id])) {
                 return false;
             }
         }
@@ -1317,6 +1326,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
+                continue;
+            }
+
+            const llama_pos x = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+            const llama_pos y = (llama_pos) dp.n_past;
+            const llama_pos expect = x < 0 ? 0 : x + 1;
+            if (y != expect) {
+                SPC_WRN("skip draft seq %d: draft pos_max=%d n_past=%d\n",
+                        (int) seq_id, (int) x, (int) y);
                 continue;
             }
 
@@ -2457,6 +2475,50 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
         default:                                    return "unknown";
     }
+}
+
+std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path) {
+    struct gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+
+    gguf_context_ptr gguf_ctx(gguf_init_from_file(path.c_str(), gguf_params));
+    if (!gguf_ctx) {
+        return {};
+    }
+
+    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return {};
+    }
+
+    const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
+    if (arch == "dflash") {
+        if (gguf_find_tensor(gguf_ctx.get(), "markov_w1.weight") >= 0) {
+            SPC_WRN("%s", "draft GGUF looks like DSpark (markov_w1.weight); this tree has no draft-dspark, using draft-dflash\n");
+        }
+        SPC_INF("%s", "auto-detected speculative type 'draft-dflash' from the draft model metadata\n");
+        return { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    }
+
+    const int64_t n_layer_id = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
+    if (n_layer_id < 0 || gguf_get_kv_type(gguf_ctx.get(), n_layer_id) != GGUF_TYPE_UINT32) {
+        return {};
+    }
+
+    const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), n_layer_id);
+    if (block_count == 0) {
+        return {};
+    }
+
+    const std::string nextn = "blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight";
+    if (gguf_find_tensor(gguf_ctx.get(), nextn.c_str()) >= 0) {
+        SPC_INF("%s", "auto-detected speculative type 'draft-mtp' from the draft model metadata\n");
+        return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    }
+
+    return {};
 }
 
 std::vector<common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names) {

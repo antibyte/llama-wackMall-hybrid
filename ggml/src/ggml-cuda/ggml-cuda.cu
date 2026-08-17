@@ -3735,6 +3735,16 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+static void ggml_cuda_evict_graphs(ggml_backend_cuda_context * cuda_ctx, const void * keep_key) {
+    for (auto it = cuda_ctx->cuda_graphs.begin(); it != cuda_ctx->cuda_graphs.end(); ) {
+        if (keep_key != nullptr && it->first == keep_key) {
+            ++it;
+        } else {
+            it = cuda_ctx->cuda_graphs.erase(it);
+        }
+    }
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3806,6 +3816,18 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
+        // Prefill and decode reuse the same ggml_cgraph / nodes[0] key.
+        // A 1792-node prefill must not keep decode's captured executable.
+        graph->warmup_complete = false;
+        graph->disable_due_to_oom = false;
+        if (graph->instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+            graph->instance = nullptr;
+        }
+        if (graph->graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph->graph));
+            graph->graph = nullptr;
+        }
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -5224,7 +5246,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+// Returns false if graph instantiate OOMed after eviction; caller must rerun eager.
+static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -5430,7 +5453,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            cudaError_t err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            if (err == cudaErrorMemoryAllocation) {
+                ggml_cuda_evict_graphs(cuda_ctx, graph_key);
+                err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            }
+            if (err == cudaErrorMemoryAllocation) {
+                GGML_LOG_WARN("%s: cudaGraphInstantiate OOM, falling back to eager compute this launch\n", __func__);
+                (void) cudaGetLastError();
+                if (graph->graph != nullptr) {
+                    CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                    graph->graph = nullptr;
+                }
+                // Do not permanently disable graphs: the next phase switch /
+                // request can recapture after VRAM is freed (shrink or evict).
+                graph->warmup_complete = false;
+                return false;
+            }
+            CUDA_CHECK(err);
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -5442,6 +5482,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+    return true;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -5515,7 +5556,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (!ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key)) {
+        // Instantiate OOM: captured work never launched. Replay eager.
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5815,6 +5859,19 @@ static ggml_guid_t ggml_backend_cuda_guid() {
 
 bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+void ggml_backend_cuda_evict_graphs(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+#ifdef USE_CUDA_GRAPH
+    ggml_cuda_evict_graphs(cuda_ctx, nullptr);
+#else
+    GGML_UNUSED(cuda_ctx);
+#endif
 }
 
 int ggml_backend_cuda_get_device_count() {

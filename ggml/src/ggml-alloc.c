@@ -902,35 +902,43 @@ static bool ggml_gallocr_reserve_n_impl(
 
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
-        // if the buffer type is used multiple times, we reuse the same buffer
+        // if the buffer type is used multiple times, we reuse the same buffer.
+        // Must skip realloc for aliases or free()/destroy double-frees (segfault on exit).
+        bool shared = false;
         for (int j = 0; j < i; j++) {
             if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
                 galloc->buffers[i] = galloc->buffers[j];
+                shared = true;
                 break;
             }
         }
+        if (shared) {
+            continue;
+        }
 
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
-        bool realloc = galloc->buffers[i] == NULL;
+        // Grow and shrink: phase batching (prefill 1k+ -> decode 64) must free the large
+        // compute peak or 6 GiB cards OOM during long-context generation.
+        bool do_realloc = galloc->buffers[i] == NULL;
         size_t new_size = 0;
+        size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
             size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
             size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
             new_size += new_chunk_size;
-            if (new_chunk_size > cur_chunk_size) {
-                realloc = true;
+            if (new_chunk_size != cur_chunk_size) {
+                do_realloc = true;
             }
         }
-        if (realloc) {
-#ifndef NDEBUG
-            {
-                size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-                if (cur_size > 0) {
-                    GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
-                        __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
-                }
+        // Drop surplus chunks when the new graph needs fewer vbuffer chunks.
+        if (new_size < cur_size) {
+            do_realloc = true;
+        }
+        if (do_realloc) {
+            if (cur_size > 0) {
+                GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
+                    __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
             }
-#endif
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
@@ -939,6 +947,12 @@ static bool ggml_gallocr_reserve_n_impl(
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
+                }
+            }
+            // Point later aliases at the new buffer (they were skipped above).
+            for (int j = i + 1; j < galloc->n_buffers; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    galloc->buffers[j] = galloc->buffers[i];
                 }
             }
         }

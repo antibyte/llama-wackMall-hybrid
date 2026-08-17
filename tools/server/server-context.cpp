@@ -1108,7 +1108,6 @@ private:
     int32_t cmoe_decode_ubatch  = 0;
     int32_t cmoe_active_batch   = 0;
     int32_t cmoe_active_ubatch  = 0;
-    bool    cmoe_prefill_disabled = false;
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1197,10 +1196,6 @@ private:
             return;
         }
 
-        if (prefill && cmoe_prefill_disabled) {
-            prefill = false;
-        }
-
         const int32_t batch = prefill ? cmoe_prefill_batch : cmoe_decode_batch;
         const int32_t ubatch = prefill ? cmoe_prefill_ubatch : cmoe_decode_ubatch;
         const bool spec_dflash = std::find(params_base.speculative.types.begin(),
@@ -1226,36 +1221,41 @@ private:
         cmoe_active_ubatch = ubatch;
     }
 
-    // Hybrid GDN can only roll back n_rs_seq tokens. If LCP would need more,
-    // STARTED will drop n_past to 0 and rebuild like a cold prompt.
-    bool slot_will_keep_lcp(const server_slot & slot) const {
-        if (!slot.task || slot.prompt.n_tokens() <= 0) {
-            return false;
+    // Tokens STARTED can actually keep. GDN can only roll back n_rs_seq tokens;
+    // a larger tail trim rebuilds from 0. Do not use prompt.n_tokens() here:
+    // that still includes generated tokens that keep_first(n_lcp) will drop.
+    int32_t slot_reusable_prefix_tokens(const server_slot & slot) const {
+        if (!slot.task || slot.prompt.n_tokens() <= 0 || !slot.task->params.cache_prompt) {
+            return 0;
         }
         const int n_lcp = (int) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
         if (n_lcp <= 0) {
-            return false;
+            return 0;
         }
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
-            return true;
+            return n_lcp;
         }
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
         const uint32_t n_rs = llama_n_rs_seq(ctx_tgt);
         if (pos_max < 0) {
-            return true;
+            return n_lcp;
         }
         const llama_pos p0 = slot.prompt.tokens.pos_next(n_lcp);
         if (p0 <= 0 || p0 > pos_max) {
-            return true;
+            return n_lcp;
         }
         const llama_pos rollback = pos_max - (p0 - 1);
-        return n_rs > 0 && rollback <= (llama_pos) n_rs;
+        if (n_rs == 0 || rollback > (llama_pos) n_rs) {
+            return 0;
+        }
+        return n_lcp;
+    }
+
+    bool slot_will_keep_lcp(const server_slot & slot) const {
+        return slot_reusable_prefix_tokens(slot) > 0;
     }
 
     bool cmoe_request_is_prefilling() const {
-        if (cmoe_prefill_disabled) {
-            return false;
-        }
         for (const auto & slot : slots) {
             if (!slot.is_processing()) {
                 continue;
@@ -1270,14 +1270,27 @@ private:
             if (!slot.task) {
                 continue;
             }
-            // If GDN cannot keep the prefix, STARTED will clear KV and rebuild.
-            // Count remaining from 0 in that case so we still arm prefill 1024.
-            const bool rebuild = slot.state == SLOT_STATE_STARTED &&
-                    slot.prompt.n_tokens() > 0 && !slot_will_keep_lcp(slot);
-            const int32_t n_have = rebuild ? 0 : slot.prompt.n_tokens();
+            // STARTED: leftover is task - reusable prefix, not task - old prompt size.
+            // PROCESSING_PROMPT: prompt.tokens is already keep_first'd and growing.
+            const int32_t n_have = slot.state == SLOT_STATE_STARTED
+                    ? slot_reusable_prefix_tokens(slot)
+                    : slot.prompt.n_tokens();
             const int32_t n_left = slot.task->n_tokens() - n_have;
             if (n_left > cmoe_decode_ubatch) {
                 return true;
+            }
+            // STARTED still holds the previous request's prompt tokens. Using
+            // pos_next() + leftover draft KV here forced a 64→prefill→64
+            // phase switch on the second chat turn, evicted CUDA graphs, and
+            // dropped decode from ~40 tok/s to ~30. The STARTED handler
+            // clears a stale draft before PROCESSING_PROMPT; skip this check
+            // until then.
+            if (n_left > 0 && ctx_dft && slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                const llama_pos dft_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id);
+                const llama_pos y = slot.prompt.tokens.pos_next();
+                if (dft_max >= 0 && y != dft_max + 1) {
+                    return true;
+                }
             }
         }
         return false;
@@ -2207,6 +2220,31 @@ private:
         return true;
     }
 
+    static bool generated_text_is_repeat_loop(const std::string & text) {
+        const size_t n = text.size();
+        if (n < 64) {
+            return false;
+        }
+        for (size_t unit = 8; unit <= 32; ++unit) {
+            const size_t need = unit * 8;
+            if (n < need) {
+                continue;
+            }
+            const char * base = text.data() + n - need;
+            bool same = true;
+            for (size_t i = 1; i < 8; ++i) {
+                if (std::memcmp(base, base + i * unit, unit) != 0) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
@@ -2253,6 +2291,12 @@ private:
             if (slot.task->params.stream) {
                 send_partial_response(slot, result, false);
             }
+        }
+
+        if (slot.has_next_token && generated_text_is_repeat_loop(slot.generated_text)) {
+            slot.stop           = STOP_TYPE_LIMIT;
+            slot.has_next_token = false;
+            SLT_WRN(slot, "stopped by repeated n-gram loop (n_decoded = %d)\n", slot.n_decoded);
         }
 
         if (incomplete) {
@@ -3776,10 +3820,19 @@ private:
                                     }
 
                                     if (do_reset) {
-                                        SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
-                                        n_past = 0;
+                                        // Hybrid seq_pos_min is max(attn, recurrent). Recurrent
+                                        // only has the tail, so this branch always fires and used
+                                        // to wipe a keepable LCP (f_keep ~ 1, then n_past = 0).
+                                        // SWA still needs a checkpoint. GDN can roll back n_rs.
+                                        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                                            SLT_INF(slot, "no checkpoint at n_past = %d pos_min = %d thold = %d; keeping LCP\n",
+                                                    n_past, (int) pos_min, (int) pos_min_thold);
+                                        } else {
+                                            SLT_INF(slot, "forcing full prompt re-processing due to lack of cache data (see %s)\n",
+                                                    "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                            pos_next = 0;
+                                            n_past = 0;
+                                        }
                                     }
                                 }
                             }
@@ -3788,8 +3841,8 @@ private:
                             // Cancel mid-generation then LCP-reuse of the prefix needs a much
                             // larger tail trim; seq_rm either aborts or leaves attn/recurrent
                             // state inconsistent and the next prefill decode IMAs.
-                            // Target KV must be rebuilt from 0, but DFlash draft KV can keep
-                            // the matching prefix so follow-up drafts stay at first-turn TPS.
+                            // Clear target and draft together. Keeping a DFlash prefix while
+                            // the target rebuilds raced the next 1024-wide GDN prefill.
                             if (n_past > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
                                 const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
                                 const llama_pos p0_rm = slot.prompt.tokens.pos_next(n_past);
@@ -3797,11 +3850,15 @@ private:
                                 if (pos_max >= 0 && p0_rm > 0 && p0_rm <= pos_max) {
                                     const llama_pos rollback = pos_max - (p0_rm - 1);
                                     if (n_rs == 0 || rollback > (llama_pos) n_rs) {
-                                        SLT_INF(slot, "LCP n_past = %d needs recurrent rollback %d > n_rs_seq = %u; reprocessing target, keeping draft prefix\n",
+                                        SLT_INF(slot, "LCP n_past = %d needs recurrent rollback %d > n_rs_seq = %u; reprocessing prompt\n",
                                                 n_past, (int) rollback, n_rs);
-                                        n_draft_keep = n_past;
+                                        n_draft_keep = 0;
                                         pos_next = 0;
                                         n_past = 0;
+                                        common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+                                        if (ctx_dft) {
+                                            common_context_seq_rm(ctx_dft, slot.id, -1, -1);
+                                        }
                                     }
                                 }
                             }
@@ -3820,13 +3877,17 @@ private:
                             }
                         }
 
+                        bool clear_dft = false;
                         if (n_past > 0 && ctx_dft) {
                             const llama_pos dft_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id);
-                            if (dft_max >= 0 && dft_max < n_past - 1) {
-                                SLT_INF(slot, "draft KV pos_max = %d < n_past - 1 = %d; reprocessing so DFlash stays aligned\n",
-                                        (int) dft_max, n_past - 1);
-                                n_draft_keep = 0;
-                                n_past = 0;
+                            const int32_t n_left_now = slot.task->n_tokens() - n_past;
+                            // n_draft_keep <= 0 means "unset" and is filled with n_past below.
+                            // New prompt tokens are not standalone-injected (wide prefill skip),
+                            // so a kept draft prefix becomes X=LCP vs Y=prompt-end on first decode.
+                            if ((dft_max >= 0 && dft_max < n_past - 1) || n_left_now > 1) {
+                                SLT_INF(slot, "clearing draft (dft_max = %d, n_past = %d, n_left = %d)\n",
+                                        (int) dft_max, n_past, n_left_now);
+                                clear_dft = true;
                             }
                         }
 
@@ -3840,14 +3901,16 @@ private:
                         if (n_draft_keep <= 0) {
                             n_draft_keep = n_past;
                         }
-                        slot.spec_dft_rm_pos = slot.prompt.tokens.pos_next(n_draft_keep);
-                        if (n_draft_keep > n_past) {
-                            SLT_INF(slot, "keeping DFlash draft prefix n_draft_keep = %d pos = %d while target rebuilds from 0\n",
-                                    n_draft_keep, (int) slot.spec_dft_rm_pos);
+                        if (clear_dft) {
+                            n_draft_keep = 0;
                         }
+                        slot.spec_dft_rm_pos = slot.prompt.tokens.pos_next(n_draft_keep);
 
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
+
+                        SLT_INF(slot, "prompt reuse n_past = %d / %d (n_left = %d)\n",
+                                n_past, slot.task->n_tokens(), slot.task->n_tokens() - n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -3881,8 +3944,9 @@ private:
 
                     common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
                     if (ctx_dft) {
+                        // spec_dft_rm_pos == 0 clears the whole draft while target keeps LCP
                         const llama_pos p0_dft = slot.spec_dft_rm_pos >= 0 ?
-                                std::max(p0, slot.spec_dft_rm_pos) : p0;
+                                slot.spec_dft_rm_pos : p0;
                         common_context_seq_rm(ctx_dft, slot.id, p0_dft, -1);
                     }
 
@@ -3901,6 +3965,11 @@ private:
                     }
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    // Hybrid GDN + 1024-wide prefill IMAs when the prompt is split
+                    // across llama_decode calls after a cancel/LCP rebuild.
+                    if (cmoe_phase_prefill && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                        do_checkpoint = false;
+                    }
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -4133,11 +4202,11 @@ private:
             llama_synchronize(ctx_tgt);
         }
 
-        if (cmoe_phase_prefill && !cmoe_prefill_disabled &&
+        if (cmoe_phase_prefill &&
                 llama_get_runtime_ubatch(ctx_tgt) < (uint32_t) cmoe_prefill_ubatch) {
-            cmoe_prefill_disabled = true;
-            SRV_WRN("cmoe prefill disabled: runtime ubatch=%u after graph reserve fallback\n",
-                    llama_get_runtime_ubatch(ctx_tgt));
+            // Graph reserve may shrink the live ubatch; stay in prefill and retry 1024 next request.
+            SRV_WRN("cmoe prefill ubatch fell back to %u (wanted %d); staying in prefill\n",
+                    llama_get_runtime_ubatch(ctx_tgt), cmoe_prefill_ubatch);
         }
 
         if (tree_slot) {
@@ -4211,10 +4280,7 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (tree_slot == nullptr && !common_speculative_process(spec.get(), batch_view)) {
-            SRV_ERR("%s", "failed to process speculative batch\n");
-
-            // TODO: handle error
-            throw std::runtime_error("failed to process speculative batch");
+            SRV_WRN("%s", "failed to process speculative batch; continuing without draft update\n");
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too

@@ -478,8 +478,8 @@ for config in "${CONFIGS[@]}"; do
             -np 1
             --no-mmproj
             --reasoning-budget "$REASONING_BUDGET"
-            --ctx-checkpoints 0
-            --cache-ram 0
+            --ctx-checkpoints "${CTX_CHECKPOINTS:-0}"
+            --cache-ram "${CACHE_RAM:-0}"
             --jinja
             --offline
             --host 127.0.0.1

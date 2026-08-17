@@ -6,8 +6,9 @@
 # keine Kommandozeilenparameter und keine externen Overrides an. Nach einer
 # Änderung einfach erneut ./start1660.sh ausführen.
 #
-# GTX 1660 Ti (sm_75, 6 GiB): DFlash n_max=2 p_min=0.75 S=33, draft q4_0,
-# prefill 768, batch 64. Kernel stack is the measured Turing winner.
+# GTX 1660 Ti (sm_75, 6 GiB): DFlash n_max=2 p_min=0.75 S=28, Turbo4 KV,
+# prefill 1856, decode 64. P0 shrink + 1856 single-chunk Long (2026-08-17:
+# +34% PP / +5% decode vs S30 p1024; +3% PP / +8% decode vs 1792).
 # GTX 1080 reference: start1080.sh. Auto baseline for other GPUs:
 #   python3 tools/hybrid_autotune/autotune.py
 #
@@ -82,14 +83,14 @@ GGML_CUDA_TURBO4_WHT_SHUFFLE="0"  # original WHT is the SM75 winner; shuffle-fir
 MTP_N="2"  # inactive DFlash fallback; used only after switching SPEC_MODE to mtp
 LLAMA_MTP_REQUANTIZE_OUTPUT="none"  # none is the 6-GiB winner; q4_K/q5_K add a draft-only LM head but consume 273/334 MiB VRAM
 LLAMA_MTP_HEAD_TRACE="0"  # 1 prints the selected MTP-head source/type once; diagnostic only
-SPEC_DRAFT_N_MAX="6"  # DFlash-only draft block size
+SPEC_DRAFT_N_MAX="2"  # short-prompt A/B 2026-08-17: 35.3 tok/s vs 32.6 at n_max=6
 SPEC_DRAFT_N_MIN="1"  # DFlash-only minimum accepted draft length
 SPEC_DRAFT_P_MIN="0.75"  # DFlash-only confidence threshold in [0, 1]
 SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash-only backend sampling switch
 DFLASH_COMBINED="1"  # fuse target feature projection and draft KV injection into the target graph
 DRAFT_NGL="all"  # the measured winner keeps all six DFlash layers on the GPU
-REASONING="auto"  # let the model template select reasoning mode
-REASONING_BUDGET="100"  # measured quality/latency compromise; clients may request another value
+REASONING="1"  # let the model template select reasoning mode
+REASONING_BUDGET="1000"  # measured quality/latency compromise; clients may request another value
 REASONING_PRESERVE="1"  # preserve reasoning in history: 1 enabled, 0 disabled
 LOAD_MODE="mmap"  # measured loading/runtime winner; "none" was 1.87% slower and reduced S to 32
 OFFLINE="1"  # prevent network model/template downloads when set to 1
@@ -109,14 +110,15 @@ DRAFT_BACKEND_SAMPLING="1"  # MTP draft sampling on the backend; 0 forces CPU dr
 # values are empty by default; setting them enables the experimental prefill /
 # decode switch implemented in common/arg.cpp.
 GPU_ARCH="auto"  # architecture used to choose an auto batch default
-CMOE_BATCH="128"  # DFlash decode batch used by the measured 6-GiB winner
-CMOE_UBATCH="128"  # physical decode ubatch; keep equal to CMOE_BATCH
-# DFlash reserves independently at the decode geometry. These values only size
-# the target prompt graph; DFlash processes larger prompts in 64-token chunks.
-CMOE_PREFILL_BATCH="1024"  # measured fast target prompt-processing batch
-CMOE_PREFILL_UBATCH="1024"  # physical target prompt ubatch
-CMOE_DECODE_BATCH=""  # optional logical batch used only during token generation
-CMOE_DECODE_UBATCH=""  # optional physical ubatch used only during token generation
+CMOE_BATCH="64"  # base/decode fallback; phase decode below overrides when set
+CMOE_UBATCH="64"  # physical base ubatch; keep equal to CMOE_BATCH
+# Phase batching: large prefill for PP; small decode so graph peak can shrink
+# after set_runtime_ubatch (P0 gallocr shrink, 2026-08-16).
+# DFlash draft context is sized to decode geometry, not prefill.
+CMOE_PREFILL_BATCH="1856"  # Long 1823 fits one chunk; +3% PP / +8% decode vs 1792
+CMOE_PREFILL_UBATCH="1856"  # physical target prompt ubatch
+CMOE_DECODE_BATCH="64"  # logical batch during generation / DFlash verify
+CMOE_DECODE_UBATCH="64"  # physical decode ubatch; phase switch frees prefill peak
 
 # Prompt-cache controls
 CTX_CHECKPOINTS="4"  # keep up to four host-side context checkpoints
@@ -128,7 +130,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots through the full-state RAM prompt cach
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="30"  # leaves production headroom for CUDA graph instances
+LLAMA_EXPERT_S="28"  # VRAM headroom for prefill 1792 + DFlash on 6 GiB (gate 2026-08-16)
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
