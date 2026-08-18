@@ -779,6 +779,15 @@ Fixed GPU references:
 - [`start1660.sh`](start1660.sh) — measured GTX 1660 Ti (sm_75, 6 GiB) production stack
 - [`start1080.sh`](start1080.sh) — measured GTX 1080 (sm_61, 8 GiB) production stack
 - [`start.sh`](start.sh) — auto-generated baseline for the current machine
+- [`start-turbollm.sh`](start-turbollm.sh) — TurboLLM with both GPU profiles registered (see [`tools/turbollm/README.md`](tools/turbollm/README.md))
+
+TurboLLM (UI + OpenAI API on port 6996):
+
+```bash
+./start-turbollm.sh
+# Engines: Hybrid GTX 1660 Ti  |  Hybrid GTX 1080
+# Then Load the MTP Qwen3.6-35B-A3B GGUF. Do not also run start1660.sh / start1080.sh.
+```
 
 Generate/refine `start.sh` with hardware detect + optional timed search:
 
