@@ -777,6 +777,7 @@ MTP_N=2 \
 Fixed GPU references:
 
 - [`start1660.sh`](start1660.sh) — measured GTX 1660 Ti (sm_75, 6 GiB) production stack
+- [`start-ling-tiny.sh`](start-ling-tiny.sh) — Ling-3.0-tiny on the 1660 Ti (KVFlash 8192, prefill 2048)
 - [`start1080.sh`](start1080.sh) — measured GTX 1080 (sm_61, 8 GiB) production stack
 - [`start.sh`](start.sh) — auto-generated baseline for the current machine
 - [`start-turbollm.sh`](start-turbollm.sh) — TurboLLM with both GPU profiles registered (see [`tools/turbollm/README.md`](tools/turbollm/README.md))

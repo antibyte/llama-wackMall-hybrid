@@ -1029,6 +1029,66 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 params.n_batch, params.n_ubatch);
         params.kv_unified = true;
         params.no_kv_offload = false;
+    } else {
+        // Phase batching is independent of expert CPU offload. All-GPU MoE
+        // models (e.g. Ling-tiny) still want a large prefill ubatch and a
+        // small decode ubatch so gallocr can shrink after prompt processing.
+        auto cmoe_phase_batch_from_env = [](const char * name, int & target) {
+            const char * value = std::getenv(name);
+            if (value == nullptr || *value == '\0') {
+                return false;
+            }
+            const int parsed = std::stoi(value);
+            if (parsed <= 0) {
+                throw std::invalid_argument(std::string(name) + " must be greater than zero");
+            }
+            target = parsed;
+            return true;
+        };
+
+        const int base_batch  = params.n_batch;
+        const int base_ubatch = params.n_ubatch;
+        params.cmoe_n_batch_prefill  = base_batch;
+        params.cmoe_n_ubatch_prefill = base_ubatch;
+        params.cmoe_n_batch_decode   = base_batch;
+        params.cmoe_n_ubatch_decode  = base_ubatch;
+
+        bool phase_batching = false;
+        phase_batching |= cmoe_phase_batch_from_env(
+                "LLAMA_CMOE_PREFILL_BATCH", params.cmoe_n_batch_prefill);
+        phase_batching |= cmoe_phase_batch_from_env(
+                "LLAMA_CMOE_PREFILL_UBATCH", params.cmoe_n_ubatch_prefill);
+        phase_batching |= cmoe_phase_batch_from_env(
+                "LLAMA_CMOE_DECODE_BATCH", params.cmoe_n_batch_decode);
+        phase_batching |= cmoe_phase_batch_from_env(
+                "LLAMA_CMOE_DECODE_UBATCH", params.cmoe_n_ubatch_decode);
+
+        if (phase_batching) {
+            if (params.cmoe_n_ubatch_prefill > params.cmoe_n_batch_prefill) {
+                throw std::invalid_argument(
+                        "LLAMA_CMOE_PREFILL_UBATCH must not exceed LLAMA_CMOE_PREFILL_BATCH");
+            }
+            if (params.cmoe_n_ubatch_decode > params.cmoe_n_batch_decode) {
+                throw std::invalid_argument(
+                        "LLAMA_CMOE_DECODE_UBATCH must not exceed LLAMA_CMOE_DECODE_BATCH");
+            }
+            params.n_batch = std::max(
+                    params.cmoe_n_batch_prefill, params.cmoe_n_batch_decode);
+            params.n_ubatch = std::max(
+                    params.cmoe_n_ubatch_prefill, params.cmoe_n_ubatch_decode);
+            LOG_INF("phase batching: prefill=%d/%d decode=%d/%d reserve=%d/%d\n",
+                    params.cmoe_n_batch_prefill,
+                    params.cmoe_n_ubatch_prefill,
+                    params.cmoe_n_batch_decode,
+                    params.cmoe_n_ubatch_decode,
+                    params.n_batch,
+                    params.n_ubatch);
+        } else {
+            params.cmoe_n_batch_prefill = 0;
+            params.cmoe_n_ubatch_prefill = 0;
+            params.cmoe_n_batch_decode = 0;
+            params.cmoe_n_ubatch_decode = 0;
+        }
     }
 
     // cmoe: keep n_threads == -1 as an auto marker when -t is unset; it is
