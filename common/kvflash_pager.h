@@ -130,7 +130,14 @@ public:
         for (size_t l = 0; l < attn_k.size(); ++l) {
             for (int kv = 0; kv < 2; ++kv) {
                 ggml_tensor * tensor = kv == 0 ? attn_k[l] : attn_v[l];
-                if (!tensor || !tensor->data || !tensor_buffer(tensor) ||
+                // MLA stores a single compressed K cache; V is reconstructed.
+                if (!tensor) {
+                    if (kv == 1) {
+                        continue;
+                    }
+                    return false;
+                }
+                if (!tensor->data || !tensor_buffer(tensor) ||
                     tensor->ne[0] <= 0 || tensor->ne[1] < cfg.pool_tokens ||
                     tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
                     tensor->nb[1] == 0 || !ggml_is_contiguous(tensor)) {

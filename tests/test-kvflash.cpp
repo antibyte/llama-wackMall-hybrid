@@ -831,6 +831,38 @@ static void test_gpu_turbo4_get_rows_if_requested() {
     std::printf("  ok Turbo4 GET_ROWS CPU/GPU roundtrip\n");
 }
 
+static void test_mla_k_only_attach() {
+    ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    assert(device);
+    ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
+    assert(backend);
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    assert(ctx);
+
+    constexpr int width = 4;
+    constexpr int pool = 256;
+    ggml_tensor * k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, width, pool, 1);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+    assert(buffer);
+
+    KvFlashConfig cfg = cfg_pool(pool, 64, 1, 1);
+    cfg.max_context_tokens = 512;
+    KvFlashPager pager;
+    assert(!pager.attach(cfg, {k}, {k, nullptr}));
+    assert(pager.attach(cfg, {k}, {nullptr}));
+    assert(pager.bind_backends({backend.get()}));
+    assert(fill_sequential(pager, 0, pool));
+    assert(pager.page_out(1));
+    assert(pager.stats().page_outs == 1);
+    std::printf("  ok MLA K-only attach\n");
+}
+
 static void test_cpu_tensor_roundtrip() {
     test_tensor_roundtrip(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
 }
@@ -914,6 +946,7 @@ int main() {
     test_atomic_microbatch_mapping();
     test_live_eviction_past_pool();
     test_long_context_lru();
+    test_mla_k_only_attach();
     test_cpu_tensor_roundtrip();
     test_cpu_turbo4_get_rows();
     test_gpu_tensor_roundtrip_if_requested();

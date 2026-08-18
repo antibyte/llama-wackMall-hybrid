@@ -1756,24 +1756,27 @@ bool llama_kv_cache::init_kvflash(uint32_t pool_tokens, uint32_t max_context_tok
     cfg.zero_freed_blocks  = false;
 
     // Collect per-layer K/V storages for bit-exact host paging.
+    // MLA layers have K only (compressed latent); V is reconstructed.
     std::vector<ggml_tensor *> ks;
     std::vector<ggml_tensor *> vs;
     for (const auto & layer : layers) {
-        if (layer.k && layer.v) {
-            ks.push_back(layer.k);
-            vs.push_back(layer.v);
+        if (!layer.k) {
+            continue;
         }
+        ks.push_back(layer.k);
+        vs.push_back(layer.v);
     }
 
-    const bool have_data = ks.size() == layers.size() && !ks.empty() &&
+    const bool k_ready = !ks.empty() &&
             std::all_of(ks.begin(), ks.end(), [](const ggml_tensor * t) {
                 return t && t->data && t->buffer;
-            }) &&
-            std::all_of(vs.begin(), vs.end(), [](const ggml_tensor * t) {
-                return t && t->data && t->buffer;
             });
+    const bool v_ready = std::all_of(vs.begin(), vs.end(), [](const ggml_tensor * t) {
+                return !t || (t->data && t->buffer);
+            });
+    const bool have_data = k_ready && v_ready;
     if (!have_data && !hparams.no_alloc) {
-        LLAMA_LOG_ERROR("%s: KVFlash requires allocated K/V storage for every attention layer\n", __func__);
+        LLAMA_LOG_ERROR("%s: KVFlash requires allocated K storage for every attention layer\n", __func__);
         return false;
     }
 
