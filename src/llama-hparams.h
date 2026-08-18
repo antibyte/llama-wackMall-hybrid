@@ -159,8 +159,10 @@ struct llama_hparams {
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
 
-    // for Kimi Linear KDA
+    // for Kimi Linear / BailingMoE3 KDA
     uint32_t n_embd_head_kda = 0;
+    bool     kda_safe_gate = false;
+    float    kda_gate_lower_bound = 0.0f;
 
     bool ssm_dt_b_c_rms = false;
 

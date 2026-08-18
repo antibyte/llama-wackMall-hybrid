@@ -1568,6 +1568,14 @@ void init(const llama_model & model) {
     const char * env_s   = getenv("LLAMA_EXPERT_S");
     const char * env_hot = getenv("LLAMA_EXPERT_HOT");
     const char * env_placement = getenv("LLAMA_EXPERT_PLACEMENT");
+    // BailingMoE3 (Ling-3.0) is KDA+MLA+MoE. Default Qwen-style S auto-fit remaps
+    // every expert tensor and can stall on 6 GiB. Require an explicit opt-in.
+    if (model.arch == LLM_ARCH_BAILINGMOE3 &&
+            !(env_s && env_s[0]) && !(env_hot && env_hot[0]) && !(env_placement && env_placement[0])) {
+        TIER_LOG("%s: expert auto-fit skipped for bailingmoe3; set LLAMA_EXPERT_S or LLAMA_EXPERT_HOT to enable\n",
+                __func__);
+        return;
+    }
     if (const char * e = getenv("LLAMA_EXPERT_ADAPT")) {
         g_adapt = atoi(e) != 0;
     } else {
