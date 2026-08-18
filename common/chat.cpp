@@ -452,31 +452,6 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
             if (message.contains("reasoning_content")) {
                 msg.reasoning_content = message.at("reasoning_content");
             }
-            // OpenWebUI often sends both reasoning_content and the same
-            // <think>...</think> still inside content. The Qwen template
-            // re-inserts reasoning_content, which would double the block
-            // and blow past context on the next turn.
-            if (!msg.reasoning_content.empty()) {
-                auto strip_think = [](std::string & text) {
-                    const std::string start = "<think>";
-                    const std::string end   = "</think>";
-                    const auto s = text.find(start);
-                    const auto e = text.find(end);
-                    if (s == std::string::npos || e == std::string::npos || e < s) {
-                        return;
-                    }
-                    text.erase(s, e + end.size() - s);
-                    while (!text.empty() && (text[0] == '\n' || text[0] == '\r')) {
-                        text.erase(text.begin());
-                    }
-                };
-                strip_think(msg.content);
-                for (auto & part : msg.content_parts) {
-                    if (part.type == "text") {
-                        strip_think(part.text);
-                    }
-                }
-            }
             if (message.contains("name")) {
                 msg.tool_name = message.at("name");
             }
