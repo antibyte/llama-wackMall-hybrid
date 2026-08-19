@@ -783,6 +783,13 @@ Fixed GPU references:
 - [`start.sh`](start.sh) — auto-generated baseline for the current machine
 - [`start-turbollm.sh`](start-turbollm.sh) — TurboLLM with both GPU profiles registered (see [`tools/turbollm/README.md`](tools/turbollm/README.md))
 
+The measured Ling launcher uses MLA K-only KVFlash, 2048/64 phase batching,
+Q8 KV, and a four-row Q8_0 single-column MMVQ schedule. On the GTX 1660 Ti,
+KVFlash plus phase batching raised long-prompt throughput from 481 to 592
+tokens/s (+23%). The Ling grouped-router `TOP_K` path uses the ordered warp
+kernel on CUDA toolkits without CUB `DeviceTopK`; together with the Q8_0
+schedule, the measured decode uplift is about 2.1% with identical token hashes.
+
 TurboLLM (UI + OpenAI API on port 6996):
 
 ```bash
@@ -984,6 +991,7 @@ Key portable controls:
 | `LLAMA_EXPERT_SHARED_HOT_IDS` | 0 | Reuse one hot-slot ID mapping for Gate, Up, and Down in a layer |
 | `GGML_CUDA_MOE_MULTI_FUSION` | 0 | Fuse quantized Gate+Up+GLU for two to four MoE target tokens on Turing or newer GPUs |
 | `GGML_CUDA_MOE_COMBINE_FUSION` | 0 | Fuse exact F32 post-Down expert weighting and ordered Top-k reduction; experimental |
+| `GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS` | 0 | Override rows/block for non-ID Q8_0 one-column MMVQ (`1`, `2`, or `4`); `0` preserves automatic selection |
 | `GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS` | 0 | Override rows/block for non-ID Q8_0 three-column MMVQ (`1`, `2`, or `4`); `0` preserves automatic selection |
 | `GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS` | 0 | Override rows/block for plain non-ID Q6_K one-column MMVQ (`1`, `2`, or `4`) |
 | `GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS` | 0 | Override rows/block for plain non-ID Q6_K three-column MMVQ (`1`, `2`, or `4`) |

@@ -10,6 +10,96 @@ using namespace cub;
 #    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
 #endif      // GGML_CUDA_USE_CUB
 
+// Ordered warp top-k for small power-of-two rows. Older CUB versions do not
+// provide DeviceTopK and otherwise fall back to sorting every element.
+template <int ncols>
+static __global__ void top_k_f32_i32_cuda(const float * src, int * dst, const int nrows, const int k) {
+    const int row  = blockIdx.x * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+
+    constexpr int values_per_thread = ncols > WARP_SIZE ? ncols / WARP_SIZE : 1;
+    float values[values_per_thread];
+    bool  active[values_per_thread];
+
+#pragma unroll
+    for (int i = 0; i < values_per_thread; ++i) {
+        const int col = lane + i * WARP_SIZE;
+        active[i] = col < ncols;
+        values[i] = active[i] ? src[row * ncols + col] : -INFINITY;
+        if (__isnanf(values[i])) {
+            values[i] = -FLT_MAX;
+        }
+    }
+
+    for (int rank = 0; rank < k; ++rank) {
+        float max_val = -INFINITY;
+        int   max_col = INT_MAX;
+
+#pragma unroll
+        for (int i = 0; i < values_per_thread; ++i) {
+            const int col = lane + i * WARP_SIZE;
+            if (active[i] && (max_col == INT_MAX || values[i] > max_val ||
+                    (values[i] == max_val && col < max_col))) {
+                max_val = values[i];
+                max_col = col;
+            }
+        }
+
+#pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+            const float other_val = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+            const int   other_col = __shfl_xor_sync(0xFFFFFFFF, max_col, mask, WARP_SIZE);
+            if (other_col != INT_MAX && (max_col == INT_MAX || other_val > max_val ||
+                    (other_val == max_val && other_col < max_col))) {
+                max_val = other_val;
+                max_col = other_col;
+            }
+        }
+
+        if (lane == 0) {
+            dst[row * k + rank] = max_col;
+        }
+        if (max_col % WARP_SIZE == lane) {
+            active[max_col / WARP_SIZE] = false;
+        }
+    }
+}
+
+static bool top_k_f32_i32_cuda_ordered(
+        const float * src, int * dst, const int ncols, const int nrows, const int k, cudaStream_t stream) {
+    if (k > WARP_SIZE || k > ncols) {
+        return false;
+    }
+
+    constexpr int rows_per_block = 4;
+    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+    const dim3 grid_dims((nrows + rows_per_block - 1) / rows_per_block, 1, 1);
+
+#define GGML_CUDA_TOP_K_CASE(N) \
+    case N: \
+        top_k_f32_i32_cuda<N><<<grid_dims, block_dims, 0, stream>>>(src, dst, nrows, k); \
+        return true
+
+    switch (ncols) {
+        GGML_CUDA_TOP_K_CASE(1);
+        GGML_CUDA_TOP_K_CASE(2);
+        GGML_CUDA_TOP_K_CASE(4);
+        GGML_CUDA_TOP_K_CASE(8);
+        GGML_CUDA_TOP_K_CASE(16);
+        GGML_CUDA_TOP_K_CASE(32);
+        GGML_CUDA_TOP_K_CASE(64);
+        GGML_CUDA_TOP_K_CASE(128);
+        GGML_CUDA_TOP_K_CASE(256);
+        GGML_CUDA_TOP_K_CASE(512);
+        default: return false;
+    }
+
+#undef GGML_CUDA_TOP_K_CASE
+}
+
 #ifdef CUB_TOP_K_AVAILABLE
 
 static void top_k_cub(ggml_cuda_pool & pool,
@@ -70,7 +160,11 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     for (int i = 0; i < nrows; i++) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
-#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+#else  // CUB_TOP_K_AVAILABLE
+    if (top_k_f32_i32_cuda_ordered(src0_d, dst_d, ncols, nrows, k, stream)) {
+        return;
+    }
+#if defined(GGML_CUDA_USE_CUB)
     // Fall back to argsort + copy
     const int    ncols_pad      = next_power_of_2(ncols);
     const size_t shared_mem     = ncols_pad * sizeof(int);
@@ -102,4 +196,5 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
                                  cudaMemcpyDeviceToDevice, stream));
 #endif
+#endif  // CUB_TOP_K_AVAILABLE
 }

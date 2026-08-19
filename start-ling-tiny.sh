@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ling-3.0-tiny (bailingmoe3) on GTX 1660 Ti — measured 2026-08-18.
+# Ling-3.0-tiny (bailingmoe3) on GTX 1660 Ti — measured 2026-08-19.
 # KVFlash 8192 + phase prefill 2048 / decode 64, all experts on GPU.
 # No MTP in this GGUF. Turbo4 is incompatible with MLA k=576.
 set -euo pipefail
@@ -19,6 +19,7 @@ KVFLASH="${KVFLASH:-8192}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export GGML_CUDA_MOE_MULTI_FUSION=1
 export GGML_CUDA_MOE_COMBINE_FUSION=1
+export GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS=4
 export GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=4
 export GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS=2
 export GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS=4
