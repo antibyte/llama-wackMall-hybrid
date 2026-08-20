@@ -4614,6 +4614,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // grouped topk-moe (BAILINGMOE3 / Ling): SIGMOID + group mask + TOP_K, before flat ARGSORT path
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+        ggml_cuda_topk_moe_grouped_args  gargs;
+        ggml_cuda_topk_moe_grouped_match match;
+        if (ggml_cuda_topk_moe_grouped_match_nodes(cgraph, i, gargs, match)) {
+            std::vector<ggml_op> ops(match.n_nodes);
+            for (int j = 0; j < match.n_nodes; ++j) {
+                ops[j] = cgraph->nodes[i + j]->op;
+            }
+            int out_nodes[2] = { match.ids_idx, match.weights_idx };
+            if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, (int) ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                gargs.weight_eps = ggml_cuda_moe_weight_eps();
+                static std::atomic<bool> logged{false};
+                if (getenv("GGML_CUDA_TOPK_MOE_TRACE") && !logged.exchange(true)) {
+                    fprintf(stderr, "ggml_cuda: grouped topk-moe fusion active: experts=128 groups=8 used=4 top=8 tokens=%d nodes=%d bias=%d norm=%d scale=%d\n",
+                            (int) match.logits->ne[1], match.n_nodes,
+                            (int) gargs.prob_bias, (int) gargs.norm, (int) gargs.scale);
+                }
+                ggml_cuda_op_topk_moe_grouped(*cuda_ctx, match.logits, match.weights, match.ids,
+                                              match.clamp, match.scale, match.bias, gargs);
+                return match.n_nodes - 1;
+            }
+            static std::atomic<bool> fuse_fail_logged{false};
+            if (getenv("GGML_CUDA_TOPK_MOE_TRACE") && !fuse_fail_logged.exchange(true)) {
+                fprintf(stderr, "ggml_cuda: grouped topk-moe matcher hit but subgraph fuse failed (nodes=%d ids_idx=%d weights_idx=%d)\n",
+                        match.n_nodes, match.ids_idx, match.weights_idx);
+            }
+        }
+    }
+
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {

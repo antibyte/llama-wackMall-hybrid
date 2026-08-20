@@ -4015,6 +4015,41 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV + GGML_OP_UNARY(SILU) + reshape (Ling KDA decode order)
+struct test_ssm_conv_silu_reshape : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_b;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_SILU_RESHAPE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne_a, ne_b);
+    }
+
+    test_ssm_conv_silu_reshape(ggml_type type, std::array<int64_t, 4> ne_a, std::array<int64_t, 4> ne_b)
+        : type(type), ne_a(ne_a), ne_b(ne_b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+        out = ggml_silu(ctx, out);
+        out = ggml_reshape_2d(ctx, out, out->ne[0], out->ne[1] * out->ne[2]);
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -4525,6 +4560,29 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+struct test_mul_mat_id_neg : public test_mul_mat_id {
+    test_mul_mat_id_neg()
+        : test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 8, 8, false, 32, 1, 256) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                const int32_t first = -1;
+                ggml_backend_tensor_set(t, &first, r * t->nb[1], sizeof(int32_t));
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_NEG";
     }
 };
 
@@ -6107,6 +6165,98 @@ struct test_topk_moe : public test_case {
             a2[i] = a[i];
             b2[i] = b[i];
         }
+        std::sort(a2.begin(), a2.end());
+        std::sort(b2.begin(), b2.end());
+        return nmse(a2.data(), b2.data(), n);
+    }
+};
+
+struct test_topk_moe_grouped : public test_case {
+    const int n_expert;
+    const int n_tokens;
+    const int n_groups;
+    const int n_group_used;
+    const int group_top;
+    const int n_expert_used;
+    const bool with_norm;
+    const bool bias_probs;
+    const float scale_w;
+    ggml_tensor * weights {};
+    ggml_tensor * selected_experts {};
+
+    test_topk_moe_grouped(int n_expert = 128, int n_tokens = 1, int n_groups = 8,
+                          int n_group_used = 4, int group_top = 2, int n_expert_used = 8,
+                          bool with_norm = true, bool bias_probs = true, float scale_w = 2.5f)
+        : n_expert(n_expert), n_tokens(n_tokens), n_groups(n_groups),
+          n_group_used(n_group_used), group_top(group_top), n_expert_used(n_expert_used),
+          with_norm(with_norm), bias_probs(bias_probs), scale_w(scale_w) {
+        GGML_ASSERT(n_expert % n_groups == 0);
+        GGML_ASSERT(n_group_used < n_groups);
+        GGML_ASSERT(n_expert_used <= n_expert);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR9(n_expert, n_tokens, n_groups, n_group_used, group_top,
+                            n_expert_used, with_norm, bias_probs, scale_w);
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TOPK_MOE_GROUPED";
+    }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_exp_per_group = n_expert / n_groups;
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tokens);
+        ggml_tensor * probs = ggml_sigmoid(ctx, logits);
+        ggml_set_name(probs, "probs");
+
+        ggml_tensor * selection_probs = probs;
+        if (bias_probs) {
+            ggml_tensor * exp_probs_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+            ggml_set_name(exp_probs_b, "exp_probs_b");
+            selection_probs = ggml_add(ctx, probs, exp_probs_b);
+        }
+
+        ggml_tensor * selection_groups = ggml_reshape_3d(ctx, selection_probs,
+                n_exp_per_group, n_groups, n_tokens);
+        ggml_tensor * group_ids = ggml_top_k(ctx, selection_groups, group_top);
+        ggml_tensor * group_vals = ggml_get_rows(ctx,
+                ggml_reshape_4d(ctx, selection_groups, 1, selection_groups->ne[0],
+                    selection_groups->ne[1], selection_groups->ne[2]),
+                group_ids);
+        ggml_tensor * group_scores = ggml_sum_rows(ctx,
+                ggml_reshape_3d(ctx, group_vals, group_vals->ne[1], group_vals->ne[2], group_vals->ne[3]));
+        group_scores = ggml_reshape_2d(ctx, group_scores, group_scores->ne[1], group_scores->ne[2]);
+
+        ggml_tensor * expert_groups = ggml_top_k(ctx, group_scores, n_group_used);
+        selection_probs = ggml_get_rows(ctx, selection_groups, expert_groups);
+        selection_probs = ggml_set_rows(ctx, ggml_fill(ctx, selection_groups, -INFINITY),
+                selection_probs, expert_groups);
+        selection_probs = ggml_reshape_2d(ctx, selection_probs, n_expert, n_tokens);
+
+        selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts);
+        if (with_norm) {
+            weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+            ggml_tensor * weights_sum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights), 6.103515625e-5, INFINITY);
+            weights = ggml_div(ctx, weights, weights_sum);
+            weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+        }
+        if (scale_w != 0.0f && scale_w != 1.0f) {
+            weights = ggml_scale(ctx, weights, scale_w);
+        }
+        ggml_set_name(weights, "weights");
+        return weights;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<float> a2(a, a + n);
+        std::vector<float> b2(b, b + n);
         std::sort(a2.begin(), a2.end());
         std::sort(b2.begin(), b2.end());
         return nmse(a2.data(), b2.data(), n);
@@ -8829,6 +8979,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Ling-3.0-tiny KDA decode: n_t=1, d_inner=2048, d_conv=4 (silu before reshape)
+    test_cases.emplace_back(new test_ssm_conv_silu_reshape(GGML_TYPE_F32, {4, 2048, 1, 1}, {4, 2048, 1, 1}));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2
@@ -9052,6 +9204,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
+    test_cases.emplace_back(new test_mul_mat_id_neg());
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
     // gpt-oss issue with Vulkan mmq_id
@@ -9669,6 +9822,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    test_cases.emplace_back(new test_topk_moe_grouped(128, 1, 8, 4, 2, 8, true, true, 2.5f));
+    test_cases.emplace_back(new test_topk_moe_grouped(128, 4, 8, 4, 2, 8, true, true, 2.5f));
+    test_cases.emplace_back(new test_topk_moe_grouped(128, 2, 8, 4, 2, 8, true, false, 2.5f));
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -10038,6 +10195,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
+    // Ling-3.0-tiny KDA decode: n_t=1, d_inner=2048, d_conv=4 (silu before reshape)
+    test_cases.emplace_back(new test_ssm_conv_silu_reshape(GGML_TYPE_F32, {4, 2048, 1, 1}, {4, 2048, 1, 1}));
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
 

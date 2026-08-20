@@ -25,7 +25,6 @@ static __global__ void mul_mat_vec_f(
     int channel_y;
     int sample_dst;
 
-    ggml_cuda_pdl_sync();
     if constexpr (is_multi_token_id) {
         // Multi-token MUL_MAT_ID path, adding these in the normal path causes a perf regression for n_tokens=1 case
         token_idx  = blockIdx.z;
@@ -38,6 +37,19 @@ static __global__ void mul_mat_vec_f(
         channel_y  = ids ? fastmodulo(blockIdx.y, nchannels_y)                 : channel_dst;
         sample_dst = ids ? 0                                                   : blockIdx.z;
     }
+
+    if (ids && ggml_cuda_mul_mat_id_is_skipped((int32_t) channel_x, fusion.skip_slot)) {
+        if (tid < ncols_dst) {
+            float * dst_row = dst + int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
+            if constexpr (is_multi_token_id) {
+                dst_row += token_idx*stride_col_dst;
+            }
+            dst_row[tid*stride_col_dst + row] = 0.0f;
+        }
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
 
     const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
     const int sample_y    = sample_dst;

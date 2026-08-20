@@ -201,7 +201,8 @@ static ggml_tensor * bailingmoe3_causal_conv1d(
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
     ggml_tensor * out = ggml_ssm_conv(ctx0, conv_x, conv_weight);
-    out = ggml_silu(ctx0, ggml_reshape_2d(ctx0, out, d_inner, n_tokens));
+    out = ggml_silu(ctx0, out);
+    out = ggml_reshape_2d(ctx0, out, d_inner, n_tokens);
     return ggml_reshape_4d(ctx0, out, head_dim, n_head, n_seq_tokens, n_seqs);
 }
 

@@ -1555,6 +1555,10 @@ static inline int32_t ggml_cuda_mul_mat_id_skip_slot(const ggml_tensor * t) {
     return slot >= 0 ? slot : -1;
 }
 
+static __device__ __forceinline__ bool ggml_cuda_mul_mat_id_is_skipped(int32_t expert_id, int32_t skip_slot) {
+    return expert_id < 0 || (skip_slot >= 0 && expert_id == skip_slot);
+}
+
 struct ggml_cuda_kernel_launch_params {
     dim3 block_nums;
     dim3 block_dims;

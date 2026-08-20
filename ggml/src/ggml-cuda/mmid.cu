@@ -46,7 +46,7 @@ static __global__ void mm_ids_helper(
             int cnt = 0;
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                nex_prev += expert_used >= 0 && expert_used < expert;
                 cnt += expert_used == expert;
             }
 
@@ -82,8 +82,8 @@ static __global__ void mm_ids_helper(
             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
-            const bool hit = expert_used == expert;
-            nex_prev += expert_used < expert;
+            const bool hit = expert_used >= 0 && expert_used == expert;
+            nex_prev += expert_used >= 0 && expert_used < expert;
 
             // With expert tiering, several slots of one token can map to the same
             // (sentinel) expert, so count hits per token instead of "any" and give
