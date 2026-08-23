@@ -1401,9 +1401,22 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
-        COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");
-        params.ctx_shift = false;
+    {
+        const int32_t n_swa = params.swa_full ? 0 : llama_model_n_swa(model);
+        if (!common_prompt_kv_shift_safe_ctx(lctx, n_swa)) {
+            if (params.ctx_shift) {
+                COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");
+                params.ctx_shift = false;
+            }
+            if (params.n_cache_reuse > 0) {
+                COM_WRN("%s", "cache reuse is not supported for this context, disabling n_cache_reuse\n");
+                params.n_cache_reuse = 0;
+            }
+            if (params.grp_attn_n != 1) {
+                COM_WRN("%s", "self-extend group-attention is not supported for this context, disabling grp_attn_n\n");
+                params.grp_attn_n = 1;
+            }
+        }
     }
 
     if (!params.control_vectors.empty()) {
@@ -1513,6 +1526,308 @@ std::string common_get_model_endpoint() {
     return model_endpoint;
 }
 
+bool common_keep_lcp_without_checkpoint(common_context_seq_rm_type rm_type, bool is_hybrid, int32_t n_swa) {
+    if (rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        return false;
+    }
+    if (rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+        return true;
+    }
+    return is_hybrid && n_swa == 0;
+}
+
+bool common_prompt_kv_shift_safe(common_context_seq_rm_type rm_type, bool is_hybrid, int32_t n_swa) {
+    return !common_keep_lcp_without_checkpoint(rm_type, is_hybrid, n_swa);
+}
+
+bool common_prompt_kv_shift_safe_ctx(const llama_context * ctx, int32_t n_swa) {
+    if (!ctx) {
+        return false;
+    }
+    const llama_model * model = llama_get_model(ctx);
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (!model || !mem || !llama_memory_can_shift(mem)) {
+        return false;
+    }
+    const bool hybrid = llama_model_is_hybrid(model);
+    const common_context_seq_rm_type rm = llama_n_rs_seq(ctx) > 0
+        ? COMMON_CONTEXT_SEQ_RM_TYPE_RS
+        : COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+    return common_prompt_kv_shift_safe(rm, hybrid, n_swa);
+}
+
+bool common_recurrent_rollback_exceeds(llama_pos pos_max, llama_pos p0_rm, uint32_t n_rs) {
+    if (pos_max < 0 || p0_rm <= 0 || p0_rm > pos_max) {
+        return false;
+    }
+    const llama_pos rollback = pos_max - (p0_rm - 1);
+    return n_rs == 0 || rollback > (llama_pos) n_rs;
+}
+
+int32_t common_reuse_prefix_tokens(int32_t n_lcp, bool rollback_exceeds, int32_t n_ckpt) {
+    if (n_lcp <= 0) {
+        return 0;
+    }
+    if (!rollback_exceeds) {
+        return n_lcp;
+    }
+    if (n_ckpt <= 0 || n_ckpt > n_lcp) {
+        return 0;
+    }
+    return n_ckpt;
+}
+
+int32_t common_prefix_checkpoint_tokens(const std::vector<int64_t> & ckpt_n_tokens, int32_t n_lcp) {
+    int32_t best = 0;
+    for (int64_t n : ckpt_n_tokens) {
+        if (n > 0 && n <= n_lcp && (int32_t) n > best) {
+            best = (int32_t) n;
+        }
+    }
+    return best;
+}
+
+int32_t common_estimate_reuse_prefix_tokens(
+        int32_t n_lcp,
+        int32_t n_cached,
+        int32_t n_ckpt,
+        uint32_t n_rs,
+        bool keep_lcp_without_ckpt) {
+    if (n_lcp <= 0 || n_cached < n_lcp) {
+        return 0;
+    }
+    if (!keep_lcp_without_ckpt) {
+        return n_lcp;
+    }
+    const llama_pos pos_max = (llama_pos) n_cached - 1;
+    const llama_pos p0_rm = (llama_pos) n_lcp;
+    const bool rollback_exceeds = common_recurrent_rollback_exceeds(pos_max, p0_rm, n_rs);
+    return common_reuse_prefix_tokens(n_lcp, rollback_exceeds, n_ckpt);
+}
+
+bool common_prompt_reuse_skip_unrelated(int32_t reuse_cur, int32_t reuse_best, float f_keep_cur) {
+    if (reuse_cur > reuse_best) {
+        return false;
+    }
+    return f_keep_cur < 0.25f;
+}
+
+bool common_prompt_reuse_better(
+        int32_t reuse_cur, int32_t reuse_best,
+        float f_keep_cur, float f_keep_best,
+        float sim_cur, float sim_best) {
+    if (reuse_cur > reuse_best) {
+        return true;
+    }
+    if (reuse_cur < reuse_best) {
+        return false;
+    }
+    if (f_keep_best < 0.0f) {
+        return true;
+    }
+    return f_keep_best < f_keep_cur && sim_best < sim_cur;
+}
+
+int32_t common_checkpoint_evict_index(const std::vector<int64_t> & ckpt_n_tokens) {
+    const int32_t n = (int32_t) ckpt_n_tokens.size();
+    if (n <= 0) {
+        return -1;
+    }
+    if (n == 1) {
+        return 0;
+    }
+    if (n == 2) {
+        return 1;
+    }
+    // Never drop index 0 (earliest prefix). Prefer to keep n-1 (turn-end).
+    // Peel the later member of the tightest adjacent pair, or the earlier of
+    // that pair when it is the tail so the next-turn radix node stays.
+    int32_t best = 1;
+    int64_t best_gap = ckpt_n_tokens[1] - ckpt_n_tokens[0];
+    for (int32_t i = 2; i < n; ++i) {
+        const int64_t gap = ckpt_n_tokens[i] - ckpt_n_tokens[i - 1];
+        if (gap <= best_gap) {
+            best_gap = gap;
+            best = i;
+        }
+    }
+    if (best == n - 1) {
+        return n - 2;
+    }
+    return best;
+}
+
+bool common_checkpoint_too_dense(int64_t n_cur, int64_t n_back, int64_t min_gap) {
+    if (n_cur <= n_back) {
+        return true;
+    }
+    if (min_gap <= 0) {
+        return false;
+    }
+    return n_cur - n_back < min_gap;
+}
+
+bool common_checkpoint_should_break(
+        bool at_last_user,
+        bool at_prefix,
+        bool has_last_user,
+        int64_t n_last,
+        int64_t pos,
+        int32_t min_step) {
+    if (at_last_user) {
+        return true;
+    }
+    if (!at_prefix) {
+        return false;
+    }
+    if (n_last < 0) {
+        return !has_last_user;
+    }
+    return min_step > 0 && pos > n_last + min_step;
+}
+
+bool common_checkpoint_should_snapshot(
+        bool want_break,
+        bool prompt_done,
+        bool near_prompt_end,
+        bool cmoe_rs_prefill,
+        bool has_last_user,
+        bool has_checkpoint) {
+    if (want_break) {
+        return true;
+    }
+    if (cmoe_rs_prefill) {
+        if (!prompt_done) {
+            return false;
+        }
+        // Chat already has the last-user radix node. Raw completion and a
+        // missed last-user copy still need a prompt-end snapshot.
+        return !has_last_user || !has_checkpoint;
+    }
+    return prompt_done || near_prompt_end;
+}
+
+bool common_checkpoint_should_split_ubatch(
+        bool should_break,
+        int64_t n_last,
+        int64_t pos,
+        int64_t n_prompt,
+        int64_t min_gap,
+        bool fill_wide) {
+    if (fill_wide || !should_break) {
+        return false;
+    }
+    if (n_last >= 0 && common_checkpoint_too_dense(pos, n_last, min_gap)) {
+        return false;
+    }
+    if (min_gap > 0 && n_prompt - pos < min_gap) {
+        return false;
+    }
+    return true;
+}
+
+bool common_checkpoint_is_radix_index(int32_t i, int32_t n) {
+    if (n <= 0 || i < 0 || i >= n) {
+        return false;
+    }
+    if (n <= 2) {
+        return true;
+    }
+    return i == 0 || i == n - 1;
+}
+
+int32_t common_cmoe_first_prefill_at(int32_t decode_ubatch, int32_t prefill_ubatch) {
+    if (decode_ubatch <= 0) {
+        return prefill_ubatch > 0 ? prefill_ubatch : 0;
+    }
+    if (prefill_ubatch <= 0) {
+        return decode_ubatch;
+    }
+    const int64_t n = (int64_t) decode_ubatch * 4;
+    if (n >= prefill_ubatch) {
+        return prefill_ubatch;
+    }
+    return (int32_t) n;
+}
+
+bool common_cmoe_prefer_prefill(
+        int32_t n_left,
+        int32_t n_have,
+        int32_t decode_ubatch,
+        int32_t prefill_ubatch,
+        bool currently_prefill) {
+    if (n_left <= 0 || decode_ubatch <= 0) {
+        return false;
+    }
+    if (prefill_ubatch > 0 && n_left > prefill_ubatch) {
+        return true;
+    }
+    if (currently_prefill) {
+        return n_left > decode_ubatch;
+    }
+    if (n_have <= 0) {
+        return n_left > common_cmoe_first_prefill_at(decode_ubatch, prefill_ubatch);
+    }
+    return false;
+}
+
+int32_t common_cmoe_graph_batch(int32_t decode_ubatch, int32_t spec_n_max) {
+    int32_t n = decode_ubatch;
+    if (n <= 0 || n > COMMON_CMOE_MMVQ_GRAPH_BATCH) {
+        n = COMMON_CMOE_MMVQ_GRAPH_BATCH;
+    }
+    if (spec_n_max > 0) {
+        const int32_t spec_batch = spec_n_max + 1;
+        if (spec_batch < n) {
+            n = spec_batch;
+        }
+    }
+    return n;
+}
+
+bool common_cmoe_use_ngram_leftover_graph(bool decode_phase, bool has_draft_ctx) {
+    return decode_phase && !has_draft_ctx;
+}
+
+bool common_cmoe_leftover_match_spec_logits(bool decode_phase, int32_t spec_n_max) {
+    return decode_phase && spec_n_max > 0;
+}
+
+llama_pos common_spec_draft_noise_trim_p0(llama_pos pos_next, llama_pos ckpt_pos_max) {
+    if (pos_next > 0) {
+        return pos_next;
+    }
+    if (ckpt_pos_max >= 0) {
+        return ckpt_pos_max + 1;
+    }
+    return -1;
+}
+
+bool common_dflash_pos_jump(llama_pos draft_pos_max, llama_pos batch_pos_min) {
+    return draft_pos_max >= 0 && batch_pos_min != draft_pos_max + 1;
+}
+
+bool common_spec_draft_covers_keep(llama_pos dft_max, int32_t n_past) {
+    if (n_past <= 0) {
+        return true;
+    }
+    return dft_max >= (llama_pos) n_past - 1;
+}
+
+bool common_spec_clear_draft_kv(bool covers_keep, bool leftover_prefill) {
+    return !covers_keep || leftover_prefill;
+}
+
+bool common_spec_dflash_keep_draft_token(int32_t n_kept, int32_t n_min, float p, float p_min) {
+    if (n_min < 0) {
+        n_min = 0;
+    }
+    if (n_kept >= n_min) {
+        return true;
+    }
+    return p_min <= 0.0f || p >= p_min;
+}
+
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
@@ -1569,6 +1884,15 @@ void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_s
 
 void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
     auto * mem = llama_get_memory(ctx);
+    if (delta != 0) {
+        const llama_model * model = llama_get_model(ctx);
+        const int32_t n_swa = model ? llama_model_n_swa(model) : 0;
+        if (!common_prompt_kv_shift_safe_ctx(ctx, n_swa)) {
+            COM_ERR("refusing KV seq_add on recurrent/hybrid GDN context (seq=%d p0=%d p1=%d delta=%d)\n",
+                    seq_id, p0, p1, delta);
+            return;
+        }
+    }
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
 }
 

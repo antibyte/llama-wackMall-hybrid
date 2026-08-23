@@ -392,9 +392,9 @@ static bool spec_types_is_mtp_only(const common_params & params) {
 
 static bool spec_types_is_dflash_only(const common_params & params) {
     const auto & types = params.speculative.types;
-    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end() &&
+    return std::any_of(types.begin(), types.end(), common_speculative_type_is_dflash_family) &&
         std::all_of(types.begin(), types.end(), [](common_speculative_type type) {
-            return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_NONE;
+            return common_speculative_type_is_dflash_family(type) || type == COMMON_SPECULATIVE_TYPE_NONE;
         });
 }
 
@@ -408,9 +408,9 @@ common_models_handler common_models_handler_init(const common_params & params, l
                                         params.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
-    const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
+    const bool spec_type_draft_dflash = std::any_of(params.speculative.types.begin(),
                                            params.speculative.types.end(),
-                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
+                                           common_speculative_type_is_dflash_family);
 
     const bool spec_type_draft_eagle3 = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -4876,6 +4876,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, force-kill model instance after this many seconds of graceful shutdown",
         [](common_params &, int) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
+
+    args.push_back(common_arg(
+        {"child-env-file"}, "PATH",
+        "in server router mode, KEY=VALUE file merged into the child server environment",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_CHILD_ENV_FILE).set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},

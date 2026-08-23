@@ -25,6 +25,7 @@
 # IDE / OS
 
 /.cache/
+/.router-runtime/
 /.ccls-cache/
 /.direnv/
 /.envrc

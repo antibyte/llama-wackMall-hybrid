@@ -519,11 +519,24 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
 }
 
 common_chat_msg_spans server_tokens::find_message_spans(const common_chat_msg_delimiters & delims) const {
+    return find_message_spans(delims, {}, {});
+}
+
+common_chat_msg_spans server_tokens::find_message_spans(
+        const common_chat_msg_delimiters & delims,
+        const llama_tokens & think_start,
+        const std::vector<llama_tokens> & think_ends) const {
     std::map<size_t, size_t> skips;
     for (const auto & it : map_idx_to_media) {
         skips[it.first] = mtmd_input_chunk_get_n_tokens(it.second.get());
     }
-    return delims.split(tokens, skips);
+    auto spans = delims.split(tokens, skips);
+    spans.add_delimiter_start_tokens(delims);
+    spans.add_token_pattern_anchors(tokens, think_start, COMMON_CHAT_ANCHOR_THINK_START, skips);
+    for (const auto & end : think_ends) {
+        spans.add_token_pattern_anchors(tokens, end, COMMON_CHAT_ANCHOR_THINK_END, skips);
+    }
+    return spans;
 }
 
 bool server_tokens::validate(const struct llama_context * ctx) const {
@@ -1122,6 +1135,12 @@ json oaicompat_chat_params_parse(
     }
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
+    if (!chat_params.thinking_start_tag.empty()) {
+        llama_params["thinking_start_tag"] = chat_params.thinking_start_tag;
+    }
+    if (!chat_params.thinking_end_tags.empty()) {
+        llama_params["thinking_end_tags"] = chat_params.thinking_end_tags;
+    }
 
     // Reasoning budget: pass parameters through to sampling layer
     {

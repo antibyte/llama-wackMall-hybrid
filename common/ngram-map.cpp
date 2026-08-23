@@ -46,6 +46,13 @@ static std::string common_tokens_to_str(const llama_tokens & inp, size_t start, 
  * @param sampled   Last sampled token
  * @return Vector of draft tokens, empty if no matching pattern is found
  */
+size_t common_ngram_simple_search_stop(size_t cur_len, uint32_t window) {
+    if (window == 0 || cur_len <= (size_t) window) {
+        return 0;
+    }
+    return cur_len - (size_t) window;
+}
+
 llama_tokens common_ngram_simple_draft(
         const common_ngram_simple_config & config,
         const llama_tokens & tokens, llama_token sampled) {
@@ -76,7 +83,8 @@ llama_tokens common_ngram_simple_draft(
 
     size_t match_pos = 0; // we ignore position 0, position 0 == no match
                           // search backwards, but skip the current match (we are currently there)
-    for (size_t j = cur_len - n_draft_min - 1; j > 0; --j) {
+    const size_t search_stop = common_ngram_simple_search_stop(cur_len, config.search_window);
+    for (size_t j = cur_len - n_draft_min - 1; j > search_stop; --j) {
         bool match = true;
         for (size_t k = 0; k < pattern.size(); ++k) {
             if (tokens[j + k] != pattern[k]) {

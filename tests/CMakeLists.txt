@@ -262,6 +262,9 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-hybrid-lcp.cpp)
+target_include_directories(test-hybrid-lcp PRIVATE ../src)
+llama_build_and_test(test-dspark-type.cpp)
 
 add_executable(test-expert-warm-cache
     test-expert-warm-cache.cpp

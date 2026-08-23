@@ -90,7 +90,7 @@ SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash-only backend sampling switch
 DFLASH_COMBINED="1"  # fuse target feature projection and draft KV injection into the target graph
 DRAFT_NGL="all"  # the measured winner keeps all six DFlash layers on the GPU
 REASONING="1"  # let the model template select reasoning mode
-REASONING_BUDGET="1000"  # measured quality/latency compromise; clients may request another value
+REASONING_BUDGET="2000"  # measured quality/latency compromise; clients may request another value
 REASONING_PRESERVE="1"  # preserve reasoning in history: 1 enabled, 0 disabled
 LOAD_MODE="mmap"  # measured loading/runtime winner; "none" was 1.87% slower and reduced S to 32
 OFFLINE="1"  # prevent network model/template downloads when set to 1
@@ -121,10 +121,10 @@ CMOE_DECODE_BATCH="64"  # logical batch during generation / DFlash verify
 CMOE_DECODE_UBATCH="64"  # physical decode ubatch; phase switch frees prefill peak
 
 # Prompt-cache controls
-CTX_CHECKPOINTS="4"  # keep up to four host-side context checkpoints
+CTX_CHECKPOINTS="8"  # think/tool/role/turn-end anchors; 4 evicted too quickly
 CACHE_RAM="2048"  # host-side full-state prompt-cache budget (MiB), including KVFlash host pages
 CACHE_PROMPT="1"  # enable prompt-prefix reuse when set to 1
-CACHE_REUSE="16"  # minimum matching chunk size for position-safe KVFlash cache reuse
+CACHE_REUSE="0"  # GDN recurrent state is prefix-dependent; chunk KV shift is unsafe
 KV_UNIFIED="1"  # share one unified KV buffer between slots when set to 1
 CACHE_IDLE_SLOTS="1"  # retain idle slots through the full-state RAM prompt cache
 
@@ -152,6 +152,8 @@ LLAMA_EXPERT_CPU_MULTI_ROW="0"  # AVX2 multi-row reduced CPU time but was neutra
 LLAMA_EXPERT_CPU_FUSED_GATE_UP="0"  # exact AVX2 dual-dot; +0.21% median was below promotion threshold on Ryzen 4800H
 
 # Warmcache. Fixed hot slots are never evicted; W=0 is the measured MTP path.
+# cpu-heavy q*~0.10 on this GPU: PCIe fill is slower than CPU cold (bench_expert_bw.py).
+LLAMA_EXPERT_BW_PROFILE="$PROJECT_ROOT/profiles/gtx1660-expert-bw.json"
 LLAMA_EXPERT_WARM_SLOTS="0"  # extra LRU slots per layer; W=0 is the measured 6-GiB winner
 LLAMA_EXPERT_WARM_AUTO_MAX="8"  # cap for W=auto; raise only after VRAM measurements
 LLAMA_EXPERT_WARM_POLICY="lru"  # replacement policy; currently only lru is supported
@@ -488,6 +490,7 @@ env_args=(
     "LLAMA_EXPERT_CPU_MULTI_ROW=$LLAMA_EXPERT_CPU_MULTI_ROW"
     "LLAMA_EXPERT_CPU_FUSED_GATE_UP=$LLAMA_EXPERT_CPU_FUSED_GATE_UP"
     "LLAMA_EXPERT_WARM_SLOTS=$LLAMA_EXPERT_WARM_SLOTS"
+    "LLAMA_EXPERT_BW_PROFILE=$LLAMA_EXPERT_BW_PROFILE"
     "LLAMA_EXPERT_WARM_AUTO_MAX=$LLAMA_EXPERT_WARM_AUTO_MAX"
     "LLAMA_EXPERT_WARM_PREFETCH=$LLAMA_EXPERT_WARM_PREFETCH"
     "LLAMA_EXPERT_VRAM_RESERVE_MIB=$LLAMA_EXPERT_VRAM_RESERVE_MIB"

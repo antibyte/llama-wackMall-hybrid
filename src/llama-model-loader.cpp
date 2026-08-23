@@ -1321,6 +1321,19 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
     return tensor;
 }
 
+void llama_model_loader::skip_tensor(const char * name) {
+    const ggml_tensor * t_meta = get_tensor_meta(name);
+    if (!t_meta) {
+        return;
+    }
+
+    const size_t nbytes = ggml_nbytes(t_meta);
+    LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", name, nbytes);
+
+    size_data -= nbytes;
+    n_created++;
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));

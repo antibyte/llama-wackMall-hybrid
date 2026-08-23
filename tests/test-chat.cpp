@@ -1622,6 +1622,74 @@ static void test_msg_token_delimiters_split() {
         assert_equals(true,  result.is_user_start(0));
         assert_equals(false, result.is_user_start(4));  // assistant span
         assert_equals(true,  result.is_user_start(9));
+
+        // role starts are semantic anchors (turns)
+        assert_equals(true,  result.is_anchor(0));
+        assert_equals(true,  result.is_anchor(4));
+        assert_equals(true,  result.is_anchor(9));
+        assert_equals(false, result.is_anchor(1));
+        assert_equals(4,     result.last_anchor_pos_at_or_before(8));
+        assert_equals(9,     result.last_anchor_pos_at_or_before(9));
+    }
+
+    // Think-start/end markers become anchors inside an assistant span
+    {
+        const llama_tokens tokens = {
+            10, 11,            // <user>
+            100,               // Hi
+            10, 12,            // <assistant>
+            50, 51,            // <think>
+            200,               // reasoning
+            52, 53,            // </think>
+            201,               // answer
+        };
+        auto result = delims.split(tokens);
+        result.add_token_pattern_anchors(tokens, {50, 51}, COMMON_CHAT_ANCHOR_THINK_START);
+        result.add_token_pattern_anchors(tokens, {52, 53}, COMMON_CHAT_ANCHOR_THINK_END);
+        result.add_delimiter_start_tokens(delims);
+        assert_equals(true, result.is_anchor(5));   // think start
+        assert_equals(true, result.is_anchor(8));   // think end
+        assert_equals(false, result.is_prefix_anchor(5));
+        assert_equals(false, result.is_prefix_anchor(8));
+        assert_equals(true,  result.is_prefix_anchor(0));  // user role
+        assert_equals(true,  result.is_prefix_anchor(3));  // assistant role
+        assert_equals(5,    result.last_anchor_pos_at_or_before(7));
+        assert_equals(8,    result.last_anchor_pos_at_or_before(8));
+        assert_equals(true, result.is_anchor_start_token(50));
+        assert_equals(true, result.is_anchor_start_token(52));
+        assert_equals(true, result.is_anchor_start_token(10)); // role delimiter first token
+        assert_equals(false, result.is_anchor_start_token(200));
+        assert_equals(false, result.is_decode_checkpoint_token(50)); // think is prefill-only
+        assert_equals(false, result.is_decode_checkpoint_token(52));
+        assert_equals(false, result.is_decode_checkpoint_token(10)); // role is prefill-only; turn-end covers generation
+    }
+
+    assert_equals(true,  common_chat_looks_like_marker("<think>"));
+    assert_equals(true,  common_chat_looks_like_marker("<|tool_call|>"));
+    assert_equals(false, common_chat_looks_like_marker("Hi"));
+    assert_equals(false, common_chat_looks_like_marker("<"));
+
+    // Decode needs the start token even when the current prompt has no think block yet.
+    {
+        common_chat_msg_spans spans;
+        spans.add_token_pattern_anchors({1, 2, 3}, {99, 100}, COMMON_CHAT_ANCHOR_THINK_START);
+        spans.add_token_pattern_anchors({1, 2, 3}, {77, 78}, COMMON_CHAT_ANCHOR_TOOL);
+        assert_equals(true, spans.is_anchor_start_token(99));
+        assert_equals(false, spans.is_decode_checkpoint_token(99));
+        assert_equals(true, spans.is_decode_checkpoint_token(77));
+        assert_equals(false, spans.is_anchor(0));
+    }
+
+    {
+        const common_chat_msg_delimiters tool_delims = {
+            { { COMMON_CHAT_ROLE_TOOL, "", { 77, 78 } },
+              { COMMON_CHAT_ROLE_USER, "", { 10, 11 } } }
+        };
+        common_chat_msg_spans spans;
+        spans.add_delimiter_start_tokens(tool_delims);
+        assert_equals(true,  spans.is_decode_checkpoint_token(77));
+        assert_equals(false, spans.is_decode_checkpoint_token(10));
+        assert_equals(true,  spans.is_anchor_start_token(10));
     }
 
     // Content before the first delimiter is not captured as a span

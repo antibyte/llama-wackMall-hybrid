@@ -172,6 +172,37 @@ struct llama_context::dflash_bridge : public llm_graph_dflash_i {
         draft_sync();
         draft.memory_update(false);
 
+        // Stale draft KV after LCP (X=0, Y=n_past) makes balloc->init log
+        // Y=X+1 on every token. Drop the sequence so standalone inject can
+        // start at Y; empty memory allows any starting position.
+        // Only the first token of the seq must be X+1; later verify tokens
+        // are consecutive and would false-trigger a wipe.
+        if (batch.pos && batch.n_seq_id && batch.seq_id) {
+            llama_seq_id seq0 = -1;
+            llama_pos y_min = -1;
+            for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                if (batch.n_seq_id[i] != 1) {
+                    continue;
+                }
+                const llama_seq_id seq_id = batch.seq_id[i][0];
+                const llama_pos y = batch.pos[i];
+                if (seq0 < 0) {
+                    seq0 = seq_id;
+                    y_min = y;
+                } else if (seq_id == seq0 && y < y_min) {
+                    y_min = y;
+                }
+            }
+            if (seq0 >= 0 && y_min >= 0) {
+                const llama_pos x = draft.memory->seq_pos_max(seq0);
+                // Same rule as common_dflash_pos_jump (src cannot include common.h).
+                if (x >= 0 && y_min != x + 1) {
+                    draft.memory->seq_rm(seq0, -1, -1);
+                    return false;
+                }
+            }
+        }
+
         dummy_tokens.assign(batch.n_tokens, 0);
         llama_batch layout = batch;
         layout.token = dummy_tokens.data();
@@ -2286,11 +2317,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && gf_res_active == res && res->can_reuse(gparams)) {
-        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
-
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
@@ -2314,11 +2340,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_active = nullptr;
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
-
         gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);

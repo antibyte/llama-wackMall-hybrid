@@ -3,6 +3,9 @@
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-model-loader.h"
+
+#include <string>
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -36,6 +39,27 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
+
+    int64_t n_vocab_draft = n_vocab;
+    const struct ggml_tensor * d2t_meta = ml->get_tensor_meta("d2t");
+    if (d2t_meta) {
+        n_vocab_draft = d2t_meta->ne[0];
+        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_draft }, 0);
+        LLAMA_LOG_INFO("%s: DFlash using d2t mapping (draft_vocab_size = %lld)\n", __func__, (long long) n_vocab_draft);
+    }
+
+    const struct ggml_tensor * markov_meta = ml->get_tensor_meta("markov_w1.weight");
+    if (markov_meta) {
+        const int64_t dspark_markov_rank = markov_meta->ne[0];
+
+        dspark_markov_w1 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
+        dspark_markov_w2 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
+
+        dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), { n_embd + dspark_markov_rank, 1 }, 0);
+        dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 }, TENSOR_NOT_REQUIRED);
+
+        LLAMA_LOG_INFO("%s: DFlash with DSpark markov head (rank = %lld)\n", __func__, (long long) dspark_markov_rank);
+    }
 
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
@@ -229,6 +253,101 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
+static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+    ggml_context * ctx0 = g.ctx0;
+    auto         & res  = g.res;
+
+    ggml_tensor * w1 = model.dspark_markov_w1;
+    ggml_tensor * w2 = model.dspark_markov_w2;
+    GGML_ASSERT(w1 && w2 && model.dspark_conf_proj && "DSpark markov/confidence weights not loaded");
+
+    ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens]
+    const int64_t n_vocab = base->ne[0];
+    const int64_t n_tok   = base->ne[1];
+
+    const auto it = model.gguf_kv.find("dflash.block_size");
+    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
+    const int64_t block_size = std::stoi(it->second);
+    GGML_ASSERT(block_size > 0);
+
+    const auto it_anchor          = model.gguf_kv.find("dflash.sample_from_anchor");
+    const bool sample_from_anchor = it_anchor == model.gguf_kv.end() || it_anchor->second == "true";
+    const int64_t i_draft_beg    = sample_from_anchor ? 0 : 1;
+
+    const int64_t n_blocks = g.ubatch.n_seqs_unq;
+    GGML_ASSERT(n_blocks > 0 && n_tok % n_blocks == 0 && "DSpark markov head requires equal-size blocks");
+    const int64_t block_drafts = n_tok / n_blocks;
+    if (block_drafts > block_size) {
+        return;
+    }
+
+    const size_t token_stride = (size_t) block_drafts * tokens->nb[0];
+    const size_t base_stride = (size_t) block_drafts * base->nb[1];
+
+    ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
+    prev = ggml_cont_1d(ctx0, prev, n_blocks);
+
+    ggml_tensor * conf_inp = res->t_embd; // [n_embd, n_tok]
+
+    ggml_tensor * cat      = nullptr;
+    ggml_tensor * cat_conf = nullptr;
+
+    if (!sample_from_anchor) {
+        cat      = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        cat_conf = ggml_sigmoid(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0)));
+    }
+
+    for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
+        ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);   // [R, n_blocks]
+        ggml_tensor * bias    = ggml_mul_mat(ctx0, w2, w1_prev); // [n_vocab_draft, n_blocks]
+        if (model.d2t) {
+            const int64_t n_draft_vocab = bias->ne[0];
+            ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_blocks), 0.0f);
+            bias = ggml_set_rows(ctx0, full,
+                    ggml_reshape_3d(ctx0, bias,      1,             n_draft_vocab, n_blocks),
+                    ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+            bias = ggml_reshape_2d(ctx0, bias, n_vocab, n_blocks);
+        }
+
+        ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
+        ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
+
+        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+
+        ggml_tensor * conf_inp_i = ggml_view_2d(ctx0, conf_inp, conf_inp->ne[0], n_blocks,
+                                                (size_t) block_drafts * conf_inp->nb[1], i*conf_inp->nb[1]);
+        ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), w1_prev, 0);
+        ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
+        if (model.dspark_conf_proj_b) {
+            conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
+        }
+        conf = ggml_sigmoid(ctx0, conf);
+
+        cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
+
+        if (i + 1 < block_drafts) {
+            prev = ggml_argmax(ctx0, col);
+        }
+    }
+
+    ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
+    out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3));
+    out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
+
+    {
+        ggml_tensor * conf = ggml_reshape_3d(ctx0, cat_conf, 1, n_blocks, block_drafts);
+        conf = ggml_cont(ctx0, ggml_permute(ctx0, conf, 0, 2, 1, 3));
+        conf = ggml_reshape_2d(ctx0, conf, 1, n_tok);
+
+        conf = ggml_repeat(ctx0, conf, res->t_embd);
+        res->t_h_nextn = conf;
+        ggml_build_forward_expand(g.gf, conf);
+    }
+
+    res->t_logits = out;
+    ggml_build_forward_expand(g.gf, out);
+}
+
 // DFlash decoder, dual-mode by batch type:
 //   * embd batch  -> fused target features: project + inject K/V into the cache.
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
@@ -336,7 +455,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    ggml_tensor * inp_tokens = inp->tokens;
+    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -419,4 +539,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    if (model.dspark_markov_w1) {
+        build_dspark_markov_head(*this, model, inp_tokens);
+    }
 }

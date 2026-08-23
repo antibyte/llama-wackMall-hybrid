@@ -164,16 +164,88 @@ struct common_chat_msg_span {
     }
 };
 
+enum common_chat_anchor_kind {
+    COMMON_CHAT_ANCHOR_ROLE = 0,
+    COMMON_CHAT_ANCHOR_THINK_START,
+    COMMON_CHAT_ANCHOR_THINK_END,
+    COMMON_CHAT_ANCHOR_TOOL,
+};
+
+bool common_chat_looks_like_marker(const std::string & text);
+
+struct common_chat_anchor {
+    common_chat_anchor_kind kind = COMMON_CHAT_ANCHOR_ROLE;
+    std::size_t pos = 0;
+};
+
+struct common_chat_msg_delimiters;
+
 struct common_chat_msg_spans {
     std::vector<common_chat_msg_span> spans;
+    std::vector<common_chat_anchor>   anchors;
+    std::vector<llama_token>          start_tokens;
+    // Tool first tokens only. Role/think stay in start_tokens for prefill;
+    // last_user + turn-end cover role boundaries without a decode copy.
+    std::vector<llama_token>          decode_ckpt_tokens;
 
     void add(common_chat_role role, size_t pos, size_t len) {
         spans.push_back({ role, pos, len });
+        add_anchor(COMMON_CHAT_ANCHOR_ROLE, pos);
     }
+
+    void add_anchor(common_chat_anchor_kind kind, size_t pos);
+    void add_start_token(llama_token tok);
+    void add_decode_ckpt_token(llama_token tok);
+    void add_delimiter_start_tokens(const common_chat_msg_delimiters & delims);
+
+    void add_token_pattern_anchors(
+            const llama_tokens & tokens,
+            const llama_tokens & pattern,
+            common_chat_anchor_kind kind,
+            const std::map<size_t, size_t> & skips = {});
 
     bool is_user_start(int32_t pos) const {
         for (auto it = spans.begin(); it != spans.end(); ++it) {
             if (it->role == COMMON_CHAT_ROLE_USER && pos == (int32_t) it->pos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool is_anchor(int32_t pos) const {
+        for (const auto & a : anchors) {
+            if ((int32_t) a.pos == pos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Role/tool positions only. Think tags stay is_anchor for inspection but
+    // must not split GDN prefill or force 19MiB snapshots.
+    bool is_prefix_anchor(int32_t pos) const {
+        for (const auto & a : anchors) {
+            if ((int32_t) a.pos == pos &&
+                    (a.kind == COMMON_CHAT_ANCHOR_ROLE || a.kind == COMMON_CHAT_ANCHOR_TOOL)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool is_anchor_start_token(llama_token tok) const {
+        for (llama_token t : start_tokens) {
+            if (t == tok) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool is_decode_checkpoint_token(llama_token tok) const {
+        for (llama_token t : decode_ckpt_tokens) {
+            if (t == tok) {
                 return true;
             }
         }
@@ -187,6 +259,16 @@ struct common_chat_msg_spans {
             }
         }
         return -1;
+    }
+
+    int32_t last_anchor_pos_at_or_before(int32_t pos) const {
+        int32_t best = -1;
+        for (const auto & a : anchors) {
+            if ((int32_t) a.pos <= pos && (int32_t) a.pos > best) {
+                best = (int32_t) a.pos;
+            }
+        }
+        return best;
     }
 };
 

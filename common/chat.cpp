@@ -143,9 +143,83 @@ common_chat_msg_delimiters common_chat_msg_delimiters_parse(const json & delimit
     return result;
 }
 
+bool common_chat_looks_like_marker(const std::string & text) {
+    if (text.size() < 2) {
+        return false;
+    }
+    return text.find('<') != std::string::npos || text.find("|>") != std::string::npos;
+}
+
 void common_chat_msg_delimiters::tokenize(const llama_vocab * vocab) {
     for (auto & d : delimiters) {
         d.tokens = common_tokenize(vocab, d.delimiter, false, true);
+    }
+}
+
+void common_chat_msg_spans::add_anchor(common_chat_anchor_kind kind, size_t pos) {
+    for (const auto & a : anchors) {
+        if (a.pos == pos && a.kind == kind) {
+            return;
+        }
+    }
+    anchors.push_back({ kind, pos });
+}
+
+void common_chat_msg_spans::add_start_token(llama_token tok) {
+    for (llama_token t : start_tokens) {
+        if (t == tok) {
+            return;
+        }
+    }
+    start_tokens.push_back(tok);
+}
+
+void common_chat_msg_spans::add_decode_ckpt_token(llama_token tok) {
+    for (llama_token t : decode_ckpt_tokens) {
+        if (t == tok) {
+            return;
+        }
+    }
+    decode_ckpt_tokens.push_back(tok);
+}
+
+void common_chat_msg_spans::add_delimiter_start_tokens(const common_chat_msg_delimiters & delims) {
+    for (const auto & d : delims.delimiters) {
+        if (!d.tokens.empty()) {
+            add_start_token(d.tokens[0]);
+            if (d.role == COMMON_CHAT_ROLE_TOOL) {
+                add_decode_ckpt_token(d.tokens[0]);
+            }
+        }
+    }
+}
+
+void common_chat_msg_spans::add_token_pattern_anchors(
+        const llama_tokens & tokens,
+        const llama_tokens & pattern,
+        common_chat_anchor_kind kind,
+        const std::map<size_t, size_t> & skips) {
+    if (pattern.empty()) {
+        return;
+    }
+    add_start_token(pattern[0]);
+    if (kind == COMMON_CHAT_ANCHOR_TOOL) {
+        add_decode_ckpt_token(pattern[0]);
+    }
+    auto skip = skips.begin();
+    for (size_t i = 0; i < tokens.size();) {
+        if (skip != skips.end() && i == skip->first) {
+            i += skip->second;
+            ++skip;
+            continue;
+        }
+        if (i + pattern.size() <= tokens.size() &&
+                std::equal(pattern.begin(), pattern.end(), tokens.begin() + i)) {
+            add_anchor(kind, i);
+            i += pattern.size();
+            continue;
+        }
+        i++;
     }
 }
 

@@ -1,0 +1,12 @@
+{
+  "schema": "llama-wackmall-expert-bw-v1",
+  "source": "pinned_h2d_cpu_overlap",
+  "expert_bytes": 1900544,
+  "pcie_gbs": 6.151,
+  "cpu_gbs": 59.8,
+  "q_star": 0.1029,
+  "fetch_fraction": 0.1029,
+  "threshold": 2.0,
+  "recommended": "cpu-heavy",
+  "note": "GTX 1660 Ti 2026-08-22. cpu-heavy: keep W=0; PCIe fill is slower than CPU cold."
+}

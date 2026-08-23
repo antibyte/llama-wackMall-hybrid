@@ -230,6 +230,12 @@ public:
     // split the tokens into message spans, skipping over media chunks
     common_chat_msg_spans find_message_spans(const common_chat_msg_delimiters & delims) const;
 
+    // role spans plus think-start/end token patterns as semantic anchors
+    common_chat_msg_spans find_message_spans(
+            const common_chat_msg_delimiters & delims,
+            const llama_tokens & think_start,
+            const std::vector<llama_tokens> & think_ends) const;
+
     // make sure all text tokens are within the vocab range
     bool validate(const struct llama_context * ctx) const;
 

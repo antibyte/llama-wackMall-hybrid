@@ -1687,18 +1687,57 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
+            // Exact token match: keep the live checkpoint set (semantic GDN/KV
+            // anchors) and treat the entry as most recently used. A shorter
+            // live prompt must not overwrite a longer cached suffix.
+            if (cur_lcp_len == (int) it->prompt.tokens.size() && !prompt.checkpoints.empty()) {
+                size_t old_ckpt = 0;
+                size_t new_ckpt = 0;
+                for (const auto & ckpt : it->prompt.checkpoints) {
+                    old_ckpt += ckpt.size();
+                }
+                for (const auto & ckpt : prompt.checkpoints) {
+                    new_ckpt += ckpt.size();
+                }
+                if (limit_size == 0 || size() - old_ckpt + new_ckpt <= limit_size) {
+                    it->prompt.checkpoints = prompt.checkpoints;
+                }
+            }
+            states.splice(states.end(), states, it);
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
     }
 
     // calculate checkpoints size to see if it will fit with the prompt
-    size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
-    }
+    std::list<common_prompt_checkpoint> ckpts = prompt.checkpoints;
+    auto ckpt_bytes = [](const std::list<common_prompt_checkpoint> & list) {
+        size_t n = 0;
+        for (const auto & ckpt : list) {
+            n += ckpt.size();
+        }
+        return n;
+    };
+    size_t checkpoints_size = ckpt_bytes(ckpts);
+    size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    // Single entry larger than the cache: keep prefix + turn-end and retry.
+    if (limit_size > 0 && state_size_new > limit_size && ckpts.size() > 2) {
+        const int32_t n = (int32_t) ckpts.size();
+        std::list<common_prompt_checkpoint> radix;
+        int32_t i = 0;
+        for (const auto & ckpt : ckpts) {
+            if (common_checkpoint_is_radix_index(i, n)) {
+                radix.push_back(ckpt);
+            }
+            i++;
+        }
+        ckpts.swap(radix);
+        checkpoints_size = ckpt_bytes(ckpts);
+        state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+        SRV_TRC(" - pruned interior checkpoints to fit cache (%d -> %d, %.3f MiB)\n",
+                n, (int) ckpts.size(), state_size_new / (1024.0 * 1024.0));
+    }
 
     // skip over-limit entries to avoid disturbing the cache
     if (limit_size > 0 && state_size_new > limit_size) {
@@ -1752,7 +1791,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::move(ckpts),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1763,38 +1802,60 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+static int32_t prompt_reuse_tokens(
+        const server_prompt & prompt,
+        const server_tokens & tokens_new,
+        uint32_t n_rs,
+        bool keep_lcp_without_ckpt) {
+    const int n_lcp = prompt.tokens.get_common_prefix(tokens_new);
+    std::vector<int64_t> ckpt_n_tokens;
+    ckpt_n_tokens.reserve(prompt.checkpoints.size());
+    for (const auto & ckpt : prompt.checkpoints) {
+        ckpt_n_tokens.push_back(ckpt.n_tokens);
+    }
+    const int32_t n_ckpt = common_prefix_checkpoint_tokens(ckpt_n_tokens, n_lcp);
+    return common_estimate_reuse_prefix_tokens(
+            n_lcp, prompt.n_tokens(), n_ckpt, n_rs, keep_lcp_without_ckpt);
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        uint32_t n_rs, bool keep_lcp_without_ckpt) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    int32_t reuse_best = prompt_reuse_tokens(prompt, tokens_new, n_rs, keep_lcp_without_ckpt);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float sim_best    = float(lcp_best) / tokens_new.size();
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, sim = %.3f, reuse = %d\n",
+            f_keep_best, sim_best, reuse_best);
 
     auto it_best = states.end();
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // Prefer the cached prompt that GDN/RS can actually keep, not the longest
+    // token LCP that would roll back past n_rs without a checkpoint.
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
+        const int32_t reuse_cur = prompt_reuse_tokens(it->prompt, tokens_new, n_rs, keep_lcp_without_ckpt);
 
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
+        if (common_prompt_reuse_skip_unrelated(reuse_cur, reuse_best, f_keep_cur)) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+        if (common_prompt_reuse_better(reuse_cur, reuse_best, f_keep_cur, f_keep_best, sim_cur, sim_best)) {
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
+            reuse_best  = reuse_cur;
 
             it_best = it;
         }
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f, reuse = %d\n",
+                f_keep_best, sim_best, reuse_best);
 
         {
             auto & data = it_best->data.main;

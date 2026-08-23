@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <random>
 #include <sstream>
+#include <fstream>
 #include <cstring>
 
 #ifndef _WIN32
@@ -113,6 +114,55 @@ static std::filesystem::path get_server_exec_path() {
     }
     return std::filesystem::path(std::string(path, count));
 #endif
+}
+
+static void env_upsert(std::vector<std::string> & env, const std::string & key, const std::string * value) {
+    const std::string prefix = key + "=";
+    env.erase(std::remove_if(env.begin(), env.end(), [&](const std::string & e) {
+        return e.size() >= prefix.size() && e.compare(0, prefix.size(), prefix) == 0;
+    }), env.end());
+    if (value) {
+        env.push_back(key + "=" + *value);
+    }
+}
+
+static void apply_child_env_file(std::vector<std::string> & env, const std::string & path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("child-env-file not readable: " + path);
+    }
+    std::string line;
+    int nline = 0;
+    while (std::getline(in, line)) {
+        nline++;
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        size_t i = 0;
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
+            i++;
+        }
+        if (i == line.size() || line[i] == '#' || line[i] == ';') {
+            continue;
+        }
+        line = line.substr(i);
+        if (line.rfind("-u ", 0) == 0 || line.rfind("UNSET ", 0) == 0) {
+            const size_t sp = line.find(' ');
+            const std::string key = string_strip(line.substr(sp + 1));
+            if (!key.empty()) {
+                env_upsert(env, key, nullptr);
+            }
+            continue;
+        }
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            throw std::runtime_error(string_format(
+                    "child-env-file %s:%d: expected KEY=VALUE or -u KEY", path.c_str(), nline));
+        }
+        const std::string key = line.substr(0, eq);
+        const std::string val = line.substr(eq + 1);
+        env_upsert(env, key, &val);
+    }
 }
 
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
@@ -801,6 +851,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        std::string child_env_file;
+        if (inst.meta.preset.get_option(COMMON_ARG_PRESET_CHILD_ENV_FILE, child_env_file) &&
+                !child_env_file.empty()) {
+            SRV_INF("applying child-env-file %s for name=%s\n", child_env_file.c_str(), inst.meta.name.c_str());
+            apply_child_env_file(child_env, child_env_file);
+        }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;

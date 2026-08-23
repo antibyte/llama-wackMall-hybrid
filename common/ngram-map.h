@@ -24,7 +24,13 @@
 struct common_ngram_simple_config {
     uint16_t   size_ngram;      // size of n-grams to lookup in self-mode
     uint16_t   size_mgram;      // size of m-grams to draft in self-mode
+    // 0 = full history. A short window misses repeats in the prompt/think prefix
+    // and kills ngram accept; the scan is cheap next to a GPU verify.
+    uint32_t   search_window = 0;
 };
+
+// Backwards search stops after this many tokens (exclusive). 0 = full history.
+size_t common_ngram_simple_search_stop(size_t cur_len, uint32_t window);
 
 // Searches for a n-gram in the history and checks whether a draft sequence should be generated.
 llama_tokens common_ngram_simple_draft(

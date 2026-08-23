@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -26,6 +28,7 @@ struct options {
     int repeats = 100;
     int warmups = 10;
     int overlap_us = 0;
+    bool overlap_cpu = false;
     size_t working_set_mib = 16;
     std::string json_path;
     std::vector<std::pair<std::string, size_t>> segments;
@@ -237,6 +240,7 @@ static void print_usage(const char * program) {
         << "  --warmups N            warm-up repetitions (default 10)\n"
         << "  --working-set-mib N    rotating source set (default 16 MiB)\n"
         << "  --overlap-us N         synthetic GPU window; 0 disables (default 0)\n"
+        << "  --overlap-cpu          pin H2D against a concurrent host DRAM read\n"
         << "  --json PATH            write JSON without overwriting an existing file\n";
 }
 
@@ -278,6 +282,8 @@ static options parse_options(int argc, char ** argv) {
             }
         } else if (argument == "--overlap-us") {
             parsed.overlap_us = parse_int(take_value(), "overlap-us", 0);
+        } else if (argument == "--overlap-cpu") {
+            parsed.overlap_cpu = true;
         } else if (argument == "--json") {
             parsed.json_path = take_value();
             if (parsed.json_path.empty()) {
@@ -427,6 +433,47 @@ static sample measure_overlap(void * destination, const void * source, size_t by
     return output;
 }
 
+static uint64_t cpu_checksum(const unsigned char * source, size_t bytes) {
+    uint64_t acc = 0;
+    const size_t n = bytes / sizeof(uint64_t);
+    const uint64_t * words = reinterpret_cast<const uint64_t *>(source);
+    for (size_t i = 0; i < n; ++i) {
+        acc += words[i];
+    }
+    return acc;
+}
+
+static sample measure_overlap_cpu(void * destination, const unsigned char * dma_source,
+        const unsigned char * cpu_source, size_t bytes, cudaStream_t copy_stream) {
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> copies{0};
+    std::atomic<uint64_t> sink{0};
+    cuda_event copy_begin;
+    cuda_event copy_end;
+    std::thread worker([&]() {
+        while (!stop.load(std::memory_order_relaxed)) {
+            sink.fetch_add(cpu_checksum(cpu_source, bytes), std::memory_order_relaxed);
+            copies.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    const auto wall_begin = clock_type::now();
+    CUDA_CHECK(cudaEventRecord(copy_begin, copy_stream));
+    CUDA_CHECK(cudaMemcpyAsync(destination, dma_source, bytes, cudaMemcpyHostToDevice, copy_stream));
+    CUDA_CHECK(cudaEventRecord(copy_end, copy_stream));
+    CUDA_CHECK(cudaEventSynchronize(copy_end));
+    const auto wall_end = clock_type::now();
+    stop.store(true, std::memory_order_relaxed);
+    worker.join();
+    float copy_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&copy_ms, copy_begin, copy_end));
+    sample output;
+    output.device_ms = copy_ms;
+    output.wall_ms = elapsed_ms(wall_begin, wall_end);
+    const uint64_t ncopy = copies.load(std::memory_order_relaxed);
+    output.compute_ms = ncopy > 0 ? output.wall_ms / (double) ncopy : output.wall_ms;
+    return output;
+}
+
 static void append_result_json(std::ostream & output, const result & value, bool first) {
     const stats device = summarize(collect(value, &sample::device_ms));
     const stats wall = summarize(collect(value, &sample::wall_ms));
@@ -472,7 +519,8 @@ static std::string make_json(const options & config, const cudaDeviceProp & prop
            << ",\"working_set_mib\":" << config.working_set_mib
            << ",\"working_set_bytes\":" << working_bytes
            << ",\"source_slots\":" << source_slots
-           << ",\"overlap_us\":" << config.overlap_us << "},"
+           << ",\"overlap_us\":" << config.overlap_us
+           << ",\"overlap_cpu\":" << (config.overlap_cpu ? "true" : "false") << "},"
            << "\n  \"segments\":[";
     bool first_segment = true;
     for (const auto & group : all_results) {
@@ -544,11 +592,13 @@ int main(int argc, char ** argv) {
         host_allocation pinned(working_bytes, cudaHostAllocDefault);
         host_allocation mapped(working_bytes, cudaHostAllocMapped);
         host_allocation staging(max_bytes, cudaHostAllocDefault);
+        host_allocation cpu_scratch(max_bytes, cudaHostAllocDefault);
         device_allocation target(max_bytes);
         device_allocation device_source(working_bytes);
         device_allocation checksum(sizeof(unsigned long long));
         fill_sources(pageable.data(), static_cast<unsigned char *>(pinned.get()),
                 static_cast<unsigned char *>(mapped.get()), working_bytes);
+        std::memcpy(cpu_scratch.get(), pinned.get(), max_bytes);
         CUDA_CHECK(cudaMemcpy(device_source.get(), pinned.get(), working_bytes, cudaMemcpyHostToDevice));
 
         void * mapped_device = nullptr;
@@ -604,6 +654,17 @@ int main(int argc, char ** argv) {
                     return measure_overlap(target.get(), static_cast<unsigned char *>(pinned.get()) + offset,
                             segment.second, config.overlap_us, properties.clockRate, checksum.get(),
                             copy_stream, compute_stream);
+                });
+            }
+            if (config.overlap_cpu) {
+                run_copy_mode("pinned_h2d_cpu_overlap",
+                        "PCIe fill overlapped with a host DRAM checksum of a disjoint buffer",
+                        [&](size_t offset) {
+                    return measure_overlap_cpu(
+                            target.get(),
+                            static_cast<unsigned char *>(pinned.get()) + offset,
+                            static_cast<unsigned char *>(cpu_scratch.get()),
+                            segment.second, copy_stream);
                 });
             }
             all_results.emplace_back(segment.first, std::move(results));

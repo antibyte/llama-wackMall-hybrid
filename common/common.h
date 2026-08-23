@@ -174,6 +174,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark (DFlash + Markov/confidence)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -181,6 +182,10 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
+
+inline bool common_speculative_type_is_dflash_family(common_speculative_type t) {
+    return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
 
 // Grammar type enumeration
 enum common_grammar_type {
@@ -389,7 +394,8 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   common_speculative_type_is_dflash_family(t);
         });
 
         if (!needs_rs_seq) {
@@ -960,6 +966,144 @@ enum common_context_seq_rm_type {
 // check if the llama_context can remove sequences
 // note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+
+// Hybrid GDN reports seq_pos_min = max(attn, recurrent). Recurrent only has the
+// tail, so a missing SWA checkpoint is a false alarm when n_swa == 0.
+bool common_keep_lcp_without_checkpoint(common_context_seq_rm_type rm_type, bool is_hybrid, int32_t n_swa);
+
+// seq_add of existing cells (chunk reuse or context shift) needs independently
+// relocatable KV. False for GDN/RS: recurrent state is prefix-dependent.
+bool common_prompt_kv_shift_safe(common_context_seq_rm_type rm_type, bool is_hybrid, int32_t n_swa);
+
+// Same check from a live context. n_swa should already apply swa_full (0 = full).
+bool common_prompt_kv_shift_safe_ctx(const llama_context * ctx, int32_t n_swa);
+
+// True if seq_rm [p0_rm, end) needs more recurrent snapshots than n_rs.
+bool common_recurrent_rollback_exceeds(llama_pos pos_max, llama_pos p0_rm, uint32_t n_rs);
+
+// Tokens that can stay resident: the LCP if recurrent rollback fits n_rs,
+// otherwise the deepest checkpoint with n_tokens <= n_lcp, else 0.
+int32_t common_reuse_prefix_tokens(int32_t n_lcp, bool rollback_exceeds, int32_t n_ckpt);
+
+// Deepest checkpoint n_tokens that still lies on the LCP, else 0.
+int32_t common_prefix_checkpoint_tokens(const std::vector<int64_t> & ckpt_n_tokens, int32_t n_lcp);
+
+// Reusable prefix for a cached sequence that is not currently in GPU memory.
+// Assumes 1:1 token/pos (text). keep_lcp_without_ckpt false returns n_lcp.
+int32_t common_estimate_reuse_prefix_tokens(
+        int32_t n_lcp,
+        int32_t n_cached,
+        int32_t n_ckpt,
+        uint32_t n_rs,
+        bool keep_lcp_without_ckpt);
+
+// Ignore a cache entry that is mostly unrelated, unless it keeps more GDN/RS tokens.
+bool common_prompt_reuse_skip_unrelated(int32_t reuse_cur, int32_t reuse_best, float f_keep_cur);
+
+// True if the candidate should replace the current best cached prompt.
+bool common_prompt_reuse_better(
+        int32_t reuse_cur, int32_t reuse_best,
+        float f_keep_cur, float f_keep_best,
+        float sim_cur, float sim_best);
+
+// Index to drop so remaining snapshots stay spread along the prompt.
+// Adjacent entries are assumed to have nondecreasing n_tokens.
+// Never drops the earliest prefix; prefers to keep the latest (turn-end).
+// Returns -1 if the list is empty.
+int32_t common_checkpoint_evict_index(const std::vector<int64_t> & ckpt_n_tokens);
+
+// True when a new snapshot at n_cur is too close to the latest one to be worth
+// the copy (GDN/RS checkpoints are tens of MiB).
+bool common_checkpoint_too_dense(int64_t n_cur, int64_t n_back, int64_t min_gap);
+
+// Split/snapshot this prompt position: always at the last user message.
+// Other role/tool nodes only when there is no user span (raw completion) or
+// min_step elapsed. Skip the first system/role split on chat prompts.
+bool common_checkpoint_should_break(
+        bool at_last_user,
+        bool at_prefix,
+        bool has_last_user,
+        int64_t n_last,
+        int64_t pos,
+        int32_t min_step);
+
+// Snapshot this prefill ubatch. Semantic breaks always copy. GDN skips a
+// prompt-end copy when last_user already snapshotted; turn-end still covers
+// generation. Non-GDN keeps the near-end offsets from PR 20288.
+bool common_checkpoint_should_snapshot(
+        bool want_break,
+        bool prompt_done,
+        bool near_prompt_end,
+        bool cmoe_rs_prefill,
+        bool has_last_user,
+        bool has_checkpoint);
+
+// End the current prefill ubatch so the next one can snapshot at pos.
+// Skip when the snapshot would be too_dense or pos sits in the final min_gap
+// tokens. fill_wide (GDN/RS) never splits: keep the ubatch full so CUDA graphs
+// stay 2048-shaped; turn-end still covers follow-up.
+bool common_checkpoint_should_split_ubatch(
+        bool should_break,
+        int64_t n_last,
+        int64_t pos,
+        int64_t n_prompt,
+        int64_t min_gap,
+        bool fill_wide = false);
+
+// True for the earliest prefix and the latest turn-end when shrinking a
+// snapshot list so a prompt-cache entry can fit.
+bool common_checkpoint_is_radix_index(int32_t i, int32_t n);
+
+// CMOE 2048<->64 evicts CUDA graphs. Prefill when leftover needs the wide
+// ubatch, or while already prefilling until the tail fits decode. Follow-up
+// leftovers (n_have > 0, currently decode) stay on decode graphs.
+bool common_cmoe_prefer_prefill(
+        int32_t n_left,
+        int32_t n_have,
+        int32_t decode_ubatch,
+        int32_t prefill_ubatch,
+        bool currently_prefill);
+
+// First prompt prefills only above this many leftover tokens. Below it, stay
+// on decode so the generation CUDA graph is captured instead of a 2048 graph
+// that set_runtime_ubatch immediately evicts. 4*decode, capped by prefill.
+int32_t common_cmoe_first_prefill_at(int32_t decode_ubatch, int32_t prefill_ubatch);
+
+// ggml-cuda mmvq.cuh MMVQ_MAX_BATCH_SIZE. MUL_MAT_ID CUDA graphs need n_tokens
+// at or below this; a 64-token leftover runs eager and recaptures decode.
+enum { COMMON_CMOE_MMVQ_GRAPH_BATCH = 8 };
+
+// Decode-phase prompt leftover batch that keeps the generation CUDA graph.
+// Caps at MMVQ_GRAPH_BATCH, and at spec_n_max+1 when that is smaller so
+// ngram verify and leftover share the same n_tokens.
+int32_t common_cmoe_graph_batch(int32_t decode_ubatch, int32_t spec_n_max);
+
+// Ngram leftover can share the decode CUDA graph. DFlash/MTP draft KV and
+// GDN recurrent must not be split into 3-token ubatches (IMA / think loops).
+bool common_cmoe_use_ngram_leftover_graph(bool decode_phase, bool has_draft_ctx);
+
+// Spec verify writes logits on every drafted token. Decode leftovers must
+// do the same or CUDA graphs recapture between leftover and generate.
+bool common_cmoe_leftover_match_spec_logits(bool decode_phase, int32_t spec_n_max);
+
+// p0 for seq_rm of the speculative noise block written at [pos_next, ...).
+// A stale ckpt.pos_max of 0 must not trim from 1 (that drops prompt KV).
+llama_pos common_spec_draft_noise_trim_p0(llama_pos pos_next, llama_pos ckpt_pos_max);
+
+// Combined DFlash: only the first token of a seq must be Y=X+1. Later
+// verify tokens are Y+1, Y+2, ... and are not a stale jump.
+bool common_dflash_pos_jump(llama_pos draft_pos_max, llama_pos batch_pos_min);
+
+// True when draft KV already covers the tokens we will keep (dft_max >= n_past-1).
+bool common_spec_draft_covers_keep(llama_pos dft_max, int32_t n_past);
+
+// Wipe draft KV when the kept prefix is missing, or leftover will prefill
+// without inject. Decode leftovers keep a consecutive DFlash prefix.
+bool common_spec_clear_draft_kv(bool covers_keep, bool leftover_prefill);
+
+// After n_min tokens pass p_min, keep later drafts so verify n_tokens stays
+// n_max+1. ggml reuses only the previous graph; 2<->3 token flips rebuild.
+bool common_spec_dflash_keep_draft_token(int32_t n_kept, int32_t n_min, float p, float p_min);
 
 // aborts execution on failure
 void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);

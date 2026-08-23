@@ -187,6 +187,9 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
+    // count leftover GGUF tensors as unused so DSpark extras can share the dflash layout
+    void skip_tensor(const char * name);
+
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;

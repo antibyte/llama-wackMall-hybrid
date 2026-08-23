@@ -214,6 +214,8 @@ def run(args: argparse.Namespace) -> None:
             "--json",
             str(run_path),
         ]
+        if args.overlap_cpu:
+            command.append("--overlap-cpu")
         for size in sizes:
             command.extend(("--segment", f"bytes-{size}={size}"))
         subprocess.run(command, check=True)
@@ -246,6 +248,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--working-set-mib", type=int, default=16)
     parser.add_argument("--overlap-us", type=int, default=0)
+    parser.add_argument(
+        "--overlap-cpu",
+        action="store_true",
+        help="also measure pinned H2D overlapped with a host DRAM checksum",
+    )
     return parser
 
 

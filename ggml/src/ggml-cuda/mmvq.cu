@@ -44,6 +44,27 @@ static int get_q8_0_ncols3_rows_override() {
     return value;
 }
 
+static int get_q3_k_ncols1_rows_override() {
+    static const int value = [] {
+        return get_rows_override("GGML_CUDA_MMVQ_Q3_K_NCOLS1_ROWS");
+    }();
+    return value;
+}
+
+static int get_q4_k_ncols1_rows_override() {
+    static const int value = [] {
+        return get_rows_override("GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS");
+    }();
+    return value;
+}
+
+static int get_q5_k_ncols1_rows_override() {
+    static const int value = [] {
+        return get_rows_override("GGML_CUDA_MMVQ_Q5_K_NCOLS1_ROWS");
+    }();
+    return value;
+}
+
 static int get_q6_k_ncols1_rows_override() {
     static const int value = [] {
         return get_rows_override("GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS");
@@ -566,7 +587,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, int rows_per_block_override = 0>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(
+        calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(),
+        (type == GGML_TYPE_Q4_K && ncols_dst == 1) ? 2 : 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1121,69 +1144,53 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
             bool use_small_k = should_use_small_k(c_ncols_dst);
 
-            if constexpr (type == GGML_TYPE_Q6_K) {
-                const int rows_override = !ids && !has_fusion && !use_small_k ? get_q6_k_ncols1_rows_override() : 0;
-                if (rows_override == 2 || rows_override == 4) {
-                    const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
-                    const dim3 block_nums((nrows_x + rows_override - 1)/rows_override,
-                            nchannels_dst, nsamples_dst);
-                    const dim3 block_dims(warp_size, nwarps, 1);
-                    static std::atomic<bool> logged{false};
-                    if (!logged.exchange(true)) {
-                        std::fprintf(stderr,
-                                "ggml_cuda: Q6_K ncols=1 MMVQ rows/block override active: %d (default 1)\n",
-                                rows_override);
-                    }
-                    if (rows_override == 2) {
-                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 2>(
-                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
-                            stride_row_x, stride_col_y, stride_col_dst,
-                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                            sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                            block_nums, block_dims, 0, ids_stride, stream);
-                    } else {
-                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 4>(
-                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
-                            stride_row_x, stride_col_y, stride_col_dst,
-                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                            sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                            block_nums, block_dims, 0, ids_stride, stream);
-                    }
-                    break;
-                }
+            int rows_override = 0;
+            const char * rows_override_name = nullptr;
+            if constexpr (type == GGML_TYPE_Q3_K) {
+                // Include MUL_MAT_ID: LFM APEX routed Q3_K is the decode hot path.
+                rows_override = !use_small_k ? get_q3_k_ncols1_rows_override() : 0;
+                rows_override_name = "Q3_K";
+            } else if constexpr (type == GGML_TYPE_Q4_K) {
+                // Include MUL_MAT_ID: Ling routed Q4_K is the decode hot path.
+                rows_override = !use_small_k ? get_q4_k_ncols1_rows_override() : 0;
+                rows_override_name = "Q4_K";
+            } else if constexpr (type == GGML_TYPE_Q5_K) {
+                rows_override = !use_small_k ? get_q5_k_ncols1_rows_override() : 0;
+                rows_override_name = "Q5_K";
+            } else if constexpr (type == GGML_TYPE_Q6_K) {
+                rows_override = !ids && !use_small_k ? get_q6_k_ncols1_rows_override() : 0;
+                rows_override_name = "Q6_K";
+            } else if constexpr (type == GGML_TYPE_Q8_0) {
+                rows_override = !ids && !has_fusion && !use_small_k ? get_q8_0_ncols1_rows_override() : 0;
+                rows_override_name = "Q8_0";
             }
-
-            if constexpr (type == GGML_TYPE_Q8_0) {
-                // Default rows/block for ncols=1 is 1; allow 2 or 4 like Q6_K.
-                const int rows_override = !ids && !has_fusion && !use_small_k ? get_q8_0_ncols1_rows_override() : 0;
-                if (rows_override == 2 || rows_override == 4) {
-                    const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
-                    const dim3 block_nums((nrows_x + rows_override - 1)/rows_override,
-                            nchannels_dst, nsamples_dst);
-                    const dim3 block_dims(warp_size, nwarps, 1);
-                    static std::atomic<bool> logged{false};
-                    if (!logged.exchange(true)) {
-                        std::fprintf(stderr,
-                                "ggml_cuda: Q8_0 ncols=1 MMVQ rows/block override active: %d (default 1)\n",
-                                rows_override);
-                    }
-                    if (rows_override == 2) {
-                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 2>(
-                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
-                            stride_row_x, stride_col_y, stride_col_dst,
-                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                            sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                            block_nums, block_dims, 0, ids_stride, stream);
-                    } else {
-                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 4>(
-                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
-                            stride_row_x, stride_col_y, stride_col_dst,
-                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                            sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                            block_nums, block_dims, 0, ids_stride, stream);
-                    }
-                    break;
+            if (rows_override == 2 || rows_override == 4) {
+                const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
+                const dim3 block_nums((nrows_x + rows_override - 1)/rows_override,
+                        nchannels_dst, nsamples_dst);
+                const dim3 block_dims(warp_size, nwarps, 1);
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true)) {
+                    std::fprintf(stderr,
+                            "ggml_cuda: %s ncols=1 MMVQ rows/block override active: %d (default 1)\n",
+                            rows_override_name, rows_override);
                 }
+                if (rows_override == 2) {
+                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 2>(
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
+                        stride_row_x, stride_col_y, stride_col_dst,
+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                        block_nums, block_dims, 0, ids_stride, stream);
+                } else {
+                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 4>(
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
+                        stride_row_x, stride_col_y, stride_col_dst,
+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                        block_nums, block_dims, 0, ids_stride, stream);
+                }
+                break;
             }
 
             if (use_small_k) {

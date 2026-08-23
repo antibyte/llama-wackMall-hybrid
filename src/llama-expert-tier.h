@@ -17,7 +17,8 @@ struct llama_model;
 //   LLAMA_EXPERT_S     - hot slots per layer (default 16)
 //   LLAMA_EXPERT_PLACEMENT - optional validated per-layer static-slot manifest;
 //                            requires W=0 and adaptation off
-//   LLAMA_EXPERT_TMAX  - max n_tokens for the hot/cold path (default 16)
+//   LLAMA_EXPERT_TMAX  - max n_tokens for the hot/cold path (default 16);
+//                        warm H2D admits only on graphs at or below this size
 //   LLAMA_EXPERT_STATS - dump cold-hit stats at exit ("1" = stderr, "0" = off, else path)
 //   LLAMA_EXPERT_ADAPT - 1: online repin of hot slots (decay + hysteresis)
 //   LLAMA_EXPERT_USAGE - dump learned hot set at exit (heat csv path, "0" = off)
@@ -45,6 +46,8 @@ struct llama_model;
 //   LLAMA_EXPERT_SKIP_SENTINEL - 1: CUDA MMVQ early-exits cold expert slots that
 //                                map to the zeroed sentinel (default 0 until
 //                                measured on the target GPU)
+//   LLAMA_EXPERT_BW_PROFILE - JSON from bench_expert_bw.py; cpu-heavy keeps W
+//                            only when 0 < q* < 1 (capped copies); MTP still W=0
 //   LLAMA_EXPERT_WARM_SLOTS - extra bounded warm slots/layer (default 0)
 //   LLAMA_EXPERT_WARM_AUTO_MAX - cap for W=auto (default 4; tune on larger GPUs)
 //   LLAMA_EXPERT_WARM_POLICY - warm replacement policy (currently lru)

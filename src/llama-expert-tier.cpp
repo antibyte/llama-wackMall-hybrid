@@ -1,6 +1,7 @@
 #include "llama-expert-tier.h"
 
 #include "llama-expert-adaptation.h"
+#include "llama-expert-bw-profile.h"
 #include "llama-expert-cache.h"
 #include "llama-expert-lookahead.h"
 #include "llama-expert-placement.h"
@@ -23,6 +24,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -62,6 +64,7 @@ struct store {
     int  il       = -1;
     int  sentinel = 0; // last w_hot channel; cold experts map here
     bool is_down  = false;
+    bool counts_wide = false; // last harvest came from a >TMAX (prefill) graph
 };
 
 // per-layer grouping for stats and online repin
@@ -92,6 +95,7 @@ struct layer_tier {
 
 static int  g_S        = 16;
 static int  g_W        = 0;
+static float g_q_star  = 1.0f;
 static int  g_tmax     = 16;
 static bool g_adapt    = false;
 static bool g_hot_only = false; // set by build_moe_cold per layer
@@ -752,6 +756,15 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
         return;
     }
 
+    int32_t peak = 0;
+    for (int expert = 0; expert < n; ++expert) {
+        if (cnt[expert] > peak) {
+            peak = cnt[expert];
+        }
+    }
+    const bool admit_graph = !L.sd->counts_wide && warm_admit_from_counts(peak, g_tmax);
+    L.sd->counts_wide = false;
+
     static const float decay = [] {
         const char * e = getenv("LLAMA_EXPERT_DECAY");
         return e ? (float) atof(e) : 1.0f;
@@ -759,7 +772,7 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
 
     const bool use_probation = g_warm_admission != warm_admission_mode::immediate;
     const bool use_frequency = g_warm_admission == warm_admission_mode::frequency;
-    if (use_probation) {
+    if (use_probation && admit_graph) {
         L.warm_admission.next_epoch();
     }
     const float frequency_decay = use_frequency ? powf(0.5f, 1.0f/(float) g_warm_admission_window) : 0.0f;
@@ -767,7 +780,7 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
     std::vector<std::pair<int32_t, int>> cold_selected;
     for (int expert = 0; expert < n; ++expert) {
         const int32_t selected = cnt[expert];
-        if (use_frequency) {
+        if (use_frequency && admit_graph) {
             L.warm_frequency[expert] = L.warm_frequency[expert]*frequency_decay + (float) selected;
         }
         L.score[expert] = L.score[expert]*decay + (float) selected;
@@ -777,19 +790,24 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
             switch (L.warm_cache.locate(expert)) {
                 case llama_expert_cache::location::fixed:
                     L.cum_fixed += (uint64_t) selected;
-                    if (use_probation) {
+                    if (use_probation && admit_graph) {
                         L.warm_admission.mark_resident(expert);
                     }
                     break;
                 case llama_expert_cache::location::warm:
                     L.cum_warm += (uint64_t) selected;
-                    L.warm_cache.touch_warm(expert);
-                    if (use_probation) {
+                    if (admit_graph) {
+                        L.warm_cache.touch_warm(expert);
+                    }
+                    if (use_probation && admit_graph) {
                         L.warm_admission.mark_resident(expert);
                     }
                     break;
                 case llama_expert_cache::location::cold:
                     L.cum_cold += (uint64_t) selected;
+                    if (!admit_graph) {
+                        break;
+                    }
                     if ((!use_probation || L.warm_admission.record_miss(expert)) &&
                             !warm_expert_pending(L, expert)) {
                         cold_selected.emplace_back(selected, expert);
@@ -841,9 +859,15 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
             protected_slots[(size_t) next.n_fixed() + warm_index] = true;
         }
     }
+    const int budget = warm_admit_budget((int) cold_selected.size(), next.n_warm(), g_q_star);
     int admitted = 0;
     for (const auto & selected : cold_selected) {
-        if (admitted >= next.n_warm() || next.locate(selected.second) != llama_expert_cache::location::cold) {
+        if (admitted >= budget) {
+            L.warm_admission_deferrals++;
+            g_warm_admission_deferrals++;
+            continue;
+        }
+        if (next.locate(selected.second) != llama_expert_cache::location::cold) {
             continue;
         }
         const auto target = next.insertion_target(protected_slots);
@@ -1505,6 +1529,7 @@ static bool explicitly_requested_by_env() {
         "LLAMA_EXPERT_CPU_MULTI_ROW",
         "LLAMA_EXPERT_SHARED_HOT_IDS",
         "LLAMA_EXPERT_WARM_SLOTS",
+        "LLAMA_EXPERT_BW_PROFILE",
         "LLAMA_EXPERT_STATIC_NO_SYNC",
         "LLAMA_EXPERT_LOOKAHEAD_TRACE",
     };
@@ -1742,6 +1767,40 @@ void init(const llama_model & model) {
         }
     }
     const bool warm_config_requested = warm_requested;
+    if (const char * bw_path = getenv("LLAMA_EXPERT_BW_PROFILE")) {
+        if (bw_path[0] && strcmp(bw_path, "0") != 0) {
+            std::ifstream in(bw_path);
+            std::string text;
+            if (!in) {
+                TIER_LOG("%s: LLAMA_EXPERT_BW_PROFILE='%s' is not readable; ignoring\n", __func__, bw_path);
+            } else {
+                text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                std::string recommended;
+                float q_star = -1.0f;
+                if (!parse_bw_profile(text, recommended, q_star)) {
+                    TIER_LOG("%s: LLAMA_EXPERT_BW_PROFILE='%s' is not a llama-wackmall-expert-bw-v1 profile; ignoring\n",
+                            __func__, bw_path);
+                } else {
+                    TIER_LOG("%s: bandwidth profile %s recommended=%s q_star=%.3f\n",
+                            __func__, bw_path, recommended.c_str(), q_star);
+                    g_q_star = q_star;
+                    if (recommended == "cpu-heavy" && warm_requested) {
+                        if (warm_keep_on_cpu_heavy(q_star)) {
+                            TIER_LOG("%s: cpu-heavy profile keeps W with q*=%.3f admit cap (PCIe fill is slower than CPU cold)\n",
+                                    __func__, q_star);
+                        } else {
+                            TIER_LOG("%s: cpu-heavy profile disables warm cache (PCIe fill is slower than CPU cold)\n",
+                                    __func__);
+                            warm_requested = false;
+                            g_warm_auto = false;
+                            g_W = 0;
+                            g_prefetch_requested = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (warm_requested && g_mtp_n > 0 && g_warm_mtp_guarded) {
         TIER_LOG("%s: warm cache guarded off for MTP-%d after deterministic mismatch; fixed hot tier remains enabled\n",
                 __func__, g_mtp_n);
@@ -2403,6 +2462,10 @@ void init(const llama_model & model) {
         } else {
             TIER_LOG("%s: warm admission immediate\n", __func__);
         }
+        if (g_q_star < 1.0f) {
+            TIER_LOG("%s: warm admit budget q*=%.3f (copies per layer <= round(q* * cold misses), cap W)\n",
+                    __func__, g_q_star);
+        }
     }
 
     const char * bridge_consume_env = getenv("GGML_CUDA_EXPERT_BRIDGE_CONSUME");
@@ -2543,6 +2606,7 @@ bool begin_moe_cold(bool eligible,
         ids->ne[1] > (int64_t) g_tmax) {
         return false;
     }
+    id->second.counts_wide = false;
     g_hot_only = true;
     return true;
 }
@@ -2573,6 +2637,7 @@ ggml_tensor * build_moe_count(ggml_context * ctx, ggml_tensor * down_w, ggml_ten
     if (it == g_stores.end() || ids->ne[1] <= (int64_t) g_tmax) {
         return nullptr;
     }
+    it->second.counts_wide = true;
     return ggml_moe_count(ctx, ids, it->second.counts);
 }
 

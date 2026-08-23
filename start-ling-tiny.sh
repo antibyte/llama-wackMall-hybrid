@@ -21,6 +21,7 @@ export GGML_CUDA_MOE_MULTI_FUSION=1
 export GGML_CUDA_MOE_COMBINE_FUSION=1
 export GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS=4
 export GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=4
+export GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS=2
 export GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS=2
 export GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS=4
 export GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE=128
@@ -49,13 +50,14 @@ exec "$SERVER" \
   -b "$DECODE" -ub "$DECODE" \
   -np 1 \
   --kv-unified \
-  --cache-prompt --cache-reuse 16 --cache-ram 2048 \
-  --ctx-checkpoints 4 --cache-idle-slots --cont-batching \
+  --cache-prompt --cache-reuse 0 --cache-ram 2048 \
+  --ctx-checkpoints 8 --cache-idle-slots --cont-batching \
   -t 8 -tb 8 \
   --jinja --backend-sampling \
-  --reasoning on --reasoning-preserve --reasoning-budget 1000 \
+  --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 \
+  --reasoning on --reasoning-preserve --reasoning-budget 4000 \
   --spec-type ngram-simple --spec-draft-n-max 4 \
   --op-offload --load-mode mmap \
-  --n-predict 8192 \
+  --n-predict 32768 \
   --alias ling-tiny \
   "$@"
