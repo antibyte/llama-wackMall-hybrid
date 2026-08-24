@@ -64,6 +64,7 @@ esac
 [[ -f "$QWEN_DRAFT" ]] || die "DFlash-Modell nicht gefunden: $QWEN_DRAFT"
 [[ -f "$LING_MODEL" ]] || die "Ling-Modell nicht gefunden: $LING_MODEL"
 [[ -f "$PROFILE" ]] || die "Expert-Profil nicht gefunden: $PROFILE"
+[[ -f "$PROJECT_ROOT/models/templates/Qwen-Fixed-v22.3.jinja" ]] || die "Qwen chat template nicht gefunden: $PROJECT_ROOT/models/templates/Qwen-Fixed-v22.3.jinja"
 [[ -f "$BW_PROFILE" ]] || die "Bandwidth-Profil nicht gefunden: $BW_PROFILE"
 if [[ -n "$API_KEY_FILE" && ! -f "$API_KEY_FILE" ]]; then
     die "API-Key-Datei nicht gefunden: $API_KEY_FILE"
@@ -110,6 +111,10 @@ UNSET_SHARED=(
     GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS
     GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
     GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0
+    GGML_CUDA_REGISTER_HOST
+    GGML_SCHED_PREFETCH_EXPERTS
+    LLAMA_ARG_CHAT_TEMPLATE_FILE
+    LLAMA_ARG_THINK
 )
 
 {
@@ -155,6 +160,8 @@ UNSET_SHARED=(
     printf 'reasoning = on\n'
     printf 'reasoning-budget = 1000\n'
     printf 'reasoning-preserve = true\n'
+    printf 'reasoning-format = deepseek\n'
+    printf 'chat-template-file = %s\n' "$PROJECT_ROOT/models/templates/Qwen-Fixed-v22.3.jinja"
     printf 'ctx-checkpoints = 8\n'
     printf 'cache-ram = 2048\n'
     printf 'cache-reuse = 0\n'
@@ -261,6 +268,8 @@ UNSET_SHARED=(
     printf 'GGML_CUDA_ASYNC_HOST_COPY=1\n'
     printf 'GGML_SCHED_ASYNC_D2H_COPY=0\n'
     printf 'GGML_SCHED_DEDUP_DST_SYNC=1\n'
+    printf 'GGML_CUDA_REGISTER_HOST=0\n'
+    printf 'GGML_SCHED_PREFETCH_EXPERTS=0\n'
 } > "$QWEN_ENV"
 
 {

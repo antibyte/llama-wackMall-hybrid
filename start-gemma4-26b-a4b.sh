@@ -54,6 +54,8 @@ export LLAMA_CMOE_DECODE_UBATCH="32"
 export GGML_CUDA_MOE_COMBINE_FUSION="1"
 export GGML_CUDA_ASYNC_HOST_COPY="1"
 export GGML_SCHED_DEDUP_DST_SYNC="1"
+# export GGML_CUDA_REGISTER_HOST=1  # mmap pin; 21 GiB failed on 1660 Ti
+# export GGML_SCHED_PREFETCH_EXPERTS=1  # n-cpu-moe prefill overlap; keep off without -ncmoe
 
 # Fixed download provenance:
 #   Hugging Face revision c099eb48e663fd284577b04978a94ffccb261841

@@ -6,11 +6,13 @@
 # keine Kommandozeilenparameter und keine externen Overrides an. Nach einer
 # Änderung einfach erneut ./start1660.sh ausführen.
 #
-# GTX 1660 Ti (sm_75, 6 GiB): DFlash n_max=2 p_min=0.75 S=28, Turbo4 KV,
-# prefill 1856, decode 64. P0 shrink + 1856 single-chunk Long (2026-08-17:
-# +34% PP / +5% decode vs S30 p1024; +3% PP / +8% decode vs 1792).
-# GTX 1080 reference: start1080.sh. Auto baseline for other GPUs:
-#   python3 tools/hybrid_autotune/autotune.py
+# GTX 1660 Ti (sm_75, 6 GiB) live reference, 2026-08-24:
+#   DFlash n_max=4 p_min=0.75, S=30, Turbo4 KV, ctx 32768, KVFlash 4096/8192,
+#   prefill 1856, decode 64, froggeric chat template.
+# Observed: ~40-42 tok/s sustained, ~52 tok/s peak.
+# Prefetch slots (210 MiB Down-expert) are allocated once and reused; gallocr
+# does not allocate a second copy. S does not shrink that tensor.
+# Snapshot: START1660_REFERENCE.md. GTX 1080: start1080.sh.
 #
 set -Eeuo pipefail
 
@@ -55,7 +57,7 @@ CPU_MOE="1"  # keep the hybrid CPU/GPU MoE tier enabled (0 disables it)
 MMPROJ_AUTO="0"  # do not load an optional multimodal projector for this text model
 
 # Model, context, KV, and server behavior
-CONTEXT="24576"  # maximum context tokens; raises KV memory when increased
+CONTEXT="32768"  # maximum context tokens; raises KV memory when increased
 N_PREDICT="8192"  # CLI/server generation limit; API requests may impose a lower limit
 # Direkt editierbare KV-Presets (jeweils TARGET_TYPE_K und TARGET_TYPE_V):
 #   q4_0/q4_0       = gemessener DFlash- und 32K-TPS-Pfad
@@ -67,8 +69,8 @@ TARGET_TYPE_V="turbo4_k"  # experimental DFlash target V cache; requires Flash A
 DRAFT_TYPE_K="turbo4_k"  # speculative draft K cache for MTP or DFlash
 DRAFT_TYPE_V="turbo4_k"  # speculative draft V cache for MTP or DFlash; requires Flash Attention
 LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy used by the measured DFlash winner
-LLAMA_KVFLASH="12288"  # resident target-KV tokens; this is a token count, not a boolean switch
-LLAMA_KVFLASH_MAX_POOL="12288"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
+LLAMA_KVFLASH="4096"  # resident target-KV tokens; this is a token count, not a boolean switch
+LLAMA_KVFLASH_MAX_POOL="8192"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
 LLAMA_KVFLASH_TAU="64"  # scorer reselection interval; inert while the current LRU policy has no scorer
 LLAMA_KVFLASH_POLICY="lru"  # only supported KVFlash replacement policy
 LLAMA_KVFLASH_STATS="0"  # production default; set to 1 to report paging and host-memory counters
@@ -83,7 +85,7 @@ GGML_CUDA_TURBO4_WHT_SHUFFLE="0"  # original WHT is the SM75 winner; shuffle-fir
 MTP_N="2"  # inactive DFlash fallback; used only after switching SPEC_MODE to mtp
 LLAMA_MTP_REQUANTIZE_OUTPUT="none"  # none is the 6-GiB winner; q4_K/q5_K add a draft-only LM head but consume 273/334 MiB VRAM
 LLAMA_MTP_HEAD_TRACE="0"  # 1 prints the selected MTP-head source/type once; diagnostic only
-SPEC_DRAFT_N_MAX="2"  # short-prompt A/B 2026-08-17: 35.3 tok/s vs 32.6 at n_max=6
+SPEC_DRAFT_N_MAX="4"  # short-prompt A/B 2026-08-17: 35.3 tok/s vs 32.6 at n_max=6
 SPEC_DRAFT_N_MIN="1"  # DFlash-only minimum accepted draft length
 SPEC_DRAFT_P_MIN="0.75"  # DFlash-only confidence threshold in [0, 1]
 SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash-only backend sampling switch
@@ -95,6 +97,8 @@ REASONING_PRESERVE="1"  # preserve reasoning in history: 1 enabled, 0 disabled
 LOAD_MODE="mmap"  # measured loading/runtime winner; "none" was 1.87% slower and reduced S to 32
 OFFLINE="1"  # prevent network model/template downloads when set to 1
 JINJA="1"  # use the model's Jinja chat template when set to 1
+CHAT_TEMPLATE_FILE="$PROJECT_ROOT/models/templates/Qwen-Fixed-v22.3.jinja"  # froggeric v22.3; empty = GGUF metadata
+REASONING_FORMAT="deepseek"  # extract <think> into reasoning_content (needed with froggeric)
 FLASH_ATTN="on"  # Flash Attention mode: on, off, or auto
 KV_OFFLOAD="1"  # place KV cache on the GPU when set to 1
 THREADS="8"  # target generation CPU workers; test physical-core/SMT alternatives
@@ -130,7 +134,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots through the full-state RAM prompt cach
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="28"  # VRAM headroom for prefill 1792 + DFlash on 6 GiB (gate 2026-08-16)
+LLAMA_EXPERT_S="30"  # VRAM headroom for prefill 1792 + DFlash on 6 GiB (gate 2026-08-16)
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
@@ -163,7 +167,7 @@ LLAMA_EXPERT_WARM_ADMISSION_WINDOW="8"  # window/half-life used by frequency adm
 LLAMA_EXPERT_WARM_PREFETCH="0"  # W=0 production winner; do not create copy traffic
 LLAMA_EXPERT_PREFETCH_STREAMS="1"  # number of prefetch CUDA streams; current implementation requires 1
 LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT="2"  # maximum simultaneous expert copies
-LLAMA_EXPERT_VRAM_RESERVE_MIB="400"  # runtime auto-fit reserve; forced S remains capped if necessary
+LLAMA_EXPERT_VRAM_RESERVE_MIB="500"  # runtime auto-fit reserve; forced S remains capped if necessary
 LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL="0"  # retain the MTP warmcache correctness guard
 LLAMA_EXPERT_STATIC_NO_SYNC="1"  # safe here: adaptation, stats, timing, usage, and W are disabled
 
@@ -230,6 +234,8 @@ GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0="1"  # 3x2K winner: 47.794 -> 48.599 token/s
 GGML_CUDA_ASYNC_HOST_COPY="1"  # 3x2K winner: pinned split H2D, 47.435 -> 48.335 token/s
 GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate: +0.48% q4 and +0.24% q8 screens
 GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner: 47.340 -> 47.713 token/s (+0.79%)
+GGML_CUDA_REGISTER_HOST="1"  # mmap pin; 21 GiB cudaHostRegister failed on 1660 Ti (host RAM, not VRAM)
+GGML_SCHED_PREFETCH_EXPERTS="2"  # persistent staging; 2 slots overlap prefill copies. S does not size this.
 
 # ============================================================================
 # End of editable configuration
@@ -253,6 +259,11 @@ LLAMA_EXPERT_HOT="$PROFILE"
 
 [[ -x "$SERVER" ]] || die "llama-server nicht ausführbar: $SERVER"
 [[ -f "$MODEL" ]] || die "Modell nicht gefunden: $MODEL"
+if [[ -n "$CHAT_TEMPLATE_FILE" ]]; then
+    [[ -f "$CHAT_TEMPLATE_FILE" ]] || die "Chat-Template nicht gefunden: $CHAT_TEMPLATE_FILE"
+    [[ "$JINJA" == 1 ]] || die "CHAT_TEMPLATE_FILE benoetigt JINJA=1."
+fi
+case "$REASONING_FORMAT" in none|deepseek|deepseek-legacy|auto) ;; *) die "REASONING_FORMAT muss none, deepseek, deepseek-legacy oder auto sein." ;; esac
 [[ -f "$PROFILE" ]] || die "Expert-Profil nicht gefunden: $PROFILE (PROFILE_KIND=$PROFILE_KIND)"
 if [[ -n "$LLAMA_EXPERT_HOT" && ! -f "$LLAMA_EXPERT_HOT" ]]; then
     die "Expert-Profil nicht gefunden: $LLAMA_EXPERT_HOT"
@@ -333,6 +344,8 @@ case "$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0" in 0|1) ;; *) die "GGML_CUDA_CONCAT_N
 case "$GGML_CUDA_ASYNC_HOST_COPY" in 0|1) ;; *) die "GGML_CUDA_ASYNC_HOST_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_ASYNC_D2H_COPY" in 0|1) ;; *) die "GGML_SCHED_ASYNC_D2H_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_DEDUP_DST_SYNC" in 0|1) ;; *) die "GGML_SCHED_DEDUP_DST_SYNC muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_REGISTER_HOST" in 0|1) ;; *) die "GGML_CUDA_REGISTER_HOST muss 0 oder 1 sein." ;; esac
+case "$GGML_SCHED_PREFETCH_EXPERTS" in 0|1|2|3|4|5|6|7|8) ;; *) die "GGML_SCHED_PREFETCH_EXPERTS muss 0 oder 1..8 sein." ;; esac
 [[ -z "$LLAMA_EXPERT_S" || -z "$LLAMA_EXPERT_PLACEMENT" ]] || \
     die "LLAMA_EXPERT_S und LLAMA_EXPERT_PLACEMENT sind gegenseitig exklusiv."
 if [[ "$LLAMA_EXPERT_LOOKAHEAD_TRACE" != 0 && "$LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON" == 0 ]]; then
@@ -457,6 +470,7 @@ env_args=(
     "LLAMA_ARG_REASONING=$REASONING"
     "LLAMA_ARG_THINK_BUDGET=$REASONING_BUDGET"
     "LLAMA_ARG_REASONING_PRESERVE=$REASONING_PRESERVE"
+    "LLAMA_ARG_THINK=$REASONING_FORMAT"
     "LLAMA_ARG_FLASH_ATTN=$FLASH_ATTN"
     "LLAMA_ARG_KV_OFFLOAD=$KV_OFFLOAD"
     "LLAMA_ARG_OFFLINE=$OFFLINE"
@@ -542,6 +556,8 @@ env_args=(
     "GGML_CUDA_ASYNC_HOST_COPY=$GGML_CUDA_ASYNC_HOST_COPY"
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
     "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"
+    "GGML_CUDA_REGISTER_HOST=$GGML_CUDA_REGISTER_HOST"
+    "GGML_SCHED_PREFETCH_EXPERTS=$GGML_SCHED_PREFETCH_EXPERTS"
     "LLAMA_DFLASH_COMBINED=$DFLASH_COMBINED"
 )
 
@@ -561,6 +577,7 @@ fi
 [[ -n "$CMOE_DECODE_UBATCH" ]] && env_args+=("LLAMA_CMOE_DECODE_UBATCH=$CMOE_DECODE_UBATCH")
 [[ -n "$THREADS_HTTP" ]] && env_args+=("LLAMA_ARG_THREADS_HTTP=$THREADS_HTTP")
 [[ -n "$LLAMA_TURBO4_Q8_FALLBACK_LAYERS" ]] && env_args+=("LLAMA_TURBO4_Q8_FALLBACK_LAYERS=$LLAMA_TURBO4_Q8_FALLBACK_LAYERS")
+[[ -n "$CHAT_TEMPLATE_FILE" ]] && env_args+=("LLAMA_ARG_CHAT_TEMPLATE_FILE=$CHAT_TEMPLATE_FILE")
 
 if [[ -n "$LLAMA_EXPERT_S" ]]; then
     env_args+=("LLAMA_EXPERT_S=$LLAMA_EXPERT_S")
@@ -629,11 +646,13 @@ llama-wackMall-hybrid start
   Q6 probes:    warps=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS warp-rows=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS reuse-y=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y
   CUDA concat:  flat-dim0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 block=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
   split copies: async-h2d=$GGML_CUDA_ASYNC_HOST_COPY async-d2h=$GGML_SCHED_ASYNC_D2H_COPY dedup-dst-sync=$GGML_SCHED_DEDUP_DST_SYNC
+  n-cpu-moe:    register-host=$GGML_CUDA_REGISTER_HOST prefetch-experts=$GGML_SCHED_PREFETCH_EXPERTS
   skip sentinel: $LLAMA_EXPERT_SKIP_SENTINEL (1=MMVQ early-exit on cold sentinel slots)
   shared hot IDs: $LLAMA_EXPERT_SHARED_HOT_IDS
   CPU fused GU: $LLAMA_EXPERT_CPU_FUSED_GATE_UP
   bridge:       consume=$GGML_CUDA_EXPERT_BRIDGE_CONSUME device-quant=$GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT hit-only=$GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY cache=${GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS:-off}/$GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS
-  reasoning:    $REASONING_BUDGET
+  reasoning:    $REASONING_BUDGET format=$REASONING_FORMAT
+  chat template: ${CHAT_TEMPLATE_FILE:-<model metadata>}
 EOF
 
 # Empty values for S/placement and inactive optional controls must not inherit

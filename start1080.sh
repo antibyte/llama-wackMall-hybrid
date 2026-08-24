@@ -95,6 +95,8 @@ REASONING_PRESERVE="1"  # preserve reasoning in history: 1 enabled, 0 disabled
 LOAD_MODE="none"  # model loading mode: mmap, mlock, mmap+mlock, dio, or none
 OFFLINE="1"  # prevent network model/template downloads when set to 1
 JINJA="1"  # use the model's Jinja chat template when set to 1
+CHAT_TEMPLATE_FILE="$PROJECT_ROOT/models/templates/Qwen-Fixed-v22.3.jinja"  # froggeric v22.3; empty = GGUF metadata
+REASONING_FORMAT="deepseek"  # extract <think> into reasoning_content (needed with froggeric)
 FLASH_ATTN="on"  # required for Turbo4
 KV_OFFLOAD="1"  # place KV cache on the GPU when set to 1
 THREADS="4"  # measured winner on i7-4770 versus 8 SMT workers
@@ -220,6 +222,8 @@ GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0="0"  # not validated as win on GTX1080 yet
 GGML_CUDA_ASYNC_HOST_COPY="1"  # 3x512 +1.63% alone; part of winner stack
 GGML_SCHED_ASYNC_D2H_COPY="0"  # smoke -0.48% on GTX1080; keep off
 GGML_SCHED_DEDUP_DST_SYNC="1"  # upstream exact win; single-copy scheduler dedup
+GGML_CUDA_REGISTER_HOST="0"  # 1660 mmap pin failed; load-mode none makes this a no-op
+GGML_SCHED_PREFETCH_EXPERTS="0"  # n-cpu-moe pp512 +58% on 1660; keep 0 with hybrid S=58
 
 # ============================================================================
 # End of editable configuration
@@ -236,6 +240,11 @@ fi
 
 [[ -x "$SERVER" ]] || die "llama-server nicht ausführbar: $SERVER"
 [[ -f "$MODEL" ]] || die "Modell nicht gefunden: $MODEL"
+if [[ -n "$CHAT_TEMPLATE_FILE" ]]; then
+    [[ -f "$CHAT_TEMPLATE_FILE" ]] || die "Chat-Template nicht gefunden: $CHAT_TEMPLATE_FILE"
+    [[ "$JINJA" == 1 ]] || die "CHAT_TEMPLATE_FILE benoetigt JINJA=1."
+fi
+case "$REASONING_FORMAT" in none|deepseek|deepseek-legacy|auto) ;; *) die "REASONING_FORMAT muss none, deepseek, deepseek-legacy oder auto sein." ;; esac
 if [[ -n "$LLAMA_EXPERT_HOT" && ! -f "$LLAMA_EXPERT_HOT" ]]; then
     die "Expert-Profil nicht gefunden: $LLAMA_EXPERT_HOT"
 fi
@@ -271,6 +280,8 @@ case "$REASONING_PRESERVE" in 0|1) ;; *) die "REASONING_PRESERVE muss 0 oder 1 s
 case "$GGML_CUDA_ASYNC_HOST_COPY" in 0|1) ;; *) die "GGML_CUDA_ASYNC_HOST_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_ASYNC_D2H_COPY" in 0|1) ;; *) die "GGML_SCHED_ASYNC_D2H_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_DEDUP_DST_SYNC" in 0|1) ;; *) die "GGML_SCHED_DEDUP_DST_SYNC muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_REGISTER_HOST" in 0|1) ;; *) die "GGML_CUDA_REGISTER_HOST muss 0 oder 1 sein." ;; esac
+case "$GGML_SCHED_PREFETCH_EXPERTS" in 0|1|2|3|4|5|6|7|8) ;; *) die "GGML_SCHED_PREFETCH_EXPERTS muss 0 oder 1..8 sein." ;; esac
 case "$LLAMA_TURBO4_V_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_V_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_MTP_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_MTP_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_DFLASH_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_DFLASH_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
@@ -417,6 +428,7 @@ env_args=(
     "LLAMA_ARG_REASONING=$REASONING"
     "LLAMA_ARG_THINK_BUDGET=$REASONING_BUDGET"
     "LLAMA_ARG_REASONING_PRESERVE=$REASONING_PRESERVE"
+    "LLAMA_ARG_THINK=$REASONING_FORMAT"
     "LLAMA_ARG_FLASH_ATTN=$FLASH_ATTN"
     "LLAMA_ARG_KV_OFFLOAD=$KV_OFFLOAD"
     "LLAMA_ARG_OFFLINE=$OFFLINE"
@@ -501,6 +513,8 @@ env_args=(
     "GGML_CUDA_ASYNC_HOST_COPY=$GGML_CUDA_ASYNC_HOST_COPY"
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
     "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"
+    "GGML_CUDA_REGISTER_HOST=$GGML_CUDA_REGISTER_HOST"
+    "GGML_SCHED_PREFETCH_EXPERTS=$GGML_SCHED_PREFETCH_EXPERTS"
     "LLAMA_DFLASH_COMBINED=$DFLASH_COMBINED"
     "LLAMA_DFLASH_DDTREE=$LLAMA_DFLASH_DDTREE"
     "LLAMA_DFLASH_TREE_VERIFY=$LLAMA_DFLASH_TREE_VERIFY"
@@ -524,6 +538,7 @@ fi
 [[ -n "$CMOE_DECODE_UBATCH" ]] && env_args+=("LLAMA_CMOE_DECODE_UBATCH=$CMOE_DECODE_UBATCH")
 [[ -n "$THREADS_HTTP" ]] && env_args+=("LLAMA_ARG_THREADS_HTTP=$THREADS_HTTP")
 [[ -n "$LLAMA_TURBO4_Q8_FALLBACK_LAYERS" ]] && env_args+=("LLAMA_TURBO4_Q8_FALLBACK_LAYERS=$LLAMA_TURBO4_Q8_FALLBACK_LAYERS")
+[[ -n "$CHAT_TEMPLATE_FILE" ]] && env_args+=("LLAMA_ARG_CHAT_TEMPLATE_FILE=$CHAT_TEMPLATE_FILE")
 
 if [[ -n "$LLAMA_EXPERT_S" ]]; then
     env_args+=("LLAMA_EXPERT_S=$LLAMA_EXPERT_S")
@@ -602,7 +617,9 @@ llama-wackMall-hybrid GTX1080 start
   backend samp: target=$TARGET_BACKEND_SAMPLING draft=$EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING
   skip/hot:     skip=$LLAMA_EXPERT_SKIP_SENTINEL shared-hot=$LLAMA_EXPERT_SHARED_HOT_IDS
   split copies: async-h2d=$GGML_CUDA_ASYNC_HOST_COPY async-d2h=$GGML_SCHED_ASYNC_D2H_COPY dedup-dst-sync=$GGML_SCHED_DEDUP_DST_SYNC
-  reasoning:    $REASONING_BUDGET
+  n-cpu-moe:    register-host=$GGML_CUDA_REGISTER_HOST prefetch-experts=$GGML_SCHED_PREFETCH_EXPERTS
+  reasoning:    $REASONING_BUDGET format=$REASONING_FORMAT
+  chat template: ${CHAT_TEMPLATE_FILE:-<model metadata>}
 EOF
 
 # Empty values for S/placement and inactive optional controls must not inherit

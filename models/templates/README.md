@@ -21,6 +21,11 @@ These templates can be updated with the following commands:
 ./scripts/get_chat_template.py Qwen/Qwen2.5-7B-Instruct                      > models/templates/Qwen-Qwen2.5-7B-Instruct.jinja
 ./scripts/get_chat_template.py Qwen/QwQ-32B                                  > models/templates/Qwen-QwQ-32B.jinja
 ./scripts/get_chat_template.py Qwen/Qwen3-0.6B                               > models/templates/Qwen-Qwen3-0.6B.jinja
+# froggeric Qwen 3.5/3.6/3.8 fix template (v22.3):
+#   https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+#   models/templates/Qwen-Fixed-v22.3.jinja
+#   used by start1660.sh / start1080.sh / start.sh / router1660.sh / router1080.sh
+#   with --jinja --chat-template-file ... --reasoning-format deepseek
 ./scripts/get_chat_template.py zai-org/GLM-4.5                               > models/templates/zai-org-GLM-4.5.jinja
 ./scripts/get_chat_template.py deepseek-ai/DeepSeek-V3.1                     > models/templates/deepseek-ai-DeepSeek-V3.1.jinja
 ```
