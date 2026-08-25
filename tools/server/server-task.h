@@ -151,7 +151,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
-    server_tokens tokens;
+    // Follow-up chat templates retokenize history; align_text_prefix rewrites
+    // ids to the cached prefix so KV reuse is not broken by BPE merges.
+    mutable server_tokens tokens;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context

@@ -518,6 +518,71 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
     return max_idx; // all tokens are equal
 }
 
+size_t server_tokens::align_text_prefix(const server_tokens & cached, const llama_vocab * vocab) {
+    if (!vocab || has_media() || cached.has_media() || empty() || cached.empty()) {
+        return get_common_prefix(cached);
+    }
+
+    const size_t n_tok = cached.get_common_prefix(*this);
+
+    std::string s_new;
+    s_new.reserve(tokens.size() * 4);
+    for (llama_token t : tokens) {
+        if (t == LLAMA_TOKEN_NULL) {
+            return n_tok;
+        }
+        s_new += common_token_to_piece(vocab, t, true);
+    }
+
+    std::vector<std::string> pieces;
+    pieces.reserve(cached.size());
+    for (size_t i = 0; i < cached.size(); ++i) {
+        const llama_token t = cached[i];
+        if (t == LLAMA_TOKEN_NULL) {
+            break;
+        }
+        pieces.push_back(common_token_to_piece(vocab, t, true));
+    }
+
+    size_t n_bytes = 0;
+    const int32_t n_keep = common_text_prefix_pieces(pieces, s_new, &n_bytes);
+    if (n_keep <= 0 || (size_t) n_keep <= n_tok) {
+        return n_tok;
+    }
+
+    llama_tokens tail;
+    if (n_bytes < s_new.size()) {
+        tail = common_tokenize(vocab, s_new.substr(n_bytes), false, true);
+    }
+
+    server_tokens rebuilt = cached.clone();
+    rebuilt.keep_first((size_t) n_keep);
+    rebuilt.insert(tail);
+    *this = std::move(rebuilt);
+    return (size_t) n_keep;
+}
+
+void server_tokens::continue_from_cached(
+        const server_tokens & cached,
+        const server_tokens & incoming,
+        int32_t last_user,
+        const llama_vocab * vocab) {
+    if (!vocab || last_user < 0 || (size_t) last_user >= incoming.size() || cached.empty()) {
+        return;
+    }
+
+    server_tokens rebuilt = cached.clone();
+    const bool have_eog = !cached.empty() && llama_vocab_is_eog(vocab, cached[cached.size() - 1]);
+    if (!have_eog) {
+        const llama_tokens sep = common_tokenize(vocab, "<|im_end|>\n", false, true);
+        rebuilt.insert(sep);
+    }
+    for (size_t i = (size_t) last_user; i < incoming.size(); ++i) {
+        rebuilt.push_back(incoming[i]);
+    }
+    *this = std::move(rebuilt);
+}
+
 common_chat_msg_spans server_tokens::find_message_spans(const common_chat_msg_delimiters & delims) const {
     return find_message_spans(delims, {}, {});
 }

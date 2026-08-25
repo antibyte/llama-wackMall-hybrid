@@ -1736,6 +1736,45 @@ bool common_checkpoint_is_radix_index(int32_t i, int32_t n) {
     return i == 0 || i == n - 1;
 }
 
+int32_t common_text_prefix_pieces(
+        const std::vector<std::string> & pieces,
+        const std::string & s_new,
+        size_t * n_bytes) {
+    std::string acc;
+    int32_t n = 0;
+    for (const std::string & piece : pieces) {
+        if (s_new.size() < acc.size() + piece.size() ||
+                s_new.compare(acc.size(), piece.size(), piece) != 0) {
+            break;
+        }
+        acc += piece;
+        n++;
+    }
+    if (n_bytes) {
+        *n_bytes = acc.size();
+    }
+    return n;
+}
+
+bool common_prompt_should_continue_cached(
+        int32_t n_keep,
+        int32_t n_cached,
+        int32_t last_user,
+        int32_t n_new) {
+    if (n_keep < 0 || n_cached <= 0 || n_new <= 0) {
+        return false;
+    }
+    if (last_user <= n_keep || last_user >= n_new) {
+        return false;
+    }
+    // Only when retokenize stopped near the original prompt, not after a
+    // near-complete text match of the generation.
+    if (n_keep > n_cached / 2 || n_cached <= n_keep + 64) {
+        return false;
+    }
+    return true;
+}
+
 int32_t common_cmoe_first_prefill_at(int32_t decode_ubatch, int32_t prefill_ubatch) {
     if (decode_ubatch <= 0) {
         return prefill_ubatch > 0 ? prefill_ubatch : 0;

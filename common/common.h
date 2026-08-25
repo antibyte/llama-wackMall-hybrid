@@ -1054,6 +1054,21 @@ bool common_checkpoint_should_split_ubatch(
 // snapshot list so a prompt-cache entry can fit.
 bool common_checkpoint_is_radix_index(int32_t i, int32_t n);
 
+// Longest run of pieces that is a byte prefix of s_new. n_bytes receives the
+// matched length when non-null.
+int32_t common_text_prefix_pieces(
+        const std::vector<std::string> & pieces,
+        const std::string & s_new,
+        size_t * n_bytes);
+
+// Follow-up whose token/text prefix stops at the original prompt while the
+// slot still holds a long generation: keep KV and only prefill the new turn.
+bool common_prompt_should_continue_cached(
+        int32_t n_keep,
+        int32_t n_cached,
+        int32_t last_user,
+        int32_t n_new);
+
 // CMOE 2048<->64 evicts CUDA graphs. Prefill when leftover needs the wide
 // ubatch, or while already prefilling until the tail fits decode. Follow-up
 // leftovers (n_have > 0, currently decode) stay on decode graphs.

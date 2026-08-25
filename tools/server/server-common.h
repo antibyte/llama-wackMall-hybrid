@@ -227,6 +227,17 @@ public:
 
     size_t get_common_prefix(const server_tokens & b) const;
 
+    // Replace a retokenized history with cached token ids for the shared text
+    // prefix, then tokenize only the remainder. Returns the kept cached count.
+    size_t align_text_prefix(const server_tokens & cached, const llama_vocab * vocab);
+
+    // Keep the full cached generation and append incoming[last_user:] (new turn).
+    void continue_from_cached(
+            const server_tokens & cached,
+            const server_tokens & incoming,
+            int32_t last_user,
+            const llama_vocab * vocab);
+
     // split the tokens into message spans, skipping over media chunks
     common_chat_msg_spans find_message_spans(const common_chat_msg_delimiters & delims) const;
 

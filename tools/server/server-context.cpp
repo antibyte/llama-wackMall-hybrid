@@ -2834,6 +2834,9 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, int64_t min_gap = 32) {
         const int id_task = slot.task->id;
         const int64_t n_cur = slot.prompt.n_tokens() - n_tokens_cur;
+        if (n_cur <= 0) {
+            return;
+        }
         if (!slot.prompt.checkpoints.empty() &&
                 common_checkpoint_too_dense(n_cur, slot.prompt.checkpoints.back().n_tokens, min_gap)) {
             return;
@@ -3752,6 +3755,33 @@ private:
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
+                        if (slot.task->params.cache_prompt &&
+                                !slot.prompt.tokens.empty() &&
+                                !slot.prompt.tokens.has_media() &&
+                                !slot.task->tokens.has_media()) {
+                            const int32_t last_user = slot.task->params.message_spans.last_user_message_pos();
+                            const int32_t n_new = slot.task->n_tokens();
+                            const int32_t n_cached = slot.prompt.n_tokens();
+                            server_tokens incoming;
+                            const bool maybe_cont = last_user > 0 && n_cached > 64;
+                            if (maybe_cont) {
+                                incoming = slot.task->tokens.clone();
+                            }
+                            const size_t n_tok = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+                            const size_t n_keep = slot.task->tokens.align_text_prefix(slot.prompt.tokens, vocab);
+                            if (n_keep > n_tok) {
+                                SLT_INF(slot, "prompt cache text-align n_keep = %zu (token-LCP was %zu, n_tokens = %d)\n",
+                                        n_keep, n_tok, slot.task->n_tokens());
+                            }
+                            if (maybe_cont && common_prompt_should_continue_cached(
+                                        (int32_t) n_keep, n_cached, last_user, n_new)) {
+                                slot.task->tokens.continue_from_cached(
+                                        slot.prompt.tokens, incoming, last_user, vocab);
+                                SLT_INF(slot, "prompt cache continue n_cached = %d last_user = %d n_tokens = %d (token-LCP was %zu)\n",
+                                        n_cached, last_user, slot.task->n_tokens(), n_tok);
+                            }
+                        }
+
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
@@ -4601,6 +4631,7 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+                maybe_checkpoint_now(slot, "prompt end", 0);
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

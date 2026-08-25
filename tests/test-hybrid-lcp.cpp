@@ -334,6 +334,27 @@ int main() {
            "out of range is not radix");
 
     {
+        size_t n_bytes = 0;
+        expect(common_text_prefix_pieces({"hel", "lo", "!"}, "hello! there", &n_bytes) == 3 && n_bytes == 6,
+               "all pieces sit in the new text");
+        expect(common_text_prefix_pieces({"hel", "lo", "!"}, "help", &n_bytes) == 1 && n_bytes == 3,
+               "BPE merge at the cache edge keeps the shared pieces");
+        expect(common_text_prefix_pieces({"ab"}, "xab", &n_bytes) == 0 && n_bytes == 0,
+               "mismatch at the first piece");
+        expect(common_text_prefix_pieces({}, "abc", &n_bytes) == 0,
+               "empty cache");
+    }
+
+    expect(common_prompt_should_continue_cached(25, 29850, 34000, 34498),
+           "long generate plus a new last-user turn continues from KV");
+    expect(!common_prompt_should_continue_cached(25, 50, 40, 80),
+           "short cached tail is not a continuation");
+    expect(!common_prompt_should_continue_cached(25, 29850, 10, 34498),
+           "last user inside the matched prefix is not a new turn");
+    expect(!common_prompt_should_continue_cached(29000, 29850, 34000, 34498),
+           "almost-full text match does not rewrite onto the new last user");
+
+    {
         std::string rec;
         float q = -1.0f;
         const std::string json =

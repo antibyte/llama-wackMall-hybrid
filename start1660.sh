@@ -57,8 +57,8 @@ CPU_MOE="1"  # keep the hybrid CPU/GPU MoE tier enabled (0 disables it)
 MMPROJ_AUTO="0"  # do not load an optional multimodal projector for this text model
 
 # Model, context, KV, and server behavior
-CONTEXT="32768"  # maximum context tokens; raises KV memory when increased
-N_PREDICT="8192"  # CLI/server generation limit; API requests may impose a lower limit
+CONTEXT="65536"  # maximum context tokens; raises KV memory when increased
+N_PREDICT="32768"  # CLI/server generation limit; API requests may impose a lower limit
 # Direkt editierbare KV-Presets (jeweils TARGET_TYPE_K und TARGET_TYPE_V):
 #   q4_0/q4_0       = gemessener DFlash- und 32K-TPS-Pfad
 #   turbo4_k/turbo4_k = aktuell aktiv; experimenteller DFlash-Kapazitaetspfad
@@ -70,7 +70,7 @@ DRAFT_TYPE_K="turbo4_k"  # speculative draft K cache for MTP or DFlash
 DRAFT_TYPE_V="turbo4_k"  # speculative draft V cache for MTP or DFlash; requires Flash Attention
 LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy used by the measured DFlash winner
 LLAMA_KVFLASH="4096"  # resident target-KV tokens; this is a token count, not a boolean switch
-LLAMA_KVFLASH_MAX_POOL="4096"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
+LLAMA_KVFLASH_MAX_POOL="8192"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
 LLAMA_KVFLASH_TAU="64"  # scorer reselection interval; inert while the current LRU policy has no scorer
 LLAMA_KVFLASH_POLICY="lru"  # only supported KVFlash replacement policy
 LLAMA_KVFLASH_STATS="0"  # production default; set to 1 to report paging and host-memory counters
@@ -92,7 +92,7 @@ SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash-only backend sampling switch
 DFLASH_COMBINED="1"  # fuse target feature projection and draft KV injection into the target graph
 DRAFT_NGL="all"  # the measured winner keeps all six DFlash layers on the GPU
 REASONING="1"  # let the model template select reasoning mode
-REASONING_BUDGET="2000"  # measured quality/latency compromise; clients may request another value
+REASONING_BUDGET="3000"  # measured quality/latency compromise; clients may request another value
 REASONING_PRESERVE="1"  # preserve reasoning in history: 1 enabled, 0 disabled
 LOAD_MODE="mmap"  # measured loading/runtime winner; "none" was 1.87% slower and reduced S to 32
 OFFLINE="1"  # prevent network model/template downloads when set to 1
@@ -126,7 +126,7 @@ CMOE_DECODE_UBATCH="64"  # physical decode ubatch; phase switch frees prefill pe
 
 # Prompt-cache controls
 CTX_CHECKPOINTS="8"  # think/tool/role/turn-end anchors; 4 evicted too quickly
-CACHE_RAM="2048"  # host-side full-state prompt-cache budget (MiB), including KVFlash host pages
+CACHE_RAM="4096"  # host-side full-state prompt-cache budget (MiB), including KVFlash host pages
 CACHE_PROMPT="1"  # enable prompt-prefix reuse when set to 1
 CACHE_REUSE="0"  # GDN recurrent state is prefix-dependent; chunk KV shift is unsafe
 KV_UNIFIED="1"  # share one unified KV buffer between slots when set to 1
@@ -134,7 +134,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots through the full-state RAM prompt cach
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="25"  # VRAM headroom for prefill 1792 + DFlash on 6 GiB (gate 2026-08-16)
+LLAMA_EXPERT_S="28"  # VRAM headroom for prefill 1792 + DFlash on 6 GiB (gate 2026-08-16)
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
@@ -150,10 +150,10 @@ LLAMA_EXPERT_TIMING="0"  # collect detailed CPU expert timing; adds measurement 
 LLAMA_EXPERT_CPU_CHUNK="64"  # cold-row chunk size; power of two from 16 through 256
 LLAMA_EXPERT_CPU_ACT_PARALLEL="0"  # experimental path did not establish a sustained winner
 LLAMA_EXPERT_CPU_ASYNC="0"  # bridge/async path regressed on this GPU; keep synchronous fallback
-LLAMA_EXPERT_CPU_DOWN_PREFETCH="0"  # no measured sustained gain on the local CPU
-LLAMA_EXPERT_CPU_REUSE_ROWS="0"  # conservative winner; row reuse is not part of the 49.134-TPS promoted Q4 path
-LLAMA_EXPERT_CPU_MULTI_ROW="0"  # AVX2 multi-row reduced CPU time but was neutral in 2K decode
-LLAMA_EXPERT_CPU_FUSED_GATE_UP="0"  # exact AVX2 dual-dot; +0.21% median was below promotion threshold on Ryzen 4800H
+LLAMA_EXPERT_CPU_DOWN_PREFETCH="1"  # no measured sustained gain on the local CPU
+LLAMA_EXPERT_CPU_REUSE_ROWS="1"  # conservative winner; row reuse is not part of the 49.134-TPS promoted Q4 path
+LLAMA_EXPERT_CPU_MULTI_ROW="1"  # AVX2 multi-row reduced CPU time but was neutral in 2K decode
+LLAMA_EXPERT_CPU_FUSED_GATE_UP="1"  # exact AVX2 dual-dot; +0.21% median was below promotion threshold on Ryzen 4800H
 
 # Warmcache. Fixed hot slots are never evicted; W=0 is the measured MTP path.
 # cpu-heavy q*~0.10 on this GPU: PCIe fill is slower than CPU cold (bench_expert_bw.py).
