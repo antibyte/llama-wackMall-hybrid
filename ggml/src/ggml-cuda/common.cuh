@@ -27,6 +27,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1190,6 +1191,9 @@ struct ggml_cuda_pool_alloc {
         GGML_ASSERT(pool != nullptr);
         GGML_ASSERT(ptr == nullptr);
         ptr = (T *) pool->alloc(size * sizeof(T), &this->actual_size);
+        if (ptr == nullptr) {
+            throw std::bad_alloc();
+        }
         return ptr;
     }
 

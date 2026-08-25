@@ -1646,7 +1646,10 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
                 ggml_backend_buffer_get_size(sched->prefetch_slots[i]) >= size) {
             continue;
         }
-        if (size > free_mem) {
+        // Leave MMQ/FA scratch for the 1856-wide prefill; a 210 MiB slot that
+        // fits still OOMs cuMemCreate during ggml_cuda_mul_mat_q on 6 GiB.
+        const size_t mmq_headroom = 256ull * 1024 * 1024;
+        if (size + mmq_headroom > free_mem) {
             break;
         }
         ggml_backend_buffer_t new_buf = ggml_backend_buft_alloc_buffer(buft, size);
@@ -2219,6 +2222,19 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_prefetch_release(ggml_backend_sched_t sched) {
+    if (sched == NULL || sched->prefetch_backend == NULL) {
+        return;
+    }
+    ggml_backend_synchronize(sched->prefetch_backend);
+    for (int i = 0; i < GGML_SCHED_MAX_PREFETCH_SLOTS; i++) {
+        ggml_backend_buffer_free(sched->prefetch_slots[i]);
+        sched->prefetch_slots[i] = NULL;
+        sched->prefetch_used[i] = false;
+    }
+    sched->prefetch_cur = 0;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

@@ -1201,8 +1201,8 @@ private:
             return;
         }
 
-        const int32_t batch = prefill ? cmoe_prefill_batch : cmoe_decode_batch;
-        const int32_t ubatch = prefill ? cmoe_prefill_ubatch : cmoe_decode_ubatch;
+        int32_t batch = prefill ? cmoe_prefill_batch : cmoe_decode_batch;
+        int32_t ubatch = prefill ? cmoe_prefill_ubatch : cmoe_decode_ubatch;
         const bool spec_dflash = std::any_of(params_base.speculative.types.begin(),
                                            params_base.speculative.types.end(),
                                            common_speculative_type_is_dflash_family);
@@ -1210,9 +1210,25 @@ private:
                 std::min<uint32_t>(ubatch, llama_n_ubatch(ctx_dft)) : (uint32_t) ubatch;
         if (!llama_set_runtime_ubatch(ctx_tgt, (uint32_t) ubatch) ||
                 (ctx_dft && !llama_set_runtime_ubatch(ctx_dft, draft_ubatch))) {
-            throw std::runtime_error(string_format(
-                    "failed to activate cmoe %s batch %d/%d",
-                    prefill ? "prefill" : "decode", batch, ubatch));
+            if (prefill && cmoe_decode_ubatch > 0) {
+                SRV_WRN("cmoe prefill %d/%d failed to reserve; falling back to decode %d/%d\n",
+                        batch, ubatch, cmoe_decode_batch, cmoe_decode_ubatch);
+                prefill = false;
+                batch = cmoe_decode_batch;
+                ubatch = cmoe_decode_ubatch;
+                const uint32_t draft_decode = ctx_dft && spec_dflash ?
+                        std::min<uint32_t>(ubatch, llama_n_ubatch(ctx_dft)) : (uint32_t) ubatch;
+                if (!llama_set_runtime_ubatch(ctx_tgt, (uint32_t) ubatch) ||
+                        (ctx_dft && !llama_set_runtime_ubatch(ctx_dft, draft_decode))) {
+                    throw std::runtime_error(string_format(
+                            "failed to activate cmoe decode batch %d/%d after prefill reserve OOM",
+                            batch, ubatch));
+                }
+            } else {
+                throw std::runtime_error(string_format(
+                        "failed to activate cmoe %s batch %d/%d",
+                        prefill ? "prefill" : "decode", batch, ubatch));
+            }
         }
 
         if (prefill != cmoe_phase_prefill ||
@@ -4459,7 +4475,11 @@ private:
                 }
 
                 if (ret < -1) {
-                    // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
+                    if (cmoe_phase_prefill) {
+                        SRV_ERR("prefill compute OOM (ret = %d); falling back to decode ubatch\n", ret);
+                        set_cmoe_batch_phase(false);
+                        return false;
+                    }
                     err = "Compute error.";
                 }
 

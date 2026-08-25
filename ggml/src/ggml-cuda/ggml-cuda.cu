@@ -1679,7 +1679,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
         }
-        CUDA_CHECK(err);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            GGML_LOG_ERROR(GGML_CUDA_NAME " pool[%d]: failed to allocate %.2f MiB: %s\n",
+                device, look_ahead_size / (1024.0 * 1024.0), cudaGetErrorString(err));
+            return nullptr;
+        }
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
 #ifdef DEBUG_CUDA_MALLOC
@@ -1760,7 +1765,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            CUresult err = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (err != CUDA_SUCCESS) {
+                const char * err_str = nullptr;
+                cuGetErrorString(err, &err_str);
+                GGML_LOG_ERROR("%s: cuMemCreate %.2f MiB failed: %s\n",
+                    __func__, reserve_size / (1024.0 * 1024.0), err_str ? err_str : "unknown");
+                return nullptr;
+            }
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -5674,9 +5686,26 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    if (!ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key)) {
-        // Instantiate OOM: captured work never launched. Replay eager.
-        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+    try {
+        if (!ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key)) {
+            // Instantiate OOM: captured work never launched. Replay eager.
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+        }
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_ERROR("%s: CUDA pool OOM during graph compute\n", __func__);
+        (void) cudaGetLastError();
+        if (use_cuda_graph && cuda_graph_update_required) {
+            cudaGraph_t abandoned = nullptr;
+            (void) cudaStreamEndCapture(cuda_ctx->stream(), &abandoned);
+            if (abandoned) {
+                (void) cudaGraphDestroy(abandoned);
+            }
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+        return GGML_STATUS_ALLOC_FAILED;
     }
 
     return GGML_STATUS_SUCCESS;

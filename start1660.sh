@@ -70,7 +70,7 @@ DRAFT_TYPE_K="turbo4_k"  # speculative draft K cache for MTP or DFlash
 DRAFT_TYPE_V="turbo4_k"  # speculative draft V cache for MTP or DFlash; requires Flash Attention
 LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy used by the measured DFlash winner
 LLAMA_KVFLASH="4096"  # resident target-KV tokens; this is a token count, not a boolean switch
-LLAMA_KVFLASH_MAX_POOL="8192"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
+LLAMA_KVFLASH_MAX_POOL="4096"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
 LLAMA_KVFLASH_TAU="64"  # scorer reselection interval; inert while the current LRU policy has no scorer
 LLAMA_KVFLASH_POLICY="lru"  # only supported KVFlash replacement policy
 LLAMA_KVFLASH_STATS="0"  # production default; set to 1 to report paging and host-memory counters
@@ -134,7 +134,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots through the full-state RAM prompt cach
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="30"  # VRAM headroom for prefill 1792 + DFlash on 6 GiB (gate 2026-08-16)
+LLAMA_EXPERT_S="25"  # VRAM headroom for prefill 1792 + DFlash on 6 GiB (gate 2026-08-16)
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file

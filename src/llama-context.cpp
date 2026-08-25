@@ -1571,6 +1571,7 @@ bool llama_context::set_runtime_ubatch(uint32_t n_ubatch) {
         }
     }
 #endif
+    ggml_backend_sched_prefetch_release(sched.get());
 
     runtime_n_ubatch = n_ubatch;
 
