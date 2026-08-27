@@ -1299,6 +1299,28 @@ private:
         return slot_reusable_prefix_tokens(slot) > 0;
     }
 
+    // STARTED runs before continue_from_cached. A blown reasoning budget
+    // retokenizes history (LCP~12) so n_left looks huge and used to force
+    // prefill 1856; continue then keeps n_cached and only the last user turn.
+    bool slot_started_will_continue(const server_slot & slot, int32_t & last_user) const {
+        last_user = -1;
+        if (!slot.task || slot.state != SLOT_STATE_STARTED ||
+                !slot.task->params.cache_prompt ||
+                slot.prompt.tokens.empty() ||
+                slot.prompt.tokens.has_media() ||
+                slot.task->tokens.has_media()) {
+            return false;
+        }
+        last_user = slot.task->params.message_spans.last_user_message_pos();
+        const int32_t n_cached = slot.prompt.n_tokens();
+        const int32_t n_new = slot.task->n_tokens();
+        if (last_user <= 0 || n_cached <= 64) {
+            return false;
+        }
+        const int32_t n_tok = (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+        return common_prompt_should_continue_cached(n_tok, n_cached, last_user, n_new);
+    }
+
     bool cmoe_request_is_prefilling() const {
         for (const auto & slot : slots) {
             if (!slot.is_processing()) {
@@ -1314,18 +1336,26 @@ private:
             if (!slot.task) {
                 continue;
             }
-            // STARTED: leftover is task - reusable prefix, not task - old prompt size.
-            // PROCESSING_PROMPT: prompt.tokens is already keep_first'd and growing.
-            const int32_t n_have = slot.state == SLOT_STATE_STARTED
-                    ? slot_reusable_prefix_tokens(slot)
-                    : slot.prompt.n_tokens();
-            const int32_t n_left = slot.task->n_tokens() - n_have;
+            int32_t n_have = 0;
+            int32_t n_left = 0;
+            int32_t cont_user = -1;
+            if (slot.state == SLOT_STATE_STARTED && slot_started_will_continue(slot, cont_user)) {
+                n_have = slot.prompt.n_tokens();
+                n_left = slot.task->n_tokens() - cont_user;
+            } else if (slot.state == SLOT_STATE_STARTED) {
+                n_have = slot_reusable_prefix_tokens(slot);
+                n_left = slot.task->n_tokens() - n_have;
+            } else {
+                n_have = slot.prompt.n_tokens();
+                n_left = slot.task->n_tokens() - n_have;
+            }
+            if (n_left < 0) {
+                n_left = 0;
+            }
             if (common_cmoe_prefer_prefill(
                     n_left, n_have, cmoe_decode_ubatch, cmoe_prefill_ubatch, cmoe_phase_prefill)) {
                 return true;
             }
-            // A stale DFlash prefix is wiped and reseeded on the decode
-            // leftover. Switching 64->prefill->64 here evicted CUDA graphs.
         }
         return false;
     }

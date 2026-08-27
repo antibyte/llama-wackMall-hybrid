@@ -289,6 +289,10 @@ int main() {
            "stale plus prefill still clears");
     expect(!common_cmoe_prefer_prefill(50, 3400, 64, 1856, false),
            "follow-up leftover does not prefill just to reseed draft");
+    expect(common_cmoe_prefer_prefill(1224, 0, 64, 1856, false),
+           "retokenized follow-up without continue still looks like a first prefill");
+    expect(!common_cmoe_prefer_prefill(12, 3074, 64, 1856, false),
+           "continue last-user leftover after a long cached generation stays decode");
 
     expect(!common_spec_dflash_keep_draft_token(0, 1, 0.50f, 0.75f),
            "first draft below p_min is dropped");
