@@ -55,6 +55,9 @@ struct llama_model;
 //   LLAMA_EXPERT_WARM_ADMISSION - immediate, second-hit, or frequency
 //                                 (default immediate)
 //   LLAMA_EXPERT_WARM_ADMISSION_WINDOW - graph window/half-life (default 8)
+//   LLAMA_EXPERT_WARM_REPLACE_RATIO - frequency hysteresis vs occupant
+//                                 (default 1.0; candidate must exceed
+//                                 ratio * occupant, e.g. 1.5)
 //   LLAMA_EXPERT_WARM_PREFETCH - 0: synchronous fill; 1: asynchronous H2D fill
 //   LLAMA_EXPERT_PREFETCH_STREAMS - async streams (currently exactly 1)
 //   LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT - global in-flight copy limit (default 2)

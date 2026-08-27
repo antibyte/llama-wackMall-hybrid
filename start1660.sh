@@ -92,7 +92,7 @@ SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash-only backend sampling switch
 DFLASH_COMBINED="1"  # fuse target feature projection and draft KV injection into the target graph
 DRAFT_NGL="all"  # the measured winner keeps all six DFlash layers on the GPU
 REASONING="1"  # let the model template select reasoning mode
-REASONING_BUDGET="3000"  # measured quality/latency compromise; clients may request another value
+REASONING_BUDGET="6000"  # measured quality/latency compromise; clients may request another value
 REASONING_PRESERVE="1"  # preserve reasoning in history: 1 enabled, 0 disabled
 LOAD_MODE="mmap"  # measured loading/runtime winner; "none" was 1.87% slower and reduced S to 32
 OFFLINE="1"  # prevent network model/template downloads when set to 1
@@ -134,7 +134,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots through the full-state RAM prompt cach
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="28"  # VRAM headroom for prefill 1792 + DFlash on 6 GiB (gate 2026-08-16)
+LLAMA_EXPERT_S="27"  # with W=2 needs slot budget 31 (28+2+1); VRAM_RESERVE_MIB=400 made it fit
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
@@ -155,21 +155,24 @@ LLAMA_EXPERT_CPU_REUSE_ROWS="1"  # conservative winner; row reuse is not part of
 LLAMA_EXPERT_CPU_MULTI_ROW="1"  # AVX2 multi-row reduced CPU time but was neutral in 2K decode
 LLAMA_EXPERT_CPU_FUSED_GATE_UP="1"  # exact AVX2 dual-dot; +0.21% median was below promotion threshold on Ryzen 4800H
 
-# Warmcache. Fixed hot slots are never evicted; W=0 is the measured MTP path.
-# cpu-heavy q*~0.10 on this GPU: PCIe fill is slower than CPU cold (bench_expert_bw.py).
+# Warmcache live trial (2026-08-26): S=28 W=2 frequency/200, async H2D, reserve 400.
+# Fitted: slot budget 31, 2.21 GiB pinned. Live 43.24 t/s / 4822 tok / accept 0.79.
+# Revert WARM_SLOTS=0 PREFETCH=0 RESERVE=500 if second-prompt OOM or quality drops.
+# cpu-heavy q*~0.10. DFlash does not take the MTP warm guard. CUDA graphs off.
 LLAMA_EXPERT_BW_PROFILE="$PROJECT_ROOT/profiles/gtx1660-expert-bw.json"
-LLAMA_EXPERT_WARM_SLOTS="0"  # extra LRU slots per layer; W=0 is the measured 6-GiB winner
+LLAMA_EXPERT_WARM_SLOTS="2"  # live trial; measured 6-GiB winner is 0
 LLAMA_EXPERT_WARM_AUTO_MAX="8"  # cap for W=auto; raise only after VRAM measurements
 LLAMA_EXPERT_WARM_POLICY="lru"  # replacement policy; currently only lru is supported
-LLAMA_EXPERT_WARM_RESET="request"  # age reset policy: request or persistent
-LLAMA_EXPERT_WARM_ADMISSION="immediate"  # admission: immediate, second-hit, or frequency
-LLAMA_EXPERT_WARM_ADMISSION_WINDOW="8"  # window/half-life used by frequency admission
-LLAMA_EXPERT_WARM_PREFETCH="0"  # W=0 production winner; do not create copy traffic
+LLAMA_EXPERT_WARM_RESET="request"  # LRU ages reset per request; long think is one request
+LLAMA_EXPERT_WARM_ADMISSION="frequency"  # live trial; immediate thrashed on this GPU
+LLAMA_EXPERT_WARM_ADMISSION_WINDOW="200"  # frequency half-life in graphs (~tokens in decode)
+LLAMA_EXPERT_WARM_REPLACE_RATIO="2.0"  # live trial: candidate must beat occupant by 2x; cut copies ~57%
+LLAMA_EXPERT_WARM_PREFETCH="1"  # async H2D; required or copies sit on the compute stream
 LLAMA_EXPERT_PREFETCH_STREAMS="1"  # number of prefetch CUDA streams; current implementation requires 1
 LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT="2"  # maximum simultaneous expert copies
-LLAMA_EXPERT_VRAM_RESERVE_MIB="500"  # runtime auto-fit reserve; forced S remains capped if necessary
-LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL="0"  # retain the MTP warmcache correctness guard
-LLAMA_EXPERT_STATIC_NO_SYNC="1"  # safe here: adaptation, stats, timing, usage, and W are disabled
+LLAMA_EXPERT_VRAM_RESERVE_MIB="460"  # runtime auto-fit reserve; forced S remains capped if necessary
+LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL="0"  # unused under DFlash; keep 0 if switching SPEC_MODE=mtp
+LLAMA_EXPERT_STATIC_NO_SYNC="1"  # rejected automatically while W>0; harmless leftover
 
 # Lookahead/bridge. These values enable diagnostics/experiments and are not a
 # production recommendation until the Oracle, quality, and MTP gates pass.
@@ -594,6 +597,7 @@ if [[ "$LLAMA_EXPERT_WARM_SLOTS" != 0 ]]; then
         "LLAMA_EXPERT_WARM_RESET=$LLAMA_EXPERT_WARM_RESET"
         "LLAMA_EXPERT_WARM_ADMISSION=$LLAMA_EXPERT_WARM_ADMISSION"
         "LLAMA_EXPERT_WARM_ADMISSION_WINDOW=$LLAMA_EXPERT_WARM_ADMISSION_WINDOW"
+        "LLAMA_EXPERT_WARM_REPLACE_RATIO=$LLAMA_EXPERT_WARM_REPLACE_RATIO"
     )
     if [[ "$LLAMA_EXPERT_WARM_PREFETCH" == 1 ]]; then
         env_args+=(
@@ -639,7 +643,7 @@ llama-wackMall-hybrid start
   MTP head:     $LLAMA_MTP_REQUANTIZE_OUTPUT (trace=$LLAMA_MTP_HEAD_TRACE)
   CMoE batch:   $CMOE_BATCH/$CMOE_UBATCH
   phase batch:  prefill=${CMOE_PREFILL_BATCH:-base}/${CMOE_PREFILL_UBATCH:-base} decode=${CMOE_DECODE_BATCH:-base}/${CMOE_DECODE_UBATCH:-base}
-  fixed S:      ${LLAMA_EXPERT_S:-auto-fit}, warm W: $LLAMA_EXPERT_WARM_SLOTS
+  fixed S:      ${LLAMA_EXPERT_S:-auto-fit}, warm W: $LLAMA_EXPERT_WARM_SLOTS (admission=$LLAMA_EXPERT_WARM_ADMISSION window=$LLAMA_EXPERT_WARM_ADMISSION_WINDOW prefetch=$LLAMA_EXPERT_WARM_PREFETCH)
   CPU threads:  $THREADS/$THREADS_BATCH (draft $DRAFT_THREADS/$DRAFT_THREADS_BATCH)
   backend samp: target=$TARGET_BACKEND_SAMPLING draft=$EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING
   CUDA rows:    Q8n1=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS Q8n2=$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS Q8n3=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS Q6n1=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS Q6n3=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS

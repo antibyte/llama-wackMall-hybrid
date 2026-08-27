@@ -107,6 +107,7 @@ static warm_admission_mode g_warm_admission = warm_admission_mode::immediate;
 static expert_usage_mode g_usage_mode = expert_usage_mode::cumulative;
 static adapt_interval g_adapt_interval = adapt_interval::request;
 static int  g_warm_admission_window = 8;
+static float g_warm_replace_ratio = 1.0f;
 static bool g_prefetch_requested = false;
 static bool g_prefetch_ready = false;
 static bool g_collect_counts = true;
@@ -204,6 +205,35 @@ static bool parse_nonnegative_int(const char * value, int & result) {
         return false;
     }
     result = (int) parsed;
+    return true;
+}
+
+static bool parse_ascii_float(const char * value, float & result, float minimum, float maximum) {
+    if (!value || !value[0]) {
+        return false;
+    }
+    const char * p = value;
+    float parsed = 0.0f;
+    bool digits = false;
+    while (*p >= '0' && *p <= '9') {
+        parsed = parsed * 10.0f + (float) (*p - '0');
+        digits = true;
+        p++;
+    }
+    if (*p == '.') {
+        p++;
+        float scale = 0.1f;
+        while (*p >= '0' && *p <= '9') {
+            parsed += (float) (*p - '0') * scale;
+            scale *= 0.1f;
+            digits = true;
+            p++;
+        }
+    }
+    if (!digits || *p != '\0' || parsed < minimum || parsed > maximum) {
+        return false;
+    }
+    result = parsed;
     return true;
 }
 
@@ -876,7 +906,8 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
         }
         if (use_frequency) {
             if (target.evicted >= 0 &&
-                    L.warm_frequency[selected.second] <= L.warm_frequency[target.evicted]) {
+                    L.warm_frequency[selected.second] <=
+                        g_warm_replace_ratio * L.warm_frequency[target.evicted]) {
                 L.warm_admission_deferrals++;
                 g_warm_admission_deferrals++;
                 continue;
@@ -1304,6 +1335,7 @@ static void dump_stats() {
                 "  \"hot_slots_min\": %d,\n"
                 "  \"hot_slots_max\": %d,\n"
                 "  \"warm_slots_per_layer\": %d,\n"
+                "  \"warm_replace_ratio\": %.3f,\n"
                 "  \"cpu_single_row_chunk\": %d,\n"
                 "  \"cpu_parallel_activation\": %s,\n"
                 "  \"cpu_down_prefetch\": %d,\n"
@@ -1333,7 +1365,7 @@ static void dump_stats() {
                 "  \"decode_tokens_per_second\": 0.0\n"
                 "}\n",
                 g_variable_placement ? -1 : g_S, hot_slots_total, hot_slots_min, hot_slots_max,
-                g_W, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "true" : "false",
+                g_W, g_warm_replace_ratio, g_cpu_single_row_chunk, g_cpu_parallel_activation ? "true" : "false",
                 g_cpu_down_prefetch, g_cpu_reuse_rows ? "true" : "false",
                 g_cpu_multi_row ? "true" : "false",
                 g_cpu_async ? "true" : "false", (unsigned long long) cpu_async_jobs,
@@ -1721,6 +1753,15 @@ void init(const llama_model & model) {
         if (const char * e = getenv("LLAMA_EXPERT_WARM_ADMISSION_WINDOW")) {
             if (!parse_nonnegative_int(e, g_warm_admission_window) || g_warm_admission_window == 0) {
                 TIER_LOG("%s: invalid LLAMA_EXPERT_WARM_ADMISSION_WINDOW='%s'; warm cache disabled\n", __func__, e);
+                warm_requested = false;
+                g_warm_auto = false;
+                g_W = 0;
+            }
+        }
+        if (const char * e = getenv("LLAMA_EXPERT_WARM_REPLACE_RATIO")) {
+            if (!parse_ascii_float(e, g_warm_replace_ratio, 1.0f, 8.0f)) {
+                TIER_LOG("%s: invalid LLAMA_EXPERT_WARM_REPLACE_RATIO='%s'; expected 1..8; warm cache disabled\n",
+                        __func__, e);
                 warm_requested = false;
                 g_warm_auto = false;
                 g_W = 0;
@@ -2456,7 +2497,8 @@ void init(const llama_model & model) {
             g_skip_sentinel ? "on" : "off", g_cpu_async ? "on" : "off");
     if (g_W > 0) {
         if (g_warm_admission == warm_admission_mode::frequency) {
-            TIER_LOG("%s: warm admission frequency window=%d graphs\n", __func__, g_warm_admission_window);
+            TIER_LOG("%s: warm admission frequency window=%d graphs replace_ratio=%.2f\n",
+                    __func__, g_warm_admission_window, g_warm_replace_ratio);
         } else if (g_warm_admission == warm_admission_mode::second_hit) {
             TIER_LOG("%s: warm admission second-hit window=%d graphs\n", __func__, g_warm_admission_window);
         } else {
