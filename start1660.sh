@@ -6,10 +6,11 @@
 # keine Kommandozeilenparameter und keine externen Overrides an. Nach einer
 # Änderung einfach erneut ./start1660.sh ausführen.
 #
-# GTX 1660 Ti (sm_75, 6 GiB) live reference, 2026-08-24:
-#   DFlash n_max=4 p_min=0.75, S=30, Turbo4 KV, ctx 32768, KVFlash 4096/8192,
-#   prefill 1856, decode 64, froggeric chat template.
-# Observed: ~40-42 tok/s sustained, ~52 tok/s peak.
+# GTX 1660 Ti (sm_75, 6 GiB) live reference, 2026-08-27:
+#   DFlash n_max=4 p_min=0.75, S=20 W=8 frequency/200 replace_ratio=2.5,
+#   Turbo4 KV, ctx 65536, KVFlash 4096/8192, prefill 1856, decode 64,
+#   froggeric chat template, reasoning budget 6000.
+# Observed first prompt: 45.04 tok/s / 3781 tok, accept 0.806, peak 3s 57.48.
 # Prefetch slots (210 MiB Down-expert) are allocated once and reused; gallocr
 # does not allocate a second copy. S does not shrink that tensor.
 # Snapshot: START1660_REFERENCE.md. GTX 1080: start1080.sh.
@@ -25,7 +26,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"  # directo
 # Paths
 SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"  # current Turbo4-enabled native sm_75 Release executable
 MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"  # target GGUF
-SPEC_MODE="dflash"  # none | mtp | dflash; DFlash winner: n_max=2 and p_min=0.75
+SPEC_MODE="dflash"  # none | mtp | dflash; live DFlash: n_max=4 and p_min=0.75
 SPEC_DRAFT_MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-DFlash-Q4_K_M.gguf"  # DFlash GGUF sidecar
 DFLASH_TARGET_TENSOR_OVERRIDE="^blk[.]40[.]=CPU"  # keep the unused embedded NextN block out of VRAM
 # Expert heat profiles (LLAMA_EXPERT_HOT). Pick one via PROFILE_KIND below.
@@ -134,7 +135,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots through the full-state RAM prompt cach
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="27"  # with W=2 needs slot budget 31 (28+2+1); VRAM_RESERVE_MIB=400 made it fit
+LLAMA_EXPERT_S="20"  # S20 + W8 + sentinel; slot budget 36, reserve 250
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
@@ -155,22 +156,21 @@ LLAMA_EXPERT_CPU_REUSE_ROWS="1"  # conservative winner; row reuse is not part of
 LLAMA_EXPERT_CPU_MULTI_ROW="1"  # AVX2 multi-row reduced CPU time but was neutral in 2K decode
 LLAMA_EXPERT_CPU_FUSED_GATE_UP="1"  # exact AVX2 dual-dot; +0.21% median was below promotion threshold on Ryzen 4800H
 
-# Warmcache live trial (2026-08-26): S=28 W=2 frequency/200, async H2D, reserve 400.
-# Fitted: slot budget 31, 2.21 GiB pinned. Live 43.24 t/s / 4822 tok / accept 0.79.
-# Revert WARM_SLOTS=0 PREFETCH=0 RESERVE=500 if second-prompt OOM or quality drops.
-# cpu-heavy q*~0.10. DFlash does not take the MTP warm guard. CUDA graphs off.
+# Warmcache live (2026-08-27): S=20 W=8 frequency/200, replace_ratio=2.5, inflight=4, reserve 250.
+# Fitted: slot budget 36, 2.06 GiB pinned, seed 59.7%. First prompt 45.04 t/s / 3781 tok / accept 0.806.
+# cpu-heavy q*=0.103. DFlash does not take the MTP warm guard. CUDA graphs off while W>0.
 LLAMA_EXPERT_BW_PROFILE="$PROJECT_ROOT/profiles/gtx1660-expert-bw.json"
-LLAMA_EXPERT_WARM_SLOTS="2"  # live trial; measured 6-GiB winner is 0
+LLAMA_EXPERT_WARM_SLOTS="8"  # measured DFlash winner with frequency/200 admission
 LLAMA_EXPERT_WARM_AUTO_MAX="8"  # cap for W=auto; raise only after VRAM measurements
 LLAMA_EXPERT_WARM_POLICY="lru"  # replacement policy; currently only lru is supported
 LLAMA_EXPERT_WARM_RESET="request"  # LRU ages reset per request; long think is one request
 LLAMA_EXPERT_WARM_ADMISSION="frequency"  # live trial; immediate thrashed on this GPU
 LLAMA_EXPERT_WARM_ADMISSION_WINDOW="200"  # frequency half-life in graphs (~tokens in decode)
-LLAMA_EXPERT_WARM_REPLACE_RATIO="2.0"  # live trial: candidate must beat occupant by 2x; cut copies ~57%
+LLAMA_EXPERT_WARM_REPLACE_RATIO="2.5"  # candidate must beat occupant by 2.5x frequency; cuts copy churn
 LLAMA_EXPERT_WARM_PREFETCH="1"  # async H2D; required or copies sit on the compute stream
 LLAMA_EXPERT_PREFETCH_STREAMS="1"  # number of prefetch CUDA streams; current implementation requires 1
-LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT="2"  # maximum simultaneous expert copies
-LLAMA_EXPERT_VRAM_RESERVE_MIB="460"  # runtime auto-fit reserve; forced S remains capped if necessary
+LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT="4"  # maximum simultaneous expert copies
+LLAMA_EXPERT_VRAM_RESERVE_MIB="250"  # runtime auto-fit reserve; forced S remains capped if necessary
 LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL="0"  # unused under DFlash; keep 0 if switching SPEC_MODE=mtp
 LLAMA_EXPERT_STATIC_NO_SYNC="1"  # rejected automatically while W>0; harmless leftover
 

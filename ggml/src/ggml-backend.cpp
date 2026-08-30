@@ -1579,6 +1579,22 @@ static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml
     }
 }
 
+static bool ggml_backend_sched_is_host_moe_weight(const ggml_tensor * input, const ggml_tensor * node) {
+    return input && node && input->buffer &&
+        node->op == GGML_OP_MUL_MAT_ID &&
+        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_host(input->buffer);
+}
+
+static bool ggml_backend_sched_prefetch_eligible(const ggml_tensor * input, const ggml_tensor * node) {
+    if (!ggml_backend_sched_is_host_moe_weight(input, node)) {
+        return false;
+    }
+
+    const ggml_tensor * ids = node->src[2];
+    return ids && ids->ne[0]*ids->ne[1] >= 4*input->ne[2];
+}
+
 static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched) {
     size_t max_size = 0;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1588,9 +1604,7 @@ static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched) {
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             const ggml_tensor * input = split->inputs[input_id];
-            if (input->buffer &&
-                ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                ggml_backend_buffer_is_host(input->buffer)) {
+            if (ggml_backend_sched_prefetch_eligible(input, split->graph.nodes[0])) {
                 max_size = std::max(max_size, ggml_nbytes(input));
             }
         }
@@ -1598,7 +1612,8 @@ static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched) {
     return max_size;
 }
 
-static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_backend_t split_backend, size_t size) {
+static bool ggml_backend_sched_prefetch_init(
+        ggml_backend_sched_t sched, ggml_backend_t split_backend, size_t size, bool slot0_only) {
     if (sched->prefetch_backend == NULL) {
         ggml_backend_dev_t dev = split_backend->device;
         ggml_backend_dev_props props;
@@ -1624,15 +1639,16 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
     }
 
     size = std::max(size, ggml_backend_sched_prefetch_max_size(sched));
+    const int n_slots = slot0_only ? 1 : sched->prefetch_n_slots;
 
     int n_ready = 0;
-    for (int i = 0; i < sched->prefetch_n_slots; i++) {
+    for (int i = 0; i < n_slots; i++) {
         if (sched->prefetch_slots[i] != NULL &&
                 ggml_backend_buffer_get_size(sched->prefetch_slots[i]) >= size) {
             n_ready++;
         }
     }
-    if (n_ready == sched->prefetch_n_slots) {
+    if (n_ready == n_slots) {
         return true;
     }
 
@@ -1641,7 +1657,7 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
     GGML_UNUSED(total_mem);
 
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
-    for (int i = 0; i < sched->prefetch_n_slots; i++) {
+    for (int i = 0; i < n_slots; i++) {
         if (sched->prefetch_slots[i] != NULL &&
                 ggml_backend_buffer_get_size(sched->prefetch_slots[i]) >= size) {
             continue;
@@ -1675,19 +1691,12 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
         ggml_backend_sched_prefetch_disable(sched, split_backend);
         return false;
     }
-    if (n_ready < sched->prefetch_n_slots) {
+    if (!slot0_only && n_ready < sched->prefetch_n_slots) {
         sched->prefetch_n_slots = n_ready;
         sched->prefetch_cur = 0;
         GGML_LOG_WARN("%s: expert prefetch reduced to %d slot(s)\n", __func__, n_ready);
     }
     return true;
-}
-
-static bool ggml_backend_sched_is_host_moe_weight(const ggml_tensor * input, const ggml_tensor * node) {
-    return input && node && input->buffer &&
-        node->op == GGML_OP_MUL_MAT_ID &&
-        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-        ggml_backend_buffer_is_host(input->buffer);
 }
 
 static void ggml_backend_sched_prefetch_bind_copies(ggml_backend_sched_t sched) {
@@ -1703,18 +1712,21 @@ static void ggml_backend_sched_prefetch_bind_copies(ggml_backend_sched_t sched) 
         }
         ggml_tensor * node = split->graph.nodes[0];
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (ggml_backend_sched_is_host_moe_weight(split->inputs[input_id], node)) {
+            if (ggml_backend_sched_prefetch_eligible(split->inputs[input_id], node)) {
                 split_backend = sched->backends[split->backend_id];
                 break;
             }
         }
     }
     if (split_backend == NULL) {
+        ggml_backend_sched_prefetch_release(sched);
         return;
     }
 
     const size_t size = ggml_backend_sched_prefetch_max_size(sched);
-    if (size == 0 || !ggml_backend_sched_prefetch_init(sched, split_backend, size)) {
+    // Slot 0 replaces the gallocr copy and must be bound before graph allocation.
+    // Additional pipeline slots are allocated later using post-graph free memory.
+    if (size == 0 || !ggml_backend_sched_prefetch_init(sched, split_backend, size, true)) {
         return;
     }
 
@@ -1728,7 +1740,7 @@ static void ggml_backend_sched_prefetch_bind_copies(ggml_backend_sched_t sched) 
         ggml_tensor * node = split->graph.nodes[0];
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_tensor * input = split->inputs[input_id];
-            if (!ggml_backend_sched_is_host_moe_weight(input, node)) {
+            if (!ggml_backend_sched_prefetch_eligible(input, node)) {
                 continue;
             }
             for (int c = 0; c < sched->n_copies; c++) {
@@ -1803,15 +1815,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->prefetch_experts && !sched->callback_eval && split_prefetch_slot == -1 &&
                         split->graph.n_nodes > 0 && input->buffer) {
                     ggml_tensor * node = split->graph.nodes[0];
-                    if (ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                            ggml_backend_buffer_is_host(input->buffer) &&
-                            node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
-                        const ggml_tensor * ids = node->src[2];
-                        const int64_t n_expert = input->ne[2];
+                    if (ggml_backend_sched_prefetch_eligible(input, node) && node->src[0] == input_cpy) {
                         // 2*n_expert (thecodacus) fired at pp64 and lost on 1660 Ti;
                         // 4*n_expert needs ~128 tokens at top-k 8.
-                        if (ids && ids->ne[0]*ids->ne[1] >= 4*n_expert &&
-                                ggml_backend_sched_prefetch_init(sched, split_backend, ggml_nbytes(input))) {
+                        if (ggml_backend_sched_prefetch_init(sched, split_backend, ggml_nbytes(input), false)) {
                             const int slot = sched->prefetch_cur;
                             sched->prefetch_cur = (sched->prefetch_cur + 1) % sched->prefetch_n_slots;
                             if (sched->prefetch_used[slot]) {
@@ -2228,7 +2235,16 @@ void ggml_backend_sched_prefetch_release(ggml_backend_sched_t sched) {
     if (sched == NULL || sched->prefetch_backend == NULL) {
         return;
     }
-    ggml_backend_synchronize(sched->prefetch_backend);
+
+    bool has_slots = false;
+    for (int i = 0; i < GGML_SCHED_MAX_PREFETCH_SLOTS; i++) {
+        has_slots = has_slots || sched->prefetch_slots[i] != NULL;
+    }
+    if (!has_slots) {
+        return;
+    }
+
+    ggml_backend_sched_synchronize(sched);
     for (int i = 0; i < GGML_SCHED_MAX_PREFETCH_SLOTS; i++) {
         ggml_backend_buffer_free(sched->prefetch_slots[i]);
         sched->prefetch_slots[i] = NULL;

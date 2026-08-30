@@ -6,7 +6,7 @@ Detect host CPU/RAM/GPU/VRAM, write a baseline `start.sh`, and optionally run a 
 
 | Host | File | VRAM | S | n_max | draft | prefill | batch |
 |------|------|------|---|-------|-------|---------|-------|
-| GTX 1660 Ti | `start1660.sh` | 6 GiB | 30 | 4 | turbo4_k | 1856 | 64 |
+| GTX 1660 Ti | `start1660.sh` | 6 GiB | 20 | 4 | turbo4_k | 1856 | 64 |
 | GTX 1080 | `start1080.sh` | 8 GiB | 58 | 8 | turbo4_k | 1024 | 128 |
 
 Baselines interpolate VRAM knobs between these two measured stacks and switch kernel flags by SM class (Pascal vs Turing+).

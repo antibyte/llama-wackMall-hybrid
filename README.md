@@ -776,8 +776,8 @@ MTP_N=2 \
 
 Fixed GPU references:
 
-- [`start1660.sh`](start1660.sh) — GTX 1660 Ti (sm_75, 6 GiB) live stack; snapshot in [`START1660_REFERENCE.md`](START1660_REFERENCE.md) (~40-42 tok/s, ~52 peak)
-- [`start-ling-tiny.sh`](start-ling-tiny.sh) — Ling-3.0-tiny on the 1660 Ti (KVFlash 8192, prefill 2048)
+- [`start1660.sh`](start1660.sh) — GTX 1660 Ti (sm_75, 6 GiB) live stack; snapshot in [`START1660_REFERENCE.md`](START1660_REFERENCE.md) (45.04 tok/s / 3781 tok, peak 3s 57.48)
+- [`start-ling-tiny.sh`](start-ling-tiny.sh) — Ling-3.0-tiny on the 1660 Ti; same knob surface as `start1660.sh` (KVFlash 8192, prefill 2048, ngram-simple, q8 KV)
 - [`start-ling-tiny-1080.sh`](start-ling-tiny-1080.sh) — Ling-3.0-tiny starting recipe for GTX 1080 (sm_61, 8 GiB)
 - [`start1080.sh`](start1080.sh) — measured GTX 1080 (sm_61, 8 GiB) production stack
 - [`start.sh`](start.sh) — auto-generated baseline for the current machine

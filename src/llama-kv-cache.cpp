@@ -571,6 +571,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 kvflash_index_page(page);
             }
         }
+
+        // Reset the pager once no resident or host-backed positions remain.
+        if (v_cells[0].get_used() == 0 && kvflash_pos_mins.empty() && kvflash_pos_maxs.empty()) {
+            clear(false);
+        }
     }
 
     return true;
