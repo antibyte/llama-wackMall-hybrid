@@ -1804,10 +1804,12 @@ bool common_cmoe_prefer_prefill(
     if (currently_prefill) {
         return n_left > decode_ubatch;
     }
-    if (n_have <= 0) {
-        return n_left > common_cmoe_first_prefill_at(decode_ubatch, prefill_ubatch);
+    // No prefill ubatch configured: follow-ups must not invent a wide graph.
+    if (n_have > 0 && prefill_ubatch <= 0) {
+        return false;
     }
-    return false;
+    // First prompts and cached follow-ups share the 4*decode threshold.
+    return n_left > common_cmoe_first_prefill_at(decode_ubatch, prefill_ubatch);
 }
 
 int32_t common_cmoe_graph_batch(int32_t decode_ubatch, int32_t spec_n_max) {

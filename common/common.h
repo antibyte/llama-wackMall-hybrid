@@ -1070,8 +1070,10 @@ bool common_prompt_should_continue_cached(
         int32_t n_new);
 
 // CMOE 2048<->64 evicts CUDA graphs. Prefill when leftover needs the wide
-// ubatch, or while already prefilling until the tail fits decode. Follow-up
-// leftovers (n_have > 0, currently decode) stay on decode graphs.
+// ubatch, or while already prefilling until the tail fits decode. First
+// prompts and cached follow-ups share the 4*decode threshold so a 768-token
+// chat turn does not stay on 64-wide decode graphs. Tiny leftovers stay
+// decode so the generation graph is not evicted.
 bool common_cmoe_prefer_prefill(
         int32_t n_left,
         int32_t n_have,

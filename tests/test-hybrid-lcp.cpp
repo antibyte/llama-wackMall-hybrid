@@ -207,7 +207,9 @@ int main() {
     expect(!common_cmoe_prefer_prefill(50, 0, 64, 2048, false),
            "first decode-sized prompt stays decode");
     expect(!common_cmoe_prefer_prefill(200, 3400, 64, 2048, false),
-           "follow-up leftover keeps decode graphs");
+           "follow-up under 4*decode keeps decode graphs");
+    expect(common_cmoe_prefer_prefill(400, 3400, 64, 2048, false),
+           "follow-up over 4*decode uses prefill");
     expect(common_cmoe_prefer_prefill(3000, 3400, 64, 2048, false),
            "follow-up longer than prefill ubatch uses prefill");
     expect(common_cmoe_prefer_prefill(200, 3400, 64, 2048, true),
