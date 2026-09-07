@@ -26,6 +26,7 @@ These templates can be updated with the following commands:
 #   models/templates/Qwen-Fixed-v22.3.jinja
 #   used by start1660.sh / start1080.sh / start.sh / router1660.sh / router1080.sh
 #   with --jinja --chat-template-file ... --reasoning-format deepseek
+./scripts/get_chat_template.py XHToken/Spark-X2.5-4B                         > models/templates/Spark2.5.jinja
 ./scripts/get_chat_template.py zai-org/GLM-4.5                               > models/templates/zai-org-GLM-4.5.jinja
 ./scripts/get_chat_template.py deepseek-ai/DeepSeek-V3.1                     > models/templates/deepseek-ai-DeepSeek-V3.1.jinja
 ```

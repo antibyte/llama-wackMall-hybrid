@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
-# llama-wackMall-hybrid GTX 1660 Ti router: Qwen and Ling on demand.
+# llama-wackMall-hybrid GTX 1660 Ti router: Qwen, Ling, and Spark on demand.
 #
 # One model in VRAM at a time (--models-max 1). OpenWebUI / API pick the
 # model name; the first request loads it, a switch unloads the other.
 #
 # Names:
-#   qwen3.6-35b-a3b-hybrid  (start1660.sh params, DFlash n_max=2, S=28)
-#   ling-tiny               (start-ling-tiny.sh params, ngram-simple)
+#   qwen3.6-35b-a3b-hybrid  (start1660 S=20 W=8 Turbo4; DFlash/think off - Nanocoder XML tools)
+#   ling-tiny               (start-ling-tiny.sh params, ngram n=12 m=4)
+#   spark-x2.5-4b           (startspark.sh params, spec none, q8 KV, ISWA)
 #
 # No extra CLI args. Edit the block below, then ./router1660.sh
 #
@@ -27,6 +28,10 @@ QWEN_NAME="qwen3.6-35b-a3b-hybrid"
 
 LING_MODEL="${LING_MODEL:-$HOME/models/ling-3.0-tiny/Ling-3.0-tiny-Q4_K_M.gguf}"
 LING_NAME="ling-tiny"
+
+SPARK_MODEL="$HOME/models/spark-x2.5-4b/Spark-X2.5-4B-Q4_K_M.gguf"
+SPARK_NAME="spark-x2.5-4b"
+SPARK_TEMPLATE="$PROJECT_ROOT/models/templates/Spark2.5.jinja"
 
 PROFILE_SPECIALIST="$PROJECT_ROOT/profiles/specialist-benchprompt.csv"
 PROFILE_GENERAL="$PROJECT_ROOT/benchmark-results/profile-corpus-train8-512-20260802T124500Z/general-profile.csv"
@@ -63,8 +68,10 @@ esac
 [[ -f "$QWEN_MODEL" ]] || die "Qwen-Modell nicht gefunden: $QWEN_MODEL"
 [[ -f "$QWEN_DRAFT" ]] || die "DFlash-Modell nicht gefunden: $QWEN_DRAFT"
 [[ -f "$LING_MODEL" ]] || die "Ling-Modell nicht gefunden: $LING_MODEL"
+[[ -f "$SPARK_MODEL" ]] || die "Spark-Modell nicht gefunden: $SPARK_MODEL"
 [[ -f "$PROFILE" ]] || die "Expert-Profil nicht gefunden: $PROFILE"
 [[ -f "$PROJECT_ROOT/models/templates/Qwen-Fixed-v22.3.jinja" ]] || die "Qwen chat template nicht gefunden: $PROJECT_ROOT/models/templates/Qwen-Fixed-v22.3.jinja"
+[[ -f "$SPARK_TEMPLATE" ]] || die "Spark chat template nicht gefunden: $SPARK_TEMPLATE"
 [[ -f "$BW_PROFILE" ]] || die "Bandwidth-Profil nicht gefunden: $BW_PROFILE"
 if [[ -n "$API_KEY_FILE" && ! -f "$API_KEY_FILE" ]]; then
     die "API-Key-Datei nicht gefunden: $API_KEY_FILE"
@@ -75,6 +82,7 @@ mkdir -p "$RUNTIME/empty-cache"
 INI="$RUNTIME/models.ini"
 QWEN_ENV="$RUNTIME/qwen.env"
 LING_ENV="$RUNTIME/ling.env"
+SPARK_ENV="$RUNTIME/spark.env"
 
 # getenv-only knobs that must not leak from Qwen into Ling or the reverse.
 UNSET_SHARED=(
@@ -102,19 +110,79 @@ UNSET_SHARED=(
     LLAMA_CMOE_UBATCH
     LLAMA_KVFLASH
     LLAMA_KVFLASH_MAX_POOL
+    LLAMA_KVFLASH_TAU
+    LLAMA_KVFLASH_POLICY
+    LLAMA_KVFLASH_STATS
+    LLAMA_EXPERT_WARM_SLOTS
+    LLAMA_EXPERT_WARM_POLICY
+    LLAMA_EXPERT_WARM_RESET
+    LLAMA_EXPERT_WARM_ADMISSION
+    LLAMA_EXPERT_WARM_ADMISSION_WINDOW
+    LLAMA_EXPERT_WARM_REPLACE_RATIO
+    LLAMA_EXPERT_WARM_PREFETCH
+    LLAMA_EXPERT_PREFETCH_STREAMS
+    LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT
+    LLAMA_EXPERT_WARM_AUTO_MAX
+    LLAMA_EXPERT_VRAM_RESERVE_MIB
+    LLAMA_EXPERT_CPU_DOWN_PREFETCH
+    LLAMA_EXPERT_CPU_REUSE_ROWS
+    LLAMA_EXPERT_CPU_MULTI_ROW
+    LLAMA_EXPERT_CPU_FUSED_GATE_UP
+    LLAMA_EXPERT_LOOKAHEAD
+    LLAMA_EXPERT_LOOKAHEAD_TRACE
+    LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON
+    LLAMA_EXPERT_LOOKAHEAD_DISTANCE
+    LLAMA_EXPERT_LOOKAHEAD_TOP_M
+    LLAMA_EXPERT_LOOKAHEAD_POINT
+    LLAMA_EXPERT_LOOKAHEAD_NORM
+    LLAMA_EXPERT_LOOKAHEAD_PREFETCH
+    LLAMA_EXPERT_LOOKAHEAD_STREAMS
+    LLAMA_EXPERT_LOOKAHEAD_MAX_INFLIGHT
+    LLAMA_EXPERT_LOOKAHEAD_LAYER_MIN
+    LLAMA_EXPERT_LOOKAHEAD_LAYER_MAX
+    LLAMA_EXPERT_LOOKAHEAD_MTP_EXPERIMENTAL
+    GGML_CUDA_EXPERT_BRIDGE_LAYERS
+    GGML_CUDA_EXPERT_BRIDGE_LAYER
+    GGML_CUDA_EXPERT_BRIDGE_K
+    GGML_CUDA_EXPERT_BRIDGE_JSON
+    GGML_CUDA_EXPERT_BRIDGE_RECURRENCE
+    GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_LAYERS
+    GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_K
+    GGML_CUDA_EXPERT_BRIDGE_CONSUME
+    GGML_CUDA_EXPERT_BRIDGE_VERIFY
+    GGML_CUDA_EXPERT_BRIDGE_TELEMETRY
+    GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT
+    GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT_RECURRENCE
+    GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY
+    GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS
+    GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS
     GGML_CUDA_MOE_MULTI_FUSION
     GGML_CUDA_MOE_COMBINE_FUSION
     GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS
+    GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS
     GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS
     GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS
     GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS
+    GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS
+    GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS
+    GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y
     GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS
+    GGML_CUDA_MMVQ_MOE_FUSED_ROWS
+    GGML_CUDA_MMVQ_MOE_PLAIN_ROWS
     GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
     GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0
+    GGML_CUDA_ASYNC_HOST_COPY
+    GGML_SCHED_ASYNC_D2H_COPY
+    GGML_SCHED_DEDUP_DST_SYNC
     GGML_CUDA_REGISTER_HOST
     GGML_SCHED_PREFETCH_EXPERTS
+    GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH
+    GGML_CUDA_TURBO4_FAST_F16_CONVERT
+    GGML_CUDA_TURBO4_WHT_SHUFFLE
     LLAMA_ARG_CHAT_TEMPLATE_FILE
     LLAMA_ARG_THINK
+    LLAMA_ARG_THREADS_HTTP
+    GGML_CUDA_DISABLE_GRAPHS
 )
 
 {
@@ -132,39 +200,32 @@ UNSET_SHARED=(
 
     printf '[%s]\n' "$QWEN_NAME"
     printf 'model = %s\n' "$QWEN_MODEL"
-    printf 'spec-draft-model = %s\n' "$QWEN_DRAFT"
-    printf 'spec-type = draft-dflash\n'
-    printf 'spec-draft-n-max = 2\n'
-    printf 'spec-draft-n-min = 1\n'
-    printf 'spec-draft-p-min = 0.75\n'
-    printf 'spec-draft-backend-sampling = true\n'
-    printf 'n-gpu-layers-draft = 99\n'
+    printf 'spec-type = none\n'
     printf 'override-tensor = ^blk[.]40[.]=CPU\n'
     printf 'cpu-moe = true\n'
-    printf 'ctx-size = 24576\n'
-    printf 'n-predict = 8192\n'
+    printf 'ctx-size = 65536\n'
+    printf 'n-predict = 768\n'
     printf 'batch-size = 64\n'
     printf 'ubatch-size = 64\n'
     printf 'threads = 8\n'
     printf 'threads-batch = 8\n'
-    printf 'spec-draft-threads = 8\n'
-    printf 'spec-draft-threads-batch = 8\n'
     printf 'cache-type-k = turbo4_k\n'
     printf 'cache-type-v = turbo4_k\n'
-    printf 'spec-draft-type-k = turbo4_k\n'
-    printf 'spec-draft-type-v = turbo4_k\n'
     printf 'flash-attn = on\n'
     printf 'kv-offload = true\n'
     printf 'load-mode = mmap\n'
     printf 'backend-sampling = true\n'
-    printf 'reasoning = on\n'
-    printf 'reasoning-budget = 1000\n'
+    printf 'temp = 0.4\n'
+    printf 'reasoning = off\n'
     printf 'reasoning-preserve = true\n'
     printf 'reasoning-format = deepseek\n'
     printf 'chat-template-file = %s\n' "$PROJECT_ROOT/models/templates/Qwen-Fixed-v22.3.jinja"
+    printf 'chat-template-kwargs = {"enable_thinking": false, "auto_disable_thinking_with_tools": true, "max_tool_response_chars": 4000, "max_tool_arg_chars": 4000}\n'
     printf 'ctx-checkpoints = 8\n'
-    printf 'cache-ram = 2048\n'
+    printf 'cache-ram = 4096\n'
     printf 'cache-reuse = 0\n'
+    printf 'cache-prompt = false\n'
+    printf 'cache-idle-slots = false\n'
     printf 'mmproj-auto = false\n'
     printf 'child-env-file = %s\n' "$QWEN_ENV"
     printf 'stop-timeout = 120\n\n'
@@ -173,15 +234,51 @@ UNSET_SHARED=(
     printf 'model = %s\n' "$LING_MODEL"
     printf 'spec-type = ngram-simple\n'
     printf 'spec-draft-n-max = 4\n'
+    printf 'spec-ngram-simple-size-n = 12\n'
+    printf 'spec-ngram-simple-size-m = 4\n'
     printf 'n-gpu-layers = 99\n'
     printf 'no-cpu-moe = true\n'
     printf 'flash-attn = on\n'
+    printf 'kv-offload = true\n'
     printf 'cache-type-k = q8_0\n'
     printf 'cache-type-v = q8_0\n'
     printf 'fit = on\n'
     printf 'fit-target = 80\n'
     printf 'fit-ctx = 2048\n'
     printf 'ctx-size = 131072\n'
+    printf 'n-predict = 768\n'
+    printf 'batch-size = 64\n'
+    printf 'ubatch-size = 64\n'
+    printf 'threads = 8\n'
+    printf 'threads-batch = 8\n'
+    printf 'backend-sampling = true\n'
+    printf 'temp = 0.4\n'
+    printf 'top-k = 20\n'
+    printf 'top-p = 0.95\n'
+    printf 'min-p = 0\n'
+    printf 'reasoning = off\n'
+    printf 'reasoning-preserve = true\n'
+    printf 'ctx-checkpoints = 8\n'
+    printf 'cache-ram = 4096\n'
+    printf 'cache-reuse = 0\n'
+    printf 'cache-prompt = false\n'
+    printf 'cache-idle-slots = false\n'
+    printf 'op-offload = true\n'
+    printf 'load-mode = none\n'
+    printf 'child-env-file = %s\n' "$LING_ENV"
+    printf 'stop-timeout = 30\n\n'
+
+    printf '[%s]\n' "$SPARK_NAME"
+    printf 'model = %s\n' "$SPARK_MODEL"
+    printf 'spec-type = none\n'
+    printf 'spec-draft-n-max = 4\n'
+    printf 'n-gpu-layers = 99\n'
+    printf 'no-cpu-moe = true\n'
+    printf 'flash-attn = on\n'
+    printf 'kv-offload = true\n'
+    printf 'cache-type-k = q8_0\n'
+    printf 'cache-type-v = q8_0\n'
+    printf 'ctx-size = 65536\n'
     printf 'n-predict = 32768\n'
     printf 'batch-size = 64\n'
     printf 'ubatch-size = 64\n'
@@ -189,23 +286,33 @@ UNSET_SHARED=(
     printf 'threads-batch = 8\n'
     printf 'backend-sampling = true\n'
     printf 'temp = 1.0\n'
-    printf 'top-k = 20\n'
+    printf 'top-k = 0\n'
     printf 'top-p = 0.95\n'
     printf 'min-p = 0\n'
     printf 'reasoning = on\n'
-    printf 'reasoning-budget = 4000\n'
     printf 'reasoning-preserve = true\n'
+    printf 'reasoning-format = deepseek\n'
+    printf 'chat-template-file = %s\n' "$SPARK_TEMPLATE"
     printf 'ctx-checkpoints = 8\n'
-    printf 'cache-ram = 2048\n'
+    printf 'cache-ram = 4096\n'
     printf 'cache-reuse = 0\n'
+    printf 'cache-prompt = true\n'
+    printf 'cache-idle-slots = true\n'
     printf 'op-offload = true\n'
     printf 'load-mode = mmap\n'
-    printf 'child-env-file = %s\n' "$LING_ENV"
+    printf 'child-env-file = %s\n' "$SPARK_ENV"
     printf 'stop-timeout = 30\n'
 } > "$INI"
 
 {
     printf '# Qwen3.6-35B-A3B hybrid, start1660.sh getenv knobs\n'
+    printf -- '-u GGML_CUDA_DISABLE_GRAPHS\n'
+    printf -- '-u LLAMA_CACHE\n'
+    printf -- '-u LLAMA_TURBO4_Q8_FALLBACK_LAYERS\n'
+    printf -- '-u LLAMA_ARG_THREADS_HTTP\n'
+    printf -- '-u LLAMA_EXPERT_USAGE_MODE\n'
+    printf -- '-u LLAMA_EXPERT_USAGE_CHECKPOINT\n'
+    printf 'CUDA_VISIBLE_DEVICES=%s\n' "$CUDA_VISIBLE_DEVICES_VALUE"
     printf 'LLAMA_CMOE_BATCH=64\n'
     printf 'LLAMA_CMOE_UBATCH=64\n'
     printf 'LLAMA_CMOE_PREFILL_BATCH=1856\n'
@@ -213,8 +320,8 @@ UNSET_SHARED=(
     printf 'LLAMA_CMOE_DECODE_BATCH=64\n'
     printf 'LLAMA_CMOE_DECODE_UBATCH=64\n'
     printf 'LLAMA_KV_Q4_SCALE=legacy\n'
-    printf 'LLAMA_KVFLASH=12288\n'
-    printf 'LLAMA_KVFLASH_MAX_POOL=12288\n'
+    printf 'LLAMA_KVFLASH=4096\n'
+    printf 'LLAMA_KVFLASH_MAX_POOL=8192\n'
     printf 'LLAMA_KVFLASH_TAU=64\n'
     printf 'LLAMA_KVFLASH_POLICY=lru\n'
     printf 'LLAMA_KVFLASH_STATS=0\n'
@@ -229,7 +336,8 @@ UNSET_SHARED=(
     printf 'LLAMA_MTP_HEAD_TRACE=0\n'
     printf 'LLAMA_DFLASH_COMBINED=1\n'
     printf 'LLAMA_EXPERT_HOT=%s\n' "$PROFILE"
-    printf 'LLAMA_EXPERT_S=28\n'
+    printf 'LLAMA_EXPERT_PLACEMENT=\n'
+    printf 'LLAMA_EXPERT_S=20\n'
     printf 'LLAMA_EXPERT_TMAX=32\n'
     printf 'LLAMA_EXPERT_STATS=0\n'
     printf 'LLAMA_EXPERT_ADAPT=0\n'
@@ -242,18 +350,51 @@ UNSET_SHARED=(
     printf 'LLAMA_EXPERT_CPU_CHUNK=64\n'
     printf 'LLAMA_EXPERT_CPU_ACT_PARALLEL=0\n'
     printf 'LLAMA_EXPERT_CPU_ASYNC=0\n'
-    printf 'LLAMA_EXPERT_CPU_DOWN_PREFETCH=0\n'
-    printf 'LLAMA_EXPERT_CPU_REUSE_ROWS=0\n'
-    printf 'LLAMA_EXPERT_CPU_MULTI_ROW=0\n'
-    printf 'LLAMA_EXPERT_CPU_FUSED_GATE_UP=0\n'
-    printf 'LLAMA_EXPERT_WARM_SLOTS=0\n'
+    printf 'LLAMA_EXPERT_CPU_DOWN_PREFETCH=1\n'
+    printf 'LLAMA_EXPERT_CPU_REUSE_ROWS=1\n'
+    printf 'LLAMA_EXPERT_CPU_MULTI_ROW=1\n'
+    printf 'LLAMA_EXPERT_CPU_FUSED_GATE_UP=1\n'
+    printf 'LLAMA_EXPERT_WARM_SLOTS=8\n'
     printf 'LLAMA_EXPERT_BW_PROFILE=%s\n' "$BW_PROFILE"
     printf 'LLAMA_EXPERT_WARM_AUTO_MAX=8\n'
-    printf 'LLAMA_EXPERT_WARM_PREFETCH=0\n'
-    printf 'LLAMA_EXPERT_VRAM_RESERVE_MIB=400\n'
+    printf 'LLAMA_EXPERT_WARM_POLICY=lru\n'
+    printf 'LLAMA_EXPERT_WARM_RESET=request\n'
+    printf 'LLAMA_EXPERT_WARM_ADMISSION=frequency\n'
+    printf 'LLAMA_EXPERT_WARM_ADMISSION_WINDOW=200\n'
+    printf 'LLAMA_EXPERT_WARM_REPLACE_RATIO=2.5\n'
+    printf 'LLAMA_EXPERT_WARM_PREFETCH=1\n'
+    printf 'LLAMA_EXPERT_PREFETCH_STREAMS=1\n'
+    printf 'LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT=4\n'
+    printf 'LLAMA_EXPERT_VRAM_RESERVE_MIB=250\n'
     printf 'LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL=0\n'
     printf 'LLAMA_EXPERT_STATIC_NO_SYNC=1\n'
     printf 'LLAMA_EXPERT_LOOKAHEAD=0\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_TRACE=0\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON=0\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_DISTANCE=1\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_TOP_M=12\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_POINT=post-moe\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_NORM=target\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_PREFETCH=0\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_STREAMS=1\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_MAX_INFLIGHT=2\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_LAYER_MIN=0\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_LAYER_MAX=-1\n'
+    printf 'LLAMA_EXPERT_LOOKAHEAD_MTP_EXPERIMENTAL=0\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_LAYERS=\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_K=2\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_JSON=0\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_RECURRENCE=0\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_LAYERS=\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_RECURRENCE_K=1\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_CONSUME=0\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_VERIFY=0\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_TELEMETRY=0\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT=0\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT_RECURRENCE=0\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY=0\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS=\n'
+    printf 'GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS=2\n'
     printf 'LLAMA_EXPERT_SHARED_HOT_IDS=1\n'
     printf 'LLAMA_EXPERT_SKIP_SENTINEL=1\n'
     printf 'GGML_CUDA_MOE_MULTI_FUSION=1\n'
@@ -262,14 +403,19 @@ UNSET_SHARED=(
     printf 'GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS=0\n'
     printf 'GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS=0\n'
     printf 'GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS=2\n'
+    printf 'GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS=0\n'
+    printf 'GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS=0\n'
+    printf 'GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y=0\n'
     printf 'GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS=4\n'
+    printf 'GGML_CUDA_MMVQ_MOE_FUSED_ROWS=0\n'
+    printf 'GGML_CUDA_MMVQ_MOE_PLAIN_ROWS=0\n'
     printf 'GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE=128\n'
     printf 'GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=1\n'
     printf 'GGML_CUDA_ASYNC_HOST_COPY=1\n'
     printf 'GGML_SCHED_ASYNC_D2H_COPY=0\n'
     printf 'GGML_SCHED_DEDUP_DST_SYNC=1\n'
-    printf 'GGML_CUDA_REGISTER_HOST=0\n'
-    printf 'GGML_SCHED_PREFETCH_EXPERTS=0\n'
+    printf 'GGML_CUDA_REGISTER_HOST=1\n'
+    printf 'GGML_SCHED_PREFETCH_EXPERTS=2\n'
 } > "$QWEN_ENV"
 
 {
@@ -303,6 +449,41 @@ UNSET_SHARED=(
     printf 'LLAMA_KVFLASH_POLICY=lru\n'
 } > "$LING_ENV"
 
+{
+    printf '# Spark-X2.5-4B, startspark.sh getenv knobs\n'
+    for key in "${UNSET_SHARED[@]}"; do
+        printf -- '-u %s\n' "$key"
+    done
+    printf -- '-u LLAMA_EXPERT_TMAX\n'
+    printf -- '-u LLAMA_EXPERT_SKIP_SENTINEL\n'
+    printf -- '-u LLAMA_EXPERT_SHARED_HOT_IDS\n'
+    printf -- '-u LLAMA_EXPERT_WARM_SLOTS\n'
+    printf -- '-u LLAMA_TURBO4_V_EXPERIMENTAL\n'
+    printf -- '-u LLAMA_ARG_FIT\n'
+    printf -- '-u LLAMA_ARG_FIT_TARGET\n'
+    printf -- '-u LLAMA_ARG_FIT_CTX\n'
+    printf 'LLAMA_ARG_NO_CPU_MOE=1\n'
+    printf 'GGML_CUDA_MOE_MULTI_FUSION=1\n'
+    printf 'GGML_CUDA_MOE_COMBINE_FUSION=1\n'
+    printf 'GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS=4\n'
+    printf 'GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS=0\n'
+    printf 'GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=4\n'
+    printf 'GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS=2\n'
+    printf 'GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS=2\n'
+    printf 'GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS=4\n'
+    printf 'GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE=128\n'
+    printf 'GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=1\n'
+    printf 'GGML_CUDA_ASYNC_HOST_COPY=1\n'
+    printf 'GGML_SCHED_DEDUP_DST_SYNC=1\n'
+    printf 'GGML_CUDA_REGISTER_HOST=1\n'
+    printf 'LLAMA_CMOE_BATCH=64\n'
+    printf 'LLAMA_CMOE_UBATCH=64\n'
+    printf 'LLAMA_CMOE_PREFILL_BATCH=2048\n'
+    printf 'LLAMA_CMOE_PREFILL_UBATCH=2048\n'
+    printf 'LLAMA_CMOE_DECODE_BATCH=64\n'
+    printf 'LLAMA_CMOE_DECODE_UBATCH=64\n'
+} > "$SPARK_ENV"
+
 if [[ -z "$API_KEY" && -z "$API_KEY_FILE" ]]; then
     printf 'WARNUNG: API_KEY/API_KEY_FILE ist leer; der Dienst ist ohne Authentifizierung im LAN erreichbar.\n' >&2
 fi
@@ -316,8 +497,10 @@ llama-wackMall-hybrid router 1660
             $QWEN_MODEL
   ling:     $LING_NAME
             $LING_MODEL
+  spark:    $SPARK_NAME
+            $SPARK_MODEL
   preset:   $INI
-  OpenWebUI model names: $QWEN_NAME  |  $LING_NAME
+  OpenWebUI model names: $QWEN_NAME  |  $LING_NAME  |  $SPARK_NAME
 EOF
 
 unset_args=(
