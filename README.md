@@ -1,12 +1,40 @@
 # llama-wackMall hybrid prototype
 
+This tree is an **experimental fork** of llama.cpp based on
+[wackMall](https://github.com/miltos22/llama-wackMall). It keeps wackMall's
+expert-granular MoE offload and adds a large set of kernels, KV, speculative,
+and launcher knobs. Most of that work was measured and tuned on a **laptop
+NVIDIA GeForce GTX 1660 Ti Mobile** (Turing sm_75, 6 GiB). Treat the defaults
+as a 6 GiB mobile recipe, not as a general llama.cpp drop-in.
+
+## GTX 1660 Ti Mobile - tested models
+
+Hardware: GTX 1660 Ti Mobile, 6 GiB, driver CUDA path `build-main-sm75`.
+Numbers are the best measured result on this card for the shipped launcher.
+Do not mix them with the RTX 3070 / RX 570 table later in this file.
+
+| Model | Quant | Launcher | Decode | Prefill | Stack |
+| --- | --- | --- | ---: | ---: | --- |
+| Qwen3.6-35B-A3B | UD-Q4_K_M | [`start1660.sh`](start1660.sh) | **45.04 tok/s** (3781 tok); peak 3s **57.48** | leftover 13 tok @ 19.4 tok/s | cpu-moe S=20 W=8, DFlash n_max=4, Turbo4 KV, KVFlash 4096/8192 |
+| Ling-3.0-tiny | Q4_K_M | [`start-ling-tiny.sh`](start-ling-tiny.sh) | **129.4 tok/s** (3x512 median) | **598 tok/s** (~2303 tok) | all-GPU MLA/KDA, ngram-simple, q8 KV, KVFlash 8192, prefill 2048 |
+| Spark-X2.5-4B | Q4_K_M | [`startspark.sh`](startspark.sh) | **76.2 tok/s** llama-bench tg128; **64.6 tok/s** Jinja chat | **273.7 tok/s** pp512 | dense hybrid SWA, spec none, q8 KV, FA on, MMVQ Q4_K rows=2 |
+
+Sources: [`START1660_REFERENCE.md`](START1660_REFERENCE.md) (Qwen live 2026-08-27),
+Ling hybrid notes 2026-08-20/25, Spark llama-bench + Jinja tune 2026-09-07.
+A GTX 1080 (sm_61, 8 GiB) recipe lives in [`start1080.sh`](start1080.sh)
+(~29 tok/s DFlash decode on that card). LFM2.5 and Ornith have launchers but
+no 1660 Ti winner numbers yet.
+
 This branch keeps llama-wackMall as the execution engine and adds a profiled static expert tier, strict LuceBox Spark profile conversion, layer-variable placement, request-balanced profile collection, an experimental bounded warm cache, and guarded CPU/synchronization experiments. The normal llama.cpp CUDA path and wackMall MTP-1/2/3 decoding remain authoritative.
 
 The safe defaults preserve existing wackMall behavior. Every experimental feature is controlled by an environment variable, so the same code can be tuned for cards with more VRAM without hard-coding GTX 1660 Ti limits.
 
 ## Current measured status
 
-The fastest reproducible local configuration on an NVIDIA GTX 1660 Ti is MTP-2, a learned top-33 fixed placement, no warm slots, q4_0/q4_0 target and draft KV, and optional cold-row reuse. Three 2,000-token runs with row reuse reached 46.593, 46.508, and 46.335 token/s, for a median of 46.508 token/s. The matching control median was 46.362 token/s, so row reuse remains default-off because the gain is only 0.31% and can be hardware dependent.
+The live Qwen stack is DFlash S=20 W=8 in the table above (45.04 tok/s / 3781 tok).
+The paragraph below is an older 2,000-token MTP-2 screen, kept for history.
+
+That MTP-2 screen used a learned top-33 fixed placement, no warm slots, q4_0/q4_0 target and draft KV, and optional cold-row reuse. Three 2,000-token runs with row reuse reached 46.593, 46.508, and 46.335 token/s, for a median of 46.508 token/s. The matching control median was 46.362 token/s, so row reuse remains default-off because the gain is only 0.31% and can be hardware dependent.
 
 MTP-3 is implemented and tested, but it was slower than MTP-2 on this machine. The warm cache is correct and remains available for larger GPUs, but W=1/2/4 caused copy churn and was slower on the 6-GiB card. Do not interpret either result as a limit for other GPUs; use the reproducible sizing and benchmark procedure below.
 
