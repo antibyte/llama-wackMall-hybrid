@@ -15,11 +15,12 @@ Do not mix them with the RTX 3070 / RX 570 table later in this file.
 
 | Model | Quant | Launcher | Decode | Prefill | Stack |
 | --- | --- | --- | ---: | ---: | --- |
-| Qwen3.6-35B-A3B | UD-Q4_K_M | [`start1660.sh`](start1660.sh) | **45.04 tok/s** (3781 tok); peak 3s **57.48** | leftover 13 tok @ 19.4 tok/s | cpu-moe S=20 W=8, DFlash n_max=4, Turbo4 KV, KVFlash 4096/8192 |
+| Qwen3.6-35B-A3B | UD-Q4_K_M | [`start1660.sh`](start1660.sh) | **45.04 tok/s** (3781 tok); peak 3s **57.48** | **177 tok/s** (~1823 tok, ubatch 1856) | cpu-moe S=20 W=8, DFlash n_max=4, Turbo4 KV, KVFlash 4096/8192 |
 | Ling-3.0-tiny | Q4_K_M | [`start-ling-tiny.sh`](start-ling-tiny.sh) | **129.4 tok/s** (3x512 median) | **598 tok/s** (~2303 tok) | all-GPU MLA/KDA, ngram-simple, q8 KV, KVFlash 8192, prefill 2048 |
 | Spark-X2.5-4B | Q4_K_M | [`startspark.sh`](startspark.sh) | **76.2 tok/s** llama-bench tg128; **64.6 tok/s** Jinja chat | **273.7 tok/s** pp512 | dense hybrid SWA, spec none, q8 KV, FA on, MMVQ Q4_K rows=2 |
 
-Sources: [`START1660_REFERENCE.md`](START1660_REFERENCE.md) (Qwen live 2026-08-27),
+Sources: [`START1660_REFERENCE.md`](START1660_REFERENCE.md) (Qwen decode, live 2026-08-27),
+[`PREFILL_PLAN.md`](PREFILL_PLAN.md) (Qwen long PP 177 tok/s e2e @ S=28 / 1856, 2026-08-17; not the 13-tok cache leftover),
 Ling hybrid notes 2026-08-20/25, Spark llama-bench + Jinja tune 2026-09-07.
 A GTX 1080 (sm_61, 8 GiB) recipe lives in [`start1080.sh`](start1080.sh)
 (~29 tok/s DFlash decode on that card). LFM2.5 and Ornith have launchers but
