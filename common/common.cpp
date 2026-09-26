@@ -1990,8 +1990,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    // Sequential tree-path fallback reuses the main sequence only, so n_seq_max
-    // stays equal to n_parallel (keeps combined DFlash graph available).
+    // Decision sequences live on their own context. The chat context stays at
+    // n_parallel so KVFlash and the combined DFlash graph still see one sequence.
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);

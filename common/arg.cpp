@@ -2737,6 +2737,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-seqs"}, "N",
+            string_format("sequences for POST /v1/decision on a separate context (default: %d, 0 = disabled, minimum 3)", params.n_seq_decision),
+            [](common_params & params, int value) {
+                if (value != 0 && value < 3) {
+                    throw std::invalid_argument("--decision-seqs needs at least 3 (cached prefix, one context, one branch)");
+                }
+                params.n_seq_decision = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

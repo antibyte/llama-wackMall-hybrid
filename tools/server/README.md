@@ -694,6 +694,13 @@ This endpoint also supports multimodal embeddings. See the documentation for the
   >2: P-Norm
 ```
 
+### POST `/v1/decision`: Score a finite JSON schema in one pass
+
+Enabled unless the server is started with `--decision-seqs 0`. The default reserves 8 sequences on a separate context, so the chat KV cache is unchanged. Every field must be an enum, a boolean, or a bounded integer or number.
+The server scores the allowed values as parallel branches of one cached prompt and returns JSON that matches the schema, with a probability per field. See [tools/parallel-decision/README.md](../parallel-decision/README.md).
+
+*Aliases:* `/decision`
+
 ### POST `/reranking`: Rerank documents according to a given query
 
 Similar to https://jina.ai/reranker/ but might change in the future.

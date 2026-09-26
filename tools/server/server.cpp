@@ -154,6 +154,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+
+        if (params.n_seq_decision > 0) {
+            SRV_INF("POST /v1/decision reserves %d sequences on a separate context; the chat cache is unchanged\n",
+                    params.n_seq_decision);
+        }
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias
@@ -209,6 +214,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_embeddings             = models_routes->proxy_post;
         routes.post_embeddings_oai         = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
+        routes.post_decision               = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
@@ -256,6 +262,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/reranking",                ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/rerank",                ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
+    ctx_http.post("/decision",                 ex_wrapper(routes.post_decision));
+    ctx_http.post("/v1/decision",              ex_wrapper(routes.post_decision));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
