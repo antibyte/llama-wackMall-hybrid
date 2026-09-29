@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/exl3.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1892,6 +1893,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    ggml_cuda_set_device(device);
+    for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+        if (exl3_int8_counter_storage[j] != nullptr) {
+            CUDA_CHECK(cudaFree(exl3_int8_counter_storage[j]));
+            exl3_int8_counter_storage[j] = nullptr;
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2908,6 +2916,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // EXL3 stores svh/suh in mul_mat src[2]/src[3]. Fused mmvq reads src[2] as expert ids.
+    if ((ffn_up->src[0] && ggml_cuda_is_exl3(ffn_up->src[0]->type)) ||
+        (ffn_gate->src[0] && ggml_cuda_is_exl3(ffn_gate->src[0]->type))) {
+        return false;
+    }
+
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
     const ggml_tensor * ffn_up_bias_src   = has_scale ? ffn_up_scale   : ffn_up;
     const ggml_tensor * ffn_gate_bias_src = has_scale ? ffn_gate_scale : ffn_gate;
@@ -3008,6 +3022,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (src0 && ggml_cuda_is_exl3(src0->type)) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -3023,7 +3041,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool
     static const bool multi_token_moe = getenv("GGML_CUDA_MOE_MULTI_FUSION") != nullptr &&
             std::atoi(getenv("GGML_CUDA_MOE_MULTI_FUSION"));
     const bool use_multi_token_moe = allow_multi_token_moe && multi_token_moe &&
-            tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] >= 2 && dst->ne[2] <= 4;
+            tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] >= 2 &&
+            dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc);
 
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         return false;
@@ -3037,6 +3056,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_is_exl3(src0->type)) {
+        ggml_cuda_mul_mat_exl3(ctx, src0, src1, dst);
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
@@ -3082,6 +3106,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    // Dense EXL3 never reaches this op. MoE keeps real ids in src[2] and scales in src[3]/src[4].
+    if (ggml_cuda_is_exl3(src0->type)) {
+        GGML_ASSERT(ggml_cuda_exl3_mul_mat_id_fast(dst));
+        ggml_cuda_mul_mat_id_exl3(ctx, dst);
+        return;
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -6366,6 +6397,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
 #endif // GGML_USE_MUSA
+                if (ggml_type_is_exl3(a->type)) {
+                    return op->op == GGML_OP_MUL_MAT && ggml_cuda_exl3_supports_mul_mat(op);
+                }
                 switch (a->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:

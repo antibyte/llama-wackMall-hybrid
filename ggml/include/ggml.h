@@ -431,8 +431,36 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_TURBO4_K = 43, // Experimental TurboQuant 4-bit KV key cache
-        GGML_TYPE_COUNT   = 44,
+        // EXL3 (exllamav3) trellis weights, mul1 codebook. K = bits per weight.
+        // Logical tensor is [k, n]; bytes are 16x16 tiles in n-tile-major order.
+        GGML_TYPE_EXL3_1  = 44,
+        GGML_TYPE_EXL3_2  = 45,
+        GGML_TYPE_EXL3_3  = 46,
+        GGML_TYPE_EXL3_4  = 47,
+        GGML_TYPE_EXL3_5  = 48,
+        GGML_TYPE_EXL3_6  = 49,
+        GGML_TYPE_EXL3_7  = 50,
+        GGML_TYPE_EXL3_8  = 51,
+        GGML_TYPE_COUNT   = 52,
     };
+
+    // EXL3 helpers. This fork stores the mul1 codebook (id 2) in GGML_TYPE_EXL3_*.
+    static inline bool ggml_type_is_exl3(enum ggml_type type) {
+        return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3_8;
+    }
+
+    static inline int ggml_exl3_bits(enum ggml_type type) {
+        return (int) type - (int) GGML_TYPE_EXL3_1 + 1;
+    }
+
+    static inline int ggml_exl3_codebook(enum ggml_type type) {
+        return ggml_type_is_exl3(type) ? 2 : -1;
+    }
+
+    static inline enum ggml_type ggml_exl3_type(int bits, int codebook) {
+        GGML_ASSERT(codebook == 2 && bits >= 1 && bits <= 8);
+        return (enum ggml_type) ((int) GGML_TYPE_EXL3_1 + bits - 1);
+    }
 
     // precision
     enum ggml_prec {

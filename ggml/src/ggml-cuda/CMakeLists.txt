@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 option(GGML_CUDA_TURBO4_KQ_DP4A "ggml: experimental DP4A Turbo4 K/Q dot product" OFF)
 option(GGML_CUDA_TURBO4_F16_PREFILL "ggml: experimental FP16 prefill kernels for Turbo4 K" OFF)
 option(GGML_CUDA_PASCAL_MMVQ_TUNING "ggml: experimental two-warp single-token MMVQ tuning for Pascal DP4A GPUs" OFF)
+option(GGML_CUDA_TURING_MMQ_DP4A "ggml: experimental DP4A MMQ kernels for SM75 builds" OFF)
 set(GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH 32 CACHE STRING
     "Minimum query batch size for experimental Turbo4 FP16 prefill")
 
@@ -113,8 +114,8 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
-    file(GLOB   SRCS "template-instances/mmq*.cu")
-    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    file(GLOB   GGML_SOURCES_CUDA_MMQ "template-instances/mmq*.cu")
+    list(APPEND GGML_SOURCES_CUDA ${GGML_SOURCES_CUDA_MMQ})
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
@@ -154,6 +155,16 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_PASCAL_MMVQ_TUNING)
         add_compile_definitions(GGML_CUDA_PASCAL_MMVQ_TUNING)
+    endif()
+
+    if (GGML_CUDA_TURING_MMQ_DP4A)
+        set_property(SOURCE
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml-cuda.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/mmq.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/mmvq.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/quantize.cu"
+            ${GGML_SOURCES_CUDA_MMQ}
+            APPEND PROPERTY COMPILE_DEFINITIONS GGML_CUDA_TURING_MMQ_DP4A)
     endif()
 
     if (GGML_CUDA_TURBO4_F16_PREFILL)

@@ -1,0 +1,29 @@
+Ich baue einen lokalen KI-Agenten in Go, der auf einem Rechner mit einer GTX 1660 Ti
+gegen llama-server (OpenAI-kompatibel, /v1/chat/completions) spricht. Schreibe eine
+vollstaendige, implementierungsnahe Spezifikation plus konkreten Go-Code, keine
+Stichpunkte-Liste.
+
+Rahmen:
+- Ein Prozess, ein Benutzer, kein SaaS.
+- Werkzeuge: read_file, write_file, list_dir, grep, run_cmd (allowlist).
+- Der Agent darf mehrere Tool-Runden in einer Aufgabe machen.
+- Kontext 64k, Antworten sollen nach Tool-Results weiterlaufen.
+- Streaming der Modell-Tokens in die CLI, Tool-Calls nicht als Text an den User.
+
+Bitte liefere nacheinander, mit echtem Code:
+
+1. Paketschnitt: cmd/agent, intern/llm, intern/tools, intern/loop, intern/sandbox, intern/memory.
+2. LLM-Client: JSON-Schema/tool-calling gegen llama-server, Timeouts, Retries, Abbruch.
+3. Tool-Loop: Modell -> Tool-Call -> Ergebnis zurueck -> weiter, inkl. Max-Iterationen
+   und was passiert, wenn das Modell XML statt JSON emittiert.
+4. Sandbox: Arbeitsverzeichnis als Root, kein Escape, run_cmd nur mit allowlist und
+   Timeout, max. Output-Bytes.
+5. Speicher: Session-Log auf Disk, kurzer rolling Summary-Block fuer Folge-Turns.
+6. Concurrency: ein aktiver Lauf, Cancel via Context, kein paralleles Schreiben derselben Datei.
+7. Fehler: retrybare HTTP-Fehler vs. Tool-Fehler vs. Modell-Unsinn; User-sichtbare Meldungen.
+8. Tests: Tabelle fuer Pfad-Escape, Tool-JSON-Parse, Loop-Abbruch; Testdoubles fuers LLM.
+9. CLI: agent -root DIR -model NAME "aufgabe", plus -dry-run.
+10. Sicherheitsgrenzen, die du bewusst NICHT lockerst, und warum.
+
+Geh in die Tiefe: Dateinamen, Structs, Fehlerwerte, Beispiel-JSON fuer einen Tool-Turn.
+Schreibe so, als wuerde ich das heute implementieren.

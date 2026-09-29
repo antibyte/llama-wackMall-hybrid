@@ -644,6 +644,10 @@ class DFlashModel(Qwen3Model):
         dflash_config = self.hparams.get("dflash_config")
         if not isinstance(dflash_config, dict):
             raise ValueError("DFlash model requires an object-valued 'dflash_config'")
+        dflash_config = dict(dflash_config)
+        # JetSpec / newer DFlash configs keep block_size on the model root.
+        if "block_size" not in dflash_config and "block_size" in self.hparams:
+            dflash_config["block_size"] = self.hparams["block_size"]
 
         self._require_int(dflash_config, "block_size", 2)
         mask_token_id = self._require_int(dflash_config, "mask_token_id", 0)
@@ -730,6 +734,8 @@ class DFlashModel(Qwen3Model):
 
         self.gguf_writer.add_block_size(dflash_config["block_size"])
         self.gguf_writer.add_target_layers([i + 1 for i in dflash_config["target_layer_ids"]])
+        if dflash_config.get("causal_head") is True:
+            self.gguf_writer.add_bool("dflash.causal_head", True)
 
         if self.hparams.get("use_sliding_window", False):
             sliding_window = self.hparams["sliding_window"]

@@ -4,6 +4,13 @@ set -Eeuo pipefail
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 SERVER="${SERVER:-$ROOT/build-main-sm75/bin/llama-server}"
 CLIENT="${CLIENT:-$ROOT/tools/bench_hybrid_client.py}"
+# Optional extra flags for tools/bench_hybrid_client.py, e.g.
+# CLIENT_EXTRA_ARGS='--temperature 0.4 --top-k 20 --top-p 0.95 --timeout 1800'
+CLIENT_EXTRA_ARGS="${CLIENT_EXTRA_ARGS:-}"
+client_extra=()
+if [[ -n "$CLIENT_EXTRA_ARGS" ]]; then
+    read -r -a client_extra <<< "$CLIENT_EXTRA_ARGS"
+fi
 MODEL="${MODEL:-$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 PROFILE="${PROFILE:-${7:-$HOME/models/qwen3.6-35b-a3b-mtp/luce-warmstart.csv}}"
 PLACEMENT="${PLACEMENT:-}"
@@ -605,7 +612,8 @@ for config in "${CONFIGS[@]}"; do
             --prompt-file "$PROMPT_FILE" \
             --prompt-repeat "$WARMUP_PROMPT_REPEAT" \
             --n-predict "$WARMUP_TOKENS" \
-            --output "$warmup_file"
+            --output "$warmup_file" \
+            "${client_extra[@]}"
 
         # A fresh measured process avoids cross-request KV/speculative state,
         # while the warm-up still primes model pages and the CUDA runtime.
@@ -641,7 +649,8 @@ for config in "${CONFIGS[@]}"; do
             --prompt-file "$PROMPT_FILE" \
             --prompt-repeat "$PROMPT_REPEAT" \
             --n-predict "$N_PREDICT" \
-            --output "$response_file"
+            --output "$response_file" \
+            "${client_extra[@]}"
 
         cleanup
 

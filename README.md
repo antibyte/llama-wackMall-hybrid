@@ -592,7 +592,7 @@ GGML_CUDA_MOE_COMBINE_FUSION=1 \
 ./build-kernel-sm75/bin/llama-server ...
 ```
 
-`LLAMA_EXPERT_SHARED_HOT_IDS=1` reuses one mapped hot-ID tensor for Gate, Up, and Down within a layer. `GGML_CUDA_MOE_MULTI_FUSION=1` extends the existing quantized CUDA fusion to bias- and scale-free `MUL_MAT_ID` graphs with two to four target tokens. The multi-token kernel is guarded off on Pascal and older GPUs until separate architecture-specific measurements are available. Keep both controls disabled for an unmodified baseline.
+`LLAMA_EXPERT_SHARED_HOT_IDS=1` reuses one mapped hot-ID tensor for Gate, Up, and Down within a layer. `GGML_CUDA_MOE_MULTI_FUSION=1` extends the existing quantized CUDA fusion to bias- and scale-free `MUL_MAT_ID` graphs with up to eight target tokens, subject to the compiled architecture and quantization type's MMVQ limit. This includes the five-token verification batch for four DFlash draft tokens. The multi-token kernel is guarded off on Pascal and older GPUs until separate architecture-specific measurements are available. Keep both controls disabled for an unmodified baseline.
 
 `GGML_CUDA_MOE_COMBINE_FUSION=1` is a separate default-off experiment. It
 replaces the post-Down F32 weighting plus the ordered Top-k reduction with one
@@ -601,6 +601,21 @@ model-dimension independent (2--32 routed experts) and has an optimized Top-8
 dispatch. The GTX 1660 Ti 3x256 screen was neutral (+0.07%), so it is not a
 production default and needs an independent sm_61 screen before use on the GTX
 1080.
+
+### DP4A MMQ on GTX 16-series GPUs
+
+`GGML_CUDA_TURING_MMQ_DP4A` is a default-off build option for SM75 GPUs without tensor cores, tested on the GTX 1660 Ti. It selects the existing DP4A kernels and activation layout for quantized matrix multiplication while retaining native SM75 matrix-vector and Flash Attention kernels. It affects every SM75 kernel in that build; leave it off for Turing GPUs with tensor cores unless separately benchmarked.
+
+```bash
+cmake -S . -B build-main-sm75 -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_CUDA_TURING_MMQ_DP4A=ON
+cmake --build build-main-sm75 --target llama-server llama-bench --parallel 6
+```
+
+The [performance review](docs/performance-review-20260929.md) records the comparisons, numerical checks, rejected experiments, and benchmark commands.
+
+### Adaptive DFlash draft length
+
+`LLAMA_DFLASH_ADAPTIVE=1` enables a default-off server experiment for one slot with classic DFlash. It compares wall time per emitted token for draft limits two and up to four, probes each limit for 32 tokens, and holds its choice for 256 tokens with 5% hysteresis. Model block size, draft batch capacity, and the configured maximum still apply. Context shifts and clipped draft limits discard incomplete measurement windows. Tree verification and mixed speculative methods are excluded. Gains depend on the prompt and context. The tested `start1660.sh` preset opts in with `DFLASH_ADAPTIVE=1`; set it to 0 in that script to restore a fixed draft limit.
 
 ### Experimental Q8_0 three-column MMVQ geometry
 
@@ -807,6 +822,7 @@ Fixed GPU references:
 
 - [`start1660.sh`](start1660.sh) — GTX 1660 Ti (sm_75, 6 GiB) live stack; snapshot in [`START1660_REFERENCE.md`](START1660_REFERENCE.md) (45.04 tok/s / 3781 tok, peak 3s 57.48)
 - [`start-ling-tiny.sh`](start-ling-tiny.sh) — Ling-3.0-tiny on the 1660 Ti; same knob surface as `start1660.sh` (KVFlash 8192, prefill 2048, ngram-simple, q8 KV)
+- [`start-ling-tiny-mtp.sh`](start-ling-tiny-mtp.sh) — same Ling recipe with the grafted NextN GGUF and `SPEC_MODE=mtp` (`MTP_N=2`)
 - [`startspark.sh`](startspark.sh) — Spark-X2.5-4B on the 1660 Ti (`spark2_5`, Q4_K_M, hybrid SWA, spec none, q8 KV; llama-bench tg128 75.9 t/s). Alias: [`start-spark-x25.sh`](start-spark-x25.sh)
 - [`start-ling-tiny-1080.sh`](start-ling-tiny-1080.sh) — Ling-3.0-tiny starting recipe for GTX 1080 (sm_61, 8 GiB)
 - [`start1080.sh`](start1080.sh) — measured GTX 1080 (sm_61, 8 GiB) production stack
@@ -1019,7 +1035,7 @@ Key portable controls:
 | `LLAMA_EXPERT_CPU_MULTI_ROW` | 0 | AVX2 Q4_K/Q5_K multi-row dots for repeated MTP expert selections; implies row-oriented traversal |
 | `LLAMA_EXPERT_CPU_FUSED_GATE_UP` | 0 | Experimental AVX2 Q4_K dual-dot sharing Q8_K activation loads between CPU-Cold Gate and Up; neutral on GTX 1660 Ti, retest on CPU-bound hosts |
 | `LLAMA_EXPERT_SHARED_HOT_IDS` | 0 | Reuse one hot-slot ID mapping for Gate, Up, and Down in a layer |
-| `GGML_CUDA_MOE_MULTI_FUSION` | 0 | Fuse quantized Gate+Up+GLU for two to four MoE target tokens on Turing or newer GPUs |
+| `GGML_CUDA_MOE_MULTI_FUSION` | 0 | Fuse quantized Gate+Up+GLU for up to eight MoE target tokens on Turing or newer GPUs, within the compiled MMVQ limits |
 | `GGML_CUDA_MOE_COMBINE_FUSION` | 0 | Fuse exact F32 post-Down expert weighting and ordered Top-k reduction; experimental |
 | `GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS` | 0 | Override rows/block for non-ID Q8_0 one-column MMVQ (`1`, `2`, or `4`); `0` preserves automatic selection |
 | `GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS` | 0 | Override rows/block for non-ID Q8_0 three-column MMVQ (`1`, `2`, or `4`); `0` preserves automatic selection |

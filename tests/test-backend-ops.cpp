@@ -6446,6 +6446,29 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+struct test_mul_mat_vec_fusion_neg : public test_mul_mat_vec_fusion {
+    test_mul_mat_vec_fusion_neg(ggml_type type, int64_t m)
+        : test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 32, 256, true, 16, 8, true) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_vec_fusion::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                const int32_t id = -1;
+                ggml_backend_tensor_set(t, &id, r * t->nb[1], sizeof(id));
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_FUSION_NEG";
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -9801,6 +9824,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t m : {2, 3, 4, 5, 6, 7, 8}) {
+            for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+                for (bool b : {false, true}) {
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m, 32, 256, true, 16, 8, b));
+                }
+            }
+            test_cases.emplace_back(new test_mul_mat_vec_fusion_neg(type, m));
+        }
+    }
+
+    for (int64_t m : {5, 8}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, m, 768, 2048, true, 16, 8, true));
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {

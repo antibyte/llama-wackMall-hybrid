@@ -141,4 +141,12 @@ std::pair<std::string, std::string> render_prompt(const common_chat_templates * 
 // {"decision": {...}, "fields": {...}} from the scores, applying each numeric field's aggregate.
 json assemble(const compiled_schema & cs, const result & r);
 
+// Intern-Decision scores one forward over a filled assistant skeleton. The marker
+// token "<decision>" is a single vocab entry only on that model.
+bool is_intern_decision(const llama_vocab * vocab);
+
+// Same response shape as handle_decision. Logits are read at the token before each
+// marker; probabilities use the published temperature 1.99241824.
+json decide_intern(llama_context * ctx, const json & body, const std::string & model_name);
+
 } // namespace llama_decision

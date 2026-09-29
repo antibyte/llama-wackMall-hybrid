@@ -14,6 +14,7 @@
 # Prefetch slots (210 MiB Down-expert) are allocated once and reused; gallocr
 # does not allocate a second copy. S does not shrink that tensor.
 # Snapshot: START1660_REFERENCE.md. GTX 1080: start1080.sh.
+# 2026-09-29: DP4A MMQ build, adaptive DFlash 2/4; see docs/performance-review-20260929.md.
 #
 set -Eeuo pipefail
 
@@ -24,7 +25,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"  # directo
 # ============================================================================
 
 # Paths
-SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"  # current Turbo4-enabled native sm_75 Release executable
+SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"  # Turbo4-enabled SM75 Release build with GGML_CUDA_TURING_MMQ_DP4A=ON
 MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"  # target GGUF
 SPEC_MODE="dflash"  # none | mtp | dflash; live DFlash: n_max=4 and p_min=0.75
 SPEC_DRAFT_MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-DFlash-Q4_K_M.gguf"  # DFlash GGUF sidecar
@@ -54,6 +55,7 @@ API_KEY_FILE=""  # optional file containing one or more API keys, one per line
 MODEL_ALIAS="qwen3.6-35b-a3b-hybrid"  # model name advertised by the OpenAI-compatible API
 CUDA_VISIBLE_DEVICES_VALUE="0"  # CUDA device list, e.g. 0 or 0,1
 N_PARALLEL="1"  # number of simultaneous server slots; 1 keeps the tested path isolated
+DECISION_SEQS="0"  # the separate decision context exceeds the 6-GiB budget with this chat preset
 CPU_MOE="1"  # keep the hybrid CPU/GPU MoE tier enabled (0 disables it)
 MMPROJ_AUTO="0"  # do not load an optional multimodal projector for this text model
 
@@ -91,6 +93,7 @@ SPEC_DRAFT_N_MIN="1"  # DFlash-only minimum accepted draft length
 SPEC_DRAFT_P_MIN="0.75"  # DFlash-only confidence threshold in [0, 1]
 SPEC_DRAFT_BACKEND_SAMPLING="1"  # DFlash-only backend sampling switch
 DFLASH_COMBINED="1"  # fuse target feature projection and draft KV injection into the target graph
+DFLASH_ADAPTIVE="1"  # compare draft caps 2/4 by wall time per emitted token; 0 restores fixed n_max
 DRAFT_NGL="all"  # the measured winner keeps all six DFlash layers on the GPU
 REASONING="1"  # let the model template select reasoning mode
 REASONING_BUDGET="6000"  # measured quality/latency compromise; clients may request another value
@@ -220,7 +223,7 @@ GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS="2"  # 2..16 and at least K; inactive while 
 # GTX 1080 binary and has no effect on this native sm_75 launcher.
 LLAMA_EXPERT_SHARED_HOT_IDS="1"  # share one mapped hot-ID tensor across Gate, Up, and Down
 LLAMA_EXPERT_SKIP_SENTINEL="1"  # 3x2K winner: 44.744 -> 46.487 tok/s (+3.90%), hash-identical
-GGML_CUDA_MOE_MULTI_FUSION="1"  # fuse Gate+Up+GLU for 2-4 target tokens on sm_75+
+GGML_CUDA_MOE_MULTI_FUSION="1"  # fuse Gate+Up+GLU up to the compiled MMVQ limit (8 on this SM75 path)
 GGML_CUDA_MOE_COMBINE_FUSION="1"  # exact combine fusion measured neutral (+0.07%)
 GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS="4"  # 3x2K winner: 46.831 -> 47.436 token/s
 GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS="0"  # A/B candidate; 0=auto (default 1 row/block for ncols=1)
@@ -331,6 +334,8 @@ case "$GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY" in 0|1) ;; *) die "GGML_CUDA_EXPERT_BRI
 case "$LLAMA_EXPERT_SHARED_HOT_IDS" in 0|1) ;; *) die "LLAMA_EXPERT_SHARED_HOT_IDS muss 0 oder 1 sein." ;; esac
 case "$LLAMA_EXPERT_SKIP_SENTINEL" in 0|1) ;; *) die "LLAMA_EXPERT_SKIP_SENTINEL muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MOE_MULTI_FUSION" in 0|1) ;; *) die "GGML_CUDA_MOE_MULTI_FUSION muss 0 oder 1 sein." ;; esac
+case "$DFLASH_ADAPTIVE" in 0|1) ;; *) die "DFLASH_ADAPTIVE muss 0 oder 1 sein." ;; esac
+[[ "$DECISION_SEQS" =~ ^[0-9]+$ ]] || die "DECISION_SEQS muss eine nichtnegative Ganzzahl sein."
 case "$GGML_CUDA_MOE_COMBINE_FUSION" in 0|1) ;; *) die "GGML_CUDA_MOE_COMBINE_FUSION muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
@@ -403,6 +408,7 @@ for phase_value in "$CMOE_PREFILL_BATCH" "$CMOE_PREFILL_UBATCH" "$CMOE_DECODE_BA
     [[ -z "$phase_value" || "$phase_value" =~ ^[1-9][0-9]*$ ]] || die "Phase-Batchwerte muessen leer oder positive Ganzzahlen sein."
 done
 
+EFFECTIVE_DFLASH_ADAPTIVE="0"
 case "$SPEC_MODE" in
     none)
         SPEC_TYPE="none"
@@ -422,6 +428,7 @@ case "$SPEC_MODE" in
         [[ -n "$SPEC_DRAFT_MODEL" ]] || die "SPEC_DRAFT_MODEL darf fuer SPEC_MODE=dflash nicht leer sein."
         [[ -f "$SPEC_DRAFT_MODEL" ]] || die "DFlash-Modell nicht gefunden: $SPEC_DRAFT_MODEL"
         SPEC_TYPE="draft-dflash"
+        EFFECTIVE_DFLASH_ADAPTIVE="$DFLASH_ADAPTIVE"
         EFFECTIVE_SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"
         EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING="$SPEC_DRAFT_BACKEND_SAMPLING"
         ;;
@@ -462,6 +469,8 @@ env_args=(
     "GGML_CUDA_TURBO4_FAST_F16_CONVERT=$GGML_CUDA_TURBO4_FAST_F16_CONVERT"
     "GGML_CUDA_TURBO4_WHT_SHUFFLE=$GGML_CUDA_TURBO4_WHT_SHUFFLE"
     "LLAMA_ARG_SPEC_TYPE=$SPEC_TYPE"
+    "LLAMA_ARG_DECISION_SEQS=$DECISION_SEQS"
+    "LLAMA_DFLASH_ADAPTIVE=$EFFECTIVE_DFLASH_ADAPTIVE"
     "LLAMA_ARG_SPEC_DRAFT_N_MAX=$EFFECTIVE_SPEC_DRAFT_N_MAX"
     "LLAMA_MTP_REQUANTIZE_OUTPUT=$LLAMA_MTP_REQUANTIZE_OUTPUT"
     "LLAMA_MTP_HEAD_TRACE=$LLAMA_MTP_HEAD_TRACE"
@@ -630,9 +639,10 @@ llama-wackMall-hybrid start
   listen:       $HOST:$PORT
   GPU:          $CUDA_VISIBLE_DEVICES_VALUE${GPU_ARCH:+ (compute $GPU_ARCH)}
   context:      $CONTEXT
+  decision seq: $DECISION_SEQS
   spec mode:    $SPEC_MODE ($SPEC_TYPE)
   MTP fallback: $MTP_N
-  DFlash:       model=${SPEC_DRAFT_MODEL:-<none>} n=$SPEC_DRAFT_N_MIN..$SPEC_DRAFT_N_MAX p-min=$SPEC_DRAFT_P_MIN backend-sampling=$SPEC_DRAFT_BACKEND_SAMPLING combined=$DFLASH_COMBINED
+  DFlash:       model=${SPEC_DRAFT_MODEL:-<none>} n=$SPEC_DRAFT_N_MIN..$SPEC_DRAFT_N_MAX p-min=$SPEC_DRAFT_P_MIN backend-sampling=$SPEC_DRAFT_BACKEND_SAMPLING combined=$DFLASH_COMBINED adaptive=$EFFECTIVE_DFLASH_ADAPTIVE
   DFlash target override: ${DFLASH_TARGET_TENSOR_OVERRIDE:-none}
   KV target:    $TARGET_TYPE_K/$TARGET_TYPE_V
   KV draft:     $DRAFT_TYPE_K/$DRAFT_TYPE_V

@@ -1421,6 +1421,8 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+    // EXL3 int8 gemv: one zeroed counter block per stream. Freed by the context destructor.
+    int * exl3_int8_counter_storage[GGML_CUDA_MAX_STREAMS] = { nullptr };
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

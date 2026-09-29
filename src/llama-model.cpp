@@ -1369,6 +1369,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // call the per-model loading function
         load_arch_tensors(ml);
 
+        // EXL3 svh has length n (ne[1]) and suh has length k (ne[0]). Other quants keep a scalar.
+        auto exl3_ne = [](const ggml_tensor * w, int dim) -> int64_t {
+            return w != nullptr && ggml_type_is_exl3(w->type) ? w->ne[dim] : 1;
+        };
+
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
         for (int i = 0; i < n_layer_all; ++i) {
@@ -1376,42 +1381,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             // attention weight scales (per-tensor, shape {1})
             if (!layer.wq_s && layer.wq) {
-                layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {exl3_ne(layer.wq, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wk_s && layer.wk) {
-                layer.wk_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wk_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "scale", i), {exl3_ne(layer.wk, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wv_s && layer.wv) {
-                layer.wv_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wv_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "scale", i), {exl3_ne(layer.wv, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wo_s && layer.wo) {
-                layer.wo_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wo_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale", i), {exl3_ne(layer.wo, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wqkv_s && layer.wqkv) {
-                layer.wqkv_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "scale", i), {exl3_ne(layer.wqkv, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wqkv_gate_s && layer.wqkv_gate) {
-                layer.wqkv_gate_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_gate_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "scale", i), {exl3_ne(layer.wqkv_gate, 1)}, TENSOR_NOT_REQUIRED);
             }
 
             // dense FFN weight scales (per-tensor, shape {1})
             if (!layer.ffn_gate_s && layer.ffn_gate) {
-                layer.ffn_gate_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "scale", i), {exl3_ne(layer.ffn_gate, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_s && layer.ffn_down) {
-                layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale", i), {exl3_ne(layer.ffn_down, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_s && layer.ffn_up) {
-                layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {exl3_ne(layer.ffn_up, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_shexp_s && layer.ffn_gate_shexp) {
-                layer.ffn_gate_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {exl3_ne(layer.ffn_gate_shexp, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_shexp_s && layer.ffn_down_shexp) {
-                layer.ffn_down_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), {exl3_ne(layer.ffn_down_shexp, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_shexp_s && layer.ffn_up_shexp) {
-                layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {exl3_ne(layer.ffn_up_shexp, 1)}, TENSOR_NOT_REQUIRED);
             }
 
             // MoE expert weight scales (per-expert, shape {n_expert})
@@ -1427,51 +1432,51 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
             if (!layer.ssm_in_s && layer.ssm_in) {
-                layer.ssm_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "scale", i), {exl3_ne(layer.ssm_in, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_out_s && layer.ssm_out) {
-                layer.ssm_out_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_out_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "scale", i), {exl3_ne(layer.ssm_out, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_alpha_s && layer.ssm_alpha) {
-                layer.ssm_alpha_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_alpha_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "scale", i), {exl3_ne(layer.ssm_alpha, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_beta_s && layer.ssm_beta) {
-                layer.ssm_beta_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_beta_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "scale", i), {exl3_ne(layer.ssm_beta, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.eh_proj_s && layer.nextn.eh_proj) {
-                layer.nextn.eh_proj_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.eh_proj_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), {exl3_ne(layer.nextn.eh_proj, 1)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.shared_head_head_s && layer.nextn.shared_head_head) {
-                layer.nextn.shared_head_head_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.shared_head_head_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), {exl3_ne(layer.nextn.shared_head_head, 1)}, TENSOR_NOT_REQUIRED);
             }
 
             // input scales
             if (!layer.wq_in_s && layer.wq) {
-                layer.wq_in_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wq_in_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "input_scale", i), {exl3_ne(layer.wq, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wk_in_s && layer.wk) {
-                layer.wk_in_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wk_in_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "input_scale", i), {exl3_ne(layer.wk, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wv_in_s && layer.wv) {
-                layer.wv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "input_scale", i), {exl3_ne(layer.wv, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wo_in_s && layer.wo) {
-                layer.wo_in_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wo_in_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "input_scale", i), {exl3_ne(layer.wo, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wqkv_in_s && layer.wqkv) {
-                layer.wqkv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "input_scale", i), {exl3_ne(layer.wqkv, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wqkv_gate_in_s && layer.wqkv_gate) {
-                layer.wqkv_gate_in_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_gate_in_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "input_scale", i), {exl3_ne(layer.wqkv_gate, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_in_s && layer.ffn_gate) {
-                layer.ffn_gate_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "input_scale", i), {exl3_ne(layer.ffn_gate, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_in_s && layer.ffn_down) {
-                layer.ffn_down_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "input_scale", i), {exl3_ne(layer.ffn_down, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_in_s && layer.ffn_up) {
-                layer.ffn_up_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "input_scale", i), {exl3_ne(layer.ffn_up, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_exps_in_s && layer.ffn_gate_exps) {
                 layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
@@ -1483,44 +1488,77 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
-                layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {exl3_ne(layer.ffn_gate_shexp, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_shexp_in_s && layer.ffn_down_shexp) {
-                layer.ffn_down_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "input_scale", i), {exl3_ne(layer.ffn_down_shexp, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_shexp_in_s && layer.ffn_up_shexp) {
-                layer.ffn_up_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "input_scale", i), {exl3_ne(layer.ffn_up_shexp, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_in_in_s && layer.ssm_in) {
-                layer.ssm_in_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_in_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "input_scale", i), {exl3_ne(layer.ssm_in, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_out_in_s && layer.ssm_out) {
-                layer.ssm_out_in_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_out_in_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "input_scale", i), {exl3_ne(layer.ssm_out, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_alpha_in_s && layer.ssm_alpha) {
-                layer.ssm_alpha_in_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_alpha_in_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "input_scale", i), {exl3_ne(layer.ssm_alpha, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_beta_in_s && layer.ssm_beta) {
-                layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {exl3_ne(layer.ssm_beta, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.eh_proj_in_s && layer.nextn.eh_proj) {
-                layer.nextn.eh_proj_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.eh_proj_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i), {exl3_ne(layer.nextn.eh_proj, 0)}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.shared_head_head_in_s && layer.nextn.shared_head_head) {
-                layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {exl3_ne(layer.nextn.shared_head_head, 0)}, TENSOR_NOT_REQUIRED);
             }
         }
         // output scales
-        if (output && output->type == GGML_TYPE_NVFP4) {
+        if (output && (output->type == GGML_TYPE_NVFP4 || ggml_type_is_exl3(output->type))) {
             // weight scale
             if (!output_s) {
-                output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
+                output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {exl3_ne(output, 1)}, TENSOR_NOT_REQUIRED);
             }
             // input scale
             if (!output_in_s) {
-                output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
+                output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {exl3_ne(output, 0)}, TENSOR_NOT_REQUIRED);
             }
         }
+
+        // Stash svh/suh on the weight so build_lora_mm can attach them as MUL_MAT src[2]/src[3].
+        auto bind_exl3 = [](ggml_tensor * w, ggml_tensor * svh, ggml_tensor * suh) {
+            if (w == nullptr || !ggml_type_is_exl3(w->type)) {
+                return;
+            }
+            if (svh == nullptr || suh == nullptr) {
+                throw std::runtime_error(format("EXL3 weight '%s' is missing its scale tensors", w->name));
+            }
+            w->src[0] = svh;
+            w->src[1] = suh;
+        };
+        for (auto & layer : layers) {
+            bind_exl3(layer.wq, layer.wq_s, layer.wq_in_s);
+            bind_exl3(layer.wk, layer.wk_s, layer.wk_in_s);
+            bind_exl3(layer.wv, layer.wv_s, layer.wv_in_s);
+            bind_exl3(layer.wo, layer.wo_s, layer.wo_in_s);
+            bind_exl3(layer.wqkv, layer.wqkv_s, layer.wqkv_in_s);
+            bind_exl3(layer.wqkv_gate, layer.wqkv_gate_s, layer.wqkv_gate_in_s);
+            bind_exl3(layer.ffn_gate, layer.ffn_gate_s, layer.ffn_gate_in_s);
+            bind_exl3(layer.ffn_up, layer.ffn_up_s, layer.ffn_up_in_s);
+            bind_exl3(layer.ffn_down, layer.ffn_down_s, layer.ffn_down_in_s);
+            bind_exl3(layer.ffn_gate_shexp, layer.ffn_gate_shexp_s, layer.ffn_gate_shexp_in_s);
+            bind_exl3(layer.ffn_up_shexp, layer.ffn_up_shexp_s, layer.ffn_up_shexp_in_s);
+            bind_exl3(layer.ffn_down_shexp, layer.ffn_down_shexp_s, layer.ffn_down_shexp_in_s);
+            bind_exl3(layer.ssm_in, layer.ssm_in_s, layer.ssm_in_in_s);
+            bind_exl3(layer.ssm_out, layer.ssm_out_s, layer.ssm_out_in_s);
+            bind_exl3(layer.ssm_alpha, layer.ssm_alpha_s, layer.ssm_alpha_in_s);
+            bind_exl3(layer.ssm_beta, layer.ssm_beta_s, layer.ssm_beta_in_s);
+            bind_exl3(layer.nextn.eh_proj, layer.nextn.eh_proj_s, layer.nextn.eh_proj_in_s);
+            bind_exl3(layer.nextn.shared_head_head, layer.nextn.shared_head_head_s, layer.nextn.shared_head_head_in_s);
+        }
+        bind_exl3(output, output_s, output_in_s);
     }
     ml.done_getting_tensors();
 

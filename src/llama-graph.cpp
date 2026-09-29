@@ -1609,7 +1609,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
-    if (w_s) {
+    if (ggml_type_is_exl3(w->type)) {
+        // svh/suh were stashed on the weight when the GGUF was loaded.
+        GGML_ASSERT(w->src[0] != nullptr && w->src[1] != nullptr);
+        res->src[2] = w->src[0];
+        res->src[3] = w->src[1];
+    } else if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
     }
 
@@ -1824,7 +1829,7 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(tmp, "ffn_up_b", il);
     }
 
-    if (up_s) {
+    if (up_s && !(up && ggml_type_is_exl3(up->type))) {
         tmp = ggml_mul(ctx0, tmp, up_s);
         cb(tmp, "ffn_up_s", il);
     }
@@ -1848,7 +1853,7 @@ ggml_tensor * llm_graph_context::build_ffn(
             cb(cur, "ffn_gate_b", il);
         }
 
-        if (gate_s) {
+        if (gate_s && !(gate && ggml_type_is_exl3(gate->type))) {
             cur = ggml_mul(ctx0, cur, gate_s);
             cb(cur, "ffn_gate_s", il);
         }
@@ -1961,7 +1966,7 @@ ggml_tensor * llm_graph_context::build_ffn(
         cur = ggml_add(ctx0, cur, down_b);
     }
 
-    if (down_s) {
+    if (down_s && !(down && ggml_type_is_exl3(down->type))) {
         cur = ggml_mul(ctx0, cur, down_s);
         cb(cur, "ffn_down_s", il);
     }

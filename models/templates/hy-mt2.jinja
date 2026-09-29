@@ -1,0 +1,42 @@
+{# Hy-MT2-30B-A3B. GGUF metadata marks EOS as the unused hash token
+   <eos:6124c78e> (id 120025). Real stop is <｜hy_end▁of▁sentence｜> (id 120001).
+   No default system prompt. reasoning_effort stays off. #}
+{%- set bos_token = '<｜hy_begin▁of▁sentence｜>' -%}
+{%- set user_token = '<｜hy_User｜>' -%}
+{%- set assistant_token = '<｜hy_Assistant｜>' -%}
+{%- set eos_token = '<｜hy_end▁of▁sentence｜>' -%}
+{%- set think_begin_token = '<think>' -%}
+{%- set think_end_token = '</think>' -%}
+{%- if not add_generation_prompt is defined -%}
+    {%- set add_generation_prompt = false -%}
+{%- endif -%}
+{%- macro visible_text(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item is mapping and item.type == 'text' -%}
+                {{- item.text -}}
+            {%- elif item is string -%}
+                {{- item -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- elif content is none -%}
+        {{- '' -}}
+    {%- else -%}
+        {{- content -}}
+    {%- endif -%}
+{%- endmacro -%}
+{{- bos_token -}}
+{%- for message in messages -%}
+    {%- if message['role'] == 'system' -%}
+        {{- visible_text(message['content']) -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- user_token + visible_text(message['content']) -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- assistant_token + think_begin_token + think_end_token + visible_text(message['content']) + eos_token -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- assistant_token + think_begin_token + think_end_token -}}
+{%- endif -%}

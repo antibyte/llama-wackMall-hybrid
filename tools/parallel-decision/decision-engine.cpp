@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <limits>
 #include <stdexcept>
 
 namespace llama_decision {
@@ -747,6 +749,354 @@ json assemble(const compiled_schema & cs, const result & r) {
     json out = json::object();
     out["decision"] = decision;
     out["fields"]   = fields;
+    return out;
+}
+
+namespace {
+
+constexpr const char * k_intern_system =
+    "You are a careful decision assistant. Use the state and decision schema in the user message to make the requested decisions. "
+    "For every field, choose exactly one answer symbol (e.g. A, B, C, ...) from its listed options and return one valid JSON object "
+    "mapping each field name to its chosen symbol. Use the field names and symbols exactly as given. Do not include explanations, Markdown, or extra text.";
+
+constexpr const char * k_answer_symbols = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+constexpr double       k_intern_temperature = 1.99241824;
+constexpr int          k_answer_symbol_count = 62;
+
+struct intern_option {
+    std::string label;
+    std::string description;
+    int         value_index;
+};
+
+std::string field_instructions(const std::string & global, const field_spec & sp) {
+    if (global.empty()) {
+        return sp.description;
+    }
+    if (sp.description.empty()) {
+        return global;
+    }
+    return global + " " + sp.description;
+}
+
+std::vector<intern_option> intern_options(const field_spec & sp) {
+    std::vector<intern_option> out;
+    if (sp.type == "boolean") {
+        if (sp.values.size() != 2) {
+            throw std::runtime_error("field \"" + sp.name + "\" is not a boolean pair");
+        }
+        out.push_back({ "no", "The answer is no (negative, or disagree with the claim).", 1 });
+        out.push_back({ "yes", "The answer is yes (affirmative, or align with the claim).", 0 });
+        return out;
+    }
+    if (sp.type == "enum") {
+        for (int i = 0; i < (int) sp.values.size(); ++i) {
+            const std::string label = sp.values[i].get<std::string>();
+            out.push_back({ label, label, i });
+        }
+        return out;
+    }
+    for (int i = 0; i < (int) sp.encoded.size(); ++i) {
+        out.push_back({ sp.encoded[i], sp.encoded[i], i });
+    }
+    return out;
+}
+
+std::vector<double> softmax_prefix(const std::vector<float> & logits, int n) {
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < n; ++i) {
+        max_logit = std::max(max_logit, (double) logits[i]);
+    }
+    std::vector<double> probs(n);
+    double sum = 0;
+    for (int i = 0; i < n; ++i) {
+        probs[i] = std::exp((double) logits[i] - max_logit);
+        sum += probs[i];
+    }
+    for (double & p : probs) {
+        p /= sum;
+    }
+    return probs;
+}
+
+// Published calibration. The chosen symbol stays the softmax argmax.
+void scale_temperature(std::vector<double> & probs) {
+    double max_log = -std::numeric_limits<double>::infinity();
+    std::vector<double> logs(probs.size());
+    for (size_t i = 0; i < probs.size(); ++i) {
+        logs[i] = probs[i] > 0.0 ? std::log(probs[i]) : -std::numeric_limits<double>::infinity();
+        max_log = std::max(max_log, logs[i]);
+    }
+    double sum = 0;
+    for (size_t i = 0; i < probs.size(); ++i) {
+        probs[i] = std::exp((logs[i] - max_log) / k_intern_temperature);
+        sum += probs[i];
+    }
+    for (double & p : probs) {
+        p /= sum;
+    }
+}
+
+int best_option(const std::vector<double> & probs, const std::vector<intern_option> & opts) {
+    int best = 0;
+    for (int i = 1; i < (int) probs.size(); ++i) {
+        if (probs[i] > probs[best] || (probs[i] == probs[best] && opts[i].label < opts[best].label)) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+llama_token one_token(const llama_vocab * vocab, const std::string & text) {
+    const tokens_t toks = common_tokenize(vocab, text, /*add_special=*/ false, /*parse_special=*/ true);
+    if (toks.size() != 1) {
+        throw std::runtime_error("\"" + text + "\" is not a single token");
+    }
+    return toks[0];
+}
+
+struct intern_batch {
+    llama_batch batch;
+    explicit intern_batch(int n) : batch(llama_batch_init(n, 0, 1)) {}
+    ~intern_batch() { llama_batch_free(batch); }
+    intern_batch(const intern_batch &) = delete;
+    intern_batch & operator=(const intern_batch &) = delete;
+};
+
+// One causal forward. Logits are taken at the token before each <decision> marker.
+std::vector<std::vector<float>> intern_forward(llama_context * ctx, const tokens_t & toks,
+                                               const std::vector<int> & score_at, int n_fields,
+                                               const std::vector<llama_token> & symbols) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (mem == nullptr) {
+        throw std::runtime_error("decision context has no memory");
+    }
+    llama_memory_clear(mem, true);
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    const int n_chunk = std::max(1, (int) std::min(llama_n_batch(ctx), llama_n_ubatch(ctx)));
+    intern_batch held(n_chunk);
+    llama_batch & batch = held.batch;
+
+    std::vector<int> slot_field;
+    int logits_in_batch = 0;
+    std::vector<std::vector<float>> rows(n_fields);
+
+    auto flush = [&]() {
+        if (batch.n_tokens == 0) {
+            return;
+        }
+        const int rc = llama_decode(ctx, batch);
+        if (rc != 0) {
+            throw std::runtime_error(rc == 1 ? "no free KV cache space for the decision prompt"
+                                             : "llama_decode failed on the decision prompt (" + std::to_string(rc) + ")");
+        }
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (slot_field[i] < 0) {
+                continue;
+            }
+            const float * row = llama_get_logits_ith(ctx, i);
+            if (row == nullptr) {
+                throw std::runtime_error("missing logits at a decision marker");
+            }
+            std::vector<float> got(symbols.size());
+            for (size_t s = 0; s < symbols.size(); ++s) {
+                if (symbols[s] < 0 || symbols[s] >= n_vocab) {
+                    throw std::runtime_error("answer symbol token is outside the vocab");
+                }
+                got[s] = row[symbols[s]];
+            }
+            rows[slot_field[i]] = std::move(got);
+        }
+        common_batch_clear(batch);
+        slot_field.clear();
+        logits_in_batch = 0;
+    };
+
+    std::vector<int> field_of(toks.size(), -1);
+    for (int field = 0; field < n_fields; ++field) {
+        const int at = score_at[field];
+        if (at < 0 || at >= (int) toks.size()) {
+            throw std::runtime_error("decision marker is outside the prompt");
+        }
+        field_of[at] = field;
+    }
+
+    for (int i = 0; i < (int) toks.size(); ++i) {
+        const bool want = field_of[i] >= 0;
+        // The decision context reserves one output row per sequence, so each
+        // micro-batch carries at most one marker logit.
+        if (want && logits_in_batch > 0) {
+            flush();
+        }
+        if (batch.n_tokens == n_chunk) {
+            flush();
+        }
+        common_batch_add(batch, toks[i], (llama_pos) i, { 0 }, want);
+        slot_field.push_back(want ? field_of[i] : -1);
+        if (want) {
+            ++logits_in_batch;
+        }
+    }
+    flush();
+
+    for (int field = 0; field < n_fields; ++field) {
+        if (rows[field].empty()) {
+            throw std::runtime_error("a decision field was not scored");
+        }
+    }
+    return rows;
+}
+
+} // namespace
+
+bool is_intern_decision(const llama_vocab * vocab) {
+    if (vocab == nullptr) {
+        return false;
+    }
+    const tokens_t toks = common_tokenize(vocab, "<decision>", /*add_special=*/ false, /*parse_special=*/ true);
+    if (toks.size() != 1) {
+        return false;
+    }
+    return common_token_to_piece(vocab, toks[0], true) == "<decision>";
+}
+
+json decide_intern(llama_context * ctx, const json & body, const std::string & model_name) {
+    if (ctx == nullptr) {
+        throw std::runtime_error("decision context is not loaded");
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const llama_token marker = one_token(vocab, "<decision>");
+    std::vector<llama_token> symbols;
+    symbols.reserve(k_answer_symbol_count);
+    for (int i = 0; i < k_answer_symbol_count; ++i) {
+        symbols.push_back(one_token(vocab, std::string(1, k_answer_symbols[i])));
+    }
+
+    const std::string instructions = body.value("instructions", std::string());
+    const compiled_schema cs = compile_schema(body.at("schema"), instructions);
+    std::vector<std::vector<intern_option>> options;
+    options.reserve(cs.specs.size());
+    for (const auto & sp : cs.specs) {
+        auto opts = intern_options(sp);
+        if (opts.empty() || (int) opts.size() > k_answer_symbol_count) {
+            throw std::invalid_argument("field \"" + sp.name + "\" needs 1-62 options");
+        }
+        options.push_back(std::move(opts));
+    }
+
+    json skeleton = json::object();
+    for (const auto & sp : cs.specs) {
+        skeleton[sp.name] = "<decision>";
+    }
+    const std::string skeleton_text = skeleton.dump(4, ' ', false);
+
+    if (!body.contains("contexts") || !body.at("contexts").is_array() || body.at("contexts").empty()) {
+        throw std::invalid_argument("\"contexts\" must be an array of 1-256 strings");
+    }
+
+    json results = json::array();
+    double prefill_ms = 0;
+    long long prompt_tokens = 0;
+    long long scored_rows = 0;
+    for (const auto & context_value : body.at("contexts")) {
+        if (!context_value.is_string() || context_value.get<std::string>().empty()) {
+            throw std::invalid_argument("every entry of \"contexts\" must be a non-empty string");
+        }
+        const std::string context = context_value.get<std::string>();
+        std::string schema_text;
+        for (size_t f = 0; f < cs.specs.size(); ++f) {
+            if (f != 0) {
+                schema_text += '\n';
+            }
+            schema_text += cs.specs[f].name + ": " + field_instructions(instructions, cs.specs[f]);
+            for (size_t i = 0; i < options[f].size(); ++i) {
+                schema_text += "\n    ";
+                schema_text += k_answer_symbols[i];
+                schema_text += " = ";
+                schema_text += options[f][i].label;
+                schema_text += ": ";
+                schema_text += options[f][i].description;
+            }
+        }
+        const std::string state = json(context).dump(-1, ' ', false);
+        const std::string user = "Return one answer for every field using the supplied answer symbols.\n\n## State\n" +
+                                 state + "\n## Decision schema\n" + schema_text;
+        if (user.find("<decision>") != std::string::npos) {
+            throw std::invalid_argument("Reserved decision marker appears in input evidence");
+        }
+        const std::string prompt = std::string("<|im_start|>system\n") + k_intern_system +
+                                   "<|im_end|>\n<|im_start|>user\n" + user +
+                                   "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" + skeleton_text +
+                                   "<|im_end|>\n";
+        const tokens_t toks = common_tokenize(vocab, prompt, /*add_special=*/ false, /*parse_special=*/ true);
+        if (toks.empty() || (int) toks.size() > (int) llama_n_ctx(ctx)) {
+            throw std::invalid_argument("decision prompt exceeds the context");
+        }
+        std::vector<int> score_at;
+        for (int i = 0; i < (int) toks.size(); ++i) {
+            if (toks[i] == marker) {
+                if (i < 1) {
+                    throw std::runtime_error("decision marker has no preceding token");
+                }
+                score_at.push_back(i - 1);
+            }
+        }
+        if (score_at.size() != cs.specs.size()) {
+            throw std::runtime_error("decision marker count does not match the schema (" + std::to_string(score_at.size()) +
+                                     " markers, " + std::to_string(cs.specs.size()) + " fields, " + std::to_string(toks.size()) +
+                                     " tokens)");
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::vector<std::vector<float>> rows = intern_forward(ctx, toks, score_at, (int) cs.specs.size(), symbols);
+        prefill_ms += ms_since(t0);
+
+        result scored;
+        scored.context_tokens = toks.size();
+        scored.rows           = (int) cs.specs.size();
+        for (size_t f = 0; f < cs.specs.size(); ++f) {
+            const int n = (int) options[f].size();
+            std::vector<double> raw = softmax_prefix(rows[f], n);
+            const int raw_best = best_option(raw, options[f]);
+            std::vector<double> scaled = raw;
+            scale_temperature(scaled);
+            if (best_option(scaled, options[f]) != raw_best) {
+                throw std::runtime_error("temperature scaling changed the decision for \"" + cs.specs[f].name + "\"");
+            }
+            std::vector<float> aligned(cs.specs[f].values.size(), 0.0f);
+            for (int i = 0; i < n; ++i) {
+                aligned[options[f][i].value_index] = (float) scaled[i];
+            }
+            const int winner = options[f][raw_best].value_index;
+            scored.fields.push_back({ winner, aligned[winner], n, false, std::move(aligned) });
+        }
+        json item = assemble(cs, scored);
+        item["usage"] = { { "context_tokens", (long long) scored.context_tokens }, { "scored_rows", scored.rows } };
+        results.push_back(std::move(item));
+        prompt_tokens += (long long) toks.size();
+        scored_rows += scored.rows;
+    }
+
+    json usage = json::object();
+    usage["prompt_tokens"]  = prompt_tokens;
+    usage["cached_tokens"]  = 0;
+    usage["context_tokens"] = prompt_tokens;
+    usage["scored_rows"]    = scored_rows;
+    json timings = json::object();
+    timings["prefill_ms"]      = prefill_ms;
+    timings["scoring_ms"]      = 0.0;
+    timings["total_ms"]        = prefill_ms;
+    timings["rounds"]          = 1;
+    timings["per_decision_ms"] = results.empty() ? 0.0 : prefill_ms / (double) results.size();
+
+    json out = json::object();
+    out["object"]  = "decision";
+    out["results"] = std::move(results);
+    out["model"]   = model_name;
+    out["created"] = (long long) std::time(nullptr);
+    out["usage"]   = std::move(usage);
+    out["timings"] = std::move(timings);
     return out;
 }
 

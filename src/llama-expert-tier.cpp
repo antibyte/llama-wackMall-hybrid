@@ -77,7 +77,7 @@ struct layer_tier {
     store * sd = nullptr; // store holding the down weight (counts source)
     std::vector<std::pair<const ggml_tensor *, store *>> ws;
     std::vector<int32_t> slot_expert; // [n_slots], -1 = empty
-    std::vector<int32_t> lut_host;    // [n_expert]
+    std::vector<int32_t> lut_host;    // [n_expert], last published map
     std::vector<float>   score;       // [n_expert], cumulative (LLAMA_EXPERT_DECAY)
     std::vector<uint64_t> cum;        // [n_expert], seed + observations (legacy persistence)
     std::vector<uint64_t> observed;   // [n_expert], observations from this process only
@@ -87,6 +87,7 @@ struct layer_tier {
     std::vector<float> warm_frequency;
     std::vector<int32_t> warm_pending;
     bool warm_enabled = false;
+    bool warm_maps_dirty = false;
     uint64_t cum_fixed = 0, cum_warm = 0, cum_cold = 0, cum_total = 0, cum_graphs = 0;
     uint64_t warm_promotions = 0, warm_evictions = 0;
     uint64_t warm_to_fixed = 0;
@@ -303,7 +304,9 @@ static void warm_invariant_abort(const layer_tier & L, const char * where) {
     }
     if (error.empty()) {
         const auto & lut = L.warm_cache.lut();
-        if (L.sd && L.sd->mask && L.sd->mask->data) {
+        if (L.lut_host != lut) {
+            error = "published lut/cache mismatch";
+        } else if (L.sd && L.sd->mask && L.sd->mask->data) {
             const int32_t * mask = (const int32_t *) L.sd->mask->data;
             for (int expert = 0; expert < L.n_expert; ++expert) {
                 const int want = lut[expert] == L.warm_cache.sentinel() ? 1 : 0;
@@ -332,6 +335,8 @@ static void upload_warm_maps(layer_tier & L) {
         }
         ggml_backend_tensor_set(st.lut, lut.data(), 0, L.n_expert*sizeof(int32_t));
     }
+    L.lut_host = lut;
+    L.warm_maps_dirty = false;
 }
 
 static void async_worker_main() {
@@ -480,7 +485,6 @@ static void poll_async_completions() {
         }
     }
 
-    std::vector<bool> changed(g_layers.size(), false);
     for (const auto & done : completed) {
         if (done.layer < 0 || done.layer >= (int) g_layers.size()) {
             TIER_LOG("expert_tier: FATAL async completion has invalid layer=%d\n", done.layer);
@@ -505,16 +509,8 @@ static void poll_async_completions() {
             L.warm_admission.mark_resident(done.expert);
         }
         L.warm_pending[warm_index] = -1;
-        L.lut_host = L.warm_cache.lut();
-        changed[done.layer] = true;
+        L.warm_maps_dirty = true;
         g_h2d_copy_us += std::max<int64_t>(0, done.completed_us - done.started_us);
-    }
-
-    for (size_t layer = 0; layer < changed.size(); ++layer) {
-        if (changed[layer]) {
-            upload_warm_maps(g_layers[layer]);
-            warm_invariant_abort(g_layers[layer], "async_publish");
-        }
     }
 }
 
@@ -776,14 +772,14 @@ static bool maybe_repin_warm_fixed(layer_tier & L, llama_expert_cache::state & n
     return true;
 }
 
-static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
+static bool maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
     if (!L.sd || !L.sd->counts->data) {
-        return;
+        return false;
     }
     int32_t * cnt = (int32_t *) L.sd->counts->data;
     const int n = L.n_expert;
     if (cnt[n] == 0) {
-        return;
+        return false;
     }
 
     int32_t peak = 0;
@@ -817,15 +813,21 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
         L.cum[expert] += (uint64_t) selected;
         L.observed[expert] += (uint64_t) selected;
         if (selected > 0) {
+            const int slot = L.lut_host[expert];
+            if (slot == L.sentinel) {
+                L.cum_cold += (uint64_t) selected;
+            } else if (slot < L.n_fixed) {
+                L.cum_fixed += (uint64_t) selected;
+            } else {
+                L.cum_warm += (uint64_t) selected;
+            }
             switch (L.warm_cache.locate(expert)) {
                 case llama_expert_cache::location::fixed:
-                    L.cum_fixed += (uint64_t) selected;
                     if (use_probation && admit_graph) {
                         L.warm_admission.mark_resident(expert);
                     }
                     break;
                 case llama_expert_cache::location::warm:
-                    L.cum_warm += (uint64_t) selected;
                     if (admit_graph) {
                         L.warm_cache.touch_warm(expert);
                     }
@@ -834,7 +836,6 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
                     }
                     break;
                 case llama_expert_cache::location::cold:
-                    L.cum_cold += (uint64_t) selected;
                     if (!admit_graph) {
                         break;
                     }
@@ -869,11 +870,9 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
     if (g_warm_mtp_guarded) {
         if (maps_changed) {
             L.warm_cache = std::move(next);
-            L.lut_host = L.warm_cache.lut();
-            upload_warm_maps(L);
+            L.warm_maps_dirty = true;
         }
-        warm_invariant_abort(L, "mtp_guarded_update");
-        return;
+        return true;
     }
 
     std::sort(cold_selected.begin(), cold_selected.end(), [](const auto & a, const auto & b) {
@@ -949,10 +948,9 @@ static void maybe_update_warm(layer_tier & L, bool allow_fixed_repin) {
 
     if (maps_changed) {
         L.warm_cache = std::move(next);
-        L.lut_host = L.warm_cache.lut();
-        upload_warm_maps(L);
+        L.warm_maps_dirty = true;
     }
-    warm_invariant_abort(L, "update");
+    return true;
 }
 
 static void fixed_invariant_abort(const layer_tier & L, const char * where) {
@@ -1402,12 +1400,6 @@ void update() {
     if (g_static_no_sync_active) {
         return;
     }
-    if (g_prefetch_ready) {
-        // update() is called only after the just-submitted graph has completed.
-        // Publishing a finished slot here keeps one LUT stable for the entire
-        // graph, including a multi-token MTP verification graph.
-        poll_async_completions();
-    }
     if (g_layers.empty()) {
         return;
     }
@@ -1418,13 +1410,23 @@ void update() {
         discard_pre_request_counts();
         return;
     }
+    if (g_prefetch_ready) {
+        // Keep the completed graph's LUT until its counts have been classified.
+        poll_async_completions();
+    }
 
     const size_t begin = g_prefetch_ready ? g_async_layer_cursor % g_layers.size() : 0;
     const bool publish_fixed = g_adapt && g_adapt_interval == adapt_interval::graph;
     for (size_t offset = 0; offset < g_layers.size(); ++offset) {
         auto & L = g_layers[(begin + offset) % g_layers.size()];
         if (L.warm_enabled) {
-            maybe_update_warm(L, publish_fixed);
+            const bool updated = maybe_update_warm(L, publish_fixed);
+            if (updated || L.warm_maps_dirty) {
+                if (L.warm_maps_dirty) {
+                    upload_warm_maps(L);
+                }
+                warm_invariant_abort(L, "update");
+            }
         } else {
             harvest_fixed_counts(L);
             if (publish_fixed) {

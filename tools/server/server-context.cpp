@@ -425,6 +425,14 @@ struct server_slot {
     int64_t t_verify_us = 0;
     int32_t n_verify_calls = 0;
 
+    int32_t spec_adaptive_max = 0;
+    int32_t spec_adaptive_cap = 0;
+    int32_t spec_adaptive_best = 0;
+    int32_t spec_adaptive_stage = 0;
+    int32_t spec_adaptive_start_n = 0;
+    int64_t spec_adaptive_start_us = 0;
+    double spec_adaptive_high_us = 0.0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -459,6 +467,11 @@ struct server_slot {
         n_accepted_per_pos.clear();
         t_verify_us = 0;
         n_verify_calls = 0;
+        spec_adaptive_cap = spec_adaptive_best = spec_adaptive_max;
+        spec_adaptive_stage = 0;
+        spec_adaptive_start_n = 0;
+        spec_adaptive_start_us = 0;
+        spec_adaptive_high_us = 0.0;
 
         task_prev = std::move(task);
         task.reset();
@@ -585,6 +598,46 @@ struct server_slot {
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
+    }
+
+    void update_dflash_adaptive() {
+        const int64_t now = ggml_time_us();
+        if (spec_adaptive_start_us == 0) {
+            spec_adaptive_cap = spec_adaptive_max;
+            spec_adaptive_stage = 0;
+            spec_adaptive_start_us = now;
+            spec_adaptive_start_n = n_decoded;
+            return;
+        }
+
+        // Sample at the next draft boundary, including rollback and empty-draft steps.
+        const int32_t n_tokens = n_decoded - spec_adaptive_start_n;
+        const int32_t window = spec_adaptive_stage == 2 ? 256 : 32;
+        if (n_tokens < window) {
+            return;
+        }
+
+        const double us_per_token = double(now - spec_adaptive_start_us) / n_tokens;
+        if (spec_adaptive_stage == 0) {
+            spec_adaptive_high_us = us_per_token;
+            spec_adaptive_cap = 2;
+            spec_adaptive_stage = 1;
+        } else if (spec_adaptive_stage == 1) {
+            if (spec_adaptive_best == spec_adaptive_max && us_per_token < 0.95 * spec_adaptive_high_us) {
+                spec_adaptive_best = 2;
+            } else if (spec_adaptive_best == 2 && spec_adaptive_high_us < 0.95 * us_per_token) {
+                spec_adaptive_best = spec_adaptive_max;
+            }
+            spec_adaptive_cap = spec_adaptive_best;
+            spec_adaptive_stage = 2;
+            SLT_INF(*this, "adaptive DFlash: cap %d = %.2f ms/tok, cap 2 = %.2f ms/tok, selected %d\n",
+                    spec_adaptive_max, spec_adaptive_high_us / 1000.0, us_per_token / 1000.0, spec_adaptive_cap);
+        } else {
+            spec_adaptive_cap = spec_adaptive_max;
+            spec_adaptive_stage = 0;
+        }
+        spec_adaptive_start_us = now;
+        spec_adaptive_start_n = n_decoded;
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
@@ -1252,10 +1305,14 @@ private:
 
         int32_t batch = prefill ? cmoe_prefill_batch : cmoe_decode_batch;
         int32_t ubatch = prefill ? cmoe_prefill_ubatch : cmoe_decode_ubatch;
-        const bool spec_dflash = std::any_of(params_base.speculative.types.begin(),
-                                           params_base.speculative.types.end(),
-                                           common_speculative_type_is_dflash_family);
-        const uint32_t draft_ubatch = ctx_dft && spec_dflash ?
+        const bool cap_draft_ubatch = ctx_dft && (
+                std::any_of(params_base.speculative.types.begin(),
+                        params_base.speculative.types.end(),
+                        common_speculative_type_is_dflash_family) ||
+                std::find(params_base.speculative.types.begin(),
+                        params_base.speculative.types.end(),
+                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end());
+        const uint32_t draft_ubatch = cap_draft_ubatch ?
                 std::min<uint32_t>(ubatch, llama_n_ubatch(ctx_dft)) : (uint32_t) ubatch;
         if (!llama_set_runtime_ubatch(ctx_tgt, (uint32_t) ubatch) ||
                 (ctx_dft && !llama_set_runtime_ubatch(ctx_dft, draft_ubatch))) {
@@ -1265,7 +1322,7 @@ private:
                 prefill = false;
                 batch = cmoe_decode_batch;
                 ubatch = cmoe_decode_ubatch;
-                const uint32_t draft_decode = ctx_dft && spec_dflash ?
+                const uint32_t draft_decode = cap_draft_ubatch ?
                         std::min<uint32_t>(ubatch, llama_n_ubatch(ctx_dft)) : (uint32_t) ubatch;
                 if (!llama_set_runtime_ubatch(ctx_tgt, (uint32_t) ubatch) ||
                         (ctx_dft && !llama_set_runtime_ubatch(ctx_dft, draft_decode))) {
@@ -1871,6 +1928,40 @@ private:
             model_dft = nullptr;
         }
 
+        const char * adaptive = std::getenv("LLAMA_DFLASH_ADAPTIVE");
+        const char * ddtree = std::getenv("LLAMA_DFLASH_DDTREE");
+        const bool adaptive_requested = adaptive != nullptr && std::strcmp(adaptive, "1") == 0;
+        const auto & adaptive_types = params_base.speculative.types;
+        const bool adaptive_dflash_only =
+                std::find(adaptive_types.begin(), adaptive_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != adaptive_types.end() &&
+                std::all_of(adaptive_types.begin(), adaptive_types.end(), [](common_speculative_type type) {
+                    return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+                });
+        int32_t adaptive_max = 0;
+        if (adaptive_requested && spec && ctx_dft && params_base.n_parallel == 1 && adaptive_dflash_only &&
+                params_base.speculative.draft.n_max > 2 && params_base.speculative.draft.n_min <= 2 &&
+                !llama_dflash_tree_verify_enabled() && (ddtree == nullptr || ddtree[0] == '\0' || ddtree[0] == '0')) {
+            int32_t block_size = 16;
+            char block_size_text[32] = {};
+            if (llama_model_meta_val_str(llama_get_model(ctx_dft), "dflash.block_size",
+                    block_size_text, sizeof(block_size_text)) >= 0) {
+                block_size = std::atoi(block_size_text);
+            }
+            // Classic DFlash reserves one position for the last accepted token.
+            const uint32_t draft_batch = std::min<uint32_t>({5, llama_n_batch(ctx_dft), llama_n_ubatch(ctx_dft)});
+            if (block_size > 1 && draft_batch > 1) {
+                adaptive_max = std::min({4, params_base.speculative.draft.n_max, block_size - 1, (int32_t) draft_batch - 1});
+            }
+        }
+        const bool adaptive_enabled = adaptive_max > 2;
+        if (adaptive_requested && !adaptive_enabled) {
+            SRV_WRN("%s", "adaptive DFlash disabled: requires one slot, classic draft-dflash only, effective n_max > 2 and n_min <= 2\n");
+        }
+        if (adaptive_enabled) {
+            SRV_INF("adaptive DFlash enabled: caps 2/%d, probe 32 tokens, hold 256 tokens, hysteresis 5%%\n",
+                    adaptive_max);
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1879,6 +1970,7 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
+            slot.spec_adaptive_max = adaptive_enabled ? adaptive_max : 0;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -3083,6 +3175,11 @@ private:
         if (!body.contains("schema")) {
             throw std::invalid_argument("\"schema\" must be provided");
         }
+        // Intern-Decision is not scored as JSON token paths. Its checkpoint reads the
+        // distribution at each <decision> marker in one forward.
+        if (llama_decision::is_intern_decision(llama_model_get_vocab(llama_get_model(ctx_decision)))) {
+            return llama_decision::decide_intern(ctx_decision, body, model_name);
+        }
         if (!decision_engine) {
             decision_engine = std::make_unique<llama_decision::engine>(ctx_decision, /*seq_base=*/ 0,
                                                                         params_base.n_seq_decision);
@@ -3726,6 +3823,7 @@ private:
                 }
 
                 slot.truncated = true;
+                slot.spec_adaptive_start_us = 0;
             }
         });
 
@@ -3759,7 +3857,15 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+                if (slot.spec_adaptive_max > 0 && slot.spec_draft.empty()) {
+                    if (n_draft_max >= slot.spec_adaptive_max) {
+                        slot.update_dflash_adaptive();
+                    } else {
+                        slot.spec_adaptive_start_us = 0;
+                    }
+                    n_draft_max = std::min(n_draft_max, slot.spec_adaptive_cap);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -5409,8 +5515,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     return;
                 }
                 const llama_tokens toks = common_tokenize(ctx_server.vocab, text, false, true);
+                // get_tokens() asserts when mtmd placeholders are present; scan text tokens only.
+                const llama_tokens mtmd_text = task.tokens.has_mtmd ? task.tokens.get_text_tokens() : llama_tokens{};
+                const llama_tokens & prompt_tokens = task.tokens.has_mtmd ? mtmd_text : task.tokens.get_tokens();
                 task.params.message_spans.add_token_pattern_anchors(
-                        task.tokens.get_tokens(), toks, COMMON_CHAT_ANCHOR_TOOL);
+                        prompt_tokens, toks, COMMON_CHAT_ANCHOR_TOOL);
             };
             if (data.contains("preserved_tokens") && data.at("preserved_tokens").is_array()) {
                 for (const auto & tag : data.at("preserved_tokens")) {

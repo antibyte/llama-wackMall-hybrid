@@ -5692,6 +5692,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I64:
             // nothing to validate
             break;
+        case GGML_TYPE_EXL3_1:
+        case GGML_TYPE_EXL3_2:
+        case GGML_TYPE_EXL3_3:
+        case GGML_TYPE_EXL3_4:
+        case GGML_TYPE_EXL3_5:
+        case GGML_TYPE_EXL3_6:
+        case GGML_TYPE_EXL3_7:
+        case GGML_TYPE_EXL3_8:
+            // 16x16 tiles are not independent rows; the matmul kernel checks the geometry.
+            break;
         default:
             {
                 fprintf(stderr, "%s: invalid type %d\n", __func__, type);

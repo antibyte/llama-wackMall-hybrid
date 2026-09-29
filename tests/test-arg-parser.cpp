@@ -112,6 +112,25 @@ static void test(void) {
         assert(draft.n_sampling_outputs_per_seq_max == 3);
     }
 
+    {
+        common_params base;
+        base.n_batch = 2048;
+        base.n_ubatch = 2048;
+        base.n_parallel = 1;
+        base.cmoe_n_batch_prefill = 2048;
+        base.cmoe_n_ubatch_prefill = 2048;
+        base.cmoe_n_batch_decode = 64;
+        base.cmoe_n_ubatch_decode = 64;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        base.speculative.draft.n_max = 2;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_batch == 64);
+        assert(draft.n_ubatch == 64);
+        assert(draft.n_outputs_max == 1);
+        assert(draft.n_sampling_outputs_per_seq_max == 1);
+    }
+
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
         try {
