@@ -26,6 +26,16 @@ static int ggml_cuda_turbo4_f16_prefill_min_batch() {
 }
 #endif
 
+// Without tensor cores the vec kernel reads quantized K/V once per Q head. From this
+// many KV cells on, GQA decode converts K/V to F16 for the tile kernel instead. 0 = off.
+static int ggml_cuda_fa_quant_tile_min_kv() {
+    static const int value = []() {
+        const char * env = std::getenv("GGML_CUDA_FA_QUANT_TILE_MIN_KV");
+        return env == nullptr ? 0 : std::max(0, std::atoi(env));
+    }();
+    return value;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -502,7 +512,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // If Turing tensor cores are available, use them:
-    if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+    if (turing_mma_available(cc) && !ggml_cuda_info().devices[device].slow_mma && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
@@ -569,7 +579,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            const int min_kv = ggml_cuda_fa_quant_tile_min_kv();
+            const bool gqa_tile = gqa_opt_applies && min_kv > 0 && K->ne[1] >= min_kv;
+            if (Q->ne[1] <= 2 && !gqa_tile) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }

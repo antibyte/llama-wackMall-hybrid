@@ -1146,6 +1146,7 @@ struct ggml_cuda_device_info {
         int     physical_device;                // backing physical CUDA device for this (virtual) device
         int     physical_share_count;           // number of (virtual) devices sharing this device's physical GPU
         int     virtual_index;                  // index of this (virtual) device among those sharing its physical GPU
+        bool    slow_mma;                       // Turing without tensor cores (GTX 16xx, MX450/550): MMA runs far below FP32 SIMT
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};

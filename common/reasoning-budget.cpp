@@ -176,11 +176,27 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
     }
 }
 
+static bool common_reasoning_budget_think_open(common_reasoning_budget_state state) {
+    return state == REASONING_BUDGET_COUNTING || state == REASONING_BUDGET_WAITING_UTF8;
+}
+
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
+    // Keep the thought open until the end tag. EOS here cuts the reply
+    // mid-sentence and never reaches the tool call after </think>.
+    if (common_reasoning_budget_think_open(ctx->state)) {
+        if (ctx->vocab != nullptr) {
+            for (size_t i = 0; i < cur_p->size; i++) {
+                if (llama_vocab_is_eog(ctx->vocab, cur_p->data[i].id)) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+            }
+        }
+        return;
+    }
+
     if (ctx->state != REASONING_BUDGET_FORCING) {
-        // passthrough — don't modify logits
         return;
     }
 
@@ -287,6 +303,17 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
         return REASONING_BUDGET_IDLE;
     }
     return ((const common_reasoning_budget_ctx *)smpl->ctx)->state;
+}
+
+bool common_reasoning_budget_blocks_eog(const struct llama_sampler * smpl, llama_token token) {
+    if (!smpl || token == LLAMA_TOKEN_NULL) {
+        return false;
+    }
+    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+    if (ctx->vocab == nullptr || !common_reasoning_budget_think_open(ctx->state)) {
+        return false;
+    }
+    return llama_vocab_is_eog(ctx->vocab, token);
 }
 
 llama_token common_reasoning_budget_get_forced_token(const struct llama_sampler * smpl) {

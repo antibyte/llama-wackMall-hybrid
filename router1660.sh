@@ -40,6 +40,13 @@ BW_PROFILE="$PROJECT_ROOT/profiles/gtx1660-expert-bw.json"
 
 HOST="0.0.0.0"
 PORT="8080"
+
+# Power profile for the model children: Performance before model work, Battery
+# once no llama-server of this user has worked for POWER_IDLE_DELAY ms (Battery
+# dims the panel to 10%). Empty commands disable switching.
+POWER_BUSY_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance"
+POWER_IDLE_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery"
+POWER_IDLE_DELAY="2000"
 CORS_ORIGINS="*"
 API_KEY=""
 API_KEY_FILE=""
@@ -528,5 +535,9 @@ server_args=(
 
 exec env "${unset_args[@]}" \
     "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES_VALUE" \
+    "LLAMA_ARG_POWER_BUSY_CMD=$POWER_BUSY_CMD" \
+    "LLAMA_ARG_POWER_IDLE_CMD=$POWER_IDLE_CMD" \
+    "LLAMA_ARG_POWER_IDLE_DELAY=$POWER_IDLE_DELAY" \
+    "LLAMA_ARG_DECISION_SEQS=0" \
     "LLAMA_CACHE=$RUNTIME/empty-cache" \
     "$SERVER" "${server_args[@]}"

@@ -1,10 +1,10 @@
-{# Hy-MT2-30B-A3B. GGUF metadata marks EOS as the unused hash token
-   <eos:6124c78e> (id 120025). Real stop is <｜hy_end▁of▁sentence｜> (id 120001).
+{# Hy-MT2-30B-A3B. Turns end with <eos:6124c78e> (id 120025, GGUF EOS),
+   as in the original template; the model emits it after a translation.
    No default system prompt. reasoning_effort stays off. #}
 {%- set bos_token = '<｜hy_begin▁of▁sentence｜>' -%}
 {%- set user_token = '<｜hy_User｜>' -%}
 {%- set assistant_token = '<｜hy_Assistant｜>' -%}
-{%- set eos_token = '<｜hy_end▁of▁sentence｜>' -%}
+{%- set eos_token = '<eos:6124c78e>' -%}
 {%- set think_begin_token = '<think>' -%}
 {%- set think_end_token = '</think>' -%}
 {%- if not add_generation_prompt is defined -%}

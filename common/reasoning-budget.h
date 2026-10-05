@@ -20,7 +20,9 @@ enum common_reasoning_budget_state {
 //
 // State machine: IDLE -> COUNTING -> WAITING_UTF8 -> FORCING -> DONE
 //   IDLE:         passthrough, watching for a start sequence
-//   COUNTING:     counting down remaining tokens, watching for a natural end sequence
+//   COUNTING:     counting down remaining tokens, watching for a natural end sequence.
+//                 End-of-generation tokens are masked so the turn cannot stop
+//                 inside the open block.
 //   WAITING_UTF8: budget exhausted, allowing tokens to complete a UTF-8 sequence
 //   FORCING:      forces forced_tokens token-by-token (all other logits -> -inf)
 //   DONE:         passthrough; a new start tag re-arms COUNTING, unless the budget
@@ -46,6 +48,9 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
 
 // Returns the token currently forced by the budget, or LLAMA_TOKEN_NULL while the sampler is in passthrough mode.
 llama_token common_reasoning_budget_get_forced_token(const struct llama_sampler * smpl);
+
+// True while a reasoning block is open and token would end generation.
+bool common_reasoning_budget_blocks_eog(const struct llama_sampler * smpl, llama_token token);
 
 // The end sequence that transitioned the sampler to DONE, or nullptr if none
 // was recorded. Cleared when a new start sequence re-arms the sampler.

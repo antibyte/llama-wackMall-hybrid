@@ -15,6 +15,8 @@
 # does not allocate a second copy. S does not shrink that tensor.
 # Snapshot: START1660_REFERENCE.md. GTX 1080: start1080.sh.
 # 2026-09-29: DP4A MMQ build, adaptive DFlash 2/4; see docs/performance-review-20260929.md.
+# 2026-10-02: q4_0/q4_0 target KV (+5.2%, better PPL/KLD than Turbo4), down prefetch 0,
+# power profile switching; see docs/performance-review-20261002.md.
 #
 set -Eeuo pipefail
 
@@ -49,6 +51,14 @@ PLACEMENT=""  # leave empty for uniform S; variable placement not promoted for p
 # Network / OpenWebUI
 HOST="0.0.0.0"  # listen address; 0.0.0.0 exposes the API on all interfaces
 PORT="8080"  # TCP port used by OpenWebUI and API clients
+
+# Power profile: Performance before model work, Battery once no llama-server of
+# this user has worked for POWER_IDLE_DELAY ms. Battery also dims the panel to
+# 10%; use ...PowerDaemon Balanced as idle command to avoid that. Empty
+# commands disable switching. Servers coordinate via /tmp/llama-power-$UID.
+POWER_BUSY_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance"
+POWER_IDLE_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery"
+POWER_IDLE_DELAY="2000"  # milliseconds without model work before POWER_IDLE_CMD runs
 CORS_ORIGINS="*"  # allowed browser origins; restrict this for a non-local deployment
 API_KEY=""  # inline API key; leave empty only on a trusted network
 API_KEY_FILE=""  # optional file containing one or more API keys, one per line
@@ -67,8 +77,8 @@ N_PREDICT="32768"  # CLI/server generation limit; API requests may impose a lowe
 #   turbo4_k/turbo4_k = aktuell aktiv; experimenteller DFlash-Kapazitaetspfad
 #   q8_0/q8_0       = Qualitaetskandidat mit hoeherem VRAM-Bedarf und etwas weniger TPS
 # Nur die beiden folgenden Zeilen aendern; die passenden Turbo4-Guards duerfen auf 1 bleiben.
-TARGET_TYPE_K="turbo4_k"  # experimental DFlash target K cache
-TARGET_TYPE_V="turbo4_k"  # experimental DFlash target V cache; requires Flash Attention
+TARGET_TYPE_K="q4_0"  # 2026-10-02 6x3x1024: q4_0/q4_0 44.98 vs turbo4 42.76 t/s (+5.2%), same S/W fit
+TARGET_TYPE_V="q4_0"  # q4/q4 PPL +0.96% KLD 0.015 vs turbo4/turbo4 +1.58% KLD 0.028 (TURBOQUANT_EXPERIMENTS)
 DRAFT_TYPE_K="turbo4_k"  # speculative draft K cache for MTP or DFlash
 DRAFT_TYPE_V="turbo4_k"  # speculative draft V cache for MTP or DFlash; requires Flash Attention
 LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy used by the measured DFlash winner
@@ -123,8 +133,8 @@ CMOE_UBATCH="64"  # physical base ubatch; keep equal to CMOE_BATCH
 # Phase batching: large prefill for PP; small decode so graph peak can shrink
 # after set_runtime_ubatch (P0 gallocr shrink, 2026-08-16).
 # DFlash draft context is sized to decode geometry, not prefill.
-CMOE_PREFILL_BATCH="1856"  # Long 1823 fits one chunk; +3% PP / +8% decode vs 1792
-CMOE_PREFILL_UBATCH="1856"  # physical target prompt ubatch
+CMOE_PREFILL_BATCH="3072"  # 2.4k agollm prompt in one expert pass: 6.0 vs 8.6 s; 4096 fails to reserve
+CMOE_PREFILL_UBATCH="3072"  # physical target prompt ubatch
 CMOE_DECODE_BATCH="64"  # logical batch during generation / DFlash verify
 CMOE_DECODE_UBATCH="64"  # physical decode ubatch; phase switch frees prefill peak
 
@@ -154,7 +164,7 @@ LLAMA_EXPERT_TIMING="0"  # collect detailed CPU expert timing; adds measurement 
 LLAMA_EXPERT_CPU_CHUNK="64"  # cold-row chunk size; power of two from 16 through 256
 LLAMA_EXPERT_CPU_ACT_PARALLEL="0"  # experimental path did not establish a sustained winner
 LLAMA_EXPERT_CPU_ASYNC="0"  # bridge/async path regressed on this GPU; keep synchronous fallback
-LLAMA_EXPERT_CPU_DOWN_PREFETCH="1"  # no measured sustained gain on the local CPU
+LLAMA_EXPERT_CPU_DOWN_PREFETCH="0"  # 2026-10-02: 0 is +0.5..1.2% on identical token streams
 LLAMA_EXPERT_CPU_REUSE_ROWS="1"  # conservative winner; row reuse is not part of the 49.134-TPS promoted Q4 path
 LLAMA_EXPERT_CPU_MULTI_ROW="1"  # AVX2 multi-row reduced CPU time but was neutral in 2K decode
 LLAMA_EXPERT_CPU_FUSED_GATE_UP="1"  # exact AVX2 dual-dot; +0.21% median was below promotion threshold on Ryzen 4800H
@@ -699,5 +709,9 @@ fi
 if [[ "$LLAMA_EXPERT_WARM_SLOTS" == 0 || "$LLAMA_EXPERT_WARM_PREFETCH" != 1 ]]; then
     unset_args+=(-u LLAMA_EXPERT_PREFETCH_STREAMS -u LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT)
 fi
+
+[[ -n "$POWER_BUSY_CMD" ]] && env_args+=("LLAMA_ARG_POWER_BUSY_CMD=$POWER_BUSY_CMD")
+[[ -n "$POWER_IDLE_CMD" ]] && env_args+=("LLAMA_ARG_POWER_IDLE_CMD=$POWER_IDLE_CMD")
+env_args+=("LLAMA_ARG_POWER_IDLE_DELAY=$POWER_IDLE_DELAY")
 
 exec env "${unset_args[@]}" "${env_args[@]}" "$SERVER" "${server_args[@]}"

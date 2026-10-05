@@ -219,7 +219,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
-        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         uint32_t(2)); // sigmoid
+        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_KOLIBRI1 ? uint32_t(5) : uint32_t(2)); // sigmoid_logit_add : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
     }
@@ -372,6 +372,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_LAGUNA:
+        case LLM_ARCH_KOLIBRI1:
             return true;
         default:
             return false;

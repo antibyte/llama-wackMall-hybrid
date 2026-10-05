@@ -1996,7 +1996,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * selected_experts_in,
          ggml_tensor ** selected_experts_out,
          ggml_tensor ** weights_out,
-                bool   snapshot_selected_experts) const {
+                bool   snapshot_selected_experts,
+         ggml_tensor * page_prefetch) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2020,7 +2021,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         selected_experts_in,
         selected_experts_out,
         weights_out,
-        snapshot_selected_experts
+        snapshot_selected_experts,
+        page_prefetch
     );
 }
 
@@ -2051,7 +2053,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * selected_experts_in,
          ggml_tensor ** selected_experts_out,
          ggml_tensor ** weights_out,
-                bool   snapshot_selected_experts) const {
+                bool   snapshot_selected_experts,
+         ggml_tensor * page_prefetch) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2060,7 +2063,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS ||
+            gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID_LOGIT_ADD) {
             ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
@@ -2080,6 +2084,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
             } break;
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID_LOGIT_ADD:
             {
                 probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
             } break;
@@ -2099,7 +2104,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // add experts selection bias - introduced in DeepSeek V3
     // leave probs unbiased as it's later used to get expert weights
     ggml_tensor * selection_probs = probs;
-    if (exp_probs_b != nullptr) {
+    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID_LOGIT_ADD) {
+        // select on biased raw logits; expert weights stay the unbiased sigmoid
+        if (exp_probs_b == nullptr) {
+            GGML_ABORT("SIGMOID_LOGIT_ADD requires exp_probs_b");
+        }
+        selection_probs = ggml_add(ctx0, logits, exp_probs_b);
+        cb(selection_probs, "ffn_moe_logits_biased", il);
+    } else if (exp_probs_b != nullptr) {
         selection_probs = ggml_add(ctx0, probs, exp_probs_b);
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
@@ -2242,6 +2254,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (moe_cold && llama_expert_tier::cpu_async_enabled()) {
         cold = llama_expert_tier::end_moe_cold(ctx0, gw, uw, down_exps, x_in, selected_experts);
         if (cold) {
+            if (page_prefetch) {
+                ggml_build_forward_expand(gf, page_prefetch);
+            }
             ggml_build_forward_expand(gf, cold);
         }
     }
@@ -2381,6 +2396,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (moe_cold) {
         if (!cold) {
             cold = llama_expert_tier::end_moe_cold(ctx0, gw, uw, down_exps, x_in, selected_experts);
+            if (cold && page_prefetch) {
+                // hot branch, then the read-ahead: the cold op follows directly,
+                // so both CPU ops land in one split
+                ggml_build_forward_expand(gf, experts);
+                ggml_build_forward_expand(gf, page_prefetch);
+            }
         }
         if (cold) {
             if (down_exps_s) {

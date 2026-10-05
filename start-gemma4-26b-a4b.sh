@@ -27,6 +27,11 @@ die() {
 # The S=21 path peaks near 5.22 GiB on a 5.61-GiB usable GPU. The runtime
 # clamps S when less VRAM is free, while 256 MiB remains reserved for graphs.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Performance before model work, Battery (dims the panel) after 2 s without work.
+export LLAMA_ARG_POWER_BUSY_CMD="${LLAMA_ARG_POWER_BUSY_CMD-busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance}"
+export LLAMA_ARG_POWER_IDLE_CMD="${LLAMA_ARG_POWER_IDLE_CMD-busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery}"
+export LLAMA_ARG_POWER_IDLE_DELAY="${LLAMA_ARG_POWER_IDLE_DELAY:-2000}"
+export LLAMA_ARG_DECISION_SEQS="${LLAMA_ARG_DECISION_SEQS:-0}"  # unused decision side context costs VRAM
 export LLAMA_EXPERT_HOT="$PROFILE"
 export LLAMA_EXPERT_S="21"
 export LLAMA_EXPERT_VRAM_RESERVE_MIB="256"

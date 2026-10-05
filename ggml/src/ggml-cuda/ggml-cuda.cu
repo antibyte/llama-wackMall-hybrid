@@ -1534,6 +1534,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
         } else if (device_name.substr(0, 21) == "NVIDIA GeForce GTX 16") {
             turing_devices_without_mma.push_back({ id, device_name });
         }
+        info.devices[id].slow_mma = !turing_devices_without_mma.empty() && turing_devices_without_mma.back().first == id;
+        if (const char * env = getenv("GGML_CUDA_SLOW_MMA")) {
+            info.devices[id].slow_mma = atoi(env) != 0;
+        }
 
         // Temporary performance fix:
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
@@ -2855,6 +2859,10 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = GGML_TYPE_F32;
     }
     if (dst->op_params[0] == GGML_PREC_F32) {
+        compute_type = GGML_TYPE_F32;
+    }
+    // cuBLAS picks HMMA kernels for FP16 GEMMs, which are ~5x slower than SGEMM without tensor cores
+    if (compute_type == GGML_TYPE_F16 && ggml_cuda_info().devices[ctx.device].slow_mma) {
         compute_type = GGML_TYPE_F32;
     }
 

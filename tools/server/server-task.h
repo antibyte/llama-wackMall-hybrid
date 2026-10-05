@@ -52,6 +52,7 @@ struct task_params {
     bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+    bool cache_continue  = true; // on an early prefix mismatch, keep the cached turns and append the last user turn
     bool return_tokens   = false;
     bool return_progress = false;
 

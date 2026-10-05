@@ -393,6 +393,29 @@ static void test_reasoning_budget_prime() {
     fprintf(stderr, "  Test 'prime from prompt tokens' passed\n");
 }
 
+static void test_reasoning_budget_blocks_eog_without_vocab() {
+    const std::vector<llama_token> start = {100};
+    const std::vector<llama_token> end = {101};
+    const std::vector<llama_token> forced = {102, 101};
+    auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 5, REASONING_BUDGET_IDLE);
+    GGML_ASSERT(!common_reasoning_budget_blocks_eog(nullptr, 1));
+    GGML_ASSERT(!common_reasoning_budget_blocks_eog(sampler, 2));
+    llama_sampler_accept(sampler, 100);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+    GGML_ASSERT(!common_reasoning_budget_blocks_eog(sampler, 2));
+
+    std::vector<llama_token_data> cur;
+    for (int i = 0; i < 4; i++) {
+        cur.emplace_back(llama_token_data{(llama_token) i, 1.0f, 0.0f});
+    }
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(sampler, &cur_p);
+    for (size_t i = 0; i < cur.size(); i++) {
+        GGML_ASSERT(std::isfinite(cur[i].logit));
+    }
+    llama_sampler_free(sampler);
+}
+
 static void test_reasoning_budget_exhausted_rearm() {
     const std::vector<llama_token> start  = {100};
     const std::vector<llama_token> end    = {101};
@@ -580,6 +603,7 @@ int main(void) {
     test_reasoning_budget_end_match();
     test_reasoning_budget_prime();
     test_reasoning_budget_exhausted_rearm();
+    test_reasoning_budget_blocks_eog_without_vocab();
 
     printf("OK (14 tests passed)\n");
 

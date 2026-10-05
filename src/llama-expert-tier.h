@@ -65,6 +65,9 @@ struct llama_model;
 //   LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL - 1 bypasses the default MTP warm guard
 //   LLAMA_EXPERT_STATIC_NO_SYNC - 1 skips the tier-update barrier only when
 //                                 adaptation, warm slots, and stats are disabled
+//   LLAMA_EXPERT_PAGE_PREFETCH - top-m predicted experts of the next layer whose
+//                                cold slabs are read ahead from the page cache
+//                                (0 = off, default)
 
 namespace llama_expert_tier {
 
@@ -161,6 +164,18 @@ bool cpu_async_enabled();
 ggml_tensor * end_moe_cold(ggml_context * ctx,
         ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,
         ggml_tensor * x, ggml_tensor * ids);
+
+// Number of predicted next-layer experts to read ahead, 0 when disabled, the
+// tier is inactive, or n_tokens is above LLAMA_EXPERT_TMAX.
+int page_prefetch_top_m(int64_t n_tokens);
+
+// CPU op that madvise(WILLNEED)s the cold slabs of the predicted experts
+// (predicted_ids [m, n_tokens], I32) in the given expert weights. Place it next
+// to the current layer's cold op so both run in one CPU split. Returns nullptr
+// when the weights have no tier store or the batch is above LLAMA_EXPERT_TMAX.
+ggml_tensor * build_page_prefetch(ggml_context * ctx,
+        ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,
+        ggml_tensor * predicted_ids);
 
 // count-only path for batches larger than LLAMA_EXPERT_TMAX (prompt
 // harvesting): returns a scalar f32 tensor (add it to the layer output to

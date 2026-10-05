@@ -3974,6 +3974,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--power-busy-cmd"}, "CMD",
+        "shell command run before the model starts working, e.g. to select a performance power profile (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.power_busy_cmd = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_POWER_BUSY_CMD"));
+    add_opt(common_arg(
+        {"--power-idle-cmd"}, "CMD",
+        "shell command run once no server of this user is working, e.g. to select a power-saving profile (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.power_idle_cmd = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_POWER_IDLE_CMD"));
+    add_opt(common_arg(
+        {"--power-idle-delay"}, "MS",
+        string_format("idle time in milliseconds before --power-idle-cmd runs (default: %d)", params.power_idle_delay_ms),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: must be >= 0");
+            }
+            params.power_idle_delay_ms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_POWER_IDLE_DELAY"));
+    add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
         [](common_params & params) {

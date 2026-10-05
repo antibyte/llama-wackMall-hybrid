@@ -26,6 +26,11 @@ SPEC_TYPE="${SPEC_TYPE:-draft-dspark}"
 [[ -f "$DRAFT" ]] || { echo "missing $DRAFT" >&2; exit 1; }
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Performance before model work, Battery (dims the panel) after 2 s without work.
+export LLAMA_ARG_POWER_BUSY_CMD="${LLAMA_ARG_POWER_BUSY_CMD-busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance}"
+export LLAMA_ARG_POWER_IDLE_CMD="${LLAMA_ARG_POWER_IDLE_CMD-busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery}"
+export LLAMA_ARG_POWER_IDLE_DELAY="${LLAMA_ARG_POWER_IDLE_DELAY:-2000}"
+export LLAMA_ARG_DECISION_SEQS="${LLAMA_ARG_DECISION_SEQS:-0}"  # unused decision side context costs VRAM
 export GGML_CUDA_MOE_MULTI_FUSION=1
 export GGML_CUDA_MOE_COMBINE_FUSION=1
 export GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS=4

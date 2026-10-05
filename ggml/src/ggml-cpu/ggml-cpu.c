@@ -38,6 +38,10 @@
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -1704,6 +1708,103 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+#if defined(__linux__)
+// Residency of a slab is re-checked at most every 100 ms: mincore over a 1.4 MB
+// slab costs ~14 us. A slab evicted in between faults as it would without this.
+#define GGML_SLAB_CACHE_SIZE 65536
+#define GGML_SLAB_RECHECK_US 100000
+
+static struct {
+    _Atomic uintptr_t addr;
+    _Atomic int64_t   t_us;
+} ggml_slab_cache[GGML_SLAB_CACHE_SIZE];
+
+static size_t ggml_slab_cache_index(uintptr_t addr) {
+    return (size_t) (((uint64_t) (addr >> 12) * 0x9E3779B97F4A7C15ull) >> 48) % GGML_SLAB_CACHE_SIZE;
+}
+
+static bool ggml_slab_recently_resident(uintptr_t addr, int64_t now) {
+    const size_t i = ggml_slab_cache_index(addr);
+    return atomic_load_explicit(&ggml_slab_cache[i].addr, memory_order_relaxed) == addr &&
+        now - atomic_load_explicit(&ggml_slab_cache[i].t_us, memory_order_relaxed) < GGML_SLAB_RECHECK_US;
+}
+
+static void ggml_slab_mark_resident(uintptr_t addr, int64_t now) {
+    const size_t i = ggml_slab_cache_index(addr);
+    atomic_store_explicit(&ggml_slab_cache[i].addr, addr, memory_order_relaxed);
+    atomic_store_explicit(&ggml_slab_cache[i].t_us, now, memory_order_relaxed);
+}
+#endif
+
+// Several threads fault different experts so the disk has more than one
+// sequential stream. Lockstep matmul reads one expert at a time. Slabs already
+// in RAM are skipped. stride is one expert; ignore tensors that are not slabs.
+// Opt-in (GGML_CPU_EXPERT_READAHEAD=1): models that fit in RAM only pay for the checks.
+static void ggml_fault_expert_slabs(
+        const void * base, size_t stride, const int64_t * counts, int n_expert, int ith, int nth) {
+#if defined(__linux__)
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_CPU_EXPERT_READAHEAD");
+        enabled = env != NULL && atoi(env) != 0;
+    }
+    if (!enabled || base == NULL || counts == NULL || nth <= 0 || stride < 4096 || stride > ((size_t) 8 << 20)) {
+        return;
+    }
+    static size_t page_size;
+    if (page_size == 0) {
+        const long got = sysconf(_SC_PAGESIZE);
+        page_size = got > 0 ? (size_t) got : 4096;
+    }
+    const size_t page = page_size;
+    const int64_t now = ggml_time_us();
+    // WILLNEED queues every missing slab of this thread at once; touching alone
+    // faults one readahead window at a time (queue depth ~1 on NVMe). The kernel
+    // reads at most one readahead window per WILLNEED call, hence the chunks.
+    const uintptr_t chunk = 128 * 1024;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int e = ith; e < n_expert; e += nth) {
+            if (counts[e] == 0) {
+                continue;
+            }
+            const uintptr_t addr = (uintptr_t) base + (size_t) e * stride;
+            if (ggml_slab_recently_resident(addr, now)) {
+                continue;
+            }
+            const uintptr_t start = addr & ~(page - 1);
+            const uintptr_t end = (addr + stride + page - 1) & ~(page - 1);
+            if (pass == 0) {
+                unsigned char vec[2048];
+                const size_t n_pages = (end - start) / page;
+                if (n_pages <= sizeof(vec) && mincore((void *) start, end - start, vec) == 0) {
+                    size_t i = 0;
+                    while (i < n_pages && (vec[i] & 1)) {
+                        ++i;
+                    }
+                    if (i == n_pages) {
+                        ggml_slab_mark_resident(addr, now);
+                        continue;
+                    }
+                }
+                for (uintptr_t c = start; c < end; c += chunk) {
+                    madvise((void *) c, MIN(chunk, end - c), MADV_WILLNEED);
+                }
+                continue;
+            }
+            const volatile unsigned char * bytes = (const volatile unsigned char *) start;
+            unsigned char acc = 0;
+            for (size_t off = 0; off < (size_t) (end - start); off += page) {
+                acc |= bytes[off];
+            }
+            __asm__ __volatile__("" : "+r"(acc) :: "memory");
+            ggml_slab_mark_resident(addr, now);
+        }
+    }
+#else
+    (void) base; (void) stride; (void) counts; (void) n_expert; (void) ith; (void) nth;
+#endif
+}
+
 // colibri-tier: dump routed expert ids to $LLAMA_EXPERT_TRACE
 // record: magic "EXTR", il, k, n_tokens, ids[k*n_tokens] (int32)
 static void expert_trace_dump(const struct ggml_tensor * src0, const struct ggml_tensor * ids) {
@@ -1872,6 +1973,9 @@ static void ggml_compute_forward_mul_mat_id(
         *current_chunk_ctr = nth;
     }
 
+    ggml_barrier(params->threadpool);
+
+    ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth);
     ggml_barrier(params->threadpool);
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -2052,6 +2156,9 @@ static void ggml_compute_forward_mul_mat_id_cold(
         *current_chunk_ctr = nth;
     }
 
+    ggml_barrier(params->threadpool);
+
+    ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth);
     ggml_barrier(params->threadpool);
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -2328,6 +2435,12 @@ static void ggml_compute_forward_moe_cold(
         *ctr = nth;
     }
 
+    ggml_barrier(params->threadpool);
+    ggml_fault_expert_slabs(w_gate->data, w_gate->nb[2], matrix_row_counts, n_as, ith, nth);
+    if (w_up != w_gate) {
+        ggml_fault_expert_slabs(w_up->data, w_up->nb[2], matrix_row_counts, n_as, ith, nth);
+    }
+    ggml_fault_expert_slabs(w_down->data, w_down->nb[2], matrix_row_counts, n_as, ith, nth);
     ggml_barrier(params->threadpool);
     if (profile_phases) {
         if (ith == 0) {

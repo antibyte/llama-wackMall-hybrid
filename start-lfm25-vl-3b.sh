@@ -7,8 +7,9 @@
 #
 # Unsloth Q4_K_M (1.67 GB) + F16 mmproj (0.85 GB).
 # Dense LFM2 hybrid (conv + attention), SigLIP2 NaFlex, native ctx 32768.
-# Binary: build-mmq-pascal (61-virtual + FORCE_MMQ). Prefill/vision ~3x vs
-# sm_75 on this TU116; decode ~5-7% slower. Text launchers stay on sm_75.
+# Binary: build-main-sm75 (DP4A MMQ). 2026-10-02 vs build-mmq-pascal:
+# tg128 126.8 vs 120.5 t/s, pp512 -2.6%; 2327-token image request 14.45 vs
+# 14.78 s, and 4.85 s once FP16 cuBLAS GEMMs avoid HMMA on this TU116.
 # Sampling from the model card: temp=0.2 top_k=50 repeat-penalty=1.0.
 # Direct answers, no think. MoE/MTP/DFlash knobs are inert.
 # Download: ./download-lfm25-vl-3b.sh
@@ -21,7 +22,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # EDITABLE CONFIGURATION -- only edit values in this section
 # ============================================================================
 
-SERVER="$PROJECT_ROOT/build-mmq-pascal/bin/llama-server"
+SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"
 MODEL="$HOME/models/lfm2.5-vl-3b/LFM2.5-VL-3B-Q4_K_M.gguf"
 MMPROJ="$HOME/models/lfm2.5-vl-3b/mmproj-F16.gguf"
 CHAT_TEMPLATE_FILE="$PROJECT_ROOT/models/templates/LFM2.5-Instruct.jinja"
@@ -29,6 +30,15 @@ CHAT_TEMPLATE_FILE="$PROJECT_ROOT/models/templates/LFM2.5-Instruct.jinja"
 # Network / OpenWebUI
 HOST="0.0.0.0"
 PORT="8080"
+
+# Power profile: Performance before model work, Battery once no llama-server of
+# this user has worked for POWER_IDLE_DELAY ms. Battery also dims the panel to
+# 10%; use ...PowerDaemon Balanced as idle command to avoid that. Empty
+# commands disable switching. Servers coordinate via /tmp/llama-power-$UID.
+POWER_BUSY_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance"
+POWER_IDLE_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery"
+POWER_IDLE_DELAY="2000"  # milliseconds without model work before POWER_IDLE_CMD runs
+DECISION_SEQS="0"  # POST /v1/decision side context; agollm serves decisions on its own worker
 CORS_ORIGINS="*"
 API_KEY=""
 API_KEY_FILE=""
@@ -55,7 +65,7 @@ KV_OFFLOAD="1"
 LOAD_MODE="mmap"
 OFFLINE="1"
 # Resident KV tokens. 8192 keeps 32k logical ctx + vision tiles inside 6 GiB; 0 disables paging.
-LLAMA_KVFLASH="8192"
+LLAMA_KVFLASH="0"  # full 32k q8 KV is ~0.27 GiB; no paging needed
 LLAMA_KVFLASH_MAX_POOL="8192"
 LLAMA_KVFLASH_TAU="64"
 LLAMA_KVFLASH_POLICY="lru"
@@ -324,5 +334,10 @@ else
     unset_args+=(-u LLAMA_ARG_CPU_MOE)
 fi
 [[ -n "$THREADS_HTTP" ]] || unset_args+=(-u LLAMA_ARG_THREADS_HTTP)
+
+[[ -n "$POWER_BUSY_CMD" ]] && env_args+=("LLAMA_ARG_POWER_BUSY_CMD=$POWER_BUSY_CMD")
+[[ -n "$POWER_IDLE_CMD" ]] && env_args+=("LLAMA_ARG_POWER_IDLE_CMD=$POWER_IDLE_CMD")
+env_args+=("LLAMA_ARG_POWER_IDLE_DELAY=$POWER_IDLE_DELAY")
+env_args+=("LLAMA_ARG_DECISION_SEQS=$DECISION_SEQS")
 
 exec env "${unset_args[@]}" "${env_args[@]}" "$SERVER" "${server_args[@]}"

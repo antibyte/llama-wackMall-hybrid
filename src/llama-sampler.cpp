@@ -1492,7 +1492,86 @@ struct llama_sampler_top_p : public llama_sampler_backend {
     const size_t min_keep;
 
     std::vector<llama_token_data> buf_sort;
+    std::vector<uint8_t>          buf_bucket;
 };
+
+// Exact top-p for a large unsorted vocabulary without sorting it: the
+// probability mass is histogrammed by distance to the maximum logit, and only
+// the buckets that can contain the cut are sorted. The probabilities and the
+// cumulative sum use the same arithmetic and order as the generic path.
+// Returns false when the cut cannot be located this way.
+static bool llama_sampler_top_p_bucketed(llama_sampler_top_p * ctx, llama_token_data_array * cur_p) {
+    constexpr int   nbuckets = 256;
+    constexpr float scale    = 8.0f; // buckets per logit unit below the maximum
+
+    const size_t n    = cur_p->size;
+    auto *       data = cur_p->data;
+
+    float max_l = data[0].logit;
+    for (size_t i = 1; i < n; ++i) {
+        max_l = std::max(max_l, data[i].logit);
+    }
+
+    auto & bucket = ctx->buf_bucket;
+    bucket.resize(n);
+    float mass[nbuckets] = {};
+    float cum_sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        const float d = max_l - data[i].logit;
+        const float e = expf(-d);
+        data[i].p = e;
+        cum_sum += e;
+        const int ib = d < (nbuckets - 1)/scale ? (int) (d*scale) : nbuckets - 1;
+        bucket[i] = (uint8_t) ib;
+        mass[ib] += e;
+    }
+
+    // the cut lies in the first bucket where the bucket mass reaches p; one
+    // extra bucket absorbs rounding differences between the two summations
+    const float target = ctx->p*cum_sum;
+    float acc = 0.0f;
+    int ib_cut = 0;
+    while (ib_cut < nbuckets - 1 && acc + mass[ib_cut] < target) {
+        acc += mass[ib_cut++];
+    }
+    const int ib_last = ib_cut + 1;
+    if (ib_last >= nbuckets - 1) {
+        return false;
+    }
+
+    auto & cand = ctx->buf_sort;
+    cand.clear();
+    for (size_t i = 0; i < n; ++i) {
+        if (bucket[i] <= ib_last) {
+            cand.push_back({ data[i].id, data[i].logit, data[i].p/cum_sum });
+        }
+    }
+    if (cand.size() < ctx->min_keep) {
+        return false;
+    }
+
+    std::sort(cand.begin(), cand.end(), [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    });
+
+    float  cum = 0.0f;
+    size_t last_idx = 0;
+    for (size_t i = 0; i < cand.size(); ++i) {
+        cum += cand[i].p;
+        if (cum >= ctx->p && i + 1 >= ctx->min_keep) {
+            last_idx = i + 1;
+            break;
+        }
+    }
+    if (last_idx == 0) {
+        return false;
+    }
+
+    std::copy(cand.begin(), cand.begin() + last_idx, data);
+    cur_p->size   = last_idx;
+    cur_p->sorted = true;
+    return true;
+}
 
 static const char * llama_sampler_top_p_name(const struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_top_p *) smpl->ctx;
@@ -1503,6 +1582,10 @@ static void llama_sampler_top_p_apply(struct llama_sampler * smpl, llama_token_d
     auto * ctx = (llama_sampler_top_p *) smpl->ctx;
 
     if (ctx->p >= 1.0f) {
+        return;
+    }
+
+    if (!cur_p->sorted && cur_p->size > 1024 && llama_sampler_top_p_bucketed(ctx, cur_p)) {
         return;
     }
 
@@ -1682,6 +1765,7 @@ struct llama_sampler * llama_sampler_init_top_p(float p, size_t min_keep) {
             /* .p        = */ p,
             /* .min_keep = */ min_keep,
             /* .buf_sort = */ {},
+            /* .buf_bucket = */ {},
         }
     );
 }

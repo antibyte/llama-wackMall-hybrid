@@ -32,6 +32,11 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <utility>
 #include <vector>
 
@@ -125,6 +130,7 @@ static bool g_shared_hot_ids = false;
 // CUDA MMVQ kernels to skip the zeroed sentinel slot (cold experts) instead of
 // loading and computing against zero weights. Default off until measured.
 static bool g_skip_sentinel = false;
+static int  g_page_prefetch_top_m = 0;
 static bool g_static_no_sync_requested = false;
 static bool g_static_no_sync_active = false;
 static int  g_prefetch_streams = 1;
@@ -1958,6 +1964,12 @@ void init(const llama_model & model) {
         }
         g_skip_sentinel = value == 1;
     }
+    if (const char * prefetch = getenv("LLAMA_EXPERT_PAGE_PREFETCH")) {
+        if (!parse_nonnegative_int(prefetch, g_page_prefetch_top_m) || g_page_prefetch_top_m > 64) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_PAGE_PREFETCH='%s'; expected 0..64\n", __func__, prefetch);
+            g_page_prefetch_top_m = 0;
+        }
+    }
     ggml_cpu_moe_set_single_row_chunk(g_cpu_single_row_chunk);
     ggml_cpu_moe_set_parallel_activation(g_cpu_parallel_activation);
     ggml_cpu_moe_set_down_prefetch(g_cpu_down_prefetch);
@@ -2670,6 +2682,78 @@ ggml_tensor * end_moe_cold(ggml_context * ctx,
             g_collect_counts ? sd.counts : nullptr, nullptr, nullptr, nullptr);
     result->op_params[0] = sd.il;
     return result;
+}
+
+#if defined(__linux__)
+static const uintptr_t readahead_chunk = 128 * 1024;
+
+static bool slab_resident(uintptr_t start, uintptr_t end, size_t page) {
+    unsigned char vec[2048];
+    const size_t n_pages = (end - start) / page;
+    if (n_pages > sizeof(vec) || mincore((void *) start, end - start, vec) != 0) {
+        return false;
+    }
+    for (size_t i = 0; i < n_pages; ++i) {
+        if (!(vec[i] & 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+// src: predicted ids, gate, up, down, cold mask. One work item per
+// (predicted expert, weight matrix); hot experts are skipped.
+static void page_prefetch_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+#if defined(__linux__)
+    static const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    const ggml_tensor * ids = dst->src[0];
+    const int32_t * cold = (const int32_t *) dst->src[4]->data;
+    const int64_t n_items = ids->ne[0] * ids->ne[1] * 3;
+    for (int64_t i = ith; i < n_items; i += nth) {
+        const int64_t k = (i / 3) % ids->ne[0];
+        const int64_t t = (i / 3) / ids->ne[0];
+        const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + k*ids->nb[0]);
+        const ggml_tensor * w = dst->src[1 + i % 3];
+        if (e < 0 || e >= w->ne[2] || !cold[e]) {
+            continue;
+        }
+        const uintptr_t addr  = (uintptr_t) w->data + (size_t) e * w->nb[2];
+        const uintptr_t start = addr & ~(page - 1);
+        const uintptr_t end   = (addr + w->nb[2] + page - 1) & ~(page - 1);
+        if (!slab_resident(start, end, page)) {
+            // the kernel reads at most one readahead window per WILLNEED call
+            for (uintptr_t c = start; c < end; c += readahead_chunk) {
+                madvise((void *) c, std::min<uintptr_t>(readahead_chunk, end - c), MADV_WILLNEED);
+            }
+        }
+    }
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(ith);
+    GGML_UNUSED(nth);
+#endif
+}
+
+int page_prefetch_top_m(int64_t n_tokens) {
+    return g_stores.empty() || n_tokens > (int64_t) g_tmax ? 0 : g_page_prefetch_top_m;
+}
+
+ggml_tensor * build_page_prefetch(ggml_context * ctx,
+        ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,
+        ggml_tensor * predicted_ids) {
+    if (g_page_prefetch_top_m <= 0 || !predicted_ids || predicted_ids->ne[1] > (int64_t) g_tmax) {
+        return nullptr;
+    }
+    auto ig = g_stores.find(gate_w);
+    if (ig == g_stores.end() || g_stores.find(up_w) == g_stores.end() || g_stores.find(down_w) == g_stores.end()) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = { predicted_ids, gate_w, up_w, down_w, ig->second.mask };
+    ggml_tensor * op = ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 5, page_prefetch_op, GGML_N_TASKS_MAX, nullptr);
+    ggml_set_name(op, "expert_page_prefetch");
+    return op;
 }
 
 ggml_tensor * build_moe_count(ggml_context * ctx, ggml_tensor * down_w, ggml_tensor * ids) {

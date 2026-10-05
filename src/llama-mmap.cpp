@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -441,6 +443,26 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 // llama_mmap
 
+static size_t llama_mem_available() {
+#ifdef __linux__
+    FILE * f = std::fopen("/proc/meminfo", "r");
+    if (!f) {
+        return 0;
+    }
+    char line[256];
+    size_t kb = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::sscanf(line, "MemAvailable: %zu kB", &kb) == 1) {
+            break;
+        }
+    }
+    std::fclose(f);
+    return kb * 1024;
+#else
+    return 0;
+#endif
+}
+
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
@@ -451,11 +473,31 @@ struct llama_mmap::impl {
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
-            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
-                    strerror(errno));
+        if (!numa) {
+            const char * prefetch_env = std::getenv("LLAMA_MMAP_PREFETCH");
+            const bool force_off = prefetch_env && prefetch_env[0] == '0' && prefetch_env[1] == '\0';
+            const bool force_on  = prefetch_env && prefetch_env[0] == '1' && prefetch_env[1] == '\0';
+            if (force_off) {
+                prefetch = 0;
+            } else if (!force_on && prefetch) {
+                const size_t avail = llama_mem_available();
+                if (avail > 0 && file->size() > avail) {
+                    prefetch = 0;
+                    LLAMA_LOG_INFO("llama_mmap: file is %.2f GiB and available RAM is %.2f GiB; pages fault from disk\n",
+                            file->size() / 1024.0 / 1024.0 / 1024.0, avail / 1024.0 / 1024.0 / 1024.0);
+                }
+            }
         }
-        if (prefetch) { flags |= MAP_POPULATE; }
+        // Files larger than RAM stay demand-paged. Do not set RANDOM advice:
+        // each expert slab is a sequential read of a few hundred KB, and RANDOM
+        // turns that into 4 KiB faults (~200 MiB/s instead of >1 GiB/s).
+        if (prefetch) {
+            if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+                LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+                        strerror(errno));
+            }
+            flags |= MAP_POPULATE;
+        }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
@@ -642,6 +684,14 @@ size_t llama_mmap::register_host(size_t first, size_t last, bool (*reg_fn)(void 
     const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
     first = first & ~(page_size - 1);
     last  = (last + page_size - 1) & ~(page_size - 1);
+
+    const size_t nbytes = last - first;
+    const size_t avail = llama_mem_available();
+    if (avail > 0 && nbytes > avail) {
+        LLAMA_LOG_INFO("llama_mmap: skip host pin of %.2f GiB (available RAM %.2f GiB)\n",
+                nbytes / 1024.0 / 1024.0 / 1024.0, avail / 1024.0 / 1024.0 / 1024.0);
+        return 0;
+    }
 
     void * reg_addr = (uint8_t *) pimpl->addr + first;
     if (!reg_fn(reg_addr, last - first)) {

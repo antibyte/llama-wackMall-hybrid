@@ -260,6 +260,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_afmoe(params);
         case LLM_ARCH_LAGUNA:
             return new llama_model_laguna(params);
+        case LLM_ARCH_KOLIBRI1:
+            return new llama_model_kolibri1(params);
         case LLM_ARCH_ERNIE4_5:
             return new llama_model_ernie4_5(params);
         case LLM_ARCH_ERNIE4_5_MOE:
@@ -850,6 +852,7 @@ static const char * llama_expert_gating_func_name(llama_expert_gating_func_type 
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX: return "softmax";
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID: return "sigmoid";
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: return "sqrtsoftplus";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID_LOGIT_ADD: return "sigmoid_logit_add";
         default:                                    return "unknown";
     }
 }
@@ -2803,6 +2806,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_PANGU_EMBED:
         case LLM_ARCH_AFMOE:
         case LLM_ARCH_LAGUNA:
+        case LLM_ARCH_KOLIBRI1:
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:

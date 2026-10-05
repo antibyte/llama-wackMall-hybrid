@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 #
-# llama-wackMall-hybrid GTX 1660 Ti launcher for Spark-X2.5-4B (spark2_5).
+# llama-wackMall-hybrid GTX 1660 Ti launcher for Lythri-4B-A2B Q8_0 (Gemma 4 E2B).
 #
 # Alle Einstellungen stehen in diesem Block. Keine Kommandozeilenparameter,
-# keine stillen Shell-Overrides. Nach einer Aenderung: ./startspark.sh
+# keine stillen Shell-Overrides. Nach einer Aenderung: ./start-lythri-4b.sh
 #
-# Spark-X2.5-4B Q4_K_M, dense hybrid SWA (3 sliding + 1 full, window 512).
-# llama-bench 2026-09-07 on GTX 1660 Ti: pp512 273.7 t/s, tg128 75.9 t/s.
-# Tune 2026-09-07: keep q8 KV, FA on, Q4_K MMVQ rows=2, prefill 2048, spec none.
-# ngram-simple did not draft on honest Jinja chat; turbo4_k KV garbled output.
-# KVFlash stays off (ISWA, not a non-SWA hybrid). Native ctx is 1M tokens;
-# 49152 with f16 KV since 2026-10-05 (see CONTEXT). Sampling from the model card:
-# temp=1.0 top_p=0.95 top_k disabled. Chat template: Spark2.5.jinja.
-# 2026-10-02: CPU sampling with the bucketed top-p beats backend sampling,
-# which argsorts the full vocabulary: chat 73.2 vs 66.0 t/s, prompt 0.3 vs 0.85 s.
-# Qwen stack: start1660.sh. Thin alias: start-spark-x25.sh.
+# Lythri-4B-A2B Q8_0 (4.59 GiB, 4.63B, gemma4 E2B, 35 layers, SWA 512, 1 KV head).
+# llama-bench 2026-10-02 GTX 1660 Ti:
+#   sm75 DP4A vs Pascal FORCE_MMQ: tg128 73.02 vs 73.07 (tie); pp512 1508 vs 1373.
+#   Production binary is build-main-sm75 (better prefill, llama-server present).
+#   FA required for quantized KV (FA off failed to create context).
+#   Q8 MMVQ ncols1 rows=4: tg128 77.48 (+6% vs default 73.02). n3 rows inert.
+#   Combo scheduler knobs with n1=4: tg128 77.51. q4_0 KV 71.5; f16 KV 77.1 on Pascal.
+#   Prefill pp2048: ub256 1414, ub2048 1403 (within 1%). Keep 2048 like Spark.
+#   Chat Jinja card sampling: CPU 65.3 t/s prompt 395 vs backend 65.1 / 295.
+#   turbo4_k loaded (73.5 t/s); ngram-simple ~85 t/s on repetitive text but hung
+#   after generate, so spec stays none. KVFlash loads at -c 32768.
+#   Sampling from the model card: temp=0.95 top_p=0.9 top_k=64 repeat-penalty=1.05.
+# Download: ./download-lythri-4b.sh
+# Results: benchmark-results/lythri-4b-q8-tune-20261002T104208Z/
 #
 set -Eeuo pipefail
 
@@ -25,8 +29,8 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # ============================================================================
 
 SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"
-MODEL="$HOME/models/spark-x2.5-4b/Spark-X2.5-4B-Q4_K_M.gguf"
-CHAT_TEMPLATE_FILE="$PROJECT_ROOT/models/templates/Spark2.5.jinja"
+MODEL="$HOME/models/lythri-4b-a2b/Lythri-4B-A2B-Q8_0.gguf"
+CHAT_TEMPLATE_FILE=""  # GGUF Jinja; add <think> after the generation prompt
 
 # Network / OpenWebUI
 HOST="0.0.0.0"
@@ -43,7 +47,7 @@ DECISION_SEQS="0"  # POST /v1/decision side context; agollm serves decisions on 
 CORS_ORIGINS="*"
 API_KEY=""
 API_KEY_FILE=""
-MODEL_ALIAS="spark-x2.5-4b"
+MODEL_ALIAS="lythri-4b-a2b"
 CUDA_VISIBLE_DEVICES_VALUE="0"
 N_PARALLEL="1"
 N_GPU_LAYERS="99"
@@ -51,39 +55,45 @@ CPU_MOE="0"
 UI="0"
 CONT_BATCHING="1"
 OP_OFFLOAD="1"
+FIT="on"
+FIT_TARGET="80"
+FIT_CTX="2048"
 
 # Context, KV, Flash Attention
-# 2026-10-05: f16 KV decodes 75.0 vs 71.4 t/s short and 48.3 vs 32.0 t/s at 47k
-# tokens (the q8_0 vec FA kernel is slow on the 1660 Ti). f16 at 65536 hit
-# cuMemCreate OOM; 49152 peaks at 5.1 of 6 GiB.
-CONTEXT="49152"
+CONTEXT="131072"
 N_PREDICT="32768"
-TARGET_TYPE_K="f16"
+TARGET_TYPE_K="f16"  # 2026-10-05: tg at 48k tokens 54.6 vs 42.7 t/s (q8_0 vec FA kernel), short 69.7 vs 64.0
 TARGET_TYPE_V="f16"
 FLASH_ATTN="on"
 KV_OFFLOAD="1"
 LOAD_MODE="mmap"
 OFFLINE="1"
+# Resident KV tokens. 8192 keeps 131k logical ctx inside 6 GiB; 0 disables paging.
+LLAMA_KVFLASH="8192"
+LLAMA_KVFLASH_MAX_POOL="8192"
+LLAMA_KVFLASH_TAU="64"
+LLAMA_KVFLASH_POLICY="lru"
+LLAMA_KVFLASH_STATS="0"
 
 # Speculative decoding: none | ngram
-# Tune 2026-09-07: ngram-simple n_max=2/4/8 did not accept drafts on Jinja chat.
 SPEC_MODE="none"
 SPEC_DRAFT_N_MAX="4"
 NGRAM_SIMPLE_SIZE_N=""
 NGRAM_SIMPLE_SIZE_M=""
 NGRAM_SIMPLE_MIN_HITS=""
 
-# Sampling (Spark-X2.5 model card)
-TEMP="1.0"
-TOP_K="0"
-TOP_P="0.95"
+# Sampling (Lythri model card)
+TEMP="0.95"
+TOP_K="64"
+TOP_P="0.9"
 MIN_P="0"
+REPEAT_PENALTY="1.05"
 
 # Reasoning / chat template
 REASONING="1"
 REASONING_BUDGET="4000"
 REASONING_PRESERVE="1"
-REASONING_FORMAT="deepseek"
+REASONING_FORMAT="auto"
 JINJA="1"
 
 THREADS="8"
@@ -107,7 +117,7 @@ CACHE_REUSE="0"
 KV_UNIFIED="1"
 CACHE_IDLE_SLOTS="1"
 
-# sm_75 kernel knobs (same winners as start1660 / start-ling-tiny)
+# sm_75 kernel knobs (same winners as start1660 / startspark)
 GGML_CUDA_MOE_MULTI_FUSION="1"
 GGML_CUDA_MOE_COMBINE_FUSION="1"
 GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS="4"
@@ -128,16 +138,16 @@ GGML_CUDA_REGISTER_HOST="1"
 # ============================================================================
 
 die() {
-    printf 'startspark.sh: %s\n' "$*" >&2
+    printf 'start-lythri-4b.sh: %s\n' "$*" >&2
     exit 1
 }
 
 if [[ $# -ne 0 ]]; then
-    die "Keine Kommandozeilenparameter: Einstellungen oben in startspark.sh aendern."
+    die "Keine Kommandozeilenparameter: Einstellungen oben in start-lythri-4b.sh aendern."
 fi
 
 [[ -x "$SERVER" ]] || die "llama-server nicht ausfuehrbar: $SERVER"
-[[ -f "$MODEL" ]] || die "Modell nicht gefunden: $MODEL"
+[[ -f "$MODEL" ]] || die "Modell nicht gefunden: $MODEL (zuerst ./download-lythri-4b.sh)"
 if [[ -n "$CHAT_TEMPLATE_FILE" ]]; then
     [[ -f "$CHAT_TEMPLATE_FILE" ]] || die "Chat-Template nicht gefunden: $CHAT_TEMPLATE_FILE"
     [[ "$JINJA" == 1 ]] || die "CHAT_TEMPLATE_FILE benoetigt JINJA=1."
@@ -149,10 +159,26 @@ case "$REASONING_FORMAT" in none|deepseek|deepseek-legacy|auto) ;; *) die "REASO
 case "$SPEC_MODE" in none|ngram|ngram-simple) ;; *) die "SPEC_MODE muss none oder ngram sein." ;; esac
 case "$CPU_MOE" in 0|1) ;; *) die "CPU_MOE muss 0 oder 1 sein." ;; esac
 case "$FLASH_ATTN" in on|off|auto) ;; *) die "FLASH_ATTN muss on, off oder auto sein." ;; esac
+case "$FIT" in on|off|1|0|true|false) ;; *) die "FIT muss on oder off sein." ;; esac
 [[ "$CONTEXT" =~ ^[1-9][0-9]*$ ]] || die "CONTEXT muss eine positive Ganzzahl sein."
 [[ "$SPEC_DRAFT_N_MAX" =~ ^[1-9][0-9]*$ ]] || die "SPEC_DRAFT_N_MAX muss eine positive Ganzzahl sein."
 [[ "$CMOE_PREFILL_BATCH" =~ ^[1-9][0-9]*$ ]] || die "CMOE_PREFILL_BATCH muss eine positive Ganzzahl sein."
 [[ "$CMOE_DECODE_BATCH" =~ ^[1-9][0-9]*$ ]] || die "CMOE_DECODE_BATCH muss eine positive Ganzzahl sein."
+[[ "$FIT_TARGET" =~ ^[0-9]+$ ]] || die "FIT_TARGET muss eine nichtnegative Ganzzahl sein."
+[[ "$FIT_CTX" =~ ^[1-9][0-9]*$ ]] || die "FIT_CTX muss eine positive Ganzzahl sein."
+[[ "$LLAMA_KVFLASH" == 0 || "$LLAMA_KVFLASH" == auto || "$LLAMA_KVFLASH" =~ ^[1-9][0-9]*$ ]] || \
+    die "LLAMA_KVFLASH muss 0, auto oder eine positive Ganzzahl sein."
+if [[ "$LLAMA_KVFLASH" =~ ^[1-9][0-9]*$ ]] && (( LLAMA_KVFLASH < 512 )); then
+    die "LLAMA_KVFLASH ist eine Tokenanzahl (mindestens 512), kein Boolean."
+fi
+[[ "$LLAMA_KVFLASH_MAX_POOL" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_KVFLASH_MAX_POOL muss eine positive Ganzzahl sein."
+case "$LLAMA_KVFLASH_POLICY" in lru) ;; *) die "LLAMA_KVFLASH_POLICY muss lru sein." ;; esac
+if [[ "$LLAMA_KVFLASH" != 0 && "$FLASH_ATTN" != on ]]; then
+    die "KVFlash benoetigt FLASH_ATTN=on."
+fi
+if [[ "$LLAMA_KVFLASH" != 0 && "$N_PARALLEL" != 1 ]]; then
+    die "KVFlash benoetigt N_PARALLEL=1."
+fi
 if [[ "$CACHE_IDLE_SLOTS" == 1 && "$CACHE_RAM" == 0 ]]; then
     die "CACHE_IDLE_SLOTS=1 benoetigt CACHE_RAM ungleich 0."
 fi
@@ -167,7 +193,7 @@ if [[ -z "$API_KEY" && -z "$API_KEY_FILE" ]]; then
 fi
 
 cat <<EOF
-llama-wackMall-hybrid start (spark-x2.5-4b)
+llama-wackMall-hybrid start (lythri-4b-a2b)
   project:   $PROJECT_ROOT
   server:    $SERVER
   model:     $MODEL
@@ -176,10 +202,11 @@ llama-wackMall-hybrid start (spark-x2.5-4b)
   context:   $CONTEXT
   spec:      $SPEC_MODE ($SPEC_TYPE) n_max=$SPEC_DRAFT_N_MAX
   KV:        $TARGET_TYPE_K/$TARGET_TYPE_V
-  ngl:       $N_GPU_LAYERS  cpu-moe=$CPU_MOE
+  KVFlash:   $LLAMA_KVFLASH (max=$LLAMA_KVFLASH_MAX_POOL policy=$LLAMA_KVFLASH_POLICY)
+  ngl:       $N_GPU_LAYERS  cpu-moe=$CPU_MOE  fit=$FIT/$FIT_TARGET/$FIT_CTX
   phase:     prefill=$CMOE_PREFILL_BATCH/$CMOE_PREFILL_UBATCH decode=$CMOE_DECODE_BATCH/$CMOE_DECODE_UBATCH
   cache:     ram=$CACHE_RAM MiB prompt=$CACHE_PROMPT reuse=$CACHE_REUSE idle=$CACHE_IDLE_SLOTS ckpt=$CTX_CHECKPOINTS
-  sampling:  temp=$TEMP top-k=$TOP_K top-p=$TOP_P min-p=$MIN_P
+  sampling:  temp=$TEMP top-k=$TOP_K top-p=$TOP_P min-p=$MIN_P repeat=$REPEAT_PENALTY
   reasoning: $REASONING_BUDGET format=$REASONING_FORMAT
   template:  ${CHAT_TEMPLATE_FILE:-<model metadata>}
 EOF
@@ -218,6 +245,9 @@ env_args=(
     "LLAMA_ARG_CTX_CHECKPOINTS=$CTX_CHECKPOINTS"
     "LLAMA_ARG_CACHE_IDLE_SLOTS=$CACHE_IDLE_SLOTS"
     "LLAMA_ARG_CONT_BATCHING=$CONT_BATCHING"
+    "LLAMA_ARG_FIT=$FIT"
+    "LLAMA_ARG_FIT_TARGET=$FIT_TARGET"
+    "LLAMA_ARG_FIT_CTX=$FIT_CTX"
     "LLAMA_CMOE_BATCH=$CMOE_BATCH"
     "LLAMA_CMOE_UBATCH=$CMOE_UBATCH"
     "LLAMA_CMOE_PREFILL_BATCH=$CMOE_PREFILL_BATCH"
@@ -245,6 +275,15 @@ if [[ "$CPU_MOE" == 1 ]]; then
 else
     env_args+=("LLAMA_ARG_NO_CPU_MOE=1")
 fi
+if [[ "$LLAMA_KVFLASH" != 0 ]]; then
+    env_args+=(
+        "LLAMA_KVFLASH=$LLAMA_KVFLASH"
+        "LLAMA_KVFLASH_MAX_POOL=$LLAMA_KVFLASH_MAX_POOL"
+        "LLAMA_KVFLASH_TAU=$LLAMA_KVFLASH_TAU"
+        "LLAMA_KVFLASH_POLICY=$LLAMA_KVFLASH_POLICY"
+        "LLAMA_KVFLASH_STATS=$LLAMA_KVFLASH_STATS"
+    )
+fi
 [[ -n "$CHAT_TEMPLATE_FILE" ]] && env_args+=("LLAMA_ARG_CHAT_TEMPLATE_FILE=$CHAT_TEMPLATE_FILE")
 [[ -n "$THREADS_HTTP" ]] && env_args+=("LLAMA_ARG_THREADS_HTTP=$THREADS_HTTP")
 
@@ -254,6 +293,7 @@ server_args=(
     --top-k "$TOP_K"
     --top-p "$TOP_P"
     --min-p "$MIN_P"
+    --repeat-penalty "$REPEAT_PENALTY"
 )
 [[ "$OP_OFFLOAD" == 1 ]] && server_args+=(--op-offload)
 [[ -n "$NGRAM_SIMPLE_SIZE_N" ]] && server_args+=(--spec-ngram-simple-size-n "$NGRAM_SIMPLE_SIZE_N")
@@ -267,13 +307,20 @@ unset_args=(
     -u LLAMA_EXPERT_S
     -u LLAMA_EXPERT_HOT
     -u LLAMA_EXPERT_PLACEMENT
-    -u LLAMA_KVFLASH
-    -u LLAMA_KVFLASH_MAX_POOL
     -u LLAMA_ARG_OVERRIDE_TENSOR
     -u LLAMA_ARG_SPEC_DRAFT_MODEL
     -u LLAMA_TURBOQUANT_LIVE_MASK_LAYER
     -u LLAMA_TURBOQUANT_CAPTURE_VALUES
 )
+if [[ "$LLAMA_KVFLASH" == 0 ]]; then
+    unset_args+=(
+        -u LLAMA_KVFLASH
+        -u LLAMA_KVFLASH_MAX_POOL
+        -u LLAMA_KVFLASH_TAU
+        -u LLAMA_KVFLASH_POLICY
+        -u LLAMA_KVFLASH_STATS
+    )
+fi
 if [[ "$CPU_MOE" == 1 ]]; then
     unset_args+=(-u LLAMA_ARG_NO_CPU_MOE)
 else

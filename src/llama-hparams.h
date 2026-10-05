@@ -15,6 +15,7 @@ enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID        = 2,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to the router weights instead of the logits
     LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS  = 4,
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID_LOGIT_ADD = 5, // top-k on logits + bias, weight by unbiased sigmoid(logits)
 };
 
 enum llama_swa_type {

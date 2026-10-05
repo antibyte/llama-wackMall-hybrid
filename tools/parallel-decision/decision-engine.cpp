@@ -759,6 +759,7 @@ constexpr const char * k_intern_system =
     "For every field, choose exactly one answer symbol (e.g. A, B, C, ...) from its listed options and return one valid JSON object "
     "mapping each field name to its chosen symbol. Use the field names and symbols exactly as given. Do not include explanations, Markdown, or extra text.";
 
+constexpr const char * k_intern_user_intro = "Return one answer for every field using the supplied answer symbols.\n\n## State\n";
 constexpr const char * k_answer_symbols = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 constexpr double       k_intern_temperature = 1.99241824;
 constexpr int          k_answer_symbol_count = 62;
@@ -863,20 +864,73 @@ struct intern_batch {
     intern_batch & operator=(const intern_batch &) = delete;
 };
 
+// The system prompt and the first user line are the same for every request. They are
+// kept on a snapshot sequence and copied, so a decision decodes only state, schema and
+// skeleton (on Vega 7 that is about half of a short prompt).
+constexpr llama_seq_id k_intern_work = 0;
+constexpr llama_seq_id k_intern_snap = 1;
+
+struct intern_prefix_cache {
+    llama_context * ctx = nullptr;
+    tokens_t        toks;
+};
+
+intern_prefix_cache & intern_cache() {
+    static intern_prefix_cache cache;
+    return cache;
+}
+
 // One causal forward. Logits are taken at the token before each <decision> marker.
+// Returns the number of prompt tokens served from the cached prefix in *n_cached.
 std::vector<std::vector<float>> intern_forward(llama_context * ctx, const tokens_t & toks,
                                                const std::vector<int> & score_at, int n_fields,
-                                               const std::vector<llama_token> & symbols) {
+                                               const std::vector<llama_token> & symbols,
+                                               const tokens_t & prefix, size_t * n_cached) {
     llama_memory_t mem = llama_get_memory(ctx);
     if (mem == nullptr) {
         throw std::runtime_error("decision context has no memory");
     }
-    llama_memory_clear(mem, true);
 
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
     const int n_chunk = std::max(1, (int) std::min(llama_n_batch(ctx), llama_n_ubatch(ctx)));
     intern_batch held(n_chunk);
     llama_batch & batch = held.batch;
+
+    // A marker inside the prefix or a tokenisation that merges across its end
+    // falls back to decoding the whole prompt.
+    size_t start = 0;
+    const bool cacheable = !prefix.empty() && prefix.size() < toks.size() &&
+                           std::equal(prefix.begin(), prefix.end(), toks.begin()) &&
+                           *std::min_element(score_at.begin(), score_at.end()) >= (int) prefix.size();
+    auto & cache = intern_cache();
+    if (cacheable) {
+        if (cache.ctx != ctx || cache.toks != prefix) {
+            llama_memory_clear(mem, true);
+            cache = {};
+            for (size_t i = 0; i < prefix.size(); ++i) {
+                if (batch.n_tokens == n_chunk) {
+                    if (llama_decode(ctx, batch) != 0) {
+                        throw std::runtime_error("llama_decode failed on the decision prefix");
+                    }
+                    common_batch_clear(batch);
+                }
+                common_batch_add(batch, prefix[i], (llama_pos) i, { k_intern_snap }, false);
+            }
+            if (batch.n_tokens > 0 && llama_decode(ctx, batch) != 0) {
+                throw std::runtime_error("llama_decode failed on the decision prefix");
+            }
+            common_batch_clear(batch);
+            cache = { ctx, prefix };
+        } else {
+            *n_cached = prefix.size();
+        }
+        llama_memory_seq_rm(mem, k_intern_work, -1, -1);
+        llama_memory_seq_cp(mem, k_intern_snap, k_intern_work, -1, -1);
+        start = prefix.size();
+    } else {
+        llama_memory_clear(mem, true);
+        cache = {};
+    }
 
     std::vector<int> slot_field;
     int logits_in_batch = 0;
@@ -922,7 +976,7 @@ std::vector<std::vector<float>> intern_forward(llama_context * ctx, const tokens
         field_of[at] = field;
     }
 
-    for (int i = 0; i < (int) toks.size(); ++i) {
+    for (int i = (int) start; i < (int) toks.size(); ++i) {
         const bool want = field_of[i] >= 0;
         // The decision context reserves one output row per sequence, so each
         // micro-batch carries at most one marker logit.
@@ -932,7 +986,7 @@ std::vector<std::vector<float>> intern_forward(llama_context * ctx, const tokens
         if (batch.n_tokens == n_chunk) {
             flush();
         }
-        common_batch_add(batch, toks[i], (llama_pos) i, { 0 }, want);
+        common_batch_add(batch, toks[i], (llama_pos) i, { k_intern_work }, want);
         slot_field.push_back(want ? field_of[i] : -1);
         if (want) {
             ++logits_in_batch;
@@ -998,7 +1052,11 @@ json decide_intern(llama_context * ctx, const json & body, const std::string & m
     json results = json::array();
     double prefill_ms = 0;
     long long prompt_tokens = 0;
+    long long cached_tokens = 0;
     long long scored_rows = 0;
+    const std::string prefix_text = std::string("<|im_start|>system\n") + k_intern_system +
+                                    "<|im_end|>\n<|im_start|>user\n" + k_intern_user_intro;
+    const tokens_t prefix = common_tokenize(vocab, prefix_text, /*add_special=*/ false, /*parse_special=*/ true);
     for (const auto & context_value : body.at("contexts")) {
         if (!context_value.is_string() || context_value.get<std::string>().empty()) {
             throw std::invalid_argument("every entry of \"contexts\" must be a non-empty string");
@@ -1020,8 +1078,7 @@ json decide_intern(llama_context * ctx, const json & body, const std::string & m
             }
         }
         const std::string state = json(context).dump(-1, ' ', false);
-        const std::string user = "Return one answer for every field using the supplied answer symbols.\n\n## State\n" +
-                                 state + "\n## Decision schema\n" + schema_text;
+        const std::string user = k_intern_user_intro + state + "\n## Decision schema\n" + schema_text;
         if (user.find("<decision>") != std::string::npos) {
             throw std::invalid_argument("Reserved decision marker appears in input evidence");
         }
@@ -1049,7 +1106,10 @@ json decide_intern(llama_context * ctx, const json & body, const std::string & m
         }
 
         const auto t0 = std::chrono::steady_clock::now();
-        const std::vector<std::vector<float>> rows = intern_forward(ctx, toks, score_at, (int) cs.specs.size(), symbols);
+        size_t n_cached = 0;
+        const std::vector<std::vector<float>> rows =
+            intern_forward(ctx, toks, score_at, (int) cs.specs.size(), symbols, prefix, &n_cached);
+        cached_tokens += (long long) n_cached;
         prefill_ms += ms_since(t0);
 
         result scored;
@@ -1080,8 +1140,8 @@ json decide_intern(llama_context * ctx, const json & body, const std::string & m
 
     json usage = json::object();
     usage["prompt_tokens"]  = prompt_tokens;
-    usage["cached_tokens"]  = 0;
-    usage["context_tokens"] = prompt_tokens;
+    usage["cached_tokens"]  = cached_tokens;
+    usage["context_tokens"] = prompt_tokens - cached_tokens;
     usage["scored_rows"]    = scored_rows;
     json timings = json::object();
     timings["prefill_ms"]      = prefill_ms;

@@ -25,7 +25,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"  # directo
 # Paths
 SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"
 MODEL="$HOME/models/nex-n2.5-mini-i1/Nex-N2.5-mini.i1-Q4_K_M.gguf"
-SPEC_MODE="dflash"  # Nex GGUF has no nextn tensors; draft-mtp cannot load. Coding uses Qwen DFlash.
+SPEC_MODE="none"  # 2026-10-05: the Qwen DFlash sidecar accepted 30-44% on Nex; decode 37.7 vs 27.7 t/s without it
 SPEC_DRAFT_MODEL="$HOME/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-DFlash-Q4_K_M.gguf"
 DFLASH_TARGET_TENSOR_OVERRIDE=""  # Nex has 40 trunk layers, no blk.40 NextN to park
 # Expert heat profiles (LLAMA_EXPERT_HOT). Pick one via PROFILE_KIND below.
@@ -33,9 +33,9 @@ DFLASH_TARGET_TENSOR_OVERRIDE=""  # Nex has 40 trunk layers, no blk.40 NextN to 
 #   specialist = phase-1 bench prompt match (~72.9% coverage; +2% sustained TPS
 #                on that prompt 2026-08-09; overfit risk on other traffic)
 # Switch for A/B: set PROFILE_KIND to "general" or "specialist", then ./start1660.sh
-PROFILE_GENERAL="$PROJECT_ROOT/benchmark-results/profile-corpus-train8-512-20260802T124500Z/general-profile.csv"
+PROFILE_GENERAL="$PROJECT_ROOT/profiles/nex-n25-mini-code.csv"  # Nex coding usage profile (8 prompts, ADAPT=1 session)
 PROFILE_SPECIALIST="$PROJECT_ROOT/profiles/specialist-benchprompt.csv"
-PROFILE_KIND="specialist"  # general | specialist — specialist: +2% sustained on phase-1 prompt (overfit risk)
+PROFILE_KIND="general"  # 2026-10-02 holdout coding prompt: Nex profile 44.3 vs Qwen specialist 41.8 t/s (+5.9%)
 # Resolve immediately so LLAMA_EXPERT_HOT below sees the real path.
 case "$PROFILE_KIND" in
     general)    PROFILE="$PROFILE_GENERAL" ;;
@@ -47,6 +47,15 @@ PLACEMENT=""  # leave empty for uniform S; variable placement not promoted for p
 # Network / OpenWebUI
 HOST="0.0.0.0"  # listen address; 0.0.0.0 exposes the API on all interfaces
 PORT="8080"  # TCP port used by OpenWebUI and API clients
+
+# Power profile: Performance before model work, Battery once no llama-server of
+# this user has worked for POWER_IDLE_DELAY ms. Battery also dims the panel to
+# 10%; use ...PowerDaemon Balanced as idle command to avoid that. Empty
+# commands disable switching. Servers coordinate via /tmp/llama-power-$UID.
+POWER_BUSY_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance"
+POWER_IDLE_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery"
+POWER_IDLE_DELAY="2000"  # milliseconds without model work before POWER_IDLE_CMD runs
+DECISION_SEQS="0"  # POST /v1/decision side context; agollm serves decisions on its own worker
 CORS_ORIGINS="*"  # allowed browser origins; restrict this for a non-local deployment
 API_KEY=""  # inline API key; leave empty only on a trusted network
 API_KEY_FILE=""  # optional file containing one or more API keys, one per line
@@ -124,8 +133,8 @@ CMOE_UBATCH="64"  # physical base ubatch; keep equal to CMOE_BATCH
 # Phase batching: large prefill for PP; small decode so graph peak can shrink
 # after set_runtime_ubatch (P0 gallocr shrink, 2026-08-16).
 # DFlash draft context is sized to decode geometry, not prefill.
-CMOE_PREFILL_BATCH="1856"  # Long 1823 fits one chunk; +3% PP / +8% decode vs 1792
-CMOE_PREFILL_UBATCH="1856"  # physical target prompt ubatch
+CMOE_PREFILL_BATCH="3072"  # 2.4k prompt in one expert pass: 4.7 vs 6.9 s
+CMOE_PREFILL_UBATCH="3072"  # physical target prompt ubatch
 CMOE_DECODE_BATCH="64"  # logical batch during generation / DFlash verify
 CMOE_DECODE_UBATCH="64"  # physical decode ubatch; phase switch frees prefill peak
 
@@ -700,5 +709,10 @@ fi
 if [[ "$LLAMA_EXPERT_WARM_SLOTS" == 0 || "$LLAMA_EXPERT_WARM_PREFETCH" != 1 ]]; then
     unset_args+=(-u LLAMA_EXPERT_PREFETCH_STREAMS -u LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT)
 fi
+
+[[ -n "$POWER_BUSY_CMD" ]] && env_args+=("LLAMA_ARG_POWER_BUSY_CMD=$POWER_BUSY_CMD")
+[[ -n "$POWER_IDLE_CMD" ]] && env_args+=("LLAMA_ARG_POWER_IDLE_CMD=$POWER_IDLE_CMD")
+env_args+=("LLAMA_ARG_POWER_IDLE_DELAY=$POWER_IDLE_DELAY")
+env_args+=("LLAMA_ARG_DECISION_SEQS=$DECISION_SEQS")
 
 exec env "${unset_args[@]}" "${env_args[@]}" "$SERVER" "${server_args[@]}"

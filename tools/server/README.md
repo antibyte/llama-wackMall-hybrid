@@ -520,6 +520,8 @@ These words will not be included in the completion, so make sure to add them to 
 
 `cache_prompt`: Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests. Because (depending on the backend) the logits are **not** guaranteed to be bit-for-bit identical for different batch sizes (prompt processing vs. token generation) enabling this option can cause nondeterministic results. Default: `true`
 
+`cache_continue`: When only an early part of the prompt matches the cache, for example because the client re-renders earlier turns without their reasoning, keep the cached conversation and append the request's last user turn instead of re-processing the history. Disable it for clients that interleave different conversations on one slot; plain prefix reuse via `cache_prompt` stays active. Default: `true`
+
 `return_tokens`: Return the raw generated token ids in the `tokens` field. Otherwise `tokens` remains empty. Default: `false`
 
 `samplers`: The order the samplers should be applied in. An array of strings representing sampler type names. If a sampler is not set, it will not be used. If a sampler is specified more than once, it will be applied multiple times. Default: `["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]` - these are all the available values.

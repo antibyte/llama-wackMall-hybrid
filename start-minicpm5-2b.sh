@@ -13,6 +13,8 @@
 #   FA required for q8/q4 KV (FA off failed). turbo4_k garbled.
 #   ngram-simple slower on Jinja think (108 vs 114 t/s). spec stays none.
 #   pp2048 ubatch 1024 is 471 t/s vs 453 at 256; 2048 is within 0.4%.
+# 2026-10-02: CPU sampling (bucketed top-p, top_k disabled) beats backend
+# sampling: chat 112.2 vs 96.0 t/s, prompt 0.14 vs 1.1 s.
 # MoE/MTP/DFlash/DSpark knobs are inert. KVFlash loads (tested -c 32768).
 # Sampling from the model card: temp=1.0 top_p=0.95. Think-only mode.
 # Download: ./download-minicpm5-2b.sh
@@ -33,6 +35,15 @@ CHAT_TEMPLATE_FILE="$PROJECT_ROOT/models/templates/openbmb-MiniCPM5-2B.jinja"
 # Network / OpenWebUI
 HOST="0.0.0.0"
 PORT="8080"
+
+# Power profile: Performance before model work, Battery once no llama-server of
+# this user has worked for POWER_IDLE_DELAY ms. Battery also dims the panel to
+# 10%; use ...PowerDaemon Balanced as idle command to avoid that. Empty
+# commands disable switching. Servers coordinate via /tmp/llama-power-$UID.
+POWER_BUSY_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance"
+POWER_IDLE_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery"
+POWER_IDLE_DELAY="2000"  # milliseconds without model work before POWER_IDLE_CMD runs
+DECISION_SEQS="0"  # POST /v1/decision side context; agollm serves decisions on its own worker
 CORS_ORIGINS="*"
 API_KEY=""
 API_KEY_FILE=""
@@ -49,10 +60,13 @@ FIT_TARGET="80"
 FIT_CTX="2048"
 
 # Context, KV, Flash Attention
-CONTEXT="131072"
+# 2026-10-05: f16 KV decodes 111 vs 104 t/s short and 51 vs 25 t/s at 45k tokens
+# (GQA 8: the q8_0 vec FA kernel reads K/V once per Q head). f16 does not fit
+# at 131072; 65536 peaks at 4.6 of 6 GiB.
+CONTEXT="65536"
 N_PREDICT="32768"
-TARGET_TYPE_K="q8_0"
-TARGET_TYPE_V="q8_0"
+TARGET_TYPE_K="f16"
+TARGET_TYPE_V="f16"
 FLASH_ATTN="on"
 KV_OFFLOAD="1"
 LOAD_MODE="mmap"
@@ -87,7 +101,7 @@ JINJA="1"
 THREADS="8"
 THREADS_BATCH="8"
 THREADS_HTTP=""
-TARGET_BACKEND_SAMPLING="1"
+TARGET_BACKEND_SAMPLING="0"
 
 # Phase batching
 CMOE_BATCH="64"
@@ -314,5 +328,10 @@ else
     unset_args+=(-u LLAMA_ARG_CPU_MOE)
 fi
 [[ -n "$THREADS_HTTP" ]] || unset_args+=(-u LLAMA_ARG_THREADS_HTTP)
+
+[[ -n "$POWER_BUSY_CMD" ]] && env_args+=("LLAMA_ARG_POWER_BUSY_CMD=$POWER_BUSY_CMD")
+[[ -n "$POWER_IDLE_CMD" ]] && env_args+=("LLAMA_ARG_POWER_IDLE_CMD=$POWER_IDLE_CMD")
+env_args+=("LLAMA_ARG_POWER_IDLE_DELAY=$POWER_IDLE_DELAY")
+env_args+=("LLAMA_ARG_DECISION_SEQS=$DECISION_SEQS")
 
 exec env "${unset_args[@]}" "${env_args[@]}" "$SERVER" "${server_args[@]}"

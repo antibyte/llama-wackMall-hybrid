@@ -1278,9 +1278,12 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    // Node capacity covers the full ubatch, buffers only the active runtime ubatch:
+    // a sampler change in the decode phase otherwise regrows the prefill peak on
+    // every request (510 MiB for Hy-MT2 on 6 GiB). set_runtime_ubatch() grows it.
+    const uint32_t n_tokens = std::min(cparams.n_ctx, runtime_n_ubatch > 0 ? runtime_n_ubatch : cparams.n_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 

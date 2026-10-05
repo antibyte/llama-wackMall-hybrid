@@ -665,6 +665,10 @@ struct common_params {
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
+    std::string power_busy_cmd;      // run before model work starts (shared across servers)
+    std::string power_idle_cmd;      // run once no server has been working for power_idle_delay_ms
+    int power_idle_delay_ms = 2000;
+
     std::vector<std::string> api_keys;
 
     std::string ssl_file_key  = "";                                                                         // NOLINT

@@ -7,12 +7,16 @@
 #
 # Unsloth Q4_K_M (1.17B, dense LFM2 hybrid, native ctx 32768).
 # llama-bench 2026-09-26 GTX 1660 Ti, FA on, q8 KV, ngl 99, threads 8:
-#   Pascal MMQ (this binary), no drafter: pp512 3428 t/s, pp2048 3228 t/s, tg128 219 t/s
+#   Pascal MMQ, no drafter: pp512 3428 t/s, pp2048 3228 t/s, tg128 219 t/s
 #   sm75 with the same flags: pp512 1077 t/s, tg128 239 t/s (274 with MMVQ rows)
+# 2026-10-02, build-main-sm75 with DP4A MMQ (this binary) vs build-mmq-pascal,
+# ub 512, Q4_K/Q6_K MMVQ rows=2: tg128 275.2 vs 222.3 t/s (+23.8%),
+# pp512 3370 vs 3471, pp2048 3029 vs 3252 (-3%/-7%).
+# CPU sampling: chat 235 t/s either way, prompt 66 vs 150 ms with backend sampling.
 #   DSpark lowered prefill and decode on both builds. Spec stays none.
 # Batch 2048 / ubatch 512 is the measured prefill shape.
 # Sampling from the Liquid instruct card: temp 0.1, top-k 50, repeat-penalty 1.05.
-# Direct answers, no think. No KVFlash: 32k q8 KV fits beside the weights.
+# Direct answers, no think. No KVFlash: 32k f16 KV fits beside the weights.
 #
 set -Eeuo pipefail
 
@@ -22,12 +26,24 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # EDITABLE CONFIGURATION -- only edit values in this section
 # ============================================================================
 
-SERVER="$PROJECT_ROOT/build-mmq-pascal/bin/llama-server"
+SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"  # SM75 DP4A MMQ build
 MODEL="$HOME/models/lfm2.5-1.2b/LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
 CHAT_TEMPLATE_FILE="$PROJECT_ROOT/models/templates/LFM2.5-Instruct.jinja"
 
 HOST="0.0.0.0"
 PORT="8080"
+
+# Power profile: Performance before model work, Battery once no llama-server of
+# this user has worked for POWER_IDLE_DELAY ms. Battery also dims the panel to
+# 10%; use ...PowerDaemon Balanced as idle command to avoid that. Empty
+# commands disable switching. Servers coordinate via /tmp/llama-power-$UID.
+POWER_BUSY_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance"
+POWER_IDLE_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery"
+POWER_IDLE_DELAY="2000"  # milliseconds without model work before POWER_IDLE_CMD runs
+DECISION_SEQS="0"  # POST /v1/decision side context; agollm serves decisions on its own worker
+
+GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS="2"  # 2026-10-02: tg128 240.0 -> 275.2 t/s together with Q6_K rows=2
+GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS="2"  # tied Q6_K output projection
 CORS_ORIGINS="*"
 API_KEY=""
 API_KEY_FILE=""
@@ -47,15 +63,15 @@ CONTEXT="32768"
 N_PREDICT="8192"
 BATCH="2048"
 UBATCH="512"
-TARGET_TYPE_K="q8_0"
-TARGET_TYPE_V="q8_0"
+TARGET_TYPE_K="f16"  # 2026-10-05: tg at 24k tokens 192 vs 140 t/s (q8_0 vec FA kernel), short 242 vs 234
+TARGET_TYPE_V="f16"
 FLASH_ATTN="on"
 KV_OFFLOAD="1"
 LOAD_MODE="mmap"
 OFFLINE="1"
 KV_UNIFIED="1"
 
-# 0 disables. Resident window is unused: the full 32k q8 cache fits in 6 GiB.
+# 0 disables. Resident window is unused: the full 32k f16 cache fits in 6 GiB.
 LLAMA_KVFLASH="0"
 LLAMA_KVFLASH_MAX_POOL="8192"
 LLAMA_KVFLASH_TAU="64"
@@ -79,7 +95,7 @@ JINJA="1"
 
 THREADS="8"
 THREADS_BATCH="8"
-TARGET_BACKEND_SAMPLING="1"
+TARGET_BACKEND_SAMPLING="0"
 
 CMOE_BATCH="512"
 CMOE_UBATCH="512"
@@ -144,6 +160,8 @@ EOF
 
 env_args=(
     "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES_VALUE"
+    "GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS=$GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS"
+    "GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS"
     "LLAMA_ARG_HOST=$HOST"
     "LLAMA_ARG_PORT=$PORT"
     "LLAMA_ARG_CORS_ORIGINS=$CORS_ORIGINS"
@@ -202,6 +220,11 @@ server_args=(
 [[ "$OP_OFFLOAD" == 1 ]] && server_args+=(--op-offload)
 [[ -n "$API_KEY" ]] && server_args+=(--api-key "$API_KEY")
 [[ -n "$API_KEY_FILE" ]] && server_args+=(--api-key-file "$API_KEY_FILE")
+
+[[ -n "$POWER_BUSY_CMD" ]] && env_args+=("LLAMA_ARG_POWER_BUSY_CMD=$POWER_BUSY_CMD")
+[[ -n "$POWER_IDLE_CMD" ]] && env_args+=("LLAMA_ARG_POWER_IDLE_CMD=$POWER_IDLE_CMD")
+env_args+=("LLAMA_ARG_POWER_IDLE_DELAY=$POWER_IDLE_DELAY")
+env_args+=("LLAMA_ARG_DECISION_SEQS=$DECISION_SEQS")
 
 exec env \
     -u LLAMA_ARG_SPEC_DRAFT_MODEL \

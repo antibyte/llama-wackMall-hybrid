@@ -579,24 +579,27 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             const llama_token forced = common_reasoning_budget_get_forced_token(rbudget);
             if (forced != LLAMA_TOKEN_NULL) {
                 id = forced;
-            }
-
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
+            } else if (common_reasoning_budget_blocks_eog(rbudget, id)) {
+                // Backend sampled EOS inside an open think block. Fall through
+                // so the CPU chain can mask it and continue the thought.
+            } else {
+                for (size_t i = 0; i < cur_p.size; ++i) {
+                    if (cur_p.data[i].id == id) {
+                        cur_p.selected = i;
+                        break;
+                    }
                 }
-            }
 
-            if (cur_p.selected < 0) {
-                // Backend filters such as top-k may have removed the forced
-                // token.  Preserve the sampler API contract with a synthetic
-                // singleton candidate rather than rerunning the CPU chain.
-                cur = { llama_token_data { id, 0.0f, 1.0f } };
-                cur_p = llama_token_data_array { cur.data(), cur.size(), 0, true };
-            }
+                if (cur_p.selected < 0) {
+                    // Backend filters such as top-k may have removed the forced
+                    // token.  Preserve the sampler API contract with a synthetic
+                    // singleton candidate rather than rerunning the CPU chain.
+                    cur = { llama_token_data { id, 0.0f, 1.0f } };
+                    cur_p = llama_token_data_array { cur.data(), cur.size(), 0, true };
+                }
 
-            return id;
+                return id;
+            }
         }
     }
 

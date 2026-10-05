@@ -10,12 +10,18 @@
 # Hybrid CPU-MoE, no Qwen specialist profile (48x128 != 40x256).
 # llama-bench 2026-09-19 GTX 1660 Ti: S=24 + MMVQ Q4_K=2 -> 24.2 tg.
 # Pascal MMQ: pp512 163 (>100). Decode ceiling ~25 tg at S=31 VRAM clamp; tg>30 not reachable.
-# Sampling: temp=0.3 repeat=1.05 (card 0.7/1.0 rambles on Q4; EOS override 120001).
+# Sampling: temp=0.3 repeat=1.05 (card 0.7/1.0 rambles on Q4).
+# EOS stays at the GGUF value 120025 <eos:6124c78e>: the original template ends
+# assistant turns with it and the model emits it after a translation.
 # Prompt: "Translate the following text into German. Note that you should
 # **only output the translated result without any additional explanation**:"
 # plus a blank line, then the source. Use the full language name (German, not de).
 # Download: ./download-hy-mt2-30b.sh
 # Results: benchmark-results/hy-mt2-30b-tune-20260919T173901Z/
+# 2026-10-02: PROFILE_KIND=none pinned no experts at all (ADAPT=0, W=0). With
+# profiles/hy-mt2-translate.csv (8 translation prompts, ADAPT=1 session usage)
+# and the SM75 DP4A build: holdout ES/EN->DE 27.5 vs 20.8 t/s (+32%), auto-fit S=17.
+# q8_0 KV drops the fit to S=4 (24.3 t/s); q4_0 gives S=16 (26.4 t/s).
 #
 set -Eeuo pipefail
 
@@ -26,7 +32,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"  # directo
 # ============================================================================
 
 # Paths
-SERVER="$PROJECT_ROOT/build-mmq-pascal/bin/llama-server"
+SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"  # SM75 DP4A MMQ build
 MODEL="$HOME/models/hy-mt2-30b/Hy-MT2-30B-A3B.Q4_K_M.gguf"
 SPEC_MODE="none"  # hy_v3 GGUF has no nextn; Qwen DFlash does not attach
 SPEC_DRAFT_MODEL=""
@@ -36,9 +42,9 @@ DFLASH_TARGET_TENSOR_OVERRIDE=""
 #   specialist = phase-1 bench prompt match (~72.9% coverage; +2% sustained TPS
 #                on that prompt 2026-08-09; overfit risk on other traffic)
 # Switch for A/B: set PROFILE_KIND to "general" or "specialist", then ./start1660.sh
-PROFILE_GENERAL="$PROJECT_ROOT/benchmark-results/profile-corpus-train8-512-20260802T124500Z/general-profile.csv"
+PROFILE_GENERAL="$PROJECT_ROOT/profiles/hy-mt2-translate.csv"  # Hy-MT2 48x128 translation usage profile
 PROFILE_SPECIALIST="$PROJECT_ROOT/profiles/specialist-benchprompt.csv"
-PROFILE_KIND="none"  # none: 48x128 MoE, Qwen specialist CSV does not apply
+PROFILE_KIND="general"  # general = hy-mt2-translate.csv; the Qwen specialist CSV does not apply (48x128)
 # Resolve immediately so LLAMA_EXPERT_HOT below sees the real path.
 case "$PROFILE_KIND" in
     general)    PROFILE="$PROFILE_GENERAL" ;;
@@ -50,6 +56,15 @@ PLACEMENT=""  # leave empty for uniform S; variable placement not promoted for p
 # Network / OpenWebUI
 HOST="0.0.0.0"  # listen address; 0.0.0.0 exposes the API on all interfaces
 PORT="8080"  # TCP port used by OpenWebUI and API clients
+
+# Power profile: Performance before model work, Battery once no llama-server of
+# this user has worked for POWER_IDLE_DELAY ms. Battery also dims the panel to
+# 10%; use ...PowerDaemon Balanced as idle command to avoid that. Empty
+# commands disable switching. Servers coordinate via /tmp/llama-power-$UID.
+POWER_BUSY_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance"
+POWER_IDLE_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery"
+POWER_IDLE_DELAY="2000"  # milliseconds without model work before POWER_IDLE_CMD runs
+DECISION_SEQS="0"  # POST /v1/decision side context; agollm serves decisions on its own worker
 CORS_ORIGINS="*"  # allowed browser origins; restrict this for a non-local deployment
 API_KEY=""  # inline API key; leave empty only on a trusted network
 API_KEY_FILE=""  # optional file containing one or more API keys, one per line
@@ -628,7 +643,6 @@ server_args=(
     --top-p "$TOP_P"
     --min-p "$MIN_P"
     --repeat-penalty "$REPEAT_PENALTY"
-    --override-kv "tokenizer.ggml.eos_token_id=int:120001"
     --reverse-prompt "<｜hy_end▁of▁sentence｜>"
     --reverse-prompt "<｜hy_EOT｜>"
 )
@@ -712,5 +726,10 @@ fi
 if [[ "$LLAMA_EXPERT_WARM_SLOTS" == 0 || "$LLAMA_EXPERT_WARM_PREFETCH" != 1 ]]; then
     unset_args+=(-u LLAMA_EXPERT_PREFETCH_STREAMS -u LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT)
 fi
+
+[[ -n "$POWER_BUSY_CMD" ]] && env_args+=("LLAMA_ARG_POWER_BUSY_CMD=$POWER_BUSY_CMD")
+[[ -n "$POWER_IDLE_CMD" ]] && env_args+=("LLAMA_ARG_POWER_IDLE_CMD=$POWER_IDLE_CMD")
+env_args+=("LLAMA_ARG_POWER_IDLE_DELAY=$POWER_IDLE_DELAY")
+env_args+=("LLAMA_ARG_DECISION_SEQS=$DECISION_SEQS")
 
 exec env "${unset_args[@]}" "${env_args[@]}" "$SERVER" "${server_args[@]}"

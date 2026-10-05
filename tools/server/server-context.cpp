@@ -19,6 +19,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "decision-engine.h"
+#include "server-power.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -1165,6 +1166,8 @@ public:
     std::unique_ptr<llama_decision::engine> decision_engine; // bound to ctx_decision
     llama_context * ctx_decision = nullptr; // separate from the chat context; freed before the model
 
+    std::unique_ptr<server_power> power;
+
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
     server_context_impl() {
@@ -1412,6 +1415,7 @@ private:
         last_user = -1;
         if (!slot.task || slot.state != SLOT_STATE_STARTED ||
                 !slot.task->params.cache_prompt ||
+                !slot.task->params.cache_continue ||
                 slot.prompt.tokens.empty() ||
                 slot.prompt.tokens.has_media() ||
                 slot.task->tokens.has_media()) {
@@ -2080,6 +2084,8 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+
+        power = std::make_unique<server_power>(params_base.power_busy_cmd, params_base.power_idle_cmd, params_base.power_idle_delay_ms);
 
         metrics.init();
 
@@ -3243,6 +3249,18 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_DECISION:
+                power->busy();
+                break;
+            default:
+                break;
+        }
+
+        switch (task.type) {
+            case SERVER_TASK_TYPE_COMPLETION:
+            case SERVER_TASK_TYPE_INFILL:
+            case SERVER_TASK_TYPE_EMBEDDING:
+            case SERVER_TASK_TYPE_RERANK:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -3607,6 +3625,9 @@ private:
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
+                // The failed batch may be partly in memory, so the cached prompt no
+                // longer matches it; reusing it aborted the next request.
+                slot.prompt_clear();
             }
         }
     }
@@ -3668,9 +3689,11 @@ private:
 
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
+                power->idle();
                 return; // skip further processing
 
             } else {
+                power->busy();
                 SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
@@ -4080,7 +4103,7 @@ private:
                             const int32_t n_new = slot.task->n_tokens();
                             const int32_t n_cached = slot.prompt.n_tokens();
                             server_tokens incoming;
-                            const bool maybe_cont = last_user > 0 && n_cached > 64;
+                            const bool maybe_cont = slot.task->params.cache_continue && last_user > 0 && n_cached > 64;
                             if (maybe_cont) {
                                 incoming = slot.task->tokens.clone();
                             }
@@ -4629,11 +4652,16 @@ private:
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         // Skip on hybrid GDN wide prefill: those offsets split the
                         // ubatch and were the IMA path. Anchors above still break.
+                        // n_ubatch changes with cmoe phase batching, so this must not be static.
+                        // Phase batching keeps only the last offset: the held-back tail ran as an
+                        // extra decode-phase chunk, a full expert pass (~2 s) on CPU-MoE models.
                         if (do_checkpoint && !cmoe_rs_prefill) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets[] = {4, 4 + n_ubatch};
+                            const int n_offsets = cmoe_phase_batching ? 1 : 2;
 
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
+                            for (int i = 0; i < n_offsets; ++i) {
+                                const int offset = checkpoint_offsets[i];
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -5326,6 +5354,8 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    // release the busy state now: a delayed idle transition must not be lost on shutdown
+    impl->power.reset();
 }
 
 void server_context::terminate() {

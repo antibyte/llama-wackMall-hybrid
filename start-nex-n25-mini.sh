@@ -31,9 +31,9 @@ DFLASH_TARGET_TENSOR_OVERRIDE=""  # Nex has 40 trunk layers, no blk.40 NextN to 
 #   specialist = phase-1 bench prompt match (~72.9% coverage; +2% sustained TPS
 #                on that prompt 2026-08-09; overfit risk on other traffic)
 # Switch for A/B: set PROFILE_KIND to "general" or "specialist", then ./start1660.sh
-PROFILE_GENERAL="$PROJECT_ROOT/benchmark-results/profile-corpus-train8-512-20260802T124500Z/general-profile.csv"
+PROFILE_GENERAL="$PROJECT_ROOT/profiles/nex-n25-mini-code.csv"  # Nex coding usage profile (8 prompts, ADAPT=1 session)
 PROFILE_SPECIALIST="$PROJECT_ROOT/profiles/specialist-benchprompt.csv"
-PROFILE_KIND="specialist"  # general | specialist — specialist: +2% sustained on phase-1 prompt (overfit risk)
+PROFILE_KIND="general"  # 2026-10-02 holdout coding prompt: Nex profile 44.3 vs Qwen specialist 41.8 t/s (+5.9%)
 # Resolve immediately so LLAMA_EXPERT_HOT below sees the real path.
 case "$PROFILE_KIND" in
     general)    PROFILE="$PROFILE_GENERAL" ;;
@@ -45,6 +45,15 @@ PLACEMENT=""  # leave empty for uniform S; variable placement not promoted for p
 # Network / OpenWebUI
 HOST="0.0.0.0"  # listen address; 0.0.0.0 exposes the API on all interfaces
 PORT="8080"  # TCP port used by OpenWebUI and API clients
+
+# Power profile: Performance before model work, Battery once no llama-server of
+# this user has worked for POWER_IDLE_DELAY ms. Battery also dims the panel to
+# 10%; use ...PowerDaemon Balanced as idle command to avoid that. Empty
+# commands disable switching. Servers coordinate via /tmp/llama-power-$UID.
+POWER_BUSY_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance"
+POWER_IDLE_CMD="busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery"
+POWER_IDLE_DELAY="2000"  # milliseconds without model work before POWER_IDLE_CMD runs
+DECISION_SEQS="0"  # POST /v1/decision side context; agollm serves decisions on its own worker
 CORS_ORIGINS="*"  # allowed browser origins; restrict this for a non-local deployment
 API_KEY=""  # inline API key; leave empty only on a trusted network
 API_KEY_FILE=""  # optional file containing one or more API keys, one per line
@@ -698,5 +707,10 @@ fi
 if [[ "$LLAMA_EXPERT_WARM_SLOTS" == 0 || "$LLAMA_EXPERT_WARM_PREFETCH" != 1 ]]; then
     unset_args+=(-u LLAMA_EXPERT_PREFETCH_STREAMS -u LLAMA_EXPERT_PREFETCH_MAX_INFLIGHT)
 fi
+
+[[ -n "$POWER_BUSY_CMD" ]] && env_args+=("LLAMA_ARG_POWER_BUSY_CMD=$POWER_BUSY_CMD")
+[[ -n "$POWER_IDLE_CMD" ]] && env_args+=("LLAMA_ARG_POWER_IDLE_CMD=$POWER_IDLE_CMD")
+env_args+=("LLAMA_ARG_POWER_IDLE_DELAY=$POWER_IDLE_DELAY")
+env_args+=("LLAMA_ARG_DECISION_SEQS=$DECISION_SEQS")
 
 exec env "${unset_args[@]}" "${env_args[@]}" "$SERVER" "${server_args[@]}"
