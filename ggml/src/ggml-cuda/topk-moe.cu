@@ -210,8 +210,11 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                 }
             }
 
-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                selection_wt[max_expert / WARP_SIZE] = -INFINITY;
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; ++i) {
+                if (max_expert == int(threadIdx.x) + i * WARP_SIZE) {
+                    selection_wt[i] = -INFINITY;
+                }
             }
         } else {
 #pragma unroll
@@ -233,13 +236,19 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                 }
             }
 
-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                wt[max_expert / WARP_SIZE] = -INFINITY;
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; ++i) {
+                if (max_expert == int(threadIdx.x) + i * WARP_SIZE) {
+                    wt[i] = -INFINITY;
+                }
             }
         }
 
-        if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
-            output_weights[k / WARP_SIZE] = max_val;
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; ++i) {
+            if (k == int(threadIdx.x) + i * WARP_SIZE) {
+                output_weights[i] = max_val;
+            }
         }
 
         if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {

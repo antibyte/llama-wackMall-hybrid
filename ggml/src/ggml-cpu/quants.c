@@ -780,6 +780,20 @@ void ggml_vec_dot_q4_K_q8_K_pair_generic(
     ggml_vec_dot_q4_K_q8_K_generic(n, s1, 0, vx1, 0, vy, 0, 1);
 }
 
+void ggml_vec_dot_q4_K_q8_K_rows4_generic(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, size_t stride, const void * GGML_RESTRICT vy) {
+    for (int r = 0; r < 4; ++r) {
+        ggml_vec_dot_q4_K_q8_K_generic(n, &s[r], 0, (const char *) vx + (size_t) r*stride, 0, vy, 0, 1);
+    }
+}
+
+void ggml_vec_dot_q6_K_q8_K_rows4_generic(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, size_t stride, const void * GGML_RESTRICT vy) {
+    for (int r = 0; r < 4; ++r) {
+        ggml_vec_dot_q6_K_q8_K_generic(n, &s[r], 0, (const char *) vx + (size_t) r*stride, 0, vy, 0, 1);
+    }
+}
+
 void ggml_vec_dot_q5_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,  size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);

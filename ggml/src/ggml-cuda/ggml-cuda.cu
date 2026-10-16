@@ -3712,6 +3712,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             return false;
         }
 
+        // The pinned source may still be produced by an asynchronous CPU graph.
+        ggml_backend_synchronize(backend_src);
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst),
                 cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
         return true;
@@ -6064,9 +6066,13 @@ int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
 
-static std::string ggml_cuda_device_description(int device) {
+static std::string ggml_cuda_device_description(int device, enum ggml_backend_dev_type * type = nullptr) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(device)));
+
+    if (type) {
+        *type = prop.integrated ? GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU;
+    }
 
     const ggml_cuda_device_info & info = ggml_cuda_info();
     std::string description = prop.name;
@@ -6138,6 +6144,7 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
 
 struct ggml_backend_cuda_device_context {
     int device;
+    enum ggml_backend_dev_type type;
     std::string name;
     std::string description;
     std::string pci_bus_id;
@@ -6273,13 +6280,7 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
-
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
-
-    return prop.integrated
-        ? GGML_BACKEND_DEVICE_TYPE_IGPU
-        : GGML_BACKEND_DEVICE_TYPE_GPU;
+    return ctx->type;
 }
 
 static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
@@ -6997,7 +6998,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 ggml_backend_cuda_device_context * dev_ctx = new ggml_backend_cuda_device_context;
                 dev_ctx->device = i;
                 dev_ctx->name = GGML_CUDA_NAME + std::to_string(i);
-                dev_ctx->description = ggml_cuda_device_description(i);
+                dev_ctx->description = ggml_cuda_device_description(i, &dev_ctx->type);
 
                 char pci_bus_id[32] = {};
                 CUDA_CHECK(cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), physical_id));

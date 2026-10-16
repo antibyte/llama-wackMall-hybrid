@@ -761,3 +761,123 @@ class DFlashModel(Qwen3Model):
         if not name.startswith("model."):
             name = "model." + name
         return super().filter_tensors((name, gen))
+
+
+@ModelBase.register("Qwen3DSparkModel")
+class DSparkModel(DFlashModel):
+    # DFlash graph plus a vanilla Markov head. Missing dflash.sample_from_anchor means anchor-first.
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    _DSPARK_TENSORS = {
+        "markov_head.markov_w1.weight": "markov_w1.weight",
+        "model.markov_head.markov_w1.weight": "markov_w1.weight",
+        "markov_head.markov_w2.weight": "markov_w2.weight",
+        "model.markov_head.markov_w2.weight": "markov_w2.weight",
+        "confidence_head.proj.weight": "conf_proj.weight",
+        "model.confidence_head.proj.weight": "conf_proj.weight",
+        "confidence_head.proj.bias": "conf_proj.bias",
+        "model.confidence_head.proj.bias": "conf_proj.bias",
+    }
+
+    def _markov_rank(self) -> int:
+        cfg = self.hparams.get("dflash_config") or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        kind = cfg.get("markov_head_type", self.hparams.get("markov_head_type", "vanilla"))
+        if kind != "vanilla":
+            raise ValueError(f"unsupported markov_head_type {kind!r} (only 'vanilla' is supported)")
+        rank = self.hparams.get("markov_rank", cfg.get("markov_rank"))
+        if type(rank) is not int or rank < 1:
+            raise ValueError("DSpark 'markov_rank' must be a positive integer")
+        return rank
+
+    def set_vocab(self):
+        import os
+        from pathlib import Path
+
+        dflash_config, _ = self._validate_config()
+        vocab_gguf = os.environ.get("LLAMA_DSPARK_VOCAB_GGUF")
+        if vocab_gguf:
+            logger.info(f"DSpark: copying tokenizer from {vocab_gguf}")
+            self._copy_tokenizer_from_gguf(Path(vocab_gguf))
+            self.gguf_writer.add_mask_token_id(dflash_config["mask_token_id"])
+            return
+        super().set_vocab()
+
+    def _copy_tokenizer_from_gguf(self, path: Path) -> None:
+        reader = gguf.GGUFReader(path)
+
+        def maybe(key: str):
+            field = reader.get_field(key)
+            return None if field is None else field.contents()
+
+        def must(key: str):
+            value = maybe(key)
+            if value is None:
+                raise ValueError(f"DSpark vocab GGUF is missing {key}")
+            return value
+
+        self.gguf_writer.add_tokenizer_model(must("tokenizer.ggml.model"))
+        pre = maybe("tokenizer.ggml.pre")
+        if pre is not None:
+            self.gguf_writer.add_tokenizer_pre(pre)
+        self.gguf_writer.add_token_list(must("tokenizer.ggml.tokens"))
+        token_type = maybe("tokenizer.ggml.token_type")
+        if token_type is not None:
+            self.gguf_writer.add_token_types(token_type)
+        merges = maybe("tokenizer.ggml.merges")
+        if merges is not None:
+            self.gguf_writer.add_token_merges(merges)
+        scores = maybe("tokenizer.ggml.scores")
+        if scores is not None:
+            self.gguf_writer.add_token_scores(scores)
+
+        id_writers = {
+            "tokenizer.ggml.bos_token_id": self.gguf_writer.add_bos_token_id,
+            "tokenizer.ggml.eos_token_id": self.gguf_writer.add_eos_token_id,
+            "tokenizer.ggml.unknown_token_id": self.gguf_writer.add_unk_token_id,
+            "tokenizer.ggml.seperator_token_id": self.gguf_writer.add_sep_token_id,
+            "tokenizer.ggml.padding_token_id": self.gguf_writer.add_pad_token_id,
+            "tokenizer.ggml.eot_token_id": self.gguf_writer.add_eot_token_id,
+            "tokenizer.ggml.eom_token_id": self.gguf_writer.add_eom_token_id,
+        }
+        for key, write in id_writers.items():
+            value = maybe(key)
+            if value is not None:
+                write(int(value))
+
+        bool_writers = {
+            "tokenizer.ggml.add_bos_token": self.gguf_writer.add_add_bos_token,
+            "tokenizer.ggml.add_eos_token": self.gguf_writer.add_add_eos_token,
+            "tokenizer.ggml.add_sep_token": self.gguf_writer.add_add_sep_token,
+            "tokenizer.ggml.add_space_prefix": self.gguf_writer.add_add_space_prefix,
+            "tokenizer.ggml.remove_extra_whitespaces": self.gguf_writer.add_remove_extra_whitespaces,
+        }
+        for key, write in bool_writers.items():
+            value = maybe(key)
+            if value is not None:
+                write(bool(value))
+
+        template = maybe("tokenizer.chat_template")
+        if isinstance(template, str) and template:
+            self.gguf_writer.add_chat_template(template)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        renamed = self._DSPARK_TENSORS.get(name)
+        if renamed is None:
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+
+        rank = self._markov_rank()
+        vocab = self.hparams["vocab_size"]
+        hidden = self.hparams["hidden_size"]
+        shape = tuple(data_torch.shape)
+        expected = {
+            "markov_w1.weight": (vocab, rank),
+            "markov_w2.weight": (vocab, rank),
+            "conf_proj.weight": (1, hidden + rank),
+            "conf_proj.bias": (1,),
+        }[renamed]
+        if shape != expected:
+            raise ValueError(f"Unexpected DSpark shape for {name}: {shape}, expected {expected}")
+        yield renamed, data_torch

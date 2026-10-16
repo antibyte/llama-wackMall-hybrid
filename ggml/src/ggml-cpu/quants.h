@@ -60,6 +60,12 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 void ggml_vec_dot_q4_K_q8_K_pair(int n, float * GGML_RESTRICT s0, float * GGML_RESTRICT s1,
         const void * GGML_RESTRICT vx0, const void * GGML_RESTRICT vx1,
         const void * GGML_RESTRICT vy);
+// Four consecutive weight rows, one shared Q8_K activation. stride is the
+// byte distance between those rows. s receives four sums.
+void ggml_vec_dot_q4_K_q8_K_rows4(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, size_t stride, const void * GGML_RESTRICT vy);
+void ggml_vec_dot_q6_K_q8_K_rows4(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, size_t stride, const void * GGML_RESTRICT vy);
 void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
@@ -100,6 +106,10 @@ void ggml_vec_dot_q4_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 void ggml_vec_dot_q4_K_q8_K_pair_generic(int n, float * GGML_RESTRICT s0, float * GGML_RESTRICT s1,
         const void * GGML_RESTRICT vx0, const void * GGML_RESTRICT vx1,
         const void * GGML_RESTRICT vy);
+void ggml_vec_dot_q4_K_q8_K_rows4_generic(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, size_t stride, const void * GGML_RESTRICT vy);
+void ggml_vec_dot_q6_K_q8_K_rows4_generic(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, size_t stride, const void * GGML_RESTRICT vy);
 void ggml_vec_dot_q5_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,  size_t by, int nrc);
 void ggml_vec_dot_q6_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq2_xxs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

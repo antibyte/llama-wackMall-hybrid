@@ -1740,21 +1740,33 @@ static void ggml_slab_mark_resident(uintptr_t addr, int64_t now) {
 // sequential stream. Lockstep matmul reads one expert at a time. Slabs already
 // in RAM are skipped. stride is one expert; ignore tensors that are not slabs.
 // Opt-in (GGML_CPU_EXPERT_READAHEAD=1): models that fit in RAM only pay for the checks.
+static bool ggml_expert_readahead_enabled(void) {
+#if defined(__linux__)
+    static atomic_int enabled = -1;
+    int value = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (value < 0) {
+        const char * env = getenv("GGML_CPU_EXPERT_READAHEAD");
+        value = env != NULL && atoi(env) != 0;
+        atomic_store_explicit(&enabled, value, memory_order_relaxed);
+    }
+    return value != 0;
+#else
+    return false;
+#endif
+}
+
 static void ggml_fault_expert_slabs(
         const void * base, size_t stride, const int64_t * counts, int n_expert, int ith, int nth) {
 #if defined(__linux__)
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char * env = getenv("GGML_CPU_EXPERT_READAHEAD");
-        enabled = env != NULL && atoi(env) != 0;
-    }
-    if (!enabled || base == NULL || counts == NULL || nth <= 0 || stride < 4096 || stride > ((size_t) 8 << 20)) {
+    if (base == NULL || counts == NULL || nth <= 0 || stride < 4096 || stride > ((size_t) 8 << 20)) {
         return;
     }
-    static size_t page_size;
+    static atomic_size_t cached_page_size = 0;
+    size_t page_size = atomic_load_explicit(&cached_page_size, memory_order_relaxed);
     if (page_size == 0) {
         const long got = sysconf(_SC_PAGESIZE);
         page_size = got > 0 ? (size_t) got : 4096;
+        atomic_store_explicit(&cached_page_size, page_size, memory_order_relaxed);
     }
     const size_t page = page_size;
     const int64_t now = ggml_time_us();
@@ -1975,8 +1987,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
-    ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth);
-    ggml_barrier(params->threadpool);
+    if (ggml_expert_readahead_enabled()) {
+        ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth);
+        ggml_barrier(params->threadpool);
+    }
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -2158,8 +2172,10 @@ static void ggml_compute_forward_mul_mat_id_cold(
 
     ggml_barrier(params->threadpool);
 
-    ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth);
-    ggml_barrier(params->threadpool);
+    if (ggml_expert_readahead_enabled()) {
+        ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth);
+        ggml_barrier(params->threadpool);
+    }
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -2381,7 +2397,7 @@ static void ggml_compute_forward_moe_cold(
     const bool verify_transient = atomic_load_explicit(&g_moe_transient_gate_up_verify, memory_order_acquire);
 
     // quantize x once, shared by all experts
-    for (int64_t t = ith; t < n_tokens; t++) {
+    for (int64_t t = ith; t < n_tokens; t += nth) {
         from_fx((const float *) ((const char *) x->data + t*x->nb[2]), xq + t*q_embd, ne_embd);
     }
 
@@ -2436,12 +2452,14 @@ static void ggml_compute_forward_moe_cold(
     }
 
     ggml_barrier(params->threadpool);
-    ggml_fault_expert_slabs(w_gate->data, w_gate->nb[2], matrix_row_counts, n_as, ith, nth);
-    if (w_up != w_gate) {
-        ggml_fault_expert_slabs(w_up->data, w_up->nb[2], matrix_row_counts, n_as, ith, nth);
+    if (ggml_expert_readahead_enabled()) {
+        ggml_fault_expert_slabs(w_gate->data, w_gate->nb[2], matrix_row_counts, n_as, ith, nth);
+        if (w_up != w_gate) {
+            ggml_fault_expert_slabs(w_up->data, w_up->nb[2], matrix_row_counts, n_as, ith, nth);
+        }
+        ggml_fault_expert_slabs(w_down->data, w_down->nb[2], matrix_row_counts, n_as, ith, nth);
+        ggml_barrier(params->threadpool);
     }
-    ggml_fault_expert_slabs(w_down->data, w_down->nb[2], matrix_row_counts, n_as, ith, nth);
-    ggml_barrier(params->threadpool);
     if (profile_phases) {
         if (ith == 0) {
             phase_clock[0] = ggml_time_us();

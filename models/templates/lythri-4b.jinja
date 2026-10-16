@@ -1,0 +1,38 @@
+{#- Lythri-4B-A2B: Gemma 4 turns, but thinking in <think> tags after the
+    generation prompt, as in the model card quickstart. The GGUF ships the
+    Gemma 4 canonical template, which puts <|think|> into the system turn and
+    parses <|channel>thought; Lythri answers that with a raw <think> block. -#}
+{{- bos_token -}}
+{%- for message in messages -%}
+    {%- set role = message['role'] -%}
+    {%- if role == 'assistant' -%}
+        {%- set role = 'model' -%}
+    {%- elif role == 'developer' -%}
+        {%- set role = 'system' -%}
+    {%- endif -%}
+    {%- if role in ['system', 'user', 'model'] -%}
+        {%- if message['content'] is string -%}
+            {%- set content = message['content'] -%}
+        {%- else -%}
+            {%- set ns = namespace(text='') -%}
+            {%- for part in message['content'] or [] -%}
+                {%- if part['type'] == 'text' -%}
+                    {%- set ns.text = ns.text + part['text'] -%}
+                {%- endif -%}
+            {%- endfor -%}
+            {%- set content = ns.text -%}
+        {%- endif -%}
+        {{- '<|turn>' + role + '\n' -}}
+        {%- if role == 'model' and message.get('reasoning_content') -%}
+            {{- '<think>\n' + message['reasoning_content'] | trim + '\n</think>\n\n' -}}
+        {%- endif -%}
+        {{- content | trim -}}
+        {{- '<turn|>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|turn>model\n' -}}
+    {%- if enable_thinking is not defined or enable_thinking -%}
+        {{- '<think>' -}}
+    {%- endif -%}
+{%- endif -%}

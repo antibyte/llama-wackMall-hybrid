@@ -30,7 +30,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"
 MODEL="$HOME/models/lythri-4b-a2b/Lythri-4B-A2B-Q8_0.gguf"
-CHAT_TEMPLATE_FILE=""  # GGUF Jinja; add <think> after the generation prompt
+CHAT_TEMPLATE_FILE="$PROJECT_ROOT/models/templates/lythri-4b.jinja"  # GGUF Gemma 4 Jinja triggers <|think|> and parses <|channel>thought; Lythri thinks in <think>
 
 # Network / OpenWebUI
 HOST="0.0.0.0"

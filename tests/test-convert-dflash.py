@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from conversion.qwen import DFlashModel, Qwen3Model  # noqa: E402
+from conversion.qwen import DFlashModel, DSparkModel, Qwen3Model  # noqa: E402
 
 
 class DFlashConverterTests(unittest.TestCase):
@@ -126,6 +126,40 @@ class DFlashConverterTests(unittest.TestCase):
         dflash_config, target_hparams = model._validate_config()
         self.assertEqual(dflash_config["block_size"], 16)
         self.assertEqual(target_hparams["num_hidden_layers"], 40)
+
+    def test_accepts_block_size_on_the_model_root(self):
+        model = self.make_model()
+        del self.dflash_config["block_size"]
+        model.hparams["block_size"] = 15
+        model.hparams["dflash_config"] = self.dflash_config
+        dflash_config, _ = model._validate_config()
+        self.assertEqual(dflash_config["block_size"], 15)
+
+    def test_dspark_renames_markov_and_confidence(self):
+        model = DSparkModel.__new__(DSparkModel)
+        model.hparams = {
+            "hidden_size": 2048,
+            "vocab_size": 248144,
+            "markov_rank": 256,
+            "dflash_config": {"markov_head_type": "vanilla", "markov_rank": 256},
+        }
+        cases = {
+            "model.markov_head.markov_w1.weight": ("markov_w1.weight", (248144, 256)),
+            "model.markov_head.markov_w2.weight": ("markov_w2.weight", (248144, 256)),
+            "model.confidence_head.proj.weight": ("conf_proj.weight", (1, 2304)),
+            "model.confidence_head.proj.bias": ("conf_proj.bias", (1,)),
+        }
+        for src, (dst, shape) in cases.items():
+            tensor = SimpleNamespace(shape=shape)
+            self.assertEqual(list(model.modify_tensors(tensor, src, None)), [(dst, tensor)])
+
+        bad = SimpleNamespace(shape=(248144, 128))
+        with self.assertRaisesRegex(ValueError, "Unexpected DSpark shape"):
+            list(model.modify_tensors(bad, "model.markov_head.markov_w1.weight", None))
+
+        model.hparams["dflash_config"]["markov_head_type"] = "grouped"
+        with self.assertRaisesRegex(ValueError, "markov_head_type"):
+            list(model.modify_tensors(SimpleNamespace(shape=(248144, 256)), "model.markov_head.markov_w1.weight", None))
 
     def test_validates_feature_fusion_weight_shape(self):
         model = self.make_model()

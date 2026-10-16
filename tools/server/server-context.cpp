@@ -28,6 +28,7 @@
 #include <cstring>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -1212,6 +1213,10 @@ private:
 
     bool cmoe_phase_batching = false;
     bool cmoe_phase_prefill  = false;
+    // Set after a prefill OOM whose tokens could not be rolled back.
+    // The rest of that request stays on the decode ubatch.
+    bool cmoe_prefill_oom    = false;
+    bool cmoe_restart_prompt = false;
     int32_t cmoe_prefill_batch  = 0;
     int32_t cmoe_prefill_ubatch = 0;
     int32_t cmoe_decode_batch   = 0;
@@ -3688,6 +3693,7 @@ private:
             }
 
             if (all_idle) {
+                cmoe_prefill_oom = false;
                 SRV_TRC("%s", "all slots are idle\n");
                 power->idle();
                 return; // skip further processing
@@ -3702,7 +3708,7 @@ private:
             }
         }
 
-        const bool request_is_prefilling = cmoe_request_is_prefilling();
+        const bool request_is_prefilling = !cmoe_prefill_oom && cmoe_request_is_prefilling();
         set_cmoe_batch_phase(request_is_prefilling);
 
         try {
@@ -3747,6 +3753,11 @@ private:
 
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
+                if (cmoe_restart_prompt) {
+                    // The prompt was cleared. This batch still holds the old positions.
+                    cmoe_restart_prompt = false;
+                    break;
+                }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -4850,9 +4861,37 @@ private:
                 }
 
                 if (ret < -1) {
-                    if (cmoe_phase_prefill) {
-                        SRV_ERR("prefill compute OOM (ret = %d); falling back to decode ubatch\n", ret);
+                    if (cmoe_phase_prefill && !cmoe_prefill_oom) {
                         set_cmoe_batch_phase(false);
+                        // Hybrid caches accept a wide ubatch before the graph runs.
+                        // seq_rm cannot undo that, so the same positions are invalid.
+                        llama_pos batch_pos = std::numeric_limits<llama_pos>::max();
+                        if (batch_view.pos) {
+                            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                                batch_pos = std::min(batch_pos, batch_view.pos[i]);
+                            }
+                        }
+                        bool stuck = false;
+                        if (auto * mem = llama_get_memory(ctx_tgt)) {
+                            for (auto & slot : slots) {
+                                if (slot.is_processing() && llama_memory_seq_pos_max(mem, slot.id) >= batch_pos) {
+                                    stuck = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!stuck) {
+                            SRV_ERR("prefill compute OOM (ret = %d); falling back to decode ubatch\n", ret);
+                            return false;
+                        }
+                        cmoe_prefill_oom = true;
+                        SRV_WRN("prefill OOM (ret = %d) left sequence positions in place; restarting the prompt at decode ubatch\n", ret);
+                        for (auto & slot : slots) {
+                            if (slot.is_processing()) {
+                                slot.prompt_clear();
+                            }
+                        }
+                        cmoe_restart_prompt = true;
                         return false;
                     }
                     err = "Compute error.";
