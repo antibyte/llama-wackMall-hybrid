@@ -421,6 +421,9 @@ private:
 
     bool has_evaluated_once = false;
 
+    // true after the prism.hadamard coverage check passes on a reserved graph
+    bool hadamard_verified = false;
+
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 

@@ -10,85 +10,108 @@
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
-static int get_rows_override(const char * name) {
+// fallback is used when the variable is unset. "0" keeps the original kernel.
+// Q4_K=2, Q6_K=2 and Q8_0=4 are the 1660 Ti one-token winners.
+static int get_rows_override(const char * name, int fallback, bool allow_two = true) {
     const char * env = std::getenv(name);
     if (!env || !env[0]) {
-        return 0;
+        return fallback;
     }
     const int parsed = std::atoi(env);
-    if (parsed == 0 || parsed == 1 || parsed == 2 || parsed == 4) {
+    if (parsed == 0 || parsed == 1 || (parsed == 2 && allow_two) || parsed == 4) {
         return parsed;
     }
-    std::fprintf(stderr, "ggml_cuda: ignoring invalid %s='%s' (expected 0, 1, 2, or 4)\n", name, env);
-    return 0;
+    std::fprintf(stderr, "ggml_cuda: ignoring invalid %s='%s' (expected %s)\n", name, env, allow_two ? "0, 1, 2, or 4" : "0, 1, or 4");
+    return fallback;
 }
 
 static int get_q8_0_ncols1_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS", 4);
+    }();
+    return value;
+}
+
+static int get_q8_0_fused_ncols1_rows_override() {
+    static const int value = [] {
+        return get_rows_override("GGML_CUDA_MMVQ_Q8_FUSED_NCOLS1_ROWS", 0);
     }();
     return value;
 }
 
 static int get_q8_0_ncols2_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS", 0);
     }();
     return value;
 }
 
 static int get_q8_0_ncols3_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS", 0);
+    }();
+    return value;
+}
+
+static int get_q8_0_ncols5_rows_override() {
+    static const int value = [] {
+        return get_rows_override("GGML_CUDA_MMVQ_Q8_NCOLS5_ROWS", 0, false);
     }();
     return value;
 }
 
 static int get_q3_k_ncols1_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_Q3_K_NCOLS1_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_Q3_K_NCOLS1_ROWS", 0);
     }();
     return value;
 }
 
 static int get_q4_k_ncols1_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS", 2);
     }();
     return value;
 }
 
 static int get_q5_k_ncols1_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_Q5_K_NCOLS1_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_Q5_K_NCOLS1_ROWS", 0);
     }();
     return value;
 }
 
 static int get_q6_k_ncols1_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS", 2);
     }();
     return value;
 }
 
 static int get_q6_k_ncols3_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS", 0);
+    }();
+    return value;
+}
+
+static int get_q6_k_ncols4_rows_override() {
+    static const int value = [] {
+        return get_rows_override("GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS", 4, false);
     }();
     return value;
 }
 
 static int get_moe_fused_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_MOE_FUSED_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_MOE_FUSED_ROWS", 0);
     }();
     return value;
 }
 
 static int get_moe_plain_rows_override() {
     static const int value = [] {
-        return get_rows_override("GGML_CUDA_MMVQ_MOE_PLAIN_ROWS");
+        return get_rows_override("GGML_CUDA_MMVQ_MOE_PLAIN_ROWS", 0);
     }();
     return value;
 }
@@ -96,6 +119,7 @@ static int get_moe_plain_rows_override() {
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
+        case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
         case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
@@ -124,6 +148,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
@@ -448,7 +473,34 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
+// Turing, 2..8 columns: rows of a few blocks make the cross-warp reduction dominate,
+// so one warp handles a group of rows over the full K. 0 keeps the generic table.
+static constexpr __host__ __device__ int mmvq_turing_multi_col_rows(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return 8;
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return 4;
+        default:
+            return 0;
+    }
+}
+
+// Turing, one column with small K: one warp per block, 8 rows per warp instead of
+// one active warp out of nwarps.
+static constexpr int mmvq_turing_small_k_rows = 8;
+
+static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC
 #ifdef GGML_CUDA_PASCAL_MMVQ_TUNING
             || table_id == MMVQ_PARAMETERS_PASCAL_DP4A
@@ -534,6 +586,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_TURING) {
+        if (ncols_dst == 1 && small_k) {
+            return 1;
+        }
+        if (ncols_dst >= 2 && ncols_dst <= 8 && mmvq_turing_multi_col_rows(type) > 0) {
+            return 1;
+        }
         if (ncols_dst == 1) {
             switch (type) {
                 case GGML_TYPE_Q2_K:
@@ -563,7 +621,15 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_TURING) {
+        if (ncols_dst == 1 && small_k) {
+            return mmvq_turing_small_k_rows;
+        }
+        if (ncols_dst >= 2 && ncols_dst <= 8 && mmvq_turing_multi_col_rows(type) > 0) {
+            return mmvq_turing_multi_col_rows(type);
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC
 #ifdef GGML_CUDA_PASCAL_MMVQ_TUNING
             || table_id == MMVQ_PARAMETERS_PASCAL_DP4A
@@ -589,7 +655,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, int rows_per_block_override = 0>
 __launch_bounds__(
-        calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(),
+        calc_nwarps(type, ncols_dst, get_device_table_id(), small_k)*ggml_cuda_get_physical_warp_size(),
         (type == GGML_TYPE_Q4_K && ncols_dst == 1) ? 2 : 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -607,9 +673,9 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k);
     constexpr int rows_per_cuda_block = rows_per_block_override > 0 ? rows_per_block_override :
-            calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+            calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -946,8 +1012,8 @@ template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1164,6 +1230,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
             } else if constexpr (type == GGML_TYPE_Q8_0) {
                 rows_override = !ids && !has_fusion && !use_small_k ? get_q8_0_ncols1_rows_override() : 0;
                 rows_override_name = "Q8_0";
+                if (!ids && has_fusion && !use_small_k && table_id == MMVQ_PARAMETERS_TURING) {
+                    rows_override = get_q8_0_fused_ncols1_rows_override();
+                    rows_override_name = "Q8_0 fused";
+                    // The dot loads cover complete row groups.
+                    if (rows_override > 1 && nrows_x % rows_override != 0) {
+                        rows_override = 0;
+                    }
+                }
             }
             if (rows_override == 2 || rows_override == 4) {
                 const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
@@ -1173,7 +1247,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 static std::atomic<bool> logged{false};
                 if (!logged.exchange(true)) {
                     std::fprintf(stderr,
-                            "ggml_cuda: %s ncols=1 MMVQ rows/block override active: %d (default 1)\n",
+                            "ggml_cuda: %s ncols=1 MMVQ rows/block %d\n",
                             rows_override_name, rows_override);
                 }
                 if (rows_override == 2) {
@@ -1324,6 +1398,37 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 4: {
             constexpr int c_ncols_dst = 4;
+            if constexpr (type == GGML_TYPE_Q6_K) {
+                const int rows_override = table_id == MMVQ_PARAMETERS_TURING && !ids && !has_fusion ? get_q6_k_ncols4_rows_override() : 0;
+                if (rows_override == 1 || (rows_override == 4 && nrows_x % 4 == 0)) {
+                    const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
+                    const dim3 block_nums((nrows_x + rows_override - 1)/rows_override,
+                            nchannels_dst, nsamples_dst);
+                    const dim3 block_dims(warp_size, nwarps, 1);
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true)) {
+                        std::fprintf(stderr,
+                                "ggml_cuda: Q6_K ncols=4 MMVQ rows/block override active: %d (table default 2)\n",
+                                rows_override);
+                    }
+                    if (rows_override == 1) {
+                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 1>(
+                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
+                            stride_row_x, stride_col_y, stride_col_dst,
+                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                            sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                            block_nums, block_dims, 0, ids_stride, stream);
+                    } else {
+                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 4>(
+                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
+                            stride_row_x, stride_col_y, stride_col_dst,
+                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                            sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                            block_nums, block_dims, 0, ids_stride, stream);
+                    }
+                    break;
+                }
+            }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1332,6 +1437,37 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 5: {
             constexpr int c_ncols_dst = 5;
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                const int rows_override = table_id == MMVQ_PARAMETERS_TURING && !ids ? get_q8_0_ncols5_rows_override() : 0;
+                if (rows_override == 1 || (rows_override == 4 && nrows_x % 4 == 0)) {
+                    const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
+                    const dim3 block_nums((nrows_x + rows_override - 1)/rows_override,
+                            nchannels_dst, nsamples_dst);
+                    const dim3 block_dims(warp_size, nwarps, 1);
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true)) {
+                        std::fprintf(stderr,
+                                "ggml_cuda: Q8_0 ncols=5 MMVQ rows/block override active: %d (table default 2)\n",
+                                rows_override);
+                    }
+                    if (rows_override == 1) {
+                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 1>(
+                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
+                            stride_row_x, stride_col_y, stride_col_dst,
+                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                            sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                            block_nums, block_dims, 0, ids_stride, stream);
+                    } else {
+                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 4>(
+                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
+                            stride_row_x, stride_col_y, stride_col_dst,
+                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                            sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                            block_nums, block_dims, 0, ids_stride, stream);
+                    }
+                    break;
+                }
+            }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1378,6 +1514,12 @@ static void mul_mat_vec_q_switch_type(
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_Q2_0:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);

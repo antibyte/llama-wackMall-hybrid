@@ -94,6 +94,8 @@ struct llama_cross {
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 };
 
+struct llama_hadamard;
+
 struct llm_graph_params;
 
 //
@@ -759,6 +761,8 @@ struct llm_graph_params {
 
     llm_graph_dflash_i * dflash;
 
+    const llama_hadamard * hdmd = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -944,6 +948,11 @@ public:
 
     bool dflash_inject_built = false;
 
+    std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
+
+    ggml_tensor * get_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot) const;
+    void          set_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, ggml_tensor * res);
+
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
@@ -1024,6 +1033,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    const llama_hadamard * hdmd;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1032,6 +1043,10 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // independent work (e.g. a shared expert) that build_moe_ffn expands right
+    // after a cold-first CPU expert op, so it overlaps the CPU split; reset per call
+    mutable ggml_tensor * moe_overlap = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1045,6 +1060,11 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    // apply the activation-side transform of a Hadamard-folded weight, if any
+    ggml_tensor * build_hadamard_input(
+              ggml_tensor * w,
+              ggml_tensor * cur) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(

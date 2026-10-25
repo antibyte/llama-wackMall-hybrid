@@ -17,6 +17,7 @@ __all__ = [
 
 
 TEXT_MODEL_MAP: dict[str, str] = {
+    "DoryForCausalLM": "dory",
     "AfmoeForCausalLM": "afmoe",
     "LagunaForCausalLM": "laguna",
     "ApertusForCausalLM": "llama",
@@ -71,6 +72,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "ExaoneForCausalLM": "exaone",
     "ExaoneMoEForCausalLM": "exaone",
     "FalconForCausalLM": "falcon",
+    "FlintForCausalLM": "flint",
     "FalconH1ForCausalLM": "falcon_h1",
     "FalconMambaForCausalLM": "mamba",
     "GPT2LMHeadModel": "gpt2",

@@ -162,6 +162,7 @@ LLAMA_EXPERT_TIMING="0"  # collect detailed CPU expert timing; adds measurement 
 LLAMA_EXPERT_CPU_CHUNK="64"  # cold-row chunk size; power of two from 16 through 256
 LLAMA_EXPERT_CPU_ACT_PARALLEL="0"  # experimental path did not establish a sustained winner
 LLAMA_EXPERT_CPU_ASYNC="0"  # bridge/async path regressed on this GPU; keep synchronous fallback
+LLAMA_EXPERT_COLD_FIRST="1"  # cold CPU experts right after the router; hot and shared experts overlap them (2026-10-25, Nex DFlash +9.5%)
 LLAMA_EXPERT_CPU_DOWN_PREFETCH="1"  # no measured sustained gain on the local CPU
 LLAMA_EXPERT_CPU_REUSE_ROWS="1"  # conservative winner; row reuse is not part of the 49.134-TPS promoted Q4 path
 LLAMA_EXPERT_CPU_MULTI_ROW="1"  # AVX2 multi-row reduced CPU time but was neutral in 2K decode
@@ -234,6 +235,7 @@ LLAMA_EXPERT_SKIP_SENTINEL="1"  # 3x2K winner: 44.744 -> 46.487 tok/s (+3.90%), 
 GGML_CUDA_MOE_MULTI_FUSION="1"  # fuse Gate+Up+GLU for 2-4 target tokens on sm_75+
 GGML_CUDA_MOE_COMBINE_FUSION="1"  # exact combine fusion measured neutral (+0.07%)
 GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS="4"  # 3x2K winner: 46.831 -> 47.436 token/s
+GGML_CUDA_MMVQ_Q8_NCOLS5_ROWS="4"
 GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS="0"  # A/B candidate; 0=auto (default 1 row/block for ncols=1)
 GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS="0"  # A/B candidate; 0=auto (default 2 rows/block for ncols=2)
 GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS="2"  # decode winner vs default 1
@@ -242,6 +244,7 @@ GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS="0"  # 1/4-warp screens lost; 0 keeps the archi
 GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS="0"  # independent warp-row kernels did not beat the winner
 GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y="0"  # shared Q8_1 unpack was exact but slightly slower on sm_75
 GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS="4"  # Q6_K output projection, MTP-2 verify graph
+GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS="4"
 GGML_CUDA_MMVQ_MOE_FUSED_ROWS="0"  # fused MoE rows/block sweep was neutral or slower
 GGML_CUDA_MMVQ_MOE_PLAIN_ROWS="0"  # plain MoE rows/block sweep was neutral or slower
 GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE="128"  # active together with flat dim-0 in the confirmed 3x2K MTP-2 winner
@@ -249,6 +252,7 @@ GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0="1"  # 3x2K winner: 47.794 -> 48.599 token/s
 GGML_CUDA_ASYNC_HOST_COPY="1"  # 3x2K winner: pinned split H2D, 47.435 -> 48.335 token/s
 GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate: +0.48% q4 and +0.24% q8 screens
 GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner: 47.340 -> 47.713 token/s (+0.79%)
+GGML_SCHED_DEFER_HOST_INPUTS="1"  # launch the hot branch before the synchronous CPU split; same tokens as cold-first alone
 GGML_CUDA_REGISTER_HOST="1"  # mmap pin; 21 GiB cudaHostRegister failed on 1660 Ti (host RAM, not VRAM)
 GGML_SCHED_PREFETCH_EXPERTS="2"  # persistent staging; 2 slots overlap prefill copies. S does not size this.
 
@@ -350,12 +354,14 @@ case "$GGML_CUDA_MOE_COMBINE_FUSION" in 0|1) ;; *) die "GGML_CUDA_MOE_COMBINE_FU
 case "$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
+case "$GGML_CUDA_MMVQ_Q8_NCOLS5_ROWS" in 0|1|4) ;; *) die "GGML_CUDA_MMVQ_Q8_NCOLS5_ROWS muss 0, 1 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS" in 0|2|4|8|16) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS muss 0, 2, 4, 8 oder 16 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y" in 0|1) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
+case "$GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS" in 0|1|4) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS muss 0, 1 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_MOE_FUSED_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_MOE_FUSED_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_MOE_PLAIN_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_MOE_PLAIN_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE" in 0|32|64|128|256) ;; *) die "GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE muss 0, 32, 64, 128 oder 256 sein." ;; esac
@@ -363,6 +369,8 @@ case "$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0" in 0|1) ;; *) die "GGML_CUDA_CONCAT_N
 case "$GGML_CUDA_ASYNC_HOST_COPY" in 0|1) ;; *) die "GGML_CUDA_ASYNC_HOST_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_ASYNC_D2H_COPY" in 0|1) ;; *) die "GGML_SCHED_ASYNC_D2H_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_DEDUP_DST_SYNC" in 0|1) ;; *) die "GGML_SCHED_DEDUP_DST_SYNC muss 0 oder 1 sein." ;; esac
+case "$GGML_SCHED_DEFER_HOST_INPUTS" in 0|1) ;; *) die "GGML_SCHED_DEFER_HOST_INPUTS muss 0 oder 1 sein." ;; esac
+case "$LLAMA_EXPERT_COLD_FIRST" in 0|1) ;; *) die "LLAMA_EXPERT_COLD_FIRST muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_REGISTER_HOST" in 0|1) ;; *) die "GGML_CUDA_REGISTER_HOST muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_PREFETCH_EXPERTS" in 0|1|2|3|4|5|6|7|8) ;; *) die "GGML_SCHED_PREFETCH_EXPERTS muss 0 oder 1..8 sein." ;; esac
 [[ -z "$LLAMA_EXPERT_S" || -z "$LLAMA_EXPERT_PLACEMENT" ]] || \
@@ -514,6 +522,7 @@ env_args=(
     "LLAMA_EXPERT_CPU_CHUNK=$LLAMA_EXPERT_CPU_CHUNK"
     "LLAMA_EXPERT_CPU_ACT_PARALLEL=$LLAMA_EXPERT_CPU_ACT_PARALLEL"
     "LLAMA_EXPERT_CPU_ASYNC=$LLAMA_EXPERT_CPU_ASYNC"
+    "LLAMA_EXPERT_COLD_FIRST=$LLAMA_EXPERT_COLD_FIRST"
     "LLAMA_EXPERT_CPU_DOWN_PREFETCH=$LLAMA_EXPERT_CPU_DOWN_PREFETCH"
     "LLAMA_EXPERT_CPU_REUSE_ROWS=$LLAMA_EXPERT_CPU_REUSE_ROWS"
     "LLAMA_EXPERT_CPU_MULTI_ROW=$LLAMA_EXPERT_CPU_MULTI_ROW"
@@ -557,6 +566,7 @@ env_args=(
     "GGML_CUDA_MOE_MULTI_FUSION=$GGML_CUDA_MOE_MULTI_FUSION"
     "GGML_CUDA_MOE_COMBINE_FUSION=$GGML_CUDA_MOE_COMBINE_FUSION"
     "GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS"
+    "GGML_CUDA_MMVQ_Q8_NCOLS5_ROWS=$GGML_CUDA_MMVQ_Q8_NCOLS5_ROWS"
     "GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS"
     "GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS=$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS"
     "GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS=$GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS"
@@ -565,6 +575,7 @@ env_args=(
     "GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS"
     "GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y"
     "GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS"
+    "GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS=$GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS"
     "GGML_CUDA_MMVQ_MOE_FUSED_ROWS=$GGML_CUDA_MMVQ_MOE_FUSED_ROWS"
     "GGML_CUDA_MMVQ_MOE_PLAIN_ROWS=$GGML_CUDA_MMVQ_MOE_PLAIN_ROWS"
     "GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE"
@@ -572,6 +583,7 @@ env_args=(
     "GGML_CUDA_ASYNC_HOST_COPY=$GGML_CUDA_ASYNC_HOST_COPY"
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
     "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"
+    "GGML_SCHED_DEFER_HOST_INPUTS=$GGML_SCHED_DEFER_HOST_INPUTS"
     "GGML_CUDA_REGISTER_HOST=$GGML_CUDA_REGISTER_HOST"
     "GGML_SCHED_PREFETCH_EXPERTS=$GGML_SCHED_PREFETCH_EXPERTS"
     "LLAMA_DFLASH_COMBINED=$DFLASH_COMBINED"
@@ -663,10 +675,10 @@ llama-wackMall-hybrid start
   fixed S:      ${LLAMA_EXPERT_S:-auto-fit}, warm W: $LLAMA_EXPERT_WARM_SLOTS (admission=$LLAMA_EXPERT_WARM_ADMISSION window=$LLAMA_EXPERT_WARM_ADMISSION_WINDOW prefetch=$LLAMA_EXPERT_WARM_PREFETCH)
   CPU threads:  $THREADS/$THREADS_BATCH (draft $DRAFT_THREADS/$DRAFT_THREADS_BATCH)
   backend samp: target=$TARGET_BACKEND_SAMPLING draft=$EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING
-  CUDA rows:    Q8n1=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS Q8n2=$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS Q8n3=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS Q4n1=$GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS Q6n1=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS Q6n3=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS
+  CUDA rows:    Q8n1=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS Q8n2=$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS Q8n3=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS Q8n5=$GGML_CUDA_MMVQ_Q8_NCOLS5_ROWS Q4n1=$GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS Q6n1=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS Q6n3=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS Q6n4=$GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS
   Q6 probes:    warps=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS warp-rows=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS reuse-y=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y
   CUDA concat:  flat-dim0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 block=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
-  split copies: async-h2d=$GGML_CUDA_ASYNC_HOST_COPY async-d2h=$GGML_SCHED_ASYNC_D2H_COPY dedup-dst-sync=$GGML_SCHED_DEDUP_DST_SYNC
+  split copies: async-h2d=$GGML_CUDA_ASYNC_HOST_COPY async-d2h=$GGML_SCHED_ASYNC_D2H_COPY dedup-dst-sync=$GGML_SCHED_DEDUP_DST_SYNC defer-host=$GGML_SCHED_DEFER_HOST_INPUTS cold-first=$LLAMA_EXPERT_COLD_FIRST
   n-cpu-moe:    register-host=$GGML_CUDA_REGISTER_HOST prefetch-experts=$GGML_SCHED_PREFETCH_EXPERTS
   skip sentinel: $LLAMA_EXPERT_SKIP_SENTINEL (1=MMVQ early-exit on cold sentinel slots)
   shared hot IDs: $LLAMA_EXPERT_SHARED_HOT_IDS

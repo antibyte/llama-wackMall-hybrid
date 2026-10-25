@@ -1039,6 +1039,8 @@ struct vk_device_struct {
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
+    bool disable_descriptor_reuse;
+    std::atomic<uint64_t> buffer_destroy_count {};
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
@@ -1108,6 +1110,10 @@ struct vk_buffer_struct {
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
+        // bump before destroying, so a thread that sees the buffer gone also sees the new count
+        if (device) {
+            device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
+        }
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
     }
@@ -2205,6 +2211,8 @@ struct ggml_backend_vk_context {
 
     std::vector<vk::DescriptorPool> descriptor_pools;
     std::vector<vk::DescriptorSet> descriptor_sets;
+    std::vector<std::vector<vk::DescriptorBufferInfo>> descriptor_set_bindings;
+    uint64_t descriptor_set_bindings_destroy_count {};
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
 
@@ -2928,6 +2936,7 @@ static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx
         vk::DescriptorSetAllocateInfo descriptor_set_alloc_info(ctx->descriptor_pools[pool_idx], alloc_count, layouts.data());
         std::vector<vk::DescriptorSet> sets = device->device.allocateDescriptorSets(descriptor_set_alloc_info);
         ctx->descriptor_sets.insert(ctx->descriptor_sets.end(), sets.begin(), sets.end());
+        ctx->descriptor_set_bindings.resize(ctx->descriptor_sets.size());
 
         pool_idx++;
     }
@@ -4063,7 +4072,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         // chip specific tuning
         if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
-            m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
+            // Renoir-class (about 8 CUs): a 128x128 output tile with TM=TN=4 does more
+            // packed fp16 FMAs per loaded byte than the narrow 16-wide GCN tile.
+            if (device->shader_core_count > 0 && device->shader_core_count <= 12) {
+                m_warptile_mmq = { 256, 128, 128, 32, 32, 64, 2, 4, 4, 1, 32 };
+            } else {
+                m_warptile_mmq = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
+            }
+            m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
         } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
             // This is intentionally using tx_m values, slight performance increase
@@ -4079,6 +4095,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
+        if (device->architecture == AMD_GCN && device->driver_id != vk::DriverId::eAmdProprietary &&
+                device->shader_core_count > 0 && device->shader_core_count <= 12) {
+            m_mmq_wg_denoms = { 128, 128, 1 };
+        }
         l_align = 128;
         m_align =  64;
         s_align =  32;
@@ -6799,6 +6819,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->idx = idx;
 
         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
+        device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
 
         device->add_rms_fusion = !device->disable_fusion &&
                                  device->subgroup_arithmetic &&
@@ -7892,9 +7913,36 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
-    vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
-    vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
-    ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+    const uint32_t descriptor_set_idx = ctx->descriptor_set_idx++;
+    vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[descriptor_set_idx];
+
+    // a new buffer can get the handle of a destroyed one, so drop cached bindings after any destroy
+    const uint64_t destroy_count = ctx->device->buffer_destroy_count.load(std::memory_order_acquire);
+    if (ctx->descriptor_set_bindings_destroy_count != destroy_count) {
+        for (auto & b : ctx->descriptor_set_bindings) {
+            b.clear();
+        }
+        ctx->descriptor_set_bindings_destroy_count = destroy_count;
+    }
+
+    // skip the write if this set already holds these bindings from the last graph
+    std::vector<vk::DescriptorBufferInfo> & bindings = ctx->descriptor_set_bindings[descriptor_set_idx];
+    bool same = !ctx->device->disable_descriptor_reuse && bindings.size() == descriptor_buffer_infos.size();
+    if (same) {
+        size_t i = 0;
+        for (const vk::DescriptorBufferInfo & info : descriptor_buffer_infos) {
+            const vk::DescriptorBufferInfo & prev = bindings[i++];
+            if (prev.buffer != info.buffer || prev.offset != info.offset || prev.range != info.range) {
+                same = false;
+                break;
+            }
+        }
+    }
+    if (!same) {
+        vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
+        ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+        bindings.assign(descriptor_buffer_infos.begin(), descriptor_buffer_infos.end());
+    }
 
     subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
     subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
@@ -15438,6 +15486,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     }
     ctx->descriptor_pools.clear();
     ctx->descriptor_sets.clear();
+    ctx->descriptor_set_bindings.clear();
 
     ctx->compute_cmd_pool.destroy(ctx->device->device);
     if (ctx->device->async_use_transfer_queue) {
@@ -16615,6 +16664,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
+
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {

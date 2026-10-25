@@ -89,8 +89,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -4237,7 +4239,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const ggml_tensor * staged_src = nullptr) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -4283,7 +4286,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                         }
                     }
 
-                    if (!found) {
+                    if (!found && src != staged_src) {
                         is_ok = false;
                         break;
                     }
@@ -4337,8 +4340,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * glu      = cgraph->nodes[node_idx + 2];
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
+            static const bool allow_input_alias = getenv("GGML_CUDA_MMVQ_INPUT_ALIAS") != nullptr &&
+                    std::atoi(getenv("GGML_CUDA_MMVQ_INPUT_ALIAS"));
+            // Quantized MMVQ stages the complete F32 input before writing its output on the same stream.
+            const ggml_tensor * staged_src = allow_input_alias && is_equal(mul_mat_glu_ops, ops) &&
+                    ggml_cuda_should_fuse_mul_mat_vec_q(ffn_up) ? ffn_up->src[1] : nullptr;
             int out_nodes[] = { node_idx + 2 };
-            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1, false, staged_src);
         }
     }
 
@@ -6413,6 +6421,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -6451,6 +6460,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

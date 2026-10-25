@@ -1786,6 +1786,61 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // Copy CPU-produced activations into a device split only before their
+    // first consumer. The independent head of that split (e.g. hot experts)
+    // is launched before the preceding CPU split runs, so both overlap.
+    static const bool defer_host_inputs = getenv("GGML_SCHED_DEFER_HOST_INPUTS") != NULL &&
+            atoi(getenv("GGML_SCHED_DEFER_HOST_INPUTS")) != 0;
+    std::vector<std::pair<int, int>> deferred_inputs; // (first consumer node, input id)
+    std::vector<std::pair<int, int>> prelaunch_inputs;
+    int prelaunched_split = -1;
+
+    // returns true if every input of the split is deferred
+    auto find_deferred_inputs = [&](int sid, std::vector<std::pair<int, int>> & out) {
+        out.clear();
+        const struct ggml_backend_sched_split * sp = &splits[sid];
+        ggml_backend_t sp_backend = sched->backends[sp->backend_id];
+        if (!defer_host_inputs || sched->callback_eval ||
+                ggml_backend_dev_type(ggml_backend_get_device(sp_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return false;
+        }
+        for (int input_id = 0; input_id < sp->n_inputs; input_id++) {
+            struct ggml_tensor * input = sp->inputs[input_id];
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) || input->buffer == NULL ||
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                    ggml_backend_dev_type(ggml_backend_get_device(input_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            const struct ggml_tensor * input_cpy = tensor_copy(input, sp->backend_id, sched->cur_copy);
+            int first_use = -1;
+            for (int j = 0; j < sp->graph.n_nodes && first_use < 0; j++) {
+                const struct ggml_tensor * node = sp->graph.nodes[j];
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    const struct ggml_tensor * src = node->src[s];
+                    if (src && (src == input_cpy || src->view_src == input_cpy)) {
+                        first_use = j;
+                        break;
+                    }
+                }
+            }
+            if (first_use > 0) {
+                out.emplace_back(first_use, input_id);
+            }
+        }
+        std::sort(out.begin(), out.end());
+        return !out.empty() && (int) out.size() == sp->n_inputs;
+    };
+
+    // the copy slot of the split must be free before its head runs
+    auto wait_copy_slot = [&](int backend_id) {
+        if (sched->events[backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_wait(sched->backends[backend_id], sched->events[backend_id][sched->cur_copy]);
+        } else {
+            synchronize_copy_slot(backend_id, sched->backends[backend_id]);
+        }
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1795,11 +1850,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_buffer_t prefetch_saved_buffer = NULL;
         void * prefetch_saved_data = NULL;
 
+        const bool prelaunched = split_id == prelaunched_split;
+        if (prelaunched) {
+            deferred_inputs.swap(prelaunch_inputs);
+            prelaunched_split = -1;
+        } else {
+            find_deferred_inputs(split_id, deferred_inputs);
+        }
+        auto is_deferred = [&](int input_id) {
+            for (const auto & d : deferred_inputs) {
+                if (d.second == input_id) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         // copy the input tensors to the split backend
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+        for (int input_id = 0; input_id < (prelaunched ? 0 : split->n_inputs); input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            if (is_deferred(input_id)) {
+                wait_copy_slot(split_backend_id);
+                continue;
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1966,7 +2042,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (dedup_dst_sync) {
                 copy_slot_reusable[split_backend_id] = false;
             }
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec = GGML_STATUS_SUCCESS;
+
+            // a CPU split runs synchronously: launch the head of the next device split first
+            if (split_id + 1 < sched->n_splits &&
+                    ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    find_deferred_inputs(split_id + 1, prelaunch_inputs)) {
+                struct ggml_backend_sched_split * next = &splits[split_id + 1];
+                wait_copy_slot(next->backend_id);
+                if (dedup_dst_sync) {
+                    copy_slot_reusable[next->backend_id] = false;
+                }
+                struct ggml_cgraph gv = ggml_graph_view(&next->graph, 0, prelaunch_inputs[0].first);
+                ec = ggml_backend_graph_compute_async(sched->backends[next->backend_id], &gv);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+                prelaunched_split = split_id + 1;
+            }
+
+            if (deferred_inputs.empty()) {
+                ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            } else {
+                int j0 = prelaunched ? deferred_inputs[0].first : 0;
+                for (size_t d = 0; d <= deferred_inputs.size() && ec == GGML_STATUS_SUCCESS; d++) {
+                    const int j1 = d < deferred_inputs.size() ? deferred_inputs[d].first : split->graph.n_nodes;
+                    if (j1 > j0) {
+                        struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1);
+                        ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                        j0 = j1;
+                    }
+                    if (d < deferred_inputs.size() && ec == GGML_STATUS_SUCCESS) {
+                        struct ggml_tensor * input = split->inputs[deferred_inputs[d].second];
+                        ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+                        struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                        if (!split_backend->iface.cpy_tensor_async ||
+                                !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                            synchronize_backend(input_backend);
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
+                    }
+                }
+            }
             if (split_prefetch_slot != -1) {
                 ggml_backend_event_record(sched->prefetch_free[split_prefetch_slot], split_backend);
                 sched->prefetch_used[split_prefetch_slot] = true;

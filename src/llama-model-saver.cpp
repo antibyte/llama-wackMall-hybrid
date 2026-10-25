@@ -31,6 +31,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_LAGUNA:
         case LLM_ARCH_KOLIBRI1:
+        case LLM_ARCH_DORY:
             return false;
         default:
             return true;
@@ -215,7 +216,9 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_FEED_FORWARD_LENGTH,               hparams.n_ff_arr, true);
     add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
     add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
-    add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_chexp);
+    if (hparams.n_ff_chexp) {
+        add_kv(LLM_KV_EXPERT_CHUNK_FEED_FORWARD_LENGTH, hparams.n_ff_chexp);
+    }
     add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                  hparams.swiglu_clamp_exp);
     add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP,                hparams.swiglu_clamp_shexp);
     add_kv(LLM_KV_USE_PARALLEL_RESIDUAL,             hparams.use_par_res);
@@ -271,6 +274,13 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
     // add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,  ???);
+    if (model->arch == LLM_ARCH_FLINT) {
+        const uint32_t n_layer = hparams.n_layer();
+        std::vector<uint32_t> swa(hparams.is_swa_impl.begin(), hparams.is_swa_impl.begin() + n_layer);
+        std::vector<uint32_t> rope(hparams.rope_pattern.begin(), hparams.rope_pattern.begin() + n_layer);
+        add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa, false);
+        add_kv(LLM_KV_ATTENTION_ROPE_PATTERN, rope, false);
+    }
     add_kv(LLM_KV_ATTENTION_SCALE,                   hparams.f_attention_scale);
     add_kv(LLM_KV_ATTENTION_OUTPUT_SCALE,            hparams.f_attn_out_scale);
     add_kv(LLM_KV_ATTENTION_VALUE_SCALE,             hparams.f_attn_value_scale);

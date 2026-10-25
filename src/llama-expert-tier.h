@@ -160,6 +160,8 @@ bool begin_moe_cold(bool eligible,
 // True only for the explicit asynchronous cold-split experiment. Graph
 // builders use it to place the cold branch before the hot branch in node order.
 bool cpu_async_enabled();
+// build the cold op right after the router so the hot branch can overlap it
+bool cold_first_enabled();
 
 ggml_tensor * end_moe_cold(ggml_context * ctx,
         ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,

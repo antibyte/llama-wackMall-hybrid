@@ -121,6 +121,7 @@ static bool g_timing_enabled = false;
 static int  g_cpu_single_row_chunk = 64;
 static bool g_cpu_parallel_activation = false;
 static bool g_cpu_async = false;
+static bool g_cold_first = false;
 static int  g_cpu_down_prefetch = 0;
 static bool g_cpu_reuse_rows = false;
 static bool g_cpu_multi_row = false;
@@ -1448,7 +1449,7 @@ void update() {
 }
 
 bool requires_post_graph_sync() {
-    return !g_static_no_sync_active;
+    return !g_layers.empty() && !g_static_no_sync_active;
 }
 
 void request_begin() {
@@ -1911,6 +1912,15 @@ void init(const llama_model & model) {
             return;
         }
         g_cpu_async = value == 1;
+    }
+    if (const char * cold_first = getenv("LLAMA_EXPERT_COLD_FIRST")) {
+        int value = 0;
+        if (!parse_nonnegative_int(cold_first, value) || value > 1) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_COLD_FIRST='%s'; expected 0 or 1\n",
+                    __func__, cold_first);
+            return;
+        }
+        g_cold_first = value == 1;
     }
     if (const char * prefetch = getenv("LLAMA_EXPERT_CPU_DOWN_PREFETCH")) {
         if (!parse_nonnegative_int(prefetch, g_cpu_down_prefetch) || g_cpu_down_prefetch > 8) {
@@ -2669,6 +2679,10 @@ bool begin_moe_cold(bool eligible,
 
 bool cpu_async_enabled() {
     return g_cpu_async;
+}
+
+bool cold_first_enabled() {
+    return g_cpu_async || g_cold_first;
 }
 
 ggml_tensor * end_moe_cold(ggml_context * ctx,

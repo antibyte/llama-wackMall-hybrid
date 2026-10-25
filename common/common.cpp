@@ -1271,6 +1271,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // warn when tiering is on but the model has no expert tensors
     if (params.cmoe && llama_expert_tier::expert_weight_bytes(*model) == 0) {
         LOG_WRN("%s: expert tiering is on but the model has no expert tensors; tiering defaults have no effect\n", __func__);
+        // The 256 clamp exists so expert weights can stay on the host. A dense
+        // model has nothing to tier, so put the untouched defaults back before
+        // the context is created. cparams was copied before the model load.
+        if (params.cmoe_restore_default_batch) {
+            params.n_batch = 2048;
+        }
+        if (params.cmoe_restore_default_ubatch) {
+            // 1024 keeps a dense prefill in one ubatch on the small-GCN matmul tile.
+            params.n_ubatch = 1024;
+        }
+        if (params.n_ubatch > params.n_batch) {
+            params.n_batch = params.n_ubatch;
+        }
+        if (params.cmoe_restore_default_batch || params.cmoe_restore_default_ubatch) {
+            cparams.n_batch = params.n_batch;
+            cparams.n_ubatch = params.n_ubatch;
+            LOG_INF("%s: no expert tensors, using batch/ubatch %d/%d\n", __func__, params.n_batch, params.n_ubatch);
+        }
     }
     // warn when tiering is on with no manual -c: fit spends free VRAM on
     // context instead of the expert cache

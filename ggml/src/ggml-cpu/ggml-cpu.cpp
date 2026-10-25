@@ -205,10 +205,21 @@ static void ggml_backend_cpu_start_async_worker(struct ggml_backend_cpu_context 
 }
 
 static bool ggml_backend_cpu_graph_is_moe_cold_only(const struct ggml_cgraph * cgraph) {
-    // a custom op may precede the cold op (the next layer's page read-ahead)
-    const int n = cgraph->n_nodes;
-    return (n == 1 || (n == 2 && cgraph->nodes[0]->op == GGML_OP_CUSTOM)) &&
-        cgraph->nodes[n - 1]->op == GGML_OP_MOE_COLD;
+    // a custom op may precede the cold op (the next layer's page read-ahead);
+    // view ops placed in the same split do no work
+    int n_cold   = 0;
+    int n_custom = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const enum ggml_op op = cgraph->nodes[i]->op;
+        if (op == GGML_OP_MOE_COLD) {
+            n_cold++;
+        } else if (op == GGML_OP_CUSTOM && n_cold == 0) {
+            n_custom++;
+        } else if (!ggml_op_is_empty(op)) {
+            return false;
+        }
+    }
+    return n_cold == 1 && n_custom <= 1;
 }
 
 static enum ggml_status ggml_backend_cpu_dispatch_async(

@@ -549,6 +549,40 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+// transform of a folded weight, applied to the matmul input: optional sign flip, then the normalized block Hadamard
+struct llama_hadamard_transform {
+    ggml_tensor * rot;
+    ggml_tensor * signs; // nullptr for identity sign mode
+
+    // if perm_rep > 1, permute the input from tiled head order [hd, nk, rep] to grouped order [hd, rep, nk]
+    int64_t perm_hd  = 0;
+    int64_t perm_nk  = 0;
+    int64_t perm_rep = 0;
+
+    bool set_gdn_v_perm(int64_t n_in, int64_t n_v, int64_t n_k) {
+        if (n_k <= 0 || n_v <= 0 || n_v % n_k != 0 || n_in % n_v != 0) {
+            return false;
+        }
+        perm_hd  = n_in / n_v;
+        perm_nk  = n_k;
+        perm_rep = n_v / n_k;
+        return true;
+    }
+};
+using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
+
+struct llama_hadamard {
+    std::unordered_map<std::string, uint32_t> weight_blocks;
+    std::unordered_map<std::string, uint32_t> inverse_blocks;
+    std::map<uint32_t, std::vector<int32_t>> sign_data;
+
+    bool gdn_v_grouped = false;
+    bool tied_output = false;
+
+    llama_hadamard_rotations rot;
+    llama_hadamard_rotations inv;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -629,6 +663,8 @@ struct llama_model {
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
+
+    llama_hadamard hdmd;
 
     // list of devices used in this model
     std::vector<llama_device> devices;
@@ -716,6 +752,9 @@ struct llama_model {
     virtual bool load_tensors(llama_model_loader & ml) = 0; // returns false if cancelled by progress_callback
 
     // model must define these
+    void load_hparams_hadamard(llama_model_loader & ml);
+    void load_tensors_hadamard();
+
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;

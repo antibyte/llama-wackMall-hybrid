@@ -9,6 +9,8 @@
 
 #include "server-common.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -466,6 +468,143 @@ std::string server_tokens::detokenize(const llama_context * ctx, bool special) c
         }
     }
     return common_detokenize(ctx, text_tokens, special);
+}
+
+static bool diffpin_enabled() {
+    static const int enabled = []() {
+        const char * v = std::getenv("LLAMA_DIFFPIN");
+        if (v == nullptr || v[0] == '\0') {
+            return 1;
+        }
+        return std::atoi(v) != 0 ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+static bool diffpin_ephemeral_line(const std::string & line) {
+    if (line.size() < 6 || line.size() > 80) {
+        return false;
+    }
+    for (unsigned char c : line) {
+        if (c == '{' || c == '}' || c == '"' || c == '`' || c == '<') {
+            return false;
+        }
+    }
+    for (size_t i = 0; i + 10 <= line.size(); ++i) {
+        const bool iso =
+            std::isdigit(line[i]) && std::isdigit(line[i + 1]) && std::isdigit(line[i + 2]) && std::isdigit(line[i + 3]) &&
+            line[i + 4] == '-' && std::isdigit(line[i + 5]) && std::isdigit(line[i + 6]) &&
+            line[i + 7] == '-' && std::isdigit(line[i + 8]) && std::isdigit(line[i + 9]);
+        if (iso) {
+            return true;
+        }
+    }
+    std::string low = line;
+    for (char & c : low) {
+        c = (char) std::tolower((unsigned char) c);
+    }
+    if (low.find("datum:") != std::string::npos || low.find("conversation started") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
+int server_tokens::diffpin_float(const llama_vocab * vocab) {
+    if (!diffpin_enabled() || !vocab || has_media() || tokens.size() < 8) {
+        return 0;
+    }
+    std::string text;
+    text.reserve(tokens.size() * 4);
+    std::vector<size_t> begin(tokens.size()), end(tokens.size());
+    std::vector<std::string> pieces(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == LLAMA_TOKEN_NULL) {
+            return 0;
+        }
+        pieces[i] = common_token_to_piece(vocab, tokens[i], true);
+        begin[i] = text.size();
+        text += pieces[i];
+        end[i] = text.size();
+    }
+
+    size_t head_end = tokens.size();
+    int role_marks = 0;
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        if (pieces[i].find("<|im_end|>") != std::string::npos ||
+                pieces[i].find("<|role_end|>") != std::string::npos ||
+                pieces[i].find("<end_of_turn>") != std::string::npos ||
+                pieces[i].find("<|eot_id|>") != std::string::npos) {
+            head_end = i;
+            break;
+        }
+        if (pieces[i].find("<|im_start|>") != std::string::npos ||
+                pieces[i].find("<start_of_turn>") != std::string::npos) {
+            role_marks++;
+            if (role_marks == 2) {
+                head_end = i;
+                break;
+            }
+        }
+    }
+    if (head_end == tokens.size() || head_end < 4) {
+        return 0;
+    }
+
+    const std::string head = text.substr(0, begin[head_end]);
+    size_t line_lo = std::string::npos;
+    size_t line_hi = std::string::npos;
+    size_t cursor = 0;
+    while (cursor < head.size()) {
+        size_t nl = head.find('\n', cursor);
+        if (nl == std::string::npos) {
+            nl = head.size();
+        }
+        const std::string line = head.substr(cursor, nl - cursor);
+        if (diffpin_ephemeral_line(line)) {
+            line_lo = cursor;
+            line_hi = nl < head.size() ? nl + 1 : nl;
+            break;
+        }
+        cursor = nl == head.size() ? nl : nl + 1;
+    }
+    if (line_lo == std::string::npos || line_hi > head.size() || line_lo >= line_hi) {
+        return 0;
+    }
+    if (line_lo > 0 && head[line_lo - 1] == '\n') {
+        line_lo--;
+    }
+
+    size_t tok_lo = tokens.size();
+    size_t tok_hi = 0;
+    for (size_t i = 0; i < head_end; ++i) {
+        if (end[i] <= line_lo || begin[i] >= line_hi) {
+            continue;
+        }
+        const std::string & piece = pieces[i];
+        for (unsigned char c : piece) {
+            if (c == '\n' || c == ' ' || c == '\t') {
+                continue;
+            }
+            if (line_lo + piece.size() > head.size() || head.compare(begin[i], piece.size(), piece) != 0) {
+                return 0;
+            }
+            if (begin[i] < line_lo || end[i] > line_hi) {
+                return 0;
+            }
+            break;
+        }
+        tok_lo = std::min(tok_lo, i);
+        tok_hi = std::max(tok_hi, i + 1);
+    }
+    if (tok_lo >= tok_hi || tok_hi >= head_end) {
+        return 0;
+    }
+
+    llama_tokens moved(tokens.begin() + tok_lo, tokens.begin() + tok_hi);
+    tokens.erase(tokens.begin() + tok_lo, tokens.begin() + tok_hi);
+    const size_t insert_at = head_end - (tok_hi - tok_lo);
+    tokens.insert(tokens.begin() + insert_at, moved.begin(), moved.end());
+    return (int) moved.size();
 }
 
 size_t server_tokens::get_common_prefix(const server_tokens & b) const {

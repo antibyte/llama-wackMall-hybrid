@@ -1139,7 +1139,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
 
         auto apply_shift_graph = [&]() -> bool {
-            if (hparams.rope_type == LLAMA_ROPE_TYPE_NONE) {
+            if (hparams.rope_type == LLAMA_ROPE_TYPE_NONE ||
+                    !std::any_of(layers.begin(), layers.end(), [&](const auto & layer) {
+                        return hparams.has_rope(layer.il);
+                    })) {
                 return true;
             }
             ggml_backend_sched_reset(sched);
@@ -1586,6 +1589,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // Dory applies RoPE per physical layer, then normalizes K.
+    if (model.arch == LLM_ARCH_DORY) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -3114,6 +3121,9 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     if (sparse_shift) {
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
+            if (!hparams.has_rope(il)) {
+                continue;
+            }
             const int64_t n_head_kv = hparams.n_head_kv(il);
             const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
             const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
@@ -3151,6 +3161,9 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
+        if (!hparams.has_rope(il)) {
+            continue;
+        }
 
         const int64_t n_head_kv    = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);

@@ -231,6 +231,11 @@ public:
     // prefix, then tokenize only the remainder. Returns the kept cached count.
     size_t align_text_prefix(const server_tokens & cached, const llama_vocab * vocab);
 
+    // Move one short date or clock line to the end of the first message so a
+    // later change does not sit in the middle of the cached prefix.
+    // LLAMA_DIFFPIN=0 disables it. Returns the number of tokens moved.
+    int diffpin_float(const llama_vocab * vocab);
+
     // Keep the full cached generation and append incoming[last_user:] (new turn).
     void continue_from_cached(
             const server_tokens & cached,

@@ -147,6 +147,8 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
+    { LLM_ARCH_DORY,             "dory"             },
+    { LLM_ARCH_FLINT,            "flint"            },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -226,6 +228,16 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_INTERLEAVE_MOE_LAYER_STEP,         "%s.interleave_moe_layer_step"         },
     { LLM_KV_FULL_ATTENTION_INTERVAL,           "%s.full_attention_interval"           },
     { LLM_KV_NUM_LOOPS,                         "%s.num_loops"                         },
+    { LLM_KV_INPUT_LAYER_COUNT,                 "%s.input_layer_count"                 },
+    { LLM_KV_RECURRENT_LAYER_COUNT,             "%s.recurrent_layer_count"             },
+    { LLM_KV_OUTPUT_LAYER_COUNT,                "%s.output_layer_count"                },
+    { LLM_KV_RECURRENT_KV_CACHE_MODE,           "%s.recurrent_kv_cache_mode"           },
+    { LLM_KV_LAYER_PATTERN,                     "%s.layer_pattern"                     },
+    { LLM_KV_ROPE_PROFILE,                      "%s.rope.profile"                      },
+    { LLM_KV_ROPE_FREQ_BASE_2,                  "%s.rope.freq_base_2"                  },
+    { LLM_KV_INIT_STD,                          "%s.init_std"                          },
+    { LLM_KV_ALPHA_INIT,                        "%s.alpha_init"                        },
+    { LLM_KV_GATE_INIT,                         "%s.gate_init"                         },
     { LLM_KV_SKIP_LOOP_FINAL_NORM,              "%s.skip_loop_final_norm"              },
 
     { LLM_KV_ATTENTION_HEAD_COUNT,                   "%s.attention.head_count"                   },
@@ -248,6 +260,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,       "%s.attention.relative_buckets_count"       },
     { LLM_KV_ATTENTION_SLIDING_WINDOW,               "%s.attention.sliding_window"               },
     { LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,       "%s.attention.sliding_window_pattern"       },
+    { LLM_KV_ATTENTION_ROPE_PATTERN,                 "%s.attention.rope_pattern"                 },
     { LLM_KV_ATTENTION_SCALE,                        "%s.attention.scale"                        },
     { LLM_KV_ATTENTION_OUTPUT_SCALE,                 "%s.attention.output_scale"                 },
     { LLM_KV_ATTENTION_VALUE_SCALE,                  "%s.attention.value_scale"                  },
@@ -310,6 +323,18 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_KDA_GATE_LOWER_BOUND, "%s.kda.gate_lower_bound" },
 
     { LLM_KV_WKV_HEAD_SIZE, "%s.wkv.head_size" },
+
+    { LLM_KV_PRISM_HADAMARD_VERSION,              "prism.hadamard.version"              },
+    { LLM_KV_PRISM_HADAMARD_TIED_OUTPUT,          "prism.hadamard.tied_output"          },
+    { LLM_KV_PRISM_HADAMARD_BLOCK_SIZE,           "prism.hadamard.block_size"           },
+    { LLM_KV_PRISM_HADAMARD_TRANSFORM,            "prism.hadamard.transform"            },
+    { LLM_KV_PRISM_HADAMARD_AXIS,                 "prism.hadamard.axis"                 },
+    { LLM_KV_PRISM_HADAMARD_SIGN_MODE,            "prism.hadamard.sign_mode"            },
+    { LLM_KV_PRISM_HADAMARD_SIGN_WIDTHS,          "prism.hadamard.sign_widths"          },
+    { LLM_KV_PRISM_HADAMARD_SIGN_VALUES,          "prism.hadamard.sign_values"          },
+    { LLM_KV_PRISM_HADAMARD_WEIGHT_NAMES,         "prism.hadamard.weight_names"         },
+    { LLM_KV_PRISM_HADAMARD_INVERSE_WEIGHT_NAMES, "prism.hadamard.inverse_weight_names" },
+    { LLM_KV_PRISM_HADAMARD_GDN_V_GROUPED,        "prism.hadamard.gdn_v_grouped"        },
 
     { LLM_KV_POSNET_EMBEDDING_LENGTH, "%s.posnet.embedding_length" },
     { LLM_KV_POSNET_BLOCK_COUNT,      "%s.posnet.block_count"      },
@@ -383,6 +408,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 };
 
 static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+    { LLM_TENSOR_RESIDUAL_ALPHA,                         "blk.%d.residual_alpha" },
+    { LLM_TENSOR_ATTN_QK_SCALE,                          "blk.%d.attn_qk_scale" },
+    { LLM_TENSOR_ATTN_GATE_SCALE,                        "blk.%d.attn_gate_scale" },
+    { LLM_TENSOR_FFN_GATE_SCALE,                         "blk.%d.ffn_gate_scale" },
+    { LLM_TENSOR_FFN_UP_SCALE,                           "blk.%d.ffn_up_scale" },
+    { LLM_TENSOR_OUTPUT_SCALE,                           "output_scale" },
     { LLM_TENSOR_TOKEN_EMBD,                             "token_embd" },
     { LLM_TENSOR_OUTPUT_NORM,                            "output_norm" },
     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
@@ -636,6 +667,12 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
 // example: https://github.com/ggml-org/llama.cpp/pull/17548
 //
 static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+    {LLM_TENSOR_RESIDUAL_ALPHA,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ATTN_QK_SCALE,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ATTN_GATE_SCALE,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_FFN_GATE_SCALE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_FFN_UP_SCALE,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_OUTPUT_SCALE,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_TOKEN_EMBD,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_POS_EMBD,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_TOKEN_TYPES,                {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},

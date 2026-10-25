@@ -954,9 +954,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             // Preserve programmatic values. If only ubatch was explicitly
             // configured, make the logical batch large enough to contain it.
             params.n_batch = (ubatch_from_env || ubatch_from_cli) ? std::max(256, params.n_ubatch) : 256;
+            params.cmoe_restore_default_batch = true;
         }
         if (!ubatch_from_env && !ubatch_from_cli && params.n_ubatch == 512) {
             params.n_ubatch = std::min(256, params.n_batch);
+            params.cmoe_restore_default_ubatch = true;
         }
 
         if (params.n_ubatch > params.n_batch) {
