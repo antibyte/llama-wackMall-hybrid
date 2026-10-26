@@ -1,3 +1,74 @@
+# Phonon-2.5 und Parakeet (ASR) gegen granite-speech vom 2026-10-26
+
+**Ergebnis: FermionResearch/Phonon-2.5 (Parakeet-TDT-0.6B-v3 in Low-Bit-Form, 156 MB, CPU) und das volle Parakeet-TDT-0.6B-v3 ueber audio.cpp auf der Vega transkribieren 6-15x schneller als die aktive agollm-ASR granite-speech-5.0-2b, machen aber mehr Wortfehler. Beide sind in agollm als Auswahl eingebaut; granite bleibt aktiv.**
+
+Testsatz: 25 FLEURS-de-Testaufnahmen (echte Sprache, Mittel 14 s) und 24 Assistenten-Saetze (phonon-TTS Annika/Anton, 2-5 s). WER ohne Zahl-Token, weil Phonon und Parakeet Ziffern schreiben, granite Zahlwoerter.
+
+| Engine | WER FLEURS | WER Assistent | Latenz Median FLEURS / Assistent |
+| --- | ---: | ---: | ---: |
+| granite-speech 5.0 2B Q8_0 (agollm, Vega) | 3.82 % | 1.63 % | 3.02 / 1.33 s |
+| Parakeet-TDT-0.6B-v3 Q8_0 (audio.cpp 820db90f, Vega) | 4.96 % | 2.72 % | 0.56 / 0.24 s |
+| Parakeet-TDT-0.6B-v3 F16 (audio.cpp, Vega) | 4.96 % | 2.72 % | 0.56 / 0.23 s |
+| Phonon-2.5 (fermion-research 0.2.15, CPU 8 Threads) | 6.11 % | 3.80 % | 0.32 / 0.11 s |
+| Parakeet ueber agollm | 4.96 % | 2.72 % | 0.49 / 0.20 s |
+| Phonon-2.5 ueber agollm | 6.11 % | 3.80 % | 0.36 / 0.16 s |
+
+Roh-WER (Zahlen mitgezaehlt) FLEURS: granite 5.24, Parakeet Q8_0 5.06, F16 4.89, Phonon 5.93 %. Q8_0 und F16 sind gleich genau; agollm nutzt Q8_0. Fehler von Parakeet und Phonon: getrennte Komposita ("ueber morgen"), Flexion ("Stelle", "mache"), Eigennamen; Phonon zusaetzlich einzelne Fehlwoerter ("Huerdenschadens" statt "Hirnschadens"). Beide ignorieren `language` und erkennen die Sprache selbst.
+
+Einbau in agollm (`internal/asr`): `config.ASR.Kind` = `fermion` (`fermion serve <Cache-Verzeichnis> --served-model-name phonon-2.5`, `HF_HUB_OFFLINE=1`, Start 2 s) oder `audiocpp` (`audiocpp_server --config runtime/asr-audiocpp.json`, Vulkan0, Start 3-4 s). Dabei aufgefallen: Push-to-Talk in der UI schickt WebM/Opus, das llama-server (und audio.cpp) nicht dekodiert -- auch granite lieferte "Failed to load image or audio file". agollm wandelt jetzt jeden Nicht-WAV-Upload per ffmpeg in 16-kHz-Mono-WAV.
+
+Artefakte (gitignored): `benchmark-results/asr-phonon25-20261026/` (`tools/asr_eval.py`, `tools/wer_summary.py`, `asr-eval*.json`, FLEURS-Ausschnitt, synthetische Saetze). Modelle: `~/models/parakeet-tdt-0.6b-v3/` (Q8_0 und F16, sha256 geprueft), Phonon im fermion-Cache.
+
+# Ming-3.0-TTS 0.5B und audio.cpp auf der Vega vom 2026-10-26
+
+**Ergebnis: Ming 3.0 TTS (audio-cpp Q8_0) laeuft mit audio.cpp (Commit 820db90f, Vulkan-Build) auf der Vega, aber langsamer als Echtzeit: RTF 1.33 (CPU mit 8 Threads 1.0). Die aktive agollm-Engine phonon 40M liegt auf der CPU bei RTF 0.09. Verstaendlich sind beide (WER 0 % auf drei deutschen Texten). audio.cpp lohnt sich fuer dieses Modell auf dieser Hardware nicht; agollm bleibt bei phonon.**
+
+| Warm, deutsche Texte 3-18 s Audio | RTF | Hinweis |
+| --- | ---: | --- |
+| phonon 40M (agollm, CPU, aktiv) | 0.086-0.095 | volle WAV nach 0.3-1.5 s |
+| Ming Q8_0, audio.cpp, Vega Vulkan | 1.32-1.38 | 107 ms Rechenzeit je 80-ms-Patch |
+| Ming Q8_0, audio.cpp, CPU 8 Threads | ~1.0 | |
+| Modellkarte: audio.cpp auf RTX 5090 | 0.17 | Python BF16 dort 0.65 |
+
+Warum audio.cpp auf CUDA 3.8x schneller als Python ist: Je 80-ms-Patch laufen ein Backbone-Schritt (n=1), zehn Flow-Schritte mit CFG (3 Token x 2 Zweige = 6 Spalten) und ein Aggregator. In PyTorch eager sind das Hunderte kleiner Kernel mit Python-Dispatch je Patch, auf einer RTX 5090 also CPU-gebunden. audio.cpp baut die Graphen einmal und verwendet sie wieder, packt QKV und Gate/Up, schreibt einen statischen KV-Cache per set_rows, nutzt Flash-Attention, rechnet beide CFG-Zweige in einem Batch und laedt Q8-Gewichte.
+
+Auf der Vega zaehlt das kaum, die GPU ist busy: 4.31 s GPU-Zeit bei 4.35 s Wandzeit (Vulkan-Perf-Logger). Matrix-Vektor mit 6 Spalten (Flow-Kopf, 10 x 107 MB je Patch) erreicht nur 18-26 GB/s gegen 41-44 GB/s bei einer Spalte (Backbone); Flow 46 %, ROUND_BF16 fuer die BF16-Paritaet 9 %, kleine elementweise Ops 18 %.
+
+Eigene Hebel auf audio.cpps Vulkan-Pfad (Patch `benchmark-results/ming-tts-20261026/audiocpp-vega-experiments.patch`, Checkout wieder auf Upstream):
+- ROUND_BF16 weglassen: -9 % je Audiosekunde, WER weiter 0 %.
+- Subgroup-Reduktion auf GCN: -5 % je Patch.
+- Schlechter: Matmul statt Matrix-Vektor ab 2-4 Spalten (RTF 2.4-2.5), 1, 4 oder 8 statt 2 Zeilen je Workgroup (+17 bis +50 %).
+
+Zusammen waere RTF ~1.15 erreichbar, also weiter nicht echtzeitfaehig. Die Techniken, mit denen audio.cpp gegenueber Python gewinnt, hatte unsere vkrt-Runtime fuer Humaneness schon (gebatchtes CFG, geteilter KV mit Views, FA ohne Umpacken; ~1.05x Echtzeit auf der Vega); die verbleibende Grenze ist die Speicherbandbreite bei zehn Flow-Durchlaeufen je 80 ms. Schneller ginge es nur mit Modellaenderungen (weniger Flow-Schritte, Q4-Flow-Kopf), mit Qualitaetsrisiko, nicht getestet.
+
+Artefakte (gitignored): `benchmark-results/ming-tts-20261026/` (`tools/`, `out/` mit allen WAVs, `exp.txt`, `exp2.txt`, Perf-Log). Modell: `~/models/ming-3.0-tts/`, audio.cpp: `~/src/audio.cpp` (Build `build/linux-vulkan-release`).
+
+# Sage-A1.5 als Planer vom 2026-10-26
+
+**Ergebnis: Sage-A1.5 (InternScience, Feintune von Qwen3.6-35B-A3B; mradermacher i1-Q4_K_M) laeuft mit dem Hybrid-Setup von Qwen3.6 und ist als agollm-Rezept `sage-a1.5` installiert. Am schnellsten ist es ohne Draft (37.3 Token/s; Qwen3.6 mit seinem DFlash-Draft 44.9). Als Planer schreibt es auf fuenf Code-Aufgaben in allen Faellen PLAN.md (Qwen3.6: 4/5) und braucht 62 statt 77 s je Plan; inhaltlich ist es gleichwertig, bei zwei Aufgaben etwas weniger konkret. Die Router-Zuordnung ist unveraendert.**
+
+| Sage-A1.5, greedy, 3 Prompts x 384 Token, A/B/A/B | Token/s |
+| --- | ---: |
+| Qwen3.6-Rezept (UD-Q4_K_M, DFlash-Draft) zum Vergleich | 44.9 |
+| ohne Draft | 37.3 |
+| DFlash-Draft von Qwen3.6 (59-84 % angenommen) | 36.6 |
+| eigener MTP-Kopf, n_max 3 (85-88 % angenommen, Warm-Slots aus) | 33.1 |
+| eigener MTP-Kopf, n_max 3, S=26 | 34.4 |
+| ohne Draft, eigenes Heatprofil statt Qwen3.6-Profil | +0.9 % (Rauschen) |
+
+| Plan-Schritt ueber agollm (Planer festgepinnt, Abbruch beim Start der Umsetzung) | Sage-A1.5 | Qwen3.6 |
+| --- | ---: | ---: |
+| PLAN.md geschrieben | 5/5 | 4/5 (Snake: kein workspace_write) |
+| Zeit je Plan (inkl. Laden) | 57-71 s, Mittel 62 | 60-93 s, Mittel 77 |
+| Bibliotheken (Three.js, Tailwind) ueber workspace_libraries | beide | beide |
+
+Inhalt: Snake gut (Umkehrschutz, Pfeiltasten-Scrollen). Sonnensystem bei beiden gut, beide empfehlen fuer OrbitControls ein CDN, obwohl der Umsetzer nichts aus dem Netz laden darf. Duplikatfinder: Sage ohne Namenskonflikte im Papierkorb, Qwen mit. Kanban: Sage ohne `darkMode: 'class'` fuer Tailwind, Qwen konkreter (Datenmodell, Events). Rate-Limiter gleichwertig.
+
+- Rezept `sage-a1.5`: Hybrid-Werte von Qwen3.6 (S=20, W=8, q4_0-KV, 64k), kein Draft, Heatprofil aus 12 eigenen Prompts (`workers/llama/assets/sage-a1.5-chat.csv`), Sampling laut Karte (temp 1.0, top_p 0.95, top_k 20, presence_penalty 1.5), Chat-Template aus dem GGUF (Tool-Calls, `verification`). Skills vorlaeufig unter Qwen3.6, damit `installed_test.go` dieselbe Zuordnung haelt.
+- Die Qwen3.6-DFlash-Vorlage passt nicht gut zu Sage; der MTP-Kopf trifft oft, entwirft aber Token fuer Token und schaltet die Warm-Slots ab.
+
+Artefakte (gitignored): `benchmark-results/sage-a15-20261026/` (`tools/`, `runs/`, `plans/` mit allen PLAN.md, `profile/`, `t1-spec.txt`, `t2-profile.txt`, `t3-planner.txt`).
+
 # Strata-Ideen vom 2026-10-26
 
 **Ergebnis: Kolibri-1 decodiert im agollm-Rezept mit +13 % (16.3 -> 18.4 Token/s, A/B/A/B mit 3.5k-Token-Prompt) und streut kaum noch. Zwei Strata-Ideen tragen: weniger Kontext-VRAM fuer mehr heisse Experten (16k statt 64k) und ein mlock-Budget fuer die heissesten CPU-Experten. Tail-Skip ist schnell, aber zu verlustbehaftet, und bleibt opt-in. Rezept und `workers/llama` (libggml-cpu, libllama) sind in agollm installiert. Kein Commit.**
