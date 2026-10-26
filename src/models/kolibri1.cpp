@@ -152,6 +152,8 @@ llama_model_kolibri1::graph::graph(const llama_model & model, const llm_graph_pa
     };
 
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         const auto & layer = model.layers[il];
 
         // sliding layers: RoPE; full-attention layers: no positional encoding

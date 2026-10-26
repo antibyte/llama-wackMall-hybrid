@@ -1,3 +1,31 @@
+# Kolibri-1-DSpark vom 2026-10-26
+
+**Ergebnis: Der DSpark-Draft `intuit/Kolibri-1-dspark` ist installiert und funktioniert, macht Kolibri-1 auf dieser Maschine aber nicht schneller (greedy +-0, mit dem Sampling von agollm -9.5 %). Er bleibt opt-in (`KOLIBRI_DSPARK=1` in `start-kolibri-1.sh`); das agollm-Rezept ist unveraendert.**
+
+| agollm-Rezept (64k, S=19), A/B/A/B, 3 Thinking-Prompts x 384 Token | greedy | Sampling (temp 1.0, top_k 128, top_p 0.97) |
+| --- | ---: | ---: |
+| ohne Draft | 15.40 | 16.71 |
+| DSpark n_max 4, p_min 0.25 | 15.37 (+-0) | 15.12 (-9.5 %) |
+| DSpark n_max 3, p_min 0.25 | 15.28 (-1 %) | - |
+| DSpark n_max 2, p_min 0 (eigener Lauf, Baseline 15.94) | 13.72 (-14 %) | - |
+| DSpark n_max 7, p_min 0.85 (eigener Lauf, Baseline 15.94) | 13.05 (-18 %) | - |
+
+## Ursachen
+
+- Der Verify ist teuer: ein Schritt mit k Token rechnet bis zu 6k verschiedene kalte Experten je Layer (384 Experten, top-6, aus RAM und SSD). Gemessen: 1 Token ~52 ms, 3 Token ~130 ms, 4 Token ~160 ms, 8 Token ~280 ms. Mit 3 Token braucht der Break-even ~2.5 akzeptierte Token je Schritt; dazu kommen ~9 ms Draft und Inject je Schritt, auch wenn p_min nichts durchlaesst.
+- Die Akzeptanz passt zur Modellkarte (MT-Bench 2.98 Token je Schritt mit FP8 und 7 Draft-Token): Essay 2.6-3.0, Code 2.1-2.3, der deutsche Go-Prompt 1.5-2.2 (Draft auf englischen Daten trainiert). Nur sehr repetitiver Text gewinnt: Zaehlen 1..300 77 % Akzeptanz, 32-38 statt ~19 Token/s.
+- Der Confidence-Head sagt 1 - TV voraus (Akzeptanz unter Rejection Sampling) und ist fuer greedy konservativ: ab p_min 0.5 kommen kaum Drafts durch (die dann zu 97-100 % passen), 0.25 war der beste Wert.
+
+## Installation
+
+- `download-kolibri-1-dspark.sh`: laedt Revision a59d588 (SHA-256-Pruefung), uebersetzt die speculators-Config ins DFlash-Format und schreibt `~/models/kolibri-1/Kolibri-1-DSpark-Q8_0.gguf` (443 MB). `aux_hidden_state_layer_ids` [4, 14, 24, 34, 44] zaehlen wie HF-`hidden_states` (k = Eingang von Layer k), deshalb `target_layer_ids` minus 1. `sliding_window` mit `sliding_window_non_causal: false` macht die Block-Attention kausal (`causal_head`). Der Tokenizer kommt aus dem Kolibri-GGUF. Braucht ein Python mit torch, safetensors und numpy (`KOLIBRI_PYTHON`).
+- `src/models/kolibri1.cpp`: der Graph setzt `res->t_layer_inp[il]`, damit DFlash/DSpark die Layer-Eingaenge bekommt (ohne Draft keine Wirkung).
+- `start-kolibri-1.sh`, `KOLIBRI_DSPARK=1`: n_max 4, p_min 0.25, kombinierter Inject, Experten-Reserve 1200 statt 500 MiB. Der Auto-Fit laeuft vor dem Laden des Drafts und kennt ihn nicht; mit 500 MiB lief der Draft bei 8k Kontext in einen OOM. Mit 1200: 8k Kontext, S=22, Peak 4.9 GB.
+- Gegengeprueft: Layer-Offset +1 (Ausgang von Layer 4..44) gibt 13.0 statt 14.4 % Akzeptanz; kausal statt bidirektional 15.5 statt 14.4 %; Sliding Window gegen volle Attention identisch auf kurzen Prompts; kombinierter gegen separaten Inject identisch; Q8_0 trifft wie BF16 (Zaehlen 77 gegen 80 %); BF16 laeuft in einen OOM (Draft-Speicher nicht gemessen).
+- Greedy mit Draft weicht in den Token von greedy ohne Draft ab (Multi-Spalten-Kernel im Verify runden anders als der 1-Spalten-Decode); alle Ausgaben sind kohaerent.
+
+Artefakte (gitignored): `benchmark-results/kolibri-dspark-20261025/` (`tools/`, `runs/`, `sweep1.txt`, `sweep2.txt`, `abab.txt`, `abab2.txt`).
+
 # MiniCPM-V-4.7-Optimierung vom 2026-10-25
 
 **Ergebnis: MiniCPM-V 4.7 35B-A3B decodiert mit +29 % (31.8 -> 41.0 Token/s, temp 1.0, ABBA); das Ziel von +10 % ist erreicht.** Die Scheduler-, Tiering- und MMVQ-Aenderungen sind im Hauptbuild und in `workers/llama` installiert. Sechs weitere getierte agollm-Modelle nutzen die neue Ueberlappung (+4 bis +20 %). Kontextgroesse (262144), q4_0-KV und Modellquantisierung bleiben erhalten. Kein Commit oder Push.

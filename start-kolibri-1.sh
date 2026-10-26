@@ -24,6 +24,27 @@ die() {
 [[ -x "$SERVER" ]] || die "llama-server is not executable: $SERVER"
 [[ -f "$MODEL" ]] || die "model not found: $MODEL (run ./download-kolibri-1.sh)"
 
+# DSpark draft (intuit/Kolibri-1-dspark, ./download-kolibri-1-dspark.sh). Off by default:
+# 2026-10-26, agollm recipe (64k, S=19), ABAB 384 tokens: greedy 15.4 vs 15.4 t/s with
+# n_max 4 / p_min 0.25, sampled 16.7 vs 15.1 t/s. A k-token verify touches up to 6k cold
+# experts per layer (~52 ms for one token, ~130 ms for three); the draft accepts ~2 per step.
+DSPARK="${KOLIBRI_DSPARK:-0}"
+DRAFT="${KOLIBRI_DRAFT:-$HOME/models/kolibri-1/Kolibri-1-DSpark-Q8_0.gguf}"
+case "$DSPARK" in 0|1) ;; *) die "KOLIBRI_DSPARK must be 0 or 1" ;; esac
+if [[ "$DSPARK" == 1 ]]; then
+    [[ -f "$DRAFT" ]] || die "draft not found: $DRAFT (run ./download-kolibri-1-dspark.sh)"
+    export LLAMA_ARG_SPEC_TYPE=draft-dspark
+    export LLAMA_ARG_SPEC_DRAFT_MODEL="$DRAFT"
+    export LLAMA_ARG_N_GPU_LAYERS_DRAFT=99
+    export LLAMA_ARG_SPEC_DRAFT_N_MAX="${LLAMA_ARG_SPEC_DRAFT_N_MAX:-4}"
+    export LLAMA_ARG_SPEC_DRAFT_N_MIN="${LLAMA_ARG_SPEC_DRAFT_N_MIN:-1}"
+    # The confidence head predicts 1 - TV (rejection sampling), so it is conservative for greedy.
+    export LLAMA_ARG_SPEC_DRAFT_P_MIN="${LLAMA_ARG_SPEC_DRAFT_P_MIN:-0.25}"
+    export LLAMA_DFLASH_COMBINED="${LLAMA_DFLASH_COMBINED:-1}"
+    # The expert auto-fit runs before the draft loads; leave ~700 MiB for its weights and buffers.
+    export LLAMA_EXPERT_VRAM_RESERVE_MIB="${LLAMA_EXPERT_VRAM_RESERVE_MIB:-1200}"
+fi
+
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export LLAMA_ARG_POWER_BUSY_CMD="${LLAMA_ARG_POWER_BUSY_CMD-busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance}"
 export LLAMA_ARG_POWER_IDLE_CMD="${LLAMA_ARG_POWER_IDLE_CMD-busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Battery}"
