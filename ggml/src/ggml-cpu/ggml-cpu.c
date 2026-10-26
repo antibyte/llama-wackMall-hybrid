@@ -78,6 +78,12 @@ static atomic_int g_moe_down_prefetch;
 static atomic_bool g_moe_reuse_rows;
 static atomic_bool g_moe_multi_row;
 static atomic_bool g_moe_fused_gate_up;
+static atomic_int g_moe_tail_skip;
+static _Atomic uint64_t g_moe_tail_skipped;
+static _Atomic uint64_t g_moe_tail_cold;
+static _Atomic uint64_t g_fault_checked;
+static _Atomic uint64_t g_fault_missing;
+static _Atomic uint64_t g_fault_wait_us;
 static _Atomic(ggml_cpu_moe_transient_gate_up_claim_fn) g_moe_transient_gate_up_claim;
 static _Atomic(ggml_cpu_moe_transient_gate_up_fetch_fn) g_moe_transient_gate_up_fetch;
 static atomic_bool g_moe_transient_gate_up_verify;
@@ -196,6 +202,21 @@ void ggml_cpu_moe_set_fused_gate_up(bool enabled) {
 
 bool ggml_cpu_moe_get_fused_gate_up(void) {
     return atomic_load_explicit(&g_moe_fused_gate_up, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_set_tail_skip(int rank) {
+    atomic_store_explicit(&g_moe_tail_skip, rank > 0 ? rank : 0, memory_order_relaxed);
+}
+
+void ggml_cpu_expert_fault_stats(uint64_t * checked, uint64_t * missing, uint64_t * wait_us) {
+    *checked = atomic_load_explicit(&g_fault_checked, memory_order_relaxed);
+    *missing = atomic_load_explicit(&g_fault_missing, memory_order_relaxed);
+    *wait_us = atomic_load_explicit(&g_fault_wait_us, memory_order_relaxed);
+}
+
+void ggml_cpu_moe_tail_skip_stats(uint64_t * skipped, uint64_t * cold) {
+    *skipped = atomic_load_explicit(&g_moe_tail_skipped, memory_order_relaxed);
+    *cold    = atomic_load_explicit(&g_moe_tail_cold, memory_order_relaxed);
 }
 
 void ggml_cpu_moe_set_transient_gate_up(
@@ -1774,12 +1795,21 @@ static void ggml_fault_expert_slabs(
     // faults one readahead window at a time (queue depth ~1 on NVMe). The kernel
     // reads at most one readahead window per WILLNEED call, hence the chunks.
     const uintptr_t chunk = 128 * 1024;
+    uint64_t n_checked = 0;
+    uint64_t n_missing = 0;
+    int64_t t_touch = 0;
     for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            t_touch = ggml_time_us();
+        }
         for (int e = ith; e < n_expert; e += nth) {
             if (counts[e] == 0) {
                 continue;
             }
             const uintptr_t addr = (uintptr_t) base + (size_t) e * stride;
+            if (pass == 0) {
+                n_checked++;
+            }
             if (ggml_slab_recently_resident(addr, now)) {
                 continue;
             }
@@ -1798,6 +1828,7 @@ static void ggml_fault_expert_slabs(
                         continue;
                     }
                 }
+                n_missing++;
                 for (uintptr_t c = start; c < end; c += chunk) {
                     madvise((void *) c, MIN(chunk, end - c), MADV_WILLNEED);
                 }
@@ -1810,6 +1841,13 @@ static void ggml_fault_expert_slabs(
             }
             __asm__ __volatile__("" : "+r"(acc) :: "memory");
             ggml_slab_mark_resident(addr, now);
+        }
+    }
+    if (n_checked > 0) {
+        atomic_fetch_add_explicit(&g_fault_checked, n_checked, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_fault_missing, n_missing, memory_order_relaxed);
+        if (n_missing > 0) {
+            atomic_fetch_add_explicit(&g_fault_wait_us, (uint64_t) (ggml_time_us() - t_touch), memory_order_relaxed);
         }
     }
 #else
@@ -2406,6 +2444,26 @@ static void ggml_compute_forward_moe_cold(
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
         int32_t * cnt = counts ? (int32_t *) counts->data : NULL;
+
+        // tail skip: the best rank of each expert over the batch. ids are in
+        // router order (argsort top-k), so the slot index is the rank.
+        const int tail_rank = atomic_load_explicit(&g_moe_tail_skip, memory_order_relaxed);
+        const bool tail_on = tail_rank > 0 && tail_rank < n_ids && n_ids <= 255 && n_as <= 1024;
+        uint8_t tail_min[1024];
+        if (tail_on) {
+            memset(tail_min, 0xff, (size_t) n_as);
+            for (int64_t t = 0; t < n_tokens; t++) {
+                for (int id = 0; id < n_ids; id++) {
+                    const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+                    if (e >= 0 && e < n_as && id < tail_min[e]) {
+                        tail_min[e] = (uint8_t) id;
+                    }
+                }
+            }
+        }
+        uint64_t n_cold = 0;
+        uint64_t n_skipped = 0;
+
         for (int64_t t = 0; t < n_tokens; t++) {
             for (int id = 0; id < n_ids; id++) {
                 const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
@@ -2417,9 +2475,18 @@ static void ggml_compute_forward_moe_cold(
                 if (cold_mask[e] == 0) {
                     continue;
                 }
+                n_cold++;
+                if (tail_on && tail_min[e] >= tail_rank) {
+                    n_skipped++;   // dst stays zero for this slot
+                    continue;
+                }
                 matrix_rows[e*(int64_t)n_ids*n_tokens + matrix_row_counts[e]] = (struct mmid_row_mapping) {id, (int32_t) t};
                 matrix_row_counts[e]++;
             }
+        }
+        if (tail_on) {
+            atomic_fetch_add_explicit(&g_moe_tail_skipped, n_skipped, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_moe_tail_cold, n_cold, memory_order_relaxed);
         }
 
         int64_t coff = 0;

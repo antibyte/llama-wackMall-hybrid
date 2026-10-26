@@ -62,6 +62,11 @@ export GGML_CPU_EXPERT_READAHEAD="${GGML_CPU_EXPERT_READAHEAD:-1}"
 export LLAMA_EXPERT_HOT="${LLAMA_EXPERT_HOT-$PROJECT_ROOT/profiles/kolibri-1-chat.csv}"
 export LLAMA_EXPERT_ADAPT="${LLAMA_EXPERT_ADAPT:-0}"
 export LLAMA_EXPERT_VRAM_RESERVE_MIB="${LLAMA_EXPERT_VRAM_RESERVE_MIB:-500}"
+# mlock the 12 GiB of CPU-side experts the profile ranks hottest, so a prefill does
+# not evict them (2026-10-26, agollm recipe: decode 18.4 vs 16.3 t/s together with 16k
+# context). Needs a memlock limit above 12 GiB; with a lower limit it locks what fits.
+export LLAMA_EXPERT_RAM_LOCK_GIB="${LLAMA_EXPERT_RAM_LOCK_GIB:-12}"
+ulimit -l unlimited 2>/dev/null || ulimit -l "$(ulimit -Hl)" 2>/dev/null || true
 export LLAMA_EXPERT_STATS="${LLAMA_EXPERT_STATS:-0}"
 export LLAMA_EXPERT_STATS_JSON="${LLAMA_EXPERT_STATS_JSON:-0}"
 export LLAMA_EXPERT_USAGE="${LLAMA_EXPERT_USAGE:-0}"

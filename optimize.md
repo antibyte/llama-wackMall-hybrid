@@ -1,3 +1,38 @@
+# Strata-Ideen vom 2026-10-26
+
+**Ergebnis: Kolibri-1 decodiert im agollm-Rezept mit +13 % (16.3 -> 18.4 Token/s, A/B/A/B mit 3.5k-Token-Prompt) und streut kaum noch. Zwei Strata-Ideen tragen: weniger Kontext-VRAM fuer mehr heisse Experten (16k statt 64k) und ein mlock-Budget fuer die heissesten CPU-Experten. Tail-Skip ist schnell, aber zu verlustbehaftet, und bleibt opt-in. Rezept und `workers/llama` (libggml-cpu, libllama) sind in agollm installiert. Kein Commit.**
+
+Grundlage: Strata 0.2.6 (github.com/niko1221/strata), Doku und `src/core/expert_source.cpp`. GTX 1660 Ti, Ryzen 7 4800H, Performance-Profil, agollm gestoppt, greedy, 3 Thinking-Prompts x 384 Token, Werte in Token/s.
+
+| Hebel | Modell | Basis | Variante | Ergebnis |
+| --- | --- | ---: | ---: | --- |
+| Kontext 16k statt 64k (S 19 -> 27) | Kolibri | 14.81 | 18.53 | +25 %, 2/2 Paare; 32k (S=24) +14 % |
+| mlock 12 GiB heisse CPU-Experten, nach 3.5k-Prefill | Kolibri 16k | 16.39 | 18.03 | +10 %, 2/2 Paare; fehlende Slabs 16 -> 11 % |
+| Altes Rezept gegen 16k + mlock 12 GiB | Kolibri | 16.34 | 18.42 | +13 %, 2/2 Paare; Prefill gleich oder schneller |
+| Tail-Skip Rang 6 / Raenge 5-6 | Kolibri 16k | 17.27 | 19.46 / 23.53 | +13 / +36 %, aber KL 0.24 / 0.32, Top-1 81 / 78 % |
+| Tail-Skip Rang 8 / Raenge 7-8 (mit DFlash) | Qwen3.6 | 48.36 | 51.26 / 54.34 | +6 / +12 %, KL 0.027 / 0.065, Top-1 91 / 89 % |
+| Next-Layer-Prefetch (8) ab kaltem Page-Cache | Kolibri 16k | 13.21 | 13.72 | +4 %, nur 1/2 Paare; bleibt aus |
+| CPU-Pinning, ein Thread je Kern (`-C 0x5555 --cpu-strict 1`) | Kolibri / Qwen3.6 | 19.08 / 48.16 | 18.08 / 47.31 | -5 / -2 %; verworfen |
+
+## Was eingebaut ist
+
+- `LLAMA_EXPERT_RAM_LOCK_GIB` (llama-expert-tier.cpp): sperrt nach dem Laden die CPU-Experten mit den hoechsten Seed-Scores per `mlock` im Page-Cache, in einem Hintergrund-Thread (12 GiB in 9-26 s). Nur fuer statische Tiers (ohne Adaption und Warm-Slots). Braucht ein memlock-Limit ueber dem Budget; `agollm.service` hat `LimitMEMLOCK=infinity`, `start-kolibri-1.sh` hebt das Limit soweit erlaubt an.
+- `LLAMA_EXPERT_TAIL_SKIP=R` (ggml-cpu.c, fusionierter kalter MoE-Op): ein kalter Experte, den alle Token des Batches nur auf Top-k-Rang >= R (0-basiert) waehlen, wird weder gelesen noch gerechnet; Beitrag null, keine Renormierung (wie Stratas `STRATA_ROUTE_TAIL_SKIP`). Opt-in, nirgends gesetzt.
+- `LLAMA_EXPERT_FAULT_STATS=1`: geprueft/fehlende Expert-Slabs und Wartezeit im Fault-Pfad beim Beenden.
+- agollm `kolibri-1.yaml`: Kontext 16384, `LLAMA_EXPERT_RAM_LOCK_GIB=12`, `tokens_per_second` 18. Router-Prompts sind auf 4000 Zeichen begrenzt, die Kompaktierung passt direkte Chats an den Kontext an, und der Szenario-Router laesst Kolibri bei zu langen Stufen aus.
+
+## Was nicht traegt
+
+- **Tail-Skip:** Strata misst KL 0.003-0.006 bei top-10 aus 512 (Raenge 8-10). Kolibri (top-6) und Qwen3.6 (top-8) verlieren mit den letzten Raengen deutlich mehr; Qwen Rang 8 entspricht etwa einer Quant-Stufe. Rauschboden: Kolibri 0, Qwen 0.0005 (ubatch 1, Warm-Slots aus).
+- **SSD-Lese-Pool mit hoher Queue-Tiefe** (Strata: 32 Threads, 128 tief): nicht gebaut. Die SSD (K3, PCIe 3.0 x4) schafft zufaellig gelesen nur 0.9-1.0 GB/s, schon ab QD 4 (fio, direct, 128k-1M); kyber gegen none ohne Unterschied. Im Betrieb liegen wir bei 0.44-0.54 GB/s in aktiven Sekunden; die Fault-Wartezeit ist ~10 % der Laufzeit, der Gewinn waere hoechstens ~5 %.
+- **Gate fuer den Next-Layer-Prefetch:** der Prefetch bringt auch ab kaltem Cache nur ~4 %; ein Gate lohnt den Umbau (Graph-Invalidierung) nicht.
+- **iommu=pt:** 12 IOMMU-Gruppen laufen mit DMA-FQ. Nicht getestet (Kernel-Parameter und Neustart); mit `--no-op-offload` geht bei Kolibri wenig ueber PCIe.
+- **Draft nur wenn es sich lohnt** (DSpark mit Option "kein Draft"): nicht gebaut; bringt nur bei repetitivem Text etwas, Kolibri liefert in agollm Prosa.
+
+Messmethode: `tools/kl.py` laesst `LLAMA_CMOE_*` und Backend-Sampling weg, sonst ersetzen die Phase-Batches `-ub 1` und alles laeuft ueber den Prefill-Pfad. Kolibri-KL mit S=27 (Wert bei 16k), 4 x 512 Token Prosa aus optimize.md und den agollm-Dokumenten.
+
+Artefakte (gitignored): `benchmark-results/strata-levers-20261026/` (`tools/`, `runs/`, `kl/`, `t1-ctx.txt` bis `t6-final.txt`, `kl-*.txt`, `deployment.json`, Backups).
+
 # Kolibri-1-DSpark vom 2026-10-26
 
 **Ergebnis: Der DSpark-Draft `intuit/Kolibri-1-dspark` ist installiert und funktioniert, macht Kolibri-1 auf dieser Maschine aber nicht schneller (greedy +-0, mit dem Sampling von agollm -9.5 %). Er bleibt opt-in (`KOLIBRI_DSPARK=1` in `start-kolibri-1.sh`); das agollm-Rezept ist unveraendert.**

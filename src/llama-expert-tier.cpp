@@ -126,6 +126,7 @@ static int  g_cpu_down_prefetch = 0;
 static bool g_cpu_reuse_rows = false;
 static bool g_cpu_multi_row = false;
 static bool g_cpu_fused_gate_up = false;
+static int  g_tail_skip = 0;
 static bool g_shared_hot_ids = false;
 // When true, MUL_MAT_ID results for the hot store carry op_params that tell the
 // CUDA MMVQ kernels to skip the zeroed sentinel slot (cold experts) instead of
@@ -1173,6 +1174,23 @@ static bool write_usage_profile_atomic() {
 }
 
 static void dump_stats() {
+    if (getenv("LLAMA_EXPERT_FAULT_STATS")) {
+        uint64_t checked = 0;
+        uint64_t missing = 0;
+        uint64_t wait_us = 0;
+        ggml_cpu_expert_fault_stats(&checked, &missing, &wait_us);
+        TIER_LOG("expert_tier: slab faults %llu missing of %llu checked (%.2f%%), fault wait %.1f ms (thread sum)\n",
+                (unsigned long long) missing, (unsigned long long) checked,
+                checked ? 100.0*(double) missing/(double) checked : 0.0, (double) wait_us/1000.0);
+    }
+    if (g_tail_skip > 0) {
+        uint64_t skipped = 0;
+        uint64_t cold = 0;
+        ggml_cpu_moe_tail_skip_stats(&skipped, &cold);
+        TIER_LOG("expert_tier: tail skip %llu of %llu cold expert slots (%.1f%%)\n",
+                (unsigned long long) skipped, (unsigned long long) cold,
+                cold ? 100.0*(double) skipped/(double) cold : 0.0);
+    }
     if (g_cpu_async) {
         uint64_t jobs = 0;
         uint64_t wait_us = 0;
@@ -1614,6 +1632,8 @@ void configure_request_scoped(bool enabled) {
     llama_expert_lookahead::configure_request_scoped(enabled);
 }
 
+static void lock_cold_experts(double gib);
+
 void init(const llama_model & model) {
     // libllama's architecture and state tests create several unrelated model
     // contexts in one process. The tier owns process-wide caches, so it must
@@ -1974,6 +1994,12 @@ void init(const llama_model & model) {
         }
         g_skip_sentinel = value == 1;
     }
+    if (const char * tail = getenv("LLAMA_EXPERT_TAIL_SKIP")) {
+        if (!parse_nonnegative_int(tail, g_tail_skip) || g_tail_skip > 63) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_TAIL_SKIP='%s'; expected 0..63\n", __func__, tail);
+            g_tail_skip = 0;
+        }
+    }
     if (const char * prefetch = getenv("LLAMA_EXPERT_PAGE_PREFETCH")) {
         if (!parse_nonnegative_int(prefetch, g_page_prefetch_top_m) || g_page_prefetch_top_m > 64) {
             TIER_LOG("%s: invalid LLAMA_EXPERT_PAGE_PREFETCH='%s'; expected 0..64\n", __func__, prefetch);
@@ -1986,6 +2012,11 @@ void init(const llama_model & model) {
     ggml_cpu_moe_set_reuse_rows(g_cpu_reuse_rows);
     ggml_cpu_moe_set_multi_row(g_cpu_multi_row);
     ggml_cpu_moe_set_fused_gate_up(g_cpu_fused_gate_up);
+    ggml_cpu_moe_set_tail_skip(g_tail_skip);
+    if (g_tail_skip > 0) {
+        TIER_LOG("%s: tail skip: cold experts routed only at top-k rank >= %d are skipped (changes output)\n",
+                __func__, g_tail_skip);
+    }
     ggml_cpu_moe_set_async(g_cpu_async);
     ggml_cpu_moe_async_stats_reset();
     ggml_cpu_moe_profile_reset();
@@ -2050,7 +2081,8 @@ void init(const llama_model & model) {
         }
         g_variable_placement = true;
     }
-    if (stats_enabled || usage_enabled || json_stats_enabled || g_cpu_async) {
+    if (stats_enabled || usage_enabled || json_stats_enabled || g_cpu_async || g_tail_skip > 0 ||
+            getenv("LLAMA_EXPERT_FAULT_STATS")) {
         atexit(dump_stats);
     }
 
@@ -2501,6 +2533,14 @@ void init(const llama_model & model) {
                 __func__, g_S, g_W, g_stores.size(), (double) total_bytes/(1 << 30),
                 total > 0 ? 100.0*hits/total : 0.0);
     }
+    if (const char * lock = getenv("LLAMA_EXPERT_RAM_LOCK_GIB")) {
+        const double gib = atof(lock);
+        if (gib > 0.0 && !g_adapt && g_W == 0) {
+            lock_cold_experts(gib);
+        } else if (gib > 0.0) {
+            TIER_LOG("%s: LLAMA_EXPERT_RAM_LOCK_GIB needs a static tier (no adaptation, no warm slots)\n", __func__);
+        }
+    }
     if (usage_enabled) {
         TIER_LOG("%s: expert usage export mode: %s\n", __func__,
                 g_usage_mode == expert_usage_mode::session ? "session" : "cumulative");
@@ -2597,6 +2637,71 @@ void init(const llama_model & model) {
     } else if (bridge_layers_env) {
         TIER_LOG("%s: CUDA expert bridge disabled by adaptation, warm slots, or an incompatible consume mode\n", __func__);
     }
+}
+
+// LLAMA_EXPERT_RAM_LOCK_GIB: a model larger than RAM reads its cold experts
+// through the page cache, and a prefill or another process evicts the hot ones
+// among them. mlock keeps the cold experts with the highest seed scores in RAM.
+// Locking reads them from the SSD, so it runs in a background thread.
+static void lock_cold_experts(double gib) {
+#if defined(__linux__)
+    struct candidate { float score; int il; int expert; };
+    std::vector<candidate> cands;
+    for (const auto & L : g_layers) {
+        if (L.ws.empty()) {
+            continue;
+        }
+        for (int e = 0; e < L.n_expert; ++e) {
+            if (L.lut_host[(size_t) e] == L.sentinel && L.score[(size_t) e] > 0.0f) {
+                cands.push_back({L.score[(size_t) e], L.il, e});
+            }
+        }
+    }
+    std::stable_sort(cands.begin(), cands.end(), [](const candidate & a, const candidate & b) {
+        return a.score > b.score;
+    });
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    const size_t budget = (size_t) (gib * (double) (1ull << 30));
+    std::vector<std::pair<uintptr_t, size_t>> ranges;
+    size_t total = 0;
+    for (const auto & c : cands) {
+        size_t bytes = 0;
+        for (const auto & ws : g_layers[(size_t) c.il].ws) {
+            bytes += ws.first->nb[2];
+        }
+        if (total + bytes > budget) {
+            break;
+        }
+        for (const auto & ws : g_layers[(size_t) c.il].ws) {
+            const uintptr_t addr = (uintptr_t) ws.first->data + (size_t) c.expert*ws.first->nb[2];
+            const uintptr_t start = addr & ~(uintptr_t) (page - 1);
+            const uintptr_t end = (addr + ws.first->nb[2] + page - 1) & ~(uintptr_t) (page - 1);
+            ranges.push_back({start, (size_t) (end - start)});
+        }
+        total += bytes;
+    }
+    const size_t n_slabs = ranges.size();
+    TIER_LOG("%s: locking %.2f GiB of cold experts in RAM in the background\n", __func__,
+            (double) total/(1ull << 30));
+    std::thread([ranges = std::move(ranges), total, n_slabs]() {
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t locked = 0;
+        for (const auto & r : ranges) {
+            if (mlock((void *) r.first, r.second) != 0) {
+                TIER_LOG("lock_cold_experts: mlock failed after %.2f GiB: %s (raise the memlock limit)\n",
+                        (double) locked/(1ull << 30), strerror(errno));
+                return;
+            }
+            locked += r.second;
+        }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        TIER_LOG("lock_cold_experts: %.2f GiB (%zu slabs) locked in %.1f s\n",
+                (double) locked/(1ull << 30), n_slabs, s);
+        (void) total;
+    }).detach();
+#else
+    (void) gib;
+#endif
 }
 
 static ggml_tensor * map_hot_ids(ggml_context * ctx, const store & s, ggml_tensor * ids) {

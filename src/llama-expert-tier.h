@@ -65,6 +65,11 @@ struct llama_model;
 //   LLAMA_EXPERT_WARM_MTP_EXPERIMENTAL - 1 bypasses the default MTP warm guard
 //   LLAMA_EXPERT_STATIC_NO_SYNC - 1 skips the tier-update barrier only when
 //                                 adaptation, warm slots, and stats are disabled
+//   LLAMA_EXPERT_RAM_LOCK_GIB - mlock this many GiB of the cold experts with the
+//                               highest seed scores (static tier only)
+//   LLAMA_EXPERT_TAIL_SKIP - R > 0: cold experts that every token of the batch
+//                            routes at 0-based top-k rank >= R are skipped
+//                            (zero contribution, no renormalisation; lossy)
 //   LLAMA_EXPERT_PAGE_PREFETCH - top-m predicted experts of the next layer whose
 //                                cold slabs are read ahead from the page cache
 //                                (0 = off, default)

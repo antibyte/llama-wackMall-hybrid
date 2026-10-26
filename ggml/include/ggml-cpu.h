@@ -145,6 +145,14 @@ extern "C" {
     GGML_BACKEND_API bool ggml_cpu_moe_get_multi_row(void);
     GGML_BACKEND_API void ggml_cpu_moe_set_fused_gate_up(bool enabled);
     GGML_BACKEND_API bool ggml_cpu_moe_get_fused_gate_up(void);
+    // Cold experts that every token of the batch routes at top-k rank >= rank
+    // (0-based, ids sorted by router score) are skipped: their contribution is
+    // zero and the other weights are not renormalised. 0 = off. Changes output.
+    GGML_BACKEND_API void ggml_cpu_moe_set_tail_skip(int rank);
+    GGML_BACKEND_API void ggml_cpu_moe_tail_skip_stats(uint64_t * skipped, uint64_t * cold);
+    // GGML_CPU_EXPERT_READAHEAD: expert slabs checked, found missing from the
+    // page cache, and microseconds spent waiting for the faults.
+    GGML_BACKEND_API void ggml_cpu_expert_fault_stats(uint64_t * checked, uint64_t * missing, uint64_t * wait_us);
     typedef bool (*ggml_cpu_moe_transient_gate_up_claim_fn)(
             int layer, int expert, int token, int64_t n_ff);
     typedef bool (*ggml_cpu_moe_transient_gate_up_fetch_fn)(
