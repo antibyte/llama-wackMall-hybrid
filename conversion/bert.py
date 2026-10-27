@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 from pathlib import Path
 from typing import Any, Callable, Iterable, TYPE_CHECKING
@@ -595,7 +596,67 @@ class ModernBertModel(BertModel):
         self.gguf_writer.add_add_bos_token(True)
         self.gguf_writer.add_add_eos_token(True)
         self.gguf_writer.add_add_sep_token(True)
+        if self._spm_bpe_tokenizer() is not None:
+            self._set_vocab_spm_bpe()
+            return
         self._set_vocab_gpt2()
+
+    def _spm_bpe_tokenizer(self) -> dict | None:
+        # mmBERT ships the Gemma 2 tokenizer only as tokenizer.json: BPE with
+        # byte fallback behind a Metaspace pre-tokenizer, i.e. a SentencePiece
+        # vocab without tokenizer.model.
+        path = self.dir_model / "tokenizer.json"
+        if not path.is_file():
+            return None
+        with open(path, encoding="utf-8") as f:
+            tok = json.load(f)
+        model = tok.get("model") or {}
+        pre = tok.get("pre_tokenizer") or {}
+        if model.get("type") == "BPE" and model.get("byte_fallback") and pre.get("type") == "Metaspace":
+            return tok
+        return None
+
+    def _set_vocab_spm_bpe(self):
+        tok = self._spm_bpe_tokenizer()
+        assert tok is not None
+        vocab: dict[str, int] = dict(tok["model"]["vocab"])
+        added = {a["content"]: a for a in tok.get("added_tokens", [])}
+        for text, a in added.items():
+            vocab.setdefault(text, a["id"])
+        n_vocab = max(self.hparams.get("vocab_size", 0), max(vocab.values()) + 1)
+        by_id: dict[int, str] = {i: t for t, i in vocab.items()}
+        unk = tok["model"].get("unk_token")
+
+        tokens: list[bytes] = []
+        scores: list[float] = []
+        toktypes: list[int] = []
+        for i in range(n_vocab):
+            text = by_id.get(i)
+            if text is None:
+                tokens.append(f"[PAD{i}]".encode("utf-8"))
+                scores.append(-1000.0)
+                toktypes.append(gguf.TokenType.UNUSED)
+                continue
+            tokens.append(text.encode("utf-8"))
+            # SentencePiece BPE scores fall with the piece index, and the HF
+            # conversion keeps that order, so -id gives the merge priority.
+            scores.append(-float(i))
+            if text in added:
+                toktypes.append(gguf.TokenType.CONTROL if added[text].get("special") else gguf.TokenType.USER_DEFINED)
+            elif text == unk:
+                toktypes.append(gguf.TokenType.UNKNOWN)
+            elif re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", text):
+                toktypes.append(gguf.TokenType.BYTE)
+            else:
+                toktypes.append(gguf.TokenType.NORMAL)
+
+        self.gguf_writer.add_tokenizer_model("llama")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()

@@ -2900,7 +2900,9 @@ private:
         res->n_tokens  = slot.task->n_tokens();
         res->res_type  = slot.task->params.res_type;
 
-        const int n_embd_out = llama_model_n_embd_out(model_tgt);
+        // rank pooling yields the classifier head: n_cls_out logits per sequence
+        const bool rank = llama_pooling_type(slot.ctx_tgt) == LLAMA_POOLING_TYPE_RANK;
+        const int n_embd_out = rank ? (int) llama_model_n_cls_out(model_tgt) : llama_model_n_embd_out(model_tgt);
 
         std::vector<float> embd_res(n_embd_out, 0.0f);
 
@@ -2921,6 +2923,12 @@ private:
 
                 res->embedding.push_back(std::vector<float>(n_embd_out, 0.0f));
                 continue;
+            }
+
+            // classifier logits are returned raw
+            if (rank) {
+                res->embedding.emplace_back(embd, embd + n_embd_out);
+                break;
             }
 
             // normalize only when there is pooling
