@@ -1,3 +1,17 @@
+# Systemebene: PCIe, Treiber, Kernel, Kuehlung vom 2026-10-31
+
+**Ergebnis: Kein wirksamer Software-Hebel. Die PCIe-Paketgroesse (Max Payload 256 statt 128 Byte per `pci=pcie_bus_perf`) aenderte nach einem Neustart weder Bandbreite noch Qwen-Prefill und wurde wieder entfernt. Alles andere ist Hardwaregrenze oder schon optimal; die CPU laeuft unter Qwen-Last thermisch begrenzt.**
+
+- **PCIe:** Die GPU kann x16, der Renoir-Root-Port nur x8 Gen3 (Hardware). Gepinnt H2D 6,64 / D2H 6,68 GB/s, ~85 % der Rohrate (7,88 GB/s); das passt rechnerisch zu 128-Byte-TLPs, war aber nicht die Ursache (siehe unten). Root-Port kann MPS 512, die GPU 256, beide stehen auf 128. `pci=pcie_bus_perf` setzte Root-Port 512 und GPU 256 (MRRS 256 statt 512), keine AER-Fehler. Gemessen (gleichzeitig kamen Kernel 7.2.6 und Treiber 595.104 dazu): H2D/D2H 6,69/6,76 -> 6,70/6,76 GB/s, Qwen-Prefill eines 3k-Prompts (`tools/qwenpp.sh`, 6 Laeufe, tokengleich) 346,4-347,6 -> 347,2-348,3 t/s. Die Bandbreite begrenzt also nicht die TLP-Groesse (der Root-Complex liefert Lese-Completions offenbar weiter in kleinen Stuecken); Parameter wieder entfernt.
+- **IOMMU:** translated, lazy. Als Bandbreitengrenze nicht ausgeschlossen, `iommu=pt` nicht getestet (Neustart); erwarteter Gewinn hoechstens klein, da 85 % der Rohrate fuer Gen3 x8 ueblich sind.
+- **CPU:** acpi-cpufreq (kein amd_pstate auf diesem Renoir-BIOS), Governor performance, Boost aktiv: 4,28 / 4,12 / 3,92 GHz bei 1 / 8 / 16 Threads. Unter Qwen (CPU-Experten plus GPU) Tctl im Mittel 96 C, 77 von 83 s ueber 95 C, 3,75-3,87 statt 4,1 GHz. GPU auf 1500 MHz begrenzt (`nvidia-smi -lgc`, 18 W weniger): CPU-Temperatur und -Takt unveraendert, Qwen 49,7 statt 50,8 t/s; verworfen. `fan_mode` 0 vs 4 (ideapad): identisch. Kein Software-Weg zu mehr Kuehlung.
+- **GPU:** 80-W-Limit fest (mobil), unter Qwen-Prefill zeitweise SW Power Cap. Runtime-PM aus, ASPM auf dem GPU-Link aus. Persistenzmodus: CUDA-Start 373 ms mit und ohne.
+- **RAM/NVMe:** 2x16 GB DDR4-3200 Dual-Rank, Dual-Channel (optimal). NVMe K3 laeuft Gen3 x4 (Slot), der Controller begrenzt Random-Reads vorher (0,9-1,0 GB/s); APST greift erst nach 100 ms Leerlauf, Interrupt-Coalescing aus, kyber = none (Strata-Runde).
+- **Speicherverwaltung:** swappiness 180 mit 16 GiB zram verdraengt eher fremde Heaps als den Modell-Page-Cache: guenstig fuer Ling/Kolibri. THP madvise; `READ_ONLY_THP_FOR_FS` ist nicht gesetzt, Modell-mmaps bleiben 4-KiB-Seiten.
+- **Mitigations:** Retpoline, STIBP always-on, Safe RET aktiv. `mitigations=off` waere moeglich, schwaecht aber die microVM- und Browser-Isolation; nicht empfohlen.
+
+Messprogramme: scratch `sysbench/bw.cu` (PCIe), `init.cu` (CUDA-Start), `sample.sh` (Telemetrie); Laeufe in `benchmark-results/avalon-review-20261031/runs/qtherm`, `ktherm-1`, `qclk-*`.
+
 # Avalon-Review: Prompt-Cache, asynchrone Split-Kopien und Graph-Cache vom 2026-10-31
 
 **Ergebnis: Aus der Analyse von freriadoc/Avalon (llama.cpp-Fork fuer Qwen3.8-Flash-Next auf RX 7900 XT) wurden drei Punkte gemessen. Avalons Regel, den RAM-Prompt-Cache bei Modellen groesser als der RAM abzuschalten, gilt hier nicht: Ling behaelt ihn. Asynchrone Eingangskopien der CPU-Splits bringen Kolibri +2,5 % und Ling +1 %, tokengleich; beide Rezepte und Startskripte setzen sie jetzt. Ein Graph-Cache pro Form fuer spekulatives Decoding laeuft tokengleich, bringt Qwen aber nur +0,5 % (Rauschen).**
