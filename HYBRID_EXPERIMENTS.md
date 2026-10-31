@@ -1299,3 +1299,40 @@ builds successfully for sm_61 with MMQ disabled; the GTX 1080 must still run
 its own geometry sweep. Local artifacts are under
 `/tmp/mmvq-q6-k-*20260806`. The host power profile was restored to `balanced`
 after the benchmark series.
+
+## CUDA RMS_NORM + MUL + ROPE fusion (llama.cpp PR #26767)
+
+Status on 2026-08-08: **correct but neutral on GTX 1660 Ti with MTP-2;
+default-off retained.**
+
+The upstream fusion was ported behind the build option
+`GGML_CUDA_RMS_NORM_MUL_ROPE_FUSION`. With the option disabled, the existing
+CUDA path remains unchanged. Both `RMS_NORM + MUL + ROPE` and the guarded
+`RMS_NORM + MUL + ROPE + VIEW + SET_ROWS` form are covered.
+
+Correctness results:
+
+- 144/144 CUDA backend cases passed (Normal/NeoX, broadcast, multi-add,
+  set-rows, and varied tensor shapes).
+- The three baseline and three fused runs had identical output and token
+  hashes.
+- MTP acceptance remained exactly `0.6297117517`; mean accepted length stayed
+  exactly `2.26`.
+
+Short real-graph A/B test: fresh server per run, MTP-2, 3 x 512 generated
+tokens, static S=33 profile, W=0, adaptation disabled, batch/ubatch 376/376,
+and q4_0/q4_0 target and draft KV:
+
+| Variant | Decode results (tok/s) | Median | Difference |
+|---|---|---:|---:|
+| existing CUDA path | 44.948, 44.275, 44.721 | 44.721 | baseline |
+| fusion enabled | 44.801, 44.748, 44.672 | 44.748 | +0.059% |
+
+VRAM stayed at 5624 MiB. The difference is within run-to-run noise, so the
+candidate did not advance to a 2,000-token run or the production defaults. It
+remains parameterized for later tests on newer or larger GPUs.
+
+Raw local results:
+
+- `/tmp/norm-rope-mtp2-base-20260808-3x512`
+- `/tmp/norm-rope-mtp2-patch-20260808-3x512`
