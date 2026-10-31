@@ -1299,3 +1299,41 @@ builds successfully for sm_61 with MMQ disabled; the GTX 1080 must still run
 its own geometry sweep. Local artifacts are under
 `/tmp/mmvq-q6-k-*20260806`. The host power profile was restored to `balanced`
 after the benchmark series.
+
+## Pascal DP4A single-token MMVQ tuning
+
+Official llama.cpp pull request #25479 introduces a Pascal-specific MMVQ
+parameter table and uses two rather than four warps for one-column quantized
+matrix-vector products on compute capabilities 6.1 and 6.2. This is directly
+relevant to the GTX 1080 decode path, but it does not apply to the local GTX
+1660 Ti (SM 75). The change was ported behind the default-off build option:
+
+```text
+GGML_CUDA_PASCAL_MMVQ_TUNING=OFF
+```
+
+When enabled, the special table is selected only for NVIDIA architectures in
+the interval `DP4A <= arch < Volta`; Volta, Turing, Ampere, AMD, and generic
+dispatch retain their existing tables. Only `ncols_dst == 1` changes to two
+warps. Multi-column MTP verification and the existing type-specific row
+geometry remain unchanged.
+
+The default-off port was compiled successfully on 2026-08-08 with CUDA
+architecture 61, GCC/G++ 12 as the CUDA host compiler, forced MMQ disabled,
+and tests enabled. `llama-server`, `llama-cli`, and `test-backend-ops` all
+linked successfully. `cuobjdump --list-elf` confirmed SM 61 cubins in
+`build-pascal-mmvq-sm61/bin/libggml-cuda.so`. This is a build result only:
+the local SM 75 GPU cannot execute an SM 61-only binary, so no correctness or
+performance result is claimed for the GTX 1080 yet.
+
+The GTX 1080 gate is a paired OFF/ON comparison in separate build directories,
+using the same model, profile, prompt, CPU thread count, KV formats, context,
+and fixed placement. First run backend correctness plus one-token no-MTP and
+MTP-2 smoke tests. Then compare three fresh-server 512-token runs. Advance to
+counterbalanced three-by-2,000-token testing only if the short median is at
+least one percent faster without hash, MTP, quality, VRAM, or stability
+regression. Test both the quality-oriented q8_0/q8_0 target cache and the
+current Turbo4/Turbo4 target configuration; the MTP draft cache must keep a
+format actually supported by the draft backend.
+
+Source reference: https://github.com/ggml-org/llama.cpp/pull/25479

@@ -102,6 +102,62 @@ cmake --build build-transient-sm61 -j 8 --target \
 
 If CUDA 12.4 rejects GCC 13, save the complete configure error. Use another installed host compiler only after documenting the exact compiler and starting a new build directory. Never add `GGML_CUDA_FORCE_MMQ` as a workaround.
 
+### A/B screen: Pascal DP4A MMVQ tuning
+
+The experimental branch `codex/pascal-mmvq-tuning` adds a default-off port of
+official llama.cpp pull request #25479. It changes only one-column MMVQ on
+SM 61/62 from four to two warps. Do not replace the regular feasibility build
+or reuse its build directory. Configure two otherwise identical directories:
+
+```bash
+cmake -S . -B build-pascal-control-sm61 -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=61 \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc-13 \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++-13 \
+    -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
+    -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13 \
+    -DGGML_CUDA_FORCE_MMQ=OFF \
+    -DGGML_CUDA_NCCL=OFF \
+    -DGGML_CUDA_PASCAL_MMVQ_TUNING=OFF \
+    -DLLAMA_BUILD_TESTS=ON \
+    -DLLAMA_BUILD_UI=OFF
+
+cmake -S . -B build-pascal-tuned-sm61 -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=61 \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc-13 \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++-13 \
+    -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
+    -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13 \
+    -DGGML_CUDA_FORCE_MMQ=OFF \
+    -DGGML_CUDA_NCCL=OFF \
+    -DGGML_CUDA_PASCAL_MMVQ_TUNING=ON \
+    -DLLAMA_BUILD_TESTS=ON \
+    -DLLAMA_BUILD_UI=OFF
+
+cmake --build build-pascal-control-sm61 -j 8 --target \
+    llama-server llama-cli test-backend-ops
+cmake --build build-pascal-tuned-sm61 -j 8 --target \
+    llama-server llama-cli test-backend-ops
+```
+
+Run the CUDA backend tests on both binaries, followed by one-token no-MTP and
+MTP-2 smoke tests. Use separate fresh servers for a three-run 512-token screen.
+Keep every non-binary variable identical and counterbalance the run order
+(`OFF, ON, ON, OFF, OFF, ON`). Test q8_0/q8_0 target KV first and the current
+Turbo4/Turbo4 target KV second; keep the supported q4_0/q4_0 MTP draft cache
+for both. Record output/token hashes, MTP acceptance, mean accepted length,
+sustained decode, VRAM, and server logs.
+
+Only start three counterbalanced 2,000-token runs per side when the short-run
+median improves by at least one percent and correctness is unchanged. The
+upstream performance report is motivation, not a result for this fork or
+machine. If the option is absent from `CMakeCache.txt`, or the log indicates
+forced MMQ, reject the run rather than interpreting its timing.
+
 Run the tests before benchmarks:
 
 ```bash
