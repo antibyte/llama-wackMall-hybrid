@@ -1299,3 +1299,45 @@ builds successfully for sm_61 with MMQ disabled; the GTX 1080 must still run
 its own geometry sweep. Local artifacts are under
 `/tmp/mmvq-q6-k-*20260806`. The host power profile was restored to `balanced`
 after the benchmark series.
+
+## Quantized CUDA copy launch grid (llama.cpp PR #26731)
+
+Status on 2026-08-08: **correct, but not a GTX 1660 Ti winner.**
+
+The official change groups F32-to-quant and quant-to-F32 copy work into
+256-thread CUDA blocks instead of launching one-thread blocks. It covers Q8_0,
+Q4_0, Q4_1, Q5_0, Q5_1, and IQ4_NL conversions. The upstream uneven-block
+Q4_0 test cases were ported with it.
+
+Correctness:
+
+- 243/243 supported CUDA `CPY` cases passed.
+- Turbo4/MTP-2 output hashes, token hashes, acceptance, and mean accepted
+  length were identical between baseline and patch.
+
+Decode screen (fresh server, 3 x 512 generated tokens, Turbo4/Turbo4 target
+KV, q4_0/q4_0 draft KV, MTP-2, S=33, W=0, 768/376 batch/ubatch):
+
+| Variant | Decode results (tok/s) | Median | Difference |
+|---|---|---:|---:|
+| existing launch | 44.905, 44.743, 44.638 | 44.743 | baseline |
+| 256-thread launch | 44.404, 44.789, 44.125 | 44.404 | -0.758% |
+
+A separate long-prompt screen repeated the standard prompt 64 times (about
+2.4K prompt tokens) and generated eight tokens:
+
+| Variant | Prompt TPS | TTFT |
+|---|---:|---:|
+| existing launch | 69.972 | 34.768 s |
+| 256-thread launch | 69.961 | 34.774 s |
+
+The long-prompt difference was effectively zero while decode regressed. The
+candidate therefore did not advance to a 2,000-token run and was not promoted
+to the launcher defaults.
+
+Raw local results:
+
+- `/tmp/cpy-grid-turbo4-base-20260808-3x512`
+- `/tmp/cpy-grid-turbo4-patch-20260808-3x512`
+- `/tmp/cpy-grid-prefill-base-20260808-1x64repeat`
+- `/tmp/cpy-grid-prefill-patch-20260808-1x64repeat`
