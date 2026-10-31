@@ -1299,3 +1299,48 @@ builds successfully for sm_61 with MMQ disabled; the GTX 1080 must still run
 its own geometry sweep. Local artifacts are under
 `/tmp/mmvq-q6-k-*20260806`. The host power profile was restored to `balanced`
 after the benchmark series.
+
+## Branchless Q4_K/Q5_K MMVQ scale unpack
+
+Date: 2026-08-08. The scale-unpack change from upstream llama.cpp PR
+[#26705](https://github.com/ggml-org/llama.cpp/pull/26705) was ported behind
+the default-off build option `GGML_CUDA_QK_SCALE_UNPACK_BRANCHLESS`. The
+option is applied only while compiling `mmvq.cu`; disabled builds preserve the
+original instructions exactly. The implementation replaces the `j < 2`
+branch in the Q4_K and Q5_K Q8_1 vector dots with masked 32-bit selection.
+
+A native SM75 Release build passed all 130 supported targeted CUDA backend
+cases selected by `type_a=(q4_K|q5_K)` across `MUL_MAT` and `MUL_MAT_ID`.
+Unsupported F16-input cases were reported as unsupported rather than failed.
+
+The isolated Q4_K `MUL_MAT_ID` screen did not establish a Turing benefit:
+
+| Shape `(n_mats,n_used,m,n,k)` | Original | Branchless | Time change |
+| --- | ---: | ---: | ---: |
+| `(128,8,768,4,2048)` | 117.57 us | 117.58 us | +0.01% |
+| `(128,8,768,8,2048)` | 233.44 us | 234.46 us | +0.44% |
+| `(128,8,768,32,2048)` | 5279.88 us | 5264.15 us | -0.30% |
+| `(32,4,1792,4,2048)` | 133.17 us | 134.83 us | +1.25% |
+| `(32,4,1792,8,2048)` | 272.26 us | 277.38 us | +1.88% |
+| `(32,4,1792,32,2048)` | 3306.74 us | 3660.32 us | +10.69% |
+
+The model-level gate used Q4_0/Q4_0 target and draft KV, MTP-2, 32K reserved
+context, S=33, 376/376 batches, eight target and draft workers, backend
+sampling, shared hot IDs, multi-token MoE fusion, the Q8/Q6 launch-geometry
+winners, async pinned H2D, and flat non-contiguous CONCAT. Three fresh
+512-token processes per side produced:
+
+| Variant | Three results | Median | Difference |
+| --- | --- | ---: | ---: |
+| original unpack | 44.894, 44.807, 44.816 | 44.816 tok/s | baseline |
+| branchless unpack | 44.284, 44.193, 44.822 | 44.284 tok/s | -1.19% |
+
+All six runs produced output hash
+`f631bd2c655418a09e5deaa59b86f0ea05ca83a9da011c0d0054522150b1ba57`
+and token hash
+`8da54b5aa571b79bb14158302991657035b374ca1282b53ed778ba5997d0ad87`.
+Acceptance was 0.629712, mean accepted length was 2.26, and peak VRAM was
+5,624 MiB throughout. The 2,000-token gate was not run because the short
+median exceeded the 1% regression stop threshold. The option remains
+default-off for an independent SM61/Pascal screen; it is not an SM75 winner.
+Raw local artifacts are under `/tmp/qk-branchless-mtp2-*20260808*`.

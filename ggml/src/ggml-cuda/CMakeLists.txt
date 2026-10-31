@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
 option(GGML_CUDA_TURBO4_KQ_DP4A "ggml: experimental DP4A Turbo4 K/Q dot product" OFF)
 option(GGML_CUDA_TURBO4_F16_PREFILL "ggml: experimental FP16 prefill kernels for Turbo4 K" OFF)
+option(GGML_CUDA_QK_SCALE_UNPACK_BRANCHLESS "ggml: branchless Q4_K/Q5_K MMVQ scale unpack" OFF)
 set(GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH 32 CACHE STRING
     "Minimum query batch size for experimental Turbo4 FP16 prefill")
 
@@ -149,6 +150,10 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_TURBO4_KQ_DP4A)
         add_compile_definitions(GGML_CUDA_TURBO4_KQ_DP4A)
+    endif()
+
+    if (GGML_CUDA_QK_SCALE_UNPACK_BRANCHLESS)
+        set_property(SOURCE mmvq.cu APPEND PROPERTY COMPILE_DEFINITIONS GGML_CUDA_QK_SCALE_UNPACK_BRANCHLESS)
     endif()
 
     if (GGML_CUDA_TURBO4_F16_PREFILL)
