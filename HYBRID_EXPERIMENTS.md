@@ -1299,3 +1299,45 @@ builds successfully for sm_61 with MMQ disabled; the GTX 1080 must still run
 its own geometry sweep. Local artifacts are under
 `/tmp/mmvq-q6-k-*20260806`. The host power profile was restored to `balanced`
 after the benchmark series.
+
+## CUDA block-reduce shared-memory race fix
+
+Official llama.cpp pull request #26385 fixes unsafe shared-memory reuse between
+multiple multi-warp reductions. The port adds the required synchronization in
+the ordinary CUDA softmax kernel and separate shared-memory regions for the
+multi-stage single-row softmax and GroupNorm variance reduction. It does not
+change expert matmul arithmetic, routing, MTP state, or KV formats.
+
+The SM 75 release build completed and the targeted CUDA backend suite passed
+all 255 supported `SOFT_MAX`, `NORM`, `RMS_NORM`, and `GROUP_NORM` cases. This
+included very large softmax rows and CUDA-graph reuse. A q4_0/q4_0 MTP-2 model
+screen used 32K context, S=33, W=0, 376/376 batches, eight CPU workers, target
+and draft backend sampling, and the historical prompt-specific profile.
+
+The first serial three-run groups were not a valid performance conclusion:
+
+| Variant | 256-token results | Median |
+|---|---|---:|
+| Existing code | 44.783, 45.028, 44.923 tok/s | 44.923 tok/s |
+| Race fix | 44.257, 44.036, 44.068 tok/s | 44.068 tok/s |
+
+A baseline rerun immediately after both groups had fallen to 44.246 tok/s,
+showing substantial time-order drift. Its immediately paired fixed run was
+44.187 tok/s, only -0.13%. All eight runs had identical output and token
+hashes, acceptance 0.675926, and mean accepted length 2.35. The fix therefore
+passes correctness but has no demonstrated throughput benefit or model-level
+output change on this Flash-Attention workload. No 2,000-token performance run
+is justified. Keep it as an upstream correctness candidate rather than a TPS
+winner; the measurements do not establish that the earlier reasoning anomaly
+was caused by this race.
+
+Artifacts:
+
+```text
+/tmp/block-reduce-base-20260808-3x256
+/tmp/block-reduce-patch-20260808-3x256
+/tmp/block-reduce-base-control-20260808-1x256
+/tmp/block-reduce-patch-control-20260808-1x256
+```
+
+Source reference: https://github.com/ggml-org/llama.cpp/pull/26385
