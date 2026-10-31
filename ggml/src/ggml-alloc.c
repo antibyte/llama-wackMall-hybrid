@@ -492,6 +492,9 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // bumped whenever a buffer is allocated again or freed (ggml_gallocr_get_generation)
+    uint64_t generation;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -821,6 +824,32 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+// GGML_ALLOC_SHRINK_MIN_MIB (default 64) and GGML_ALLOC_SHRINK_RATIO (default 0.5): a compute buffer
+// is reallocated smaller only when the graph needs at most RATIO of it and at least MIN_MIB less
+static size_t ggml_gallocr_shrink_min(void) {
+    static long long min_mib = -1;
+    if (min_mib < 0) {
+        const char * env = getenv("GGML_ALLOC_SHRINK_MIN_MIB");
+        min_mib = env ? atoll(env) : 64;
+        if (min_mib < 0) {
+            min_mib = 0;
+        }
+    }
+    return (size_t) min_mib * 1024 * 1024;
+}
+
+static double ggml_gallocr_shrink_ratio(void) {
+    static double ratio = -1.0;
+    if (ratio < 0.0) {
+        const char * env = getenv("GGML_ALLOC_SHRINK_RATIO");
+        ratio = env ? atof(env) : 0.5;
+        if (ratio < 0.0 || ratio > 1.0) {
+            ratio = 0.5;
+        }
+    }
+    return ratio;
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
@@ -918,7 +947,10 @@ static bool ggml_gallocr_reserve_n_impl(
 
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         // Grow and shrink: phase batching (prefill 1k+ -> decode 64) must free the large
-        // compute peak or 6 GiB cards OOM during long-context generation.
+        // compute peak or 6 GiB cards OOM during long-context generation. Shrink only to at
+        // most GGML_ALLOC_SHRINK_RATIO of the size and by at least GGML_ALLOC_SHRINK_MIN_MIB:
+        // graphs of alternating small shapes (speculative verify and decode) otherwise
+        // reallocated on every switch (12.6 <-> 13.3 MiB). Ratio 1 and 0 MiB shrink on any decrease.
         bool do_realloc = galloc->buffers[i] == NULL;
         size_t new_size = 0;
         size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
@@ -926,12 +958,12 @@ static bool ggml_gallocr_reserve_n_impl(
             size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
             size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
             new_size += new_chunk_size;
-            if (new_chunk_size != cur_chunk_size) {
+            if (new_chunk_size > cur_chunk_size) {
                 do_realloc = true;
             }
         }
-        // Drop surplus chunks when the new graph needs fewer vbuffer chunks.
-        if (new_size < cur_size) {
+        if (new_size < cur_size && (double) new_size <= ggml_gallocr_shrink_ratio() * (double) cur_size &&
+                cur_size - new_size >= ggml_gallocr_shrink_min()) {
             do_realloc = true;
         }
         if (do_realloc) {
@@ -939,6 +971,7 @@ static bool ggml_gallocr_reserve_n_impl(
                 GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
                     __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
             }
+            galloc->generation++;
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
@@ -974,6 +1007,10 @@ void ggml_gallocr_reserve_n_size(
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+}
+
+uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc) {
+    return galloc->generation;
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {

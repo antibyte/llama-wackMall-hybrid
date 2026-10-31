@@ -904,6 +904,12 @@ public:
     void set_dflash_inject_built(bool value) { dflash_inject_built = value; }
     bool get_dflash_inject_built() const { return dflash_inject_built; }
 
+    // backend sampler input bindings of this graph (llama_sampler_backend_get_inputs), saved after it is
+    // built and restored before it is replayed after another graph; save returns false when a sampler
+    // with backend inputs is not known, and the graph must then not be replayed
+    bool save_sampler_inputs();
+    void restore_sampler_inputs();
+
     void add_tree_state_copy(int32_t node, ggml_tensor * src, ggml_tensor * dst);
     bool commit_tree_state(int32_t node);
 
@@ -947,6 +953,8 @@ public:
     std::vector<std::vector<std::pair<ggml_tensor *, ggml_tensor *>>> tree_state_copies;
 
     bool dflash_inject_built = false;
+
+    std::vector<std::vector<ggml_tensor *>> sampler_inputs;
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 

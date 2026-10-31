@@ -413,6 +413,14 @@ private:
     llm_graph_result_ptr gf_res_reserve;
     llm_graph_result * gf_res_active = nullptr;
 
+    // graphs of small ubatches (decode, speculative verification and drafting), one per shape and most
+    // recently used first, kept built with their scheduler split and allocation (ggml_backend_sched_plan_*):
+    // a change of shape replays the kept graph instead of building, splitting and allocating it again
+    std::vector<std::pair<uint64_t, llm_graph_result_ptr>> gf_res_small;
+    llm_graph_result * get_gf_res_small(const llama_ubatch & ubatch);
+    // drop every kept graph result and scheduler plan
+    void reset_graph_results();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -426,6 +434,10 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // env: LLAMA_GRAPH_SMALL_TOKENS, LLAMA_GRAPH_SMALL_SHAPES (0 disables the per-shape graphs)
+    uint32_t graph_small_max_tokens = 16;
+    size_t   graph_small_max_shapes = 8;
 
     struct dflash_bridge;
     std::unique_ptr<dflash_bridge> dflash;

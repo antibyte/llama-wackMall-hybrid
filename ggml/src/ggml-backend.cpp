@@ -775,6 +775,42 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// upper bound of kept plans; the caller limits them further by forgetting graphs it drops
+// (llama_context: LLAMA_GRAPH_SMALL_SHAPES)
+#ifndef GGML_SCHED_MAX_PLANS
+#define GGML_SCHED_MAX_PLANS 32
+#endif
+
+// the per-graph state of the scheduler (split, input copies, allocation) kept for a later run of the same
+// graph object (ggml_backend_sched_plan_*); swapped with the scheduler's own fields
+struct ggml_backend_sched_plan {
+    const struct ggml_cgraph * key = nullptr; // null: free
+    int      key_n_nodes = 0;
+    uint64_t gen         = 0;                 // allocator generation when the graph was allocated
+    uint64_t used        = 0;
+    bool     arrays      = false;             // the arrays below exist
+
+    bool is_reset = false;
+    bool is_alloc = false;
+    struct ggml_hash_set  hash_set = {};
+    int                 * hv_tensor_backend_ids = nullptr;
+    struct ggml_tensor ** hv_tensor_copies      = nullptr;
+    int * node_backend_ids      = nullptr;
+    int * leaf_backend_ids      = nullptr;
+    int * prev_node_backend_ids = nullptr;
+    int * prev_leaf_backend_ids = nullptr;
+    struct ggml_cgraph graph = {};
+    struct ggml_backend_sched_split * splits = nullptr;
+    int n_splits        = 0;
+    int splits_capacity = 0;
+    struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS] = {};
+    int n_graph_inputs = 0;
+    struct ggml_context * ctx = nullptr;
+    char * context_buffer     = nullptr;
+};
+
+static void ggml_backend_sched_plan_free(ggml_backend_sched_plan * p);
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -840,6 +876,16 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // kept plans (ggml_backend_sched_plan_*); plan_key is the graph the current state belongs to once
+    // plan_set marked it, with its node count and the allocator generation at that time
+    size_t graph_size;
+    struct ggml_backend_sched_plan * plans[GGML_SCHED_MAX_PLANS];
+    int n_plans;
+    const struct ggml_cgraph * plan_key;
+    int      plan_key_n_nodes;
+    uint64_t plan_gen;
+    uint64_t plan_clock;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2166,6 +2212,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->graph_size = graph_size;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2233,6 +2280,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
         ggml_backend_free(sched->prefetch_backend);
     }
+    for (int i = 0; i < sched->n_plans; i++) {
+        ggml_backend_sched_plan_free(sched->plans[i]);
+    }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
@@ -2249,8 +2299,155 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
+static void ggml_backend_sched_plan_swap(ggml_backend_sched_t sched, ggml_backend_sched_plan * p) {
+    std::swap(sched->is_reset,              p->is_reset);
+    std::swap(sched->is_alloc,              p->is_alloc);
+    std::swap(sched->hash_set,              p->hash_set);
+    std::swap(sched->hv_tensor_backend_ids, p->hv_tensor_backend_ids);
+    std::swap(sched->hv_tensor_copies,      p->hv_tensor_copies);
+    std::swap(sched->node_backend_ids,      p->node_backend_ids);
+    std::swap(sched->leaf_backend_ids,      p->leaf_backend_ids);
+    std::swap(sched->prev_node_backend_ids, p->prev_node_backend_ids);
+    std::swap(sched->prev_leaf_backend_ids, p->prev_leaf_backend_ids);
+    std::swap(sched->graph,                 p->graph);
+    std::swap(sched->splits,                p->splits);
+    std::swap(sched->n_splits,              p->n_splits);
+    std::swap(sched->splits_capacity,       p->splits_capacity);
+    std::swap(sched->graph_inputs,          p->graph_inputs);
+    std::swap(sched->n_graph_inputs,        p->n_graph_inputs);
+    std::swap(sched->ctx,                   p->ctx);
+    std::swap(sched->context_buffer,        p->context_buffer);
+    std::swap(sched->plan_key,              p->key);
+    std::swap(sched->plan_key_n_nodes,      p->key_n_nodes);
+    std::swap(sched->plan_gen,              p->gen);
+}
+
+// arrays of a plan, sized as ggml_backend_sched_new sizes the scheduler's
+static void ggml_backend_sched_plan_arrays(ggml_backend_sched_t sched, ggml_backend_sched_plan * p) {
+    const size_t graph_size = sched->graph_size;
+    p->hash_set              = ggml_hash_set_new(graph_size);
+    p->hv_tensor_backend_ids = (int *) malloc(p->hash_set.size * sizeof(p->hv_tensor_backend_ids[0]));
+    p->hv_tensor_copies      = (ggml_tensor **) malloc(p->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    const size_t nodes_size = graph_size + graph_size*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+    p->node_backend_ids      = (int *) calloc(nodes_size, sizeof(int));
+    p->leaf_backend_ids      = (int *) calloc(nodes_size, sizeof(int));
+    p->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(int));
+    p->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(int));
+    p->splits_capacity = 16;
+    p->splits          = (ggml_backend_sched_split *) calloc(p->splits_capacity, sizeof(p->splits[0]));
+    p->context_buffer  = (char *) malloc(sched->context_buffer_size);
+    // the hash arrays are filled by the reset that follows a swap
+    p->is_reset = false;
+    p->is_alloc = false;
+    p->arrays   = true;
+}
+
+static void ggml_backend_sched_plan_free(ggml_backend_sched_plan * p) {
+    if (p->arrays) {
+        ggml_free(p->ctx);
+        ggml_hash_set_free(&p->hash_set);
+        free(p->splits);
+        free(p->hv_tensor_backend_ids);
+        free(p->hv_tensor_copies);
+        free(p->node_backend_ids);
+        free(p->leaf_backend_ids);
+        free(p->prev_node_backend_ids);
+        free(p->prev_leaf_backend_ids);
+        free(p->context_buffer);
+        free(p->graph.nodes);
+        free(p->graph.leafs);
+    }
+    delete p;
+}
+
+static bool ggml_backend_sched_plan_valid(ggml_backend_sched_t sched, const ggml_backend_sched_plan * p) {
+    return p->key != nullptr && p->is_alloc && p->gen == ggml_gallocr_get_generation(sched->galloc);
+}
+
+// before a reset: the current state goes into a free, stale or least recently used plan if plan_set marked it
+static void ggml_backend_sched_plan_stash(ggml_backend_sched_t sched) {
+    if (sched->plan_key == nullptr) {
+        return;
+    }
+    if (!sched->is_alloc || sched->plan_gen != ggml_gallocr_get_generation(sched->galloc)) {
+        sched->plan_key = nullptr;
+        return;
+    }
+    ggml_backend_sched_plan * slot = nullptr;
+    for (int i = 0; i < sched->n_plans; i++) {
+        ggml_backend_sched_plan * p = sched->plans[i];
+        if (!ggml_backend_sched_plan_valid(sched, p)) {
+            slot = p;
+            break;
+        }
+        if (slot == nullptr || p->used < slot->used) {
+            slot = p;
+        }
+    }
+    if (slot == nullptr || (ggml_backend_sched_plan_valid(sched, slot) && sched->n_plans < GGML_SCHED_MAX_PLANS)) {
+        slot = new ggml_backend_sched_plan();
+        sched->plans[sched->n_plans++] = slot;
+    }
+    if (!slot->arrays) {
+        ggml_backend_sched_plan_arrays(sched, slot);
+    }
+    ggml_backend_sched_plan_swap(sched, slot);
+    slot->used = ++sched->plan_clock;
+    // the scheduler now holds the arrays of the dropped plan (or new ones): the reset clears them
+    sched->plan_key = nullptr;
+    sched->is_alloc = false;
+    sched->is_reset = false;
+}
+
+void ggml_backend_sched_plan_set(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched->is_alloc);
+    sched->plan_key         = graph;
+    sched->plan_key_n_nodes = graph->n_nodes;
+    sched->plan_gen         = ggml_gallocr_get_generation(sched->galloc);
+}
+
+bool ggml_backend_sched_plan_use(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
+    const uint64_t gen = ggml_gallocr_get_generation(sched->galloc);
+    if (sched->is_alloc && sched->plan_key == graph && sched->plan_key_n_nodes == graph->n_nodes && sched->plan_gen == gen) {
+        return true;
+    }
+    for (int i = 0; i < sched->n_plans; i++) {
+        ggml_backend_sched_plan * p = sched->plans[i];
+        if (p->key == graph && p->key_n_nodes == graph->n_nodes && ggml_backend_sched_plan_valid(sched, p)) {
+            // the current state takes the plan's place, kept only if it is a valid plan itself
+            const bool keep = sched->plan_key != nullptr && sched->is_alloc && sched->plan_gen == gen;
+            ggml_backend_sched_plan_swap(sched, p);
+            if (!keep) {
+                p->key = nullptr;
+            }
+            p->used = ++sched->plan_clock;
+            return true;
+        }
+    }
+    return false;
+}
+
+void ggml_backend_sched_plan_forget(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
+    if (sched->plan_key == graph) {
+        sched->plan_key = nullptr;
+    }
+    for (int i = 0; i < sched->n_plans; i++) {
+        if (sched->plans[i]->key == graph) {
+            sched->plans[i]->key = nullptr;
+        }
+    }
+}
+
+void ggml_backend_sched_plan_clear(ggml_backend_sched_t sched) {
+    sched->plan_key = nullptr;
+    for (int i = 0; i < sched->n_plans; i++) {
+        sched->plans[i]->key = nullptr;
+    }
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    ggml_backend_sched_plan_stash(sched);
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -2278,6 +2475,11 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+
+    // the split below overwrites the current state: keep a marked plan first
+    if (sched->plan_key != nullptr) {
+        ggml_backend_sched_reset(sched);
+    }
 
     ggml_backend_sched_synchronize(sched);
 

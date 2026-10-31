@@ -352,6 +352,16 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // Plans keep the split and allocation of a graph object for later runs, so a caller that keeps one graph per
+    // shape can switch between them without splitting and allocating again. plan_set marks the graph just
+    // allocated; a reset then keeps its state aside instead of dropping it. plan_use makes a kept graph current
+    // again (false if it was never kept, was forgotten, or the compute buffers moved since); the graph must be
+    // unchanged since plan_set. plan_forget before rebuilding a kept graph object; plan_clear drops them all.
+    GGML_API void                 ggml_backend_sched_plan_set(ggml_backend_sched_t sched, const struct ggml_cgraph * graph);
+    GGML_API bool                 ggml_backend_sched_plan_use(ggml_backend_sched_t sched, const struct ggml_cgraph * graph);
+    GGML_API void                 ggml_backend_sched_plan_forget(ggml_backend_sched_t sched, const struct ggml_cgraph * graph);
+    GGML_API void                 ggml_backend_sched_plan_clear(ggml_backend_sched_t sched);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 

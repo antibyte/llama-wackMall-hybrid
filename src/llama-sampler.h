@@ -38,6 +38,13 @@ struct llama_sampler_chain {
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
+// backend_set_input() writes the input tensors the last backend_apply() created. A kept graph of another
+// shape (llama_context::gf_res_small) gets its own back before it is replayed: get appends one entry per
+// sampler with backend inputs, set consumes them in the same order. get returns false for a sampler with
+// backend inputs it does not know.
+bool llama_sampler_backend_get_inputs(const llama_sampler * smpl, std::vector<std::vector<ggml_tensor *>> & out);
+void llama_sampler_backend_set_inputs(llama_sampler * smpl, const std::vector<std::vector<ggml_tensor *>> & in, size_t & pos);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         int32_t context_size,
         float   dry_multiplier,

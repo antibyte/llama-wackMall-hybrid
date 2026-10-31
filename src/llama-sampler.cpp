@@ -3846,6 +3846,60 @@ static struct llama_sampler_i llama_sampler_logit_bias_i = {
     /* .backend_reset     = */ llama_sampler_logit_bias_backend_reset,
 };
 
+bool llama_sampler_backend_get_inputs(const llama_sampler * smpl, std::vector<std::vector<ggml_tensor *>> & out) {
+    if (smpl->iface->backend_set_input == nullptr || smpl->iface == &llama_sampler_empty_i) {
+        return true;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+        for (const auto & entry : chain->samplers) {
+            if (!entry.is_backend) {
+                break;
+            }
+            if (!llama_sampler_backend_get_inputs(entry.ptr, out)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (smpl->iface == &llama_sampler_dist_i) {
+        out.push_back(((const llama_sampler_dist *) smpl->ctx)->inp_uniforms);
+        return true;
+    }
+    if (smpl->iface == &llama_sampler_logit_bias_i) {
+        const auto * sctx = (const llama_sampler_logit_bias *) smpl->ctx;
+        out.push_back({ sctx->inp_logit_bias, sctx->inp_logit_idxs });
+        return true;
+    }
+    return false;
+}
+
+void llama_sampler_backend_set_inputs(llama_sampler * smpl, const std::vector<std::vector<ggml_tensor *>> & in, size_t & pos) {
+    if (smpl->iface->backend_set_input == nullptr || smpl->iface == &llama_sampler_empty_i) {
+        return;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        auto * chain = (llama_sampler_chain *) smpl->ctx;
+        for (auto & entry : chain->samplers) {
+            if (!entry.is_backend) {
+                break;
+            }
+            llama_sampler_backend_set_inputs(entry.ptr, in, pos);
+        }
+        return;
+    }
+    GGML_ASSERT(pos < in.size());
+    if (smpl->iface == &llama_sampler_dist_i) {
+        ((llama_sampler_dist *) smpl->ctx)->inp_uniforms = in[pos++];
+    } else if (smpl->iface == &llama_sampler_logit_bias_i) {
+        auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
+        GGML_ASSERT(in[pos].size() == 2);
+        sctx->inp_logit_bias = in[pos][0];
+        sctx->inp_logit_idxs = in[pos][1];
+        pos++;
+    }
+}
+
 struct llama_sampler * llama_sampler_init_logit_bias(
                          int32_t   n_vocab,
                          int32_t   n_logit_bias,

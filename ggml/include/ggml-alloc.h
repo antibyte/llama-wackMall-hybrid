@@ -71,6 +71,9 @@ GGML_API bool ggml_gallocr_reserve_n(
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
+// changes whenever a buffer is allocated again or freed: tensors placed before have moved
+GGML_API uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc);
+
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
 // Utils

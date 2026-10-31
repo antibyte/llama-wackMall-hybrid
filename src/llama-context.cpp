@@ -745,6 +745,16 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * LLAMA_GRAPH_SMALL_TOKENS = getenv("LLAMA_GRAPH_SMALL_TOKENS");
+        const char * LLAMA_GRAPH_SMALL_SHAPES = getenv("LLAMA_GRAPH_SMALL_SHAPES");
+        if (LLAMA_GRAPH_SMALL_TOKENS) {
+            graph_small_max_tokens = (uint32_t) std::max(0, atoi(LLAMA_GRAPH_SMALL_TOKENS));
+        }
+        if (LLAMA_GRAPH_SMALL_SHAPES) {
+            // the scheduler keeps at most 32 plans (GGML_SCHED_MAX_PLANS)
+            graph_small_max_shapes = (size_t) std::min(32, std::max(0, atoi(LLAMA_GRAPH_SMALL_SHAPES)));
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1353,6 +1363,7 @@ void llama_context::sched_reserve() {
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_tree.reset();
+    gf_res_small.clear();
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_active = nullptr;
 
@@ -1685,14 +1696,10 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
-        // reset the previous graph result to make sure that it won't be reused
+        // reset the previous graph results to make sure that they won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
-        //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
-        if (gf_res_tree) {
-            gf_res_tree->reset();
-        }
-        gf_res_active = nullptr;
+        //       reset the graph results only if the memory module did reset the scheduler
+        reset_graph_results();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -2372,10 +2379,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    if (cparams.tree_parent_ids != nullptr && !gf_res_tree) {
+    const bool tree = cparams.tree_parent_ids != nullptr;
+    if (tree && !gf_res_tree) {
         gf_res_tree.reset(new llm_graph_result(gf_res_prev->get_max_nodes()));
     }
-    auto * res = cparams.tree_parent_ids != nullptr ? gf_res_tree.get() : gf_res_prev.get();
+    const bool small = !tree && !cparams.pipeline_parallel && graph_small_max_shapes > 0 &&
+            ubatch.n_tokens <= graph_small_max_tokens;
+    auto * res = tree ? gf_res_tree.get() : small ? get_gf_res_small(ubatch) : gf_res_prev.get();
     auto * gf  = res->get_gf();
 
     const int64_t t_pu0 = (dflash != nullptr) ? ggml_time_us() : 0;
@@ -2384,7 +2394,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_active == res && res->can_reuse(gparams)) {
+    bool reuse = !graph_reuse_disable && res->can_reuse(gparams);
+    if (reuse && gf_res_active != res) {
+        // another graph ran since: replay this one's kept split and allocation if the buffers have not moved
+        reuse = small && ggml_backend_sched_plan_use(sched.get(), gf);
+        if (reuse) {
+            if (gf_res_active != nullptr) {
+                // the inputs set below may overlap memory the previous graph still reads
+                ggml_backend_sched_synchronize(sched.get());
+            }
+            res->restore_sampler_inputs();
+        }
+    }
+
+    if (reuse) {
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
@@ -2402,6 +2425,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (gf_res_active != nullptr && gf_res_active != res) {
             ggml_backend_sched_synchronize(sched.get());
         }
+        // before the reset, which would keep this graph's stale state as its plan
+        ggml_backend_sched_plan_forget(sched.get(), gf);
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2422,6 +2447,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+        if (small && res->save_sampler_inputs()) {
+            ggml_backend_sched_plan_set(sched.get(), gf);
         }
         if (dflash != nullptr) {
             dflash->n_graph_rebuild++;
@@ -3578,6 +3606,40 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+llm_graph_result * llama_context::get_gf_res_small(const llama_ubatch & ubatch) {
+    const uint64_t key = (uint64_t) ubatch.n_tokens << 32 | (uint32_t) n_outputs;
+    for (size_t i = 0; i < gf_res_small.size(); i++) {
+        if (gf_res_small[i].first == key) {
+            std::rotate(gf_res_small.begin(), gf_res_small.begin() + i, gf_res_small.begin() + i + 1);
+            return gf_res_small[0].second.get();
+        }
+    }
+    if (gf_res_small.size() >= graph_small_max_shapes) {
+        auto & last = gf_res_small.back();
+        ggml_backend_sched_plan_forget(sched.get(), last.second->get_gf());
+        if (gf_res_active == last.second.get()) {
+            gf_res_active = nullptr;
+        }
+        gf_res_small.pop_back();
+    }
+    gf_res_small.insert(gf_res_small.begin(), { key, llm_graph_result_ptr(new llm_graph_result(gf_res_prev->get_max_nodes())) });
+    return gf_res_small[0].second.get();
+}
+
+void llama_context::reset_graph_results() {
+    gf_res_prev->reset();
+    if (gf_res_tree) {
+        gf_res_tree->reset();
+    }
+    for (auto & entry : gf_res_small) {
+        entry.second->reset();
+    }
+    gf_res_active = nullptr;
+    if (sched) {
+        ggml_backend_sched_plan_clear(sched.get());
+    }
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -3588,14 +3650,10 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
-    ggml_backend_sched_reset(sched.get());
+    // when the scheduler is reset, we cannot reuse the old graphs, so we reset the previous graph results to prevent that
+    reset_graph_results();
 
-    // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
-    if (gf_res_tree) {
-        gf_res_tree->reset();
-    }
-    gf_res_active = nullptr;
+    ggml_backend_sched_reset(sched.get());
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -4650,7 +4708,8 @@ void llama_context::opt_epoch_iter(
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
-            res->reset();
+            // the optimizer graph is allocated outside the scheduler, so the next decode must rebuild
+            reset_graph_results();
 
             auto * gf = model.build_graph(gparams);
 

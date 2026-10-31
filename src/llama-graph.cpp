@@ -1357,6 +1357,7 @@ void llm_graph_result::reset() {
     lookahead_traces.clear();
     tree_state_copies.clear();
     dflash_inject_built = false;
+    sampler_inputs.clear();
     hdmd_inputs.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
@@ -1398,6 +1399,23 @@ bool llm_graph_result::commit_tree_state(int32_t node) {
         ggml_backend_tensor_copy(src, dst);
     }
     return true;
+}
+
+bool llm_graph_result::save_sampler_inputs() {
+    sampler_inputs.clear();
+    for (const auto & entry : params.samplers) {
+        if (!llama_sampler_backend_get_inputs(entry.second, sampler_inputs)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llm_graph_result::restore_sampler_inputs() {
+    size_t pos = 0;
+    for (const auto & entry : params.samplers) {
+        llama_sampler_backend_set_inputs(entry.second, sampler_inputs, pos);
+    }
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
