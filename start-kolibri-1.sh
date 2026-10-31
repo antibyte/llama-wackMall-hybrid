@@ -76,6 +76,17 @@ export LLAMA_EXPERT_CPU_CHUNK="${LLAMA_EXPERT_CPU_CHUNK:-64}"
 export LLAMA_EXPERT_CPU_FUSED_GATE_UP="${LLAMA_EXPERT_CPU_FUSED_GATE_UP:-1}"
 export LLAMA_EXPERT_SHARED_HOT_IDS="${LLAMA_EXPERT_SHARED_HOT_IDS:-1}"
 export LLAMA_EXPERT_SKIP_SENTINEL="${LLAMA_EXPERT_SKIP_SENTINEL:-1}"
+# Copy the CPU splits' inputs from the GPU asynchronously, one sync per split:
+# decode 17.45 -> 17.89 t/s, same tokens (benchmark-results/avalon-review-20261031).
+export GGML_SCHED_ASYNC_D2H_COPY="${GGML_SCHED_ASYNC_D2H_COPY:-1}"
+export GGML_SCHED_DEDUP_DST_SYNC="${GGML_SCHED_DEDUP_DST_SYNC:-1}"
+# Compute buffers shrink only to at most RATIO and by at least MIN_MIB (prefill -> decode still frees the
+# prefill peak; small shape switches no longer reallocate). 0 / 1 = shrink on any decrease.
+export GGML_ALLOC_SHRINK_MIN_MIB="${GGML_ALLOC_SHRINK_MIN_MIB:-64}"
+export GGML_ALLOC_SHRINK_RATIO="${GGML_ALLOC_SHRINK_RATIO:-0.5}"
+# One kept graph per small ubatch shape; only speculative decoding switches shapes. SHAPES 0 = off.
+export LLAMA_GRAPH_SMALL_TOKENS="${LLAMA_GRAPH_SMALL_TOKENS:-16}"
+export LLAMA_GRAPH_SMALL_SHAPES="${LLAMA_GRAPH_SMALL_SHAPES:-8}"
 # Read ahead the top-8 predicted cold experts of the next layer: +23% on the first
 # tokens after a cold start, -2% over a 1024-token answer (extra GPU router work).
 export LLAMA_EXPERT_PAGE_PREFETCH="${LLAMA_EXPERT_PAGE_PREFETCH:-0}"

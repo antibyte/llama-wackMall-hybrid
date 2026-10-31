@@ -256,6 +256,14 @@ GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner: 47.340 -> 47.713 token/s (+0
 GGML_SCHED_DEFER_HOST_INPUTS="1"  # launch the hot branch before the synchronous CPU split; same tokens as cold-first alone
 GGML_CUDA_REGISTER_HOST="1"  # mmap pin; 21 GiB cudaHostRegister failed on 1660 Ti (host RAM, not VRAM)
 GGML_SCHED_PREFETCH_EXPERTS="2"  # persistent staging; 2 slots overlap prefill copies. S does not size this.
+# Compute buffers shrink only to at most RATIO and by at least MIN_MIB (2026-10-31): verify/decode switches
+# reallocated CUDA0 12.6 <-> 13.3 MiB every time; rebuild 4.5 -> 3.7 ms, same tokens. 0 / 1 = shrink on any decrease.
+GGML_ALLOC_SHRINK_MIN_MIB="64"
+GGML_ALLOC_SHRINK_RATIO="0.5"
+# One kept graph (split + allocation) per small ubatch shape (2026-10-31): verify rebuilds 72 -> 22 per
+# request, same tokens, decode 50.27 -> 50.31 t/s (noise). SHAPES 0 = off; at most 32.
+LLAMA_GRAPH_SMALL_TOKENS="16"
+LLAMA_GRAPH_SMALL_SHAPES="8"
 
 # ============================================================================
 # End of editable configuration
@@ -372,6 +380,10 @@ case "$GGML_SCHED_DEFER_HOST_INPUTS" in 0|1) ;; *) die "GGML_SCHED_DEFER_HOST_IN
 case "$LLAMA_EXPERT_COLD_FIRST" in 0|1) ;; *) die "LLAMA_EXPERT_COLD_FIRST muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_REGISTER_HOST" in 0|1) ;; *) die "GGML_CUDA_REGISTER_HOST muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_PREFETCH_EXPERTS" in 0|1|2|3|4|5|6|7|8) ;; *) die "GGML_SCHED_PREFETCH_EXPERTS muss 0 oder 1..8 sein." ;; esac
+[[ "$GGML_ALLOC_SHRINK_MIN_MIB" =~ ^[0-9]+$ ]] || die "GGML_ALLOC_SHRINK_MIN_MIB muss eine ganze Zahl >= 0 sein."
+[[ "$GGML_ALLOC_SHRINK_RATIO" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || die "GGML_ALLOC_SHRINK_RATIO muss zwischen 0 und 1 liegen."
+[[ "$LLAMA_GRAPH_SMALL_TOKENS" =~ ^[0-9]+$ ]] || die "LLAMA_GRAPH_SMALL_TOKENS muss eine ganze Zahl >= 0 sein."
+[[ "$LLAMA_GRAPH_SMALL_SHAPES" =~ ^[0-9]+$ && "$LLAMA_GRAPH_SMALL_SHAPES" -le 32 ]] || die "LLAMA_GRAPH_SMALL_SHAPES muss 0..32 sein."
 [[ -z "$LLAMA_EXPERT_S" || -z "$LLAMA_EXPERT_PLACEMENT" ]] || \
     die "LLAMA_EXPERT_S und LLAMA_EXPERT_PLACEMENT sind gegenseitig exklusiv."
 if [[ "$LLAMA_EXPERT_LOOKAHEAD_TRACE" != 0 && "$LLAMA_EXPERT_LOOKAHEAD_TRACE_JSON" == 0 ]]; then
@@ -592,6 +604,10 @@ env_args=(
     "GGML_SCHED_DEFER_HOST_INPUTS=$GGML_SCHED_DEFER_HOST_INPUTS"
     "GGML_CUDA_REGISTER_HOST=$GGML_CUDA_REGISTER_HOST"
     "GGML_SCHED_PREFETCH_EXPERTS=$GGML_SCHED_PREFETCH_EXPERTS"
+    "GGML_ALLOC_SHRINK_MIN_MIB=$GGML_ALLOC_SHRINK_MIN_MIB"
+    "GGML_ALLOC_SHRINK_RATIO=$GGML_ALLOC_SHRINK_RATIO"
+    "LLAMA_GRAPH_SMALL_TOKENS=$LLAMA_GRAPH_SMALL_TOKENS"
+    "LLAMA_GRAPH_SMALL_SHAPES=$LLAMA_GRAPH_SMALL_SHAPES"
     "LLAMA_DFLASH_COMBINED=$DFLASH_COMBINED"
 )
 
@@ -683,6 +699,7 @@ llama-wackMall-hybrid start
   CUDA concat:  flat-dim0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 block=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
   split copies: async-h2d=$GGML_CUDA_ASYNC_HOST_COPY async-d2h=$GGML_SCHED_ASYNC_D2H_COPY dedup-dst-sync=$GGML_SCHED_DEDUP_DST_SYNC defer-host=$GGML_SCHED_DEFER_HOST_INPUTS cold-first=$LLAMA_EXPERT_COLD_FIRST
   n-cpu-moe:    register-host=$GGML_CUDA_REGISTER_HOST prefetch-experts=$GGML_SCHED_PREFETCH_EXPERTS
+  graphs:       small-shapes=$LLAMA_GRAPH_SMALL_SHAPES (<= $LLAMA_GRAPH_SMALL_TOKENS tokens) shrink=${GGML_ALLOC_SHRINK_MIN_MIB} MiB/x$GGML_ALLOC_SHRINK_RATIO
   skip sentinel: $LLAMA_EXPERT_SKIP_SENTINEL (1=MMVQ early-exit on cold sentinel slots)
   shared hot IDs: $LLAMA_EXPERT_SHARED_HOT_IDS
   CPU fused GU: $LLAMA_EXPERT_CPU_FUSED_GATE_UP

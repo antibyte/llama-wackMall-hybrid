@@ -1,3 +1,36 @@
+# Avalon-Review: Prompt-Cache, asynchrone Split-Kopien und Graph-Cache vom 2026-10-31
+
+**Ergebnis: Aus der Analyse von freriadoc/Avalon (llama.cpp-Fork fuer Qwen3.8-Flash-Next auf RX 7900 XT) wurden drei Punkte gemessen. Avalons Regel, den RAM-Prompt-Cache bei Modellen groesser als der RAM abzuschalten, gilt hier nicht: Ling behaelt ihn. Asynchrone Eingangskopien der CPU-Splits bringen Kolibri +2,5 % und Ling +1 %, tokengleich; beide Rezepte und Startskripte setzen sie jetzt. Ein Graph-Cache pro Form fuer spekulatives Decoding laeuft tokengleich, bringt Qwen aber nur +0,5 % (Rauschen).**
+
+Messungen und Skripte: `benchmark-results/avalon-review-20261031/`. agollm war gestoppt.
+
+- **Prompt-Cache (Avalon 57c58e00):** `tools/cachebench.py` fuehrt vier verschiedene Chats (1,7k-2,4k Tokens, `cache_prompt: true`), einen Decode-Test und eine Folgefrage zu Chat 1 auf einem Server aus. Mit `--cache-ram 8192` belegen vier gespeicherte Chats ~2 GiB, die dem Page-Cache fehlen: Decode 7,33 statt 7,63 t/s (-4 %), 32 statt 29-31 GB SSD-Reads. Die Folgefrage stellt dafuer 1803 Tokens aus dem Cache wieder her und rechnet 29 neu (3,5-3,8 s statt 42-50 s Prefill). Avalon prefillt mit ~1600 t/s, dort kostet ein Neuaufbau wenig. Das Ling-Rezept setzt `LLAMA_ARG_CACHE_RAM` jetzt ausdruecklich auf 8192.
+- **Asynchrone Split-Kopien (Avalon 98a8dc2b, dort +5,3 %):** entspricht unserem `GGML_SCHED_ASYNC_D2H_COPY=1` plus `GGML_SCHED_DEDUP_DST_SYNC=1`, das bei Kolibri und Ling fehlte. Kolibri, vier verschachtelte Runden nach einem Aufwaermlauf: 17,45 -> 17,89 t/s, vorn in 3 von 4 Paaren, kleinste Streuung. Ling: 7,50 -> 7,58 t/s (im Rauschen; die SSD begrenzt). Cold-First plus Defer bei Kolibri: Mittel 18,50, Median 18,0 t/s, aber von einem schnellen Lauf getragen (Slab-Faults schwanken je Lauf zwischen 3,8 und 9 %); nicht uebernommen.
+- **Graph-Cache pro Form (Avalon a9a8168e):** Spekulatives Decoding wechselt die Graphformen (Verify 5 Tokens, Decode 1 Token); `llama_context` behielt nur den letzten Graphen. Umgesetzt: Scheduler-Plaene (`ggml_backend_sched_plan_*`), ein Graph je kleiner Form (`LLAMA_GRAPH_SMALL_TOKENS` 16, `LLAMA_GRAPH_SMALL_SHAPES` 8, 0 schaltet ab) und gesicherte Eingabe-Bindungen der Backend-Sampler (ohne sie las ein wiederverwendeter Graph veraltete Indizes: illegal memory access in `set_rows`). Nebenbei gefunden: Der Allokator legte die Compute-Puffer bei jedem Formwechsel neu an (CUDA0 12,63 <-> 13,30 MiB, Host 0,50 <-> 0,82 MiB, ~25-mal in 128 Tokens); er verkleinert jetzt nur noch auf hoechstens die Haelfte und um mindestens 64 MiB (`GGML_ALLOC_SHRINK_RATIO` 0.5, `GGML_ALLOC_SHRINK_MIN_MIB` 64; 1 und 0 stellen das alte Verhalten her). Qwen3.6 DFlash, drei verschachtelte Runden, alle 54 Antworten identisch: alte Binary 50,02, nur Allokator 50,27, Allokator plus Plaene 50,31 t/s. Die Neubauten sinken von 72/38 auf 22/19 je Request, der Gewinn bleibt im Rauschen: Die restlichen Neubauten entstehen, wenn der KV-Bereich ueber eine 256er-Stufe waechst. Beides bleibt standardmaessig an; `start1660.sh`, `router1660.sh`, `start-kolibri-1.sh`, `start-ling-3-flash.sh` und die agollm-Rezepte qwen3.6-35b-a3b-hybrid, kolibri-1 und ling-3-flash setzen die vier Parameter ausdruecklich.
+
+# Ling-3.0-flash Q4_K_M von der SSD vom 2026-10-30
+
+**Ergebnis: inclusionAI/Ling-3.0-flash (127B MoE, 512 Experten top-8 plus ein Shared Expert, KDA/MLA-Hybrid, eine MTP-Schicht) laeuft als bartowski-Q4_K_M (72,5 GiB, 2,4x RAM) auf der 1660 Ti mit ~7,5 t/s Decode. Ein Prompt mit 3,9k Tokens prefillt mit 33-41 t/s, kurze Prompts mit 7-11 t/s. Die Experten streamen von der SSD; beim Decode liest sie 0,9-1,2 GB/s, ihr Maximum. Eingebaut als `start-ling-3-flash.sh` und agollm-Rezept `ling-3-flash` (nur von Hand waehlbar).**
+
+Der Fork kann `bailingmoe3` seit b0ce1363b (auch in `build-main-sm75` und agollm `workers/llama`). Auf der GPU liegen Attention, KDA, Router, Shared Experts, die zwei dichten Schichten und ein statisches Hot-Set; der Rest der 20 480 Experten-Slices (je 3,4 MB) kommt aus dem Page-Cache oder der SSD. Wichtig: Fuer `bailingmoe3` startet das Tiering nur mit `LLAMA_EXPERT_HOT` oder `LLAMA_EXPERT_S`; ohne beides rechnet die CPU alle Experten und `LLAMA_EXPERT_USAGE` schreibt nichts. Das Profil `profiles/ling-3-flash-chat.csv` stammt aus 14 agollm-artigen Prompts (3,3k Tokens, S=8 mit ADAPT=1 aufgezeichnet): Top-16 je Schicht decken 26 %, Top-64 51 %, Top-128 70 % der Expertenwahlen. Das Auto-Fit setzt S=12 (2,13 GB frei, 136 MB je Slot), 23 % Abdeckung.
+
+Messung: agollm gestoppt, A/B/A/B ohne Cache-Raeumung, je ein 3,9k-Token-Prompt (sein Prefill zieht alle Experten durch den Cache), dann drei Kurzprompts mit 256 Greedy-Tokens.
+
+| Variante | Decode t/s (Mittel je Runde) | Ergebnis |
+| --- | ---: | --- |
+| Basis: Hot-Set S=12, RAM-Lock 12 GiB | 7,23 / 7,11 / 7,25 / 7,32 | |
+| Cold-First + Defer-Host-Inputs | 7,21 / 7,27 | tokengleich, kein Gewinn |
+| RAM-Lock 0 GiB | 7,39 / 7,46 | **uebernommen** (Lock senkt Fehlseiten 35 -> 30 %, spart aber keine Zeit) |
+| RAM-Lock 18 GiB | 7,21 / 7,16 | |
+| ADAPT=1 (adaptives Hot-Set) | 7,45 / 7,37 | gegen Basis 7,61 / 7,43 |
+| MTP-Draft n=1 | 7,59 / 7,80 | jeder Draft angenommen (127/127 je Prompt) und Greedy-Ausgabe weicht ab: Verify-Pfad verdaechtig, nicht uebernommen |
+| MTP-Draft n=2 | 6,98 / 6,71 | langsamer |
+| Prefill-ubatch 4096 | 7,71 / 7,54 | Prefill 15 statt 37 t/s, S faellt auf 8 |
+
+Ohne Hot-Set aus kaltem Cache (erster Lauf): 6,7 t/s ueber die 14 Profil-Prompts. Ueber agollm: 41-Token-Frage nach 58 s beantwortet (10 s Laden, 4,8 s Prefill, 298 Tokens mit 7,2 t/s), Denken (englisch) und deutsche Antwort sauber getrennt. Nicht gemessen: Decode bei langem Kontext (MLA-KV ist mit 7 Schichten zu 576 Werten je Token klein) und Threads ueber 8 (bei Kolibri ohne Gewinn).
+
+Artefakte (gitignored): `benchmark-results/ling-3-flash-20261030/` (`tools/mbench.py`, `tools/abn.sh`, `runs/`, `ab*.txt`, `profile-corpus.jsonl`). Modell: `~/models/ling-3-flash/` (sha256 geprueft, `download-ling-3-flash.sh`).
+
 # Phonon-2.5 und Parakeet (ASR) gegen granite-speech vom 2026-10-26
 
 **Ergebnis: FermionResearch/Phonon-2.5 (Parakeet-TDT-0.6B-v3 in Low-Bit-Form, 156 MB, CPU) und das volle Parakeet-TDT-0.6B-v3 ueber audio.cpp auf der Vega transkribieren 6-15x schneller als die aktive agollm-ASR granite-speech-5.0-2b, machen aber mehr Wortfehler. Beide sind in agollm als Auswahl eingebaut; granite bleibt aktiv.**
