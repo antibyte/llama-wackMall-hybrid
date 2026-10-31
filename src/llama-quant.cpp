@@ -288,7 +288,18 @@ static void llama_tensor_dequantize_impl(
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
     // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+    if (params->only_copy) {
+        // COPY remains byte-for-byte for every tensor unless the caller
+        // explicitly requests an output/token-embedding override.  This makes
+        // it possible to create a controlled single-tensor variant without
+        // requantizing the rest of an already quantized model.
+        const std::string_view name = ggml_get_name(tensor);
+        const bool output_override = params->output_tensor_type < GGML_TYPE_COUNT && name == "output.weight";
+        const bool token_override  = params->token_embedding_type < GGML_TYPE_COUNT && name == "token_embd.weight";
+        if (!output_override && !token_override) {
+            return false;
+        }
+    }
 
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;

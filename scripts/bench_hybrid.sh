@@ -46,8 +46,16 @@ SHARED_HOT_IDS="${SHARED_HOT_IDS:-0}"
 MOE_MULTI_FUSION="${MOE_MULTI_FUSION:-0}"
 MOE_COMBINE_FUSION="${MOE_COMBINE_FUSION:-0}"
 MMVQ_Q8_NCOLS3_ROWS="${MMVQ_Q8_NCOLS3_ROWS:-0}"
+MMVQ_Q8_NCOLS1_ROWS="${MMVQ_Q8_NCOLS1_ROWS:-0}"
 MMVQ_Q6_K_NCOLS1_ROWS="${MMVQ_Q6_K_NCOLS1_ROWS:-0}"
+MMVQ_Q6_K_NCOLS1_WARPS="${MMVQ_Q6_K_NCOLS1_WARPS:-0}"
+MMVQ_Q6_K_NCOLS1_WARP_ROWS="${MMVQ_Q6_K_NCOLS1_WARP_ROWS:-0}"
+MMVQ_Q6_K_NCOLS1_REUSE_Y="${MMVQ_Q6_K_NCOLS1_REUSE_Y:-0}"
 MMVQ_Q6_K_NCOLS3_ROWS="${MMVQ_Q6_K_NCOLS3_ROWS:-0}"
+MMVQ_MOE_FUSED_ROWS="${MMVQ_MOE_FUSED_ROWS:-0}"
+MMVQ_MOE_PLAIN_ROWS="${MMVQ_MOE_PLAIN_ROWS:-0}"
+CONCAT_NONCONT_BLOCK_SIZE="${CONCAT_NONCONT_BLOCK_SIZE:-0}"
+CONCAT_NONCONT_FLAT_DIM0="${CONCAT_NONCONT_FLAT_DIM0:-0}"
 CPU_MASK="${CPU_MASK:-}"
 CPU_POLL="${CPU_POLL:-}"
 BEST_W="${BEST_W:-${6:-2}}"
@@ -144,7 +152,7 @@ if command -v system76-power >/dev/null; then
 fi
 
 printf '%s\n' \
-  'config,rep,fixed_s,effective_fixed_s,warm_s,mtp_n,context,target_type_k,target_type_v,cpu_threads,draft_threads,draft_type_k,draft_type_v,draft_p_min,draft_backend_sampling,target_backend_sampling,reasoning_budget,cpu_chunk,cpu_act_parallel,cpu_async,cpu_down_prefetch,cpu_reuse_rows,cpu_multi_row,shared_hot_ids,moe_multi_fusion,moe_combine_fusion,mmvq_q8_ncols3_rows,mmvq_q6_k_ncols1_rows,mmvq_q6_k_ncols3_rows,load_mode,cmoe_batch,cmoe_ubatch,prompt_repeat,profile_sha256,placement_sha256,power_profile,cpu_mask,cpu_poll,adapt,adapt_cuda_graphs,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,cpu_gate_up_ms,cpu_activation_ms,cpu_down_ms,cpu_async_jobs,cpu_async_wait_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
+  'config,rep,fixed_s,effective_fixed_s,warm_s,mtp_n,context,target_type_k,target_type_v,cpu_threads,draft_threads,draft_type_k,draft_type_v,draft_p_min,draft_backend_sampling,target_backend_sampling,reasoning_budget,cpu_chunk,cpu_act_parallel,cpu_async,cpu_down_prefetch,cpu_reuse_rows,cpu_multi_row,shared_hot_ids,moe_multi_fusion,moe_combine_fusion,mmvq_q8_ncols3_rows,mmvq_q8_ncols1_rows,mmvq_q6_k_ncols1_rows,mmvq_q6_k_ncols1_warps,mmvq_q6_k_ncols1_warp_rows,mmvq_q6_k_ncols1_reuse_y,mmvq_q6_k_ncols3_rows,mmvq_moe_fused_rows,mmvq_moe_plain_rows,concat_noncont_block_size,concat_noncont_flat_dim0,load_mode,cmoe_batch,cmoe_ubatch,prompt_repeat,profile_sha256,placement_sha256,power_profile,cpu_mask,cpu_poll,adapt,adapt_cuda_graphs,static_no_sync_requested,static_no_sync_active,prompt_tps,ttft_ms,decode_tps,sustained_decode_tps,mtp_acceptance,mean_accepted_length,hot_hits,warm_hits,cold_hits,cold_share,repins,warm_promotions,warm_evictions,h2d_copies,h2d_bytes,h2d_ms,cpu_expert_ms,cpu_gate_up_ms,cpu_activation_ms,cpu_down_ms,cpu_async_jobs,cpu_async_wait_ms,gpu_expert_ms,sync_wait_ms,vram_peak_mib,ram_peak_mib,gpu_util_avg,cpu_util_avg,predicted_tokens,output_sha256,token_sha256' \
   > "$RUNS_CSV"
 
 PID=""
@@ -259,7 +267,7 @@ for config in "${CONFIGS[@]}"; do
         warmup_lookahead_file="$RESULTS_DIR/$stem.warmup.lookahead-%r.json"
         lookahead_file="$RESULTS_DIR/$stem.lookahead-%r.json"
 
-        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N context=$CONTEXT target_kv=$TARGET_TYPE_K/$TARGET_TYPE_V batch=$CMOE_BATCH/$CMOE_UBATCH prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V pmin=${DRAFT_P_MIN:-default} draft_backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING target_backend_sampling=$TARGET_BACKEND_SAMPLING reasoning_budget=$REASONING_BUDGET cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS cpu_multi_row=$CPU_MULTI_ROW shared_hot_ids=$SHARED_HOT_IDS moe_multi_fusion=$MOE_MULTI_FUSION moe_combine_fusion=$MOE_COMBINE_FUSION mmvq_q8_ncols3_rows=$MMVQ_Q8_NCOLS3_ROWS mmvq_q6_k_ncols1_rows=$MMVQ_Q6_K_NCOLS1_ROWS mmvq_q6_k_ncols3_rows=$MMVQ_Q6_K_NCOLS3_ROWS load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC lookahead_trace=$LOOKAHEAD_TRACE ==="
+        echo "=== $config, Lauf $rep/$REPEATS: fixed=$FIXED_S warm=$WARM_S mtp=$MTP_N context=$CONTEXT target_kv=$TARGET_TYPE_K/$TARGET_TYPE_V batch=$CMOE_BATCH/$CMOE_UBATCH prompt_repeat=$PROMPT_REPEAT draft_kv=$DRAFT_TYPE_K/$DRAFT_TYPE_V pmin=${DRAFT_P_MIN:-default} draft_backend_sampling=$EFFECTIVE_DRAFT_BACKEND_SAMPLING target_backend_sampling=$TARGET_BACKEND_SAMPLING reasoning_budget=$REASONING_BUDGET cpu_chunk=$CPU_CHUNK cpu_act_parallel=$CPU_ACT_PARALLEL cpu_async=$CPU_ASYNC cpu_down_prefetch=$CPU_DOWN_PREFETCH cpu_reuse_rows=$CPU_REUSE_ROWS cpu_multi_row=$CPU_MULTI_ROW shared_hot_ids=$SHARED_HOT_IDS moe_multi_fusion=$MOE_MULTI_FUSION moe_combine_fusion=$MOE_COMBINE_FUSION mmvq_q8_ncols3_rows=$MMVQ_Q8_NCOLS3_ROWS mmvq_q8_ncols1_rows=$MMVQ_Q8_NCOLS1_ROWS mmvq_q6_k_ncols1_rows=$MMVQ_Q6_K_NCOLS1_ROWS mmvq_q6_k_ncols1_warps=$MMVQ_Q6_K_NCOLS1_WARPS mmvq_q6_k_ncols1_warp_rows=$MMVQ_Q6_K_NCOLS1_WARP_ROWS mmvq_q6_k_ncols1_reuse_y=$MMVQ_Q6_K_NCOLS1_REUSE_Y mmvq_q6_k_ncols3_rows=$MMVQ_Q6_K_NCOLS3_ROWS mmvq_moe_fused_rows=$MMVQ_MOE_FUSED_ROWS mmvq_moe_plain_rows=$MMVQ_MOE_PLAIN_ROWS concat_noncont_block=$CONCAT_NONCONT_BLOCK_SIZE concat_noncont_flat_dim0=$CONCAT_NONCONT_FLAT_DIM0 load_mode=$LOAD_MODE prefetch=$PREFETCH threads=${CPU_THREADS:-auto}/${DRAFT_THREADS:-auto} power=$POWER_PROFILE adapt=$ADAPT adapt_cuda_graphs=$ADAPT_CUDA_GRAPHS static_no_sync=$STATIC_NO_SYNC lookahead_trace=$LOOKAHEAD_TRACE ==="
 
         env_args=(
             CUDA_VISIBLE_DEVICES=0
@@ -281,8 +289,16 @@ for config in "${CONFIGS[@]}"; do
             "GGML_CUDA_MOE_MULTI_FUSION=$MOE_MULTI_FUSION"
             "GGML_CUDA_MOE_COMBINE_FUSION=$MOE_COMBINE_FUSION"
             "GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS=$MMVQ_Q8_NCOLS3_ROWS"
+            "GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS=$MMVQ_Q8_NCOLS1_ROWS"
             "GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS=$MMVQ_Q6_K_NCOLS1_ROWS"
+            "GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS=$MMVQ_Q6_K_NCOLS1_WARPS"
+            "GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS=$MMVQ_Q6_K_NCOLS1_WARP_ROWS"
+            "GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y=$MMVQ_Q6_K_NCOLS1_REUSE_Y"
             "GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS=$MMVQ_Q6_K_NCOLS3_ROWS"
+            "GGML_CUDA_MMVQ_MOE_FUSED_ROWS=$MMVQ_MOE_FUSED_ROWS"
+            "GGML_CUDA_MMVQ_MOE_PLAIN_ROWS=$MMVQ_MOE_PLAIN_ROWS"
+            "GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE=$CONCAT_NONCONT_BLOCK_SIZE"
+            "GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=$CONCAT_NONCONT_FLAT_DIM0"
             "LLAMA_EXPERT_STATIC_NO_SYNC=$STATIC_NO_SYNC"
             LLAMA_EXPERT_DECAY=1.0
             "LLAMA_EXPERT_WARM_SLOTS=$WARM_S"
@@ -488,7 +504,7 @@ if not trace.get("records"):
 PY
         fi
 
-        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "$CONTEXT" "$TARGET_TYPE_K" "$TARGET_TYPE_V" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$TARGET_BACKEND_SAMPLING" "$REASONING_BUDGET" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$CPU_ASYNC" "$CPU_DOWN_PREFETCH" "$CPU_REUSE_ROWS" "$CPU_MULTI_ROW" "$SHARED_HOT_IDS" "$MOE_MULTI_FUSION" "$MOE_COMBINE_FUSION" "$MMVQ_Q8_NCOLS3_ROWS" "$MMVQ_Q6_K_NCOLS1_ROWS" "$MMVQ_Q6_K_NCOLS3_ROWS" "$LOAD_MODE" "$CMOE_BATCH" "$CMOE_UBATCH" "$PROMPT_REPEAT" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$ADAPT_CUDA_GRAPHS" "$STATIC_NO_SYNC" \
+        python3 - "$config" "$rep" "$FIXED_S" "$WARM_S" "$MTP_N" "$CONTEXT" "$TARGET_TYPE_K" "$TARGET_TYPE_V" "${CPU_THREADS:-auto}" "${DRAFT_THREADS:-auto}" "$DRAFT_TYPE_K" "$DRAFT_TYPE_V" "${DRAFT_P_MIN:-default}" "$EFFECTIVE_DRAFT_BACKEND_SAMPLING" "$TARGET_BACKEND_SAMPLING" "$REASONING_BUDGET" "$CPU_CHUNK" "$CPU_ACT_PARALLEL" "$CPU_ASYNC" "$CPU_DOWN_PREFETCH" "$CPU_REUSE_ROWS" "$CPU_MULTI_ROW" "$SHARED_HOT_IDS" "$MOE_MULTI_FUSION" "$MOE_COMBINE_FUSION" "$MMVQ_Q8_NCOLS3_ROWS" "$MMVQ_Q8_NCOLS1_ROWS" "$MMVQ_Q6_K_NCOLS1_ROWS" "$MMVQ_Q6_K_NCOLS1_WARPS" "$MMVQ_Q6_K_NCOLS1_WARP_ROWS" "$MMVQ_Q6_K_NCOLS1_REUSE_Y" "$MMVQ_Q6_K_NCOLS3_ROWS" "$MMVQ_MOE_FUSED_ROWS" "$MMVQ_MOE_PLAIN_ROWS" "$CONCAT_NONCONT_BLOCK_SIZE" "$CONCAT_NONCONT_FLAT_DIM0" "$LOAD_MODE" "$CMOE_BATCH" "$CMOE_UBATCH" "$PROMPT_REPEAT" "$PROFILE_SHA256" "$PLACEMENT_SHA256" "$POWER_PROFILE" "${CPU_MASK:-auto}" "${CPU_POLL:-default}" "$ADAPT" "$ADAPT_CUDA_GRAPHS" "$STATIC_NO_SYNC" \
             "$response_file" "$stats_file" "$samples_file" "$log_file" >> "$RUNS_CSV" <<'PY'
 import csv
 import json
@@ -497,7 +513,7 @@ import statistics
 import sys
 from pathlib import Path
 
-config, rep, fixed_s, warm_s, mtp_n, context, target_type_k, target_type_v, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
+config, rep, fixed_s, warm_s, mtp_n, context, target_type_k, target_type_v, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q8_ncols1_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols1_warps, mmvq_q6_k_ncols1_warp_rows, mmvq_q6_k_ncols1_reuse_y, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, response_path, stats_path, samples_path, log_path = sys.argv[1:]
 response = json.loads(Path(response_path).read_text())
 stats_file = Path(stats_path)
 stats = json.loads(stats_file.read_text()) if stats_file.exists() else {}
@@ -532,7 +548,7 @@ total = float(stats.get("selected_total", 0) or 0)
 cold = float(stats.get("cold_hits", 0) or 0)
 
 row = [
-    config, rep, fixed_s, effective_fixed_s, warm_s, mtp_n, context, target_type_k, target_type_v, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols3_rows, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, int(static_active),
+    config, rep, fixed_s, effective_fixed_s, warm_s, mtp_n, context, target_type_k, target_type_v, cpu_threads, draft_threads, draft_type_k, draft_type_v, draft_p_min, draft_backend_sampling, target_backend_sampling, reasoning_budget, cpu_chunk, cpu_act_parallel, cpu_async, cpu_down_prefetch, cpu_reuse_rows, cpu_multi_row, shared_hot_ids, moe_multi_fusion, moe_combine_fusion, mmvq_q8_ncols3_rows, mmvq_q8_ncols1_rows, mmvq_q6_k_ncols1_rows, mmvq_q6_k_ncols1_warps, mmvq_q6_k_ncols1_warp_rows, mmvq_q6_k_ncols1_reuse_y, mmvq_q6_k_ncols3_rows, mmvq_moe_fused_rows, mmvq_moe_plain_rows, concat_noncont_block_size, concat_noncont_flat_dim0, load_mode, cmoe_batch, cmoe_ubatch, prompt_repeat, profile_sha256, placement_sha256, power_profile, cpu_mask, cpu_poll, adapt, adapt_cuda_graphs, static_requested, int(static_active),
     timings.get("prompt_per_second", 0),
     response.get("ttft_ms", 0),
     timings.get("predicted_per_second", 0),
@@ -585,7 +601,7 @@ numeric = [
     "predicted_tokens",
 ]
 with open(destination, "w", newline="") as handle:
-    fields = ["config", "repeats", "fixed_s", "effective_fixed_s", "warm_s", "mtp_n", "context", "target_type_k", "target_type_v", "cpu_threads", "draft_threads", "draft_type_k", "draft_type_v", "draft_p_min", "draft_backend_sampling", "target_backend_sampling", "reasoning_budget", "cpu_chunk", "cpu_act_parallel", "cpu_async", "cpu_down_prefetch", "cpu_reuse_rows", "cpu_multi_row", "shared_hot_ids", "moe_multi_fusion", "moe_combine_fusion", "mmvq_q8_ncols3_rows", "mmvq_q6_k_ncols1_rows", "mmvq_q6_k_ncols3_rows", "load_mode", "cmoe_batch", "cmoe_ubatch", "prompt_repeat", "profile_sha256", "placement_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "adapt_cuda_graphs", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
+    fields = ["config", "repeats", "fixed_s", "effective_fixed_s", "warm_s", "mtp_n", "context", "target_type_k", "target_type_v", "cpu_threads", "draft_threads", "draft_type_k", "draft_type_v", "draft_p_min", "draft_backend_sampling", "target_backend_sampling", "reasoning_budget", "cpu_chunk", "cpu_act_parallel", "cpu_async", "cpu_down_prefetch", "cpu_reuse_rows", "cpu_multi_row", "shared_hot_ids", "moe_multi_fusion", "moe_combine_fusion", "mmvq_q8_ncols3_rows", "mmvq_q8_ncols1_rows", "mmvq_q6_k_ncols1_rows", "mmvq_q6_k_ncols1_warps", "mmvq_q6_k_ncols1_warp_rows", "mmvq_q6_k_ncols1_reuse_y", "mmvq_q6_k_ncols3_rows", "mmvq_moe_fused_rows", "mmvq_moe_plain_rows", "concat_noncont_block_size", "concat_noncont_flat_dim0", "load_mode", "cmoe_batch", "cmoe_ubatch", "prompt_repeat", "profile_sha256", "placement_sha256", "power_profile", "cpu_mask", "cpu_poll", "adapt", "adapt_cuda_graphs", "static_no_sync_requested", "static_no_sync_active"] + numeric + [
         "output_hashes_identical", "token_hashes_identical", "output_sha256", "token_sha256",
     ]
     writer = csv.DictWriter(handle, fieldnames=fields)
@@ -622,8 +638,16 @@ with open(destination, "w", newline="") as handle:
             "moe_multi_fusion": group[0]["moe_multi_fusion"],
             "moe_combine_fusion": group[0]["moe_combine_fusion"],
             "mmvq_q8_ncols3_rows": group[0]["mmvq_q8_ncols3_rows"],
+            "mmvq_q8_ncols1_rows": group[0]["mmvq_q8_ncols1_rows"],
             "mmvq_q6_k_ncols1_rows": group[0]["mmvq_q6_k_ncols1_rows"],
+            "mmvq_q6_k_ncols1_warps": group[0]["mmvq_q6_k_ncols1_warps"],
+            "mmvq_q6_k_ncols1_warp_rows": group[0]["mmvq_q6_k_ncols1_warp_rows"],
+            "mmvq_q6_k_ncols1_reuse_y": group[0]["mmvq_q6_k_ncols1_reuse_y"],
             "mmvq_q6_k_ncols3_rows": group[0]["mmvq_q6_k_ncols3_rows"],
+            "mmvq_moe_fused_rows": group[0]["mmvq_moe_fused_rows"],
+            "mmvq_moe_plain_rows": group[0]["mmvq_moe_plain_rows"],
+            "concat_noncont_block_size": group[0]["concat_noncont_block_size"],
+            "concat_noncont_flat_dim0": group[0]["concat_noncont_flat_dim0"],
             "load_mode": group[0]["load_mode"],
             "cmoe_batch": group[0]["cmoe_batch"],
             "cmoe_ubatch": group[0]["cmoe_ubatch"],

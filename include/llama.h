@@ -427,7 +427,7 @@ extern "C" {
         enum ggml_type token_embedding_type;                        // token embeddings tensor type
         bool allow_requantize;                                      // allow quantizing non-f32/f16 tensors
         bool quantize_output_tensor;                                // quantize output.weight
-        bool only_copy;                                             // only copy tensors - ftype, allow_requantize and quantize_output_tensor are ignored
+        bool only_copy;                                             // copy tensors unchanged except explicit output/token-embedding type overrides
         bool pure;                                                  // quantize all tensors to the default type
         bool keep_split;                                            // quantize to the same number of shards
         bool dry_run;                                               // calculate and show the final quantization size without performing quantization

@@ -1,6 +1,44 @@
 #include "concat.cuh"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <stdint.h>
+
+static int get_concat_non_cont_block_size() {
+    static const int value = [] {
+        const char * env = std::getenv("GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE");
+        if (!env || !env[0] || env[0] == '0') {
+            return CUDA_CONCAT_BLOCK_SIZE;
+        }
+        const int parsed = std::atoi(env);
+        if (parsed == 32 || parsed == 64 || parsed == 128 || parsed == CUDA_CONCAT_BLOCK_SIZE) {
+            return parsed;
+        }
+        std::fprintf(stderr,
+                "ggml_cuda: ignoring invalid GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE='%s' (expected 32, 64, 128, or 256)\n",
+                env);
+        return CUDA_CONCAT_BLOCK_SIZE;
+    }();
+    return value;
+}
+
+static bool get_concat_non_cont_flat_dim0() {
+    static const bool value = [] {
+        const char * env = std::getenv("GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0");
+        if (!env || !env[0] || env[0] == '0') {
+            return false;
+        }
+        if (env[0] == '1' && env[1] == '\0') {
+            return true;
+        }
+        std::fprintf(stderr,
+                "ggml_cuda: ignoring invalid GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0='%s' (expected 0 or 1)\n",
+                env);
+        return false;
+    }();
+    return value;
+}
 
 // contiguous kernels
 template <typename T, int dim>
@@ -140,6 +178,56 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 }
 
 template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_non_cont_flat_dim0(
+        const char * src0,
+        const char * src1,
+              char * dst,
+           int64_t   ne00,
+           int64_t   ne01,
+           int64_t   ne02,
+           int64_t   ne03,
+          uint64_t   nb00,
+          uint64_t   nb01,
+          uint64_t   nb02,
+          uint64_t   nb03,
+          uint64_t   nb10,
+          uint64_t   nb11,
+          uint64_t   nb12,
+          uint64_t   nb13,
+           int64_t   ne0,
+           int64_t   ne1,
+           int64_t   ne2,
+           int64_t   ne3,
+          uint64_t   nb0,
+          uint64_t   nb1,
+          uint64_t   nb2,
+          uint64_t   nb3) {
+    const int64_t n      = ne0 * ne1 * ne2 * ne3;
+    const int64_t stride = (int64_t) blockDim.x * gridDim.x;
+
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        int64_t rest = i;
+        const int64_t i0 = rest % ne0;
+        rest /= ne0;
+        const int64_t i1 = rest % ne1;
+        rest /= ne1;
+        const int64_t i2 = rest % ne2;
+        const int64_t i3 = rest / ne2;
+
+        const T * x;
+        if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+            x = (const T *) (src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+        } else {
+            x = (const T *) (src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+        }
+
+        T * y = (T *) (dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+        *y = *x;
+    }
+}
+
+template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
@@ -163,9 +251,35 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
+        const int block_size = get_concat_non_cont_block_size();
+        const bool flat_dim0 = dim == 0 && get_concat_non_cont_flat_dim0();
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
+        static std::atomic<bool> logged{false};
+        if ((block_size != CUDA_CONCAT_BLOCK_SIZE || flat_dim0) && !logged.exchange(true)) {
+            std::fprintf(stderr,
+                    "ggml_cuda: non-contiguous CONCAT override active: block=%d (default %d), flat_dim0=%d; "
+                    "dim=%d dst=[%lld,%lld,%lld,%lld] nb=[%llu,%llu,%llu,%llu]\n",
+                    block_size, CUDA_CONCAT_BLOCK_SIZE, flat_dim0 ? 1 : 0, dim,
+                    (long long) dst->ne[0], (long long) dst->ne[1],
+                    (long long) dst->ne[2], (long long) dst->ne[3],
+                    (unsigned long long) dst->nb[0], (unsigned long long) dst->nb[1],
+                    (unsigned long long) dst->nb[2], (unsigned long long) dst->nb[3]);
+        }
+        if (flat_dim0) {
+            const int64_t n = ggml_nelements(dst);
+            const int64_t num_blocks64 = (n + block_size - 1) / block_size;
+            const int num_blocks = num_blocks64 > 0x7FFFFFFF ? 0x7FFFFFFF : (int) num_blocks64;
+            concat_non_cont_flat_dim0<T><<<num_blocks, block_size, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            return;
+        }
         auto launch_kernel = [&](auto dim) {
-            concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            concat_non_cont<T, dim><<<grid_dim, block_size, 0, stream>>>(
                 (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
                 src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],

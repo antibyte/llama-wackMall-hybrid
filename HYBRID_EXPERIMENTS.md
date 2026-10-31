@@ -1299,3 +1299,176 @@ builds successfully for sm_61 with MMQ disabled; the GTX 1080 must still run
 its own geometry sweep. Local artifacts are under
 `/tmp/mmvq-q6-k-*20260806`. The host power profile was restored to `balanced`
 after the benchmark series.
+
+## Non-contiguous CONCAT launch and flattened dim-0 kernel
+
+The optimized node-level trace still attributed 14.728 ms, 327 calls, and an
+average 45.039 us per call to `concat_non_cont`. Runtime shape logging showed
+that all observed decode calls used `dim=0`, destination shape `[5,8192,1,1]`,
+and destination strides `[4,20,163840,163840]`. The generic launch used grid
+`(8192,1,1)` and block `(256,1,1)`, leaving 251 of 256 threads idle in each
+block.
+
+`GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE` provides an exact launch-only screen for
+32, 64, 128, or 256 threads. Unset/zero retains 256. All 32-token controls at
+32, 64, and 128 produced the baseline output hash
+`d9fdfc64eaeed536c06fff98c8c5e8dac40aaaabbe2fa6fdc2004359c167a373`
+and token hash
+`7f1751e2f0fd131bef0b898f721802694ee46c75e9bfc3a2c59213adcfe58dad`.
+The phase-matched 3x512 screen was:
+
+| Threads/block | Median decode | Difference from 256 | Hashes |
+|---:|---:|---:|---|
+| 256 | 47.529 tok/s | baseline | identical |
+| 128 | 47.942 tok/s | +0.87% | identical |
+| 64 | 48.071 tok/s | +1.14% | identical |
+| 32 | 48.121 tok/s | +1.25% | identical |
+
+The 32-thread variant then reached 48.142, 48.380, and 48.353 tok/s over three
+fresh-server 2,000-token runs, for a 48.353 median. This is +1.17% over the
+immediately preceding 47.794 tok/s Q8/Q6 geometry winner.
+
+The larger improvement is `GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=1`. It maps all
+logical elements into a one-dimensional, grid-stride kernel while retaining
+the original byte strides and source-selection semantics. It applies only to
+the non-contiguous `dim=0` branch and remains default-off. The observed tensor
+uses 160 blocks at 256 threads instead of 8,192 blocks. A 32-token correctness
+run was bit-identical. Its 3x512 screen reached 48.518, 48.453, and 48.377 tok/s
+(48.453 median). Three 2,000-token runs reached:
+
+| Variant | Three decode results | Median | Difference from 47.794 |
+|---|---|---:|---:|
+| flattened dim-0 | 48.788, 48.379, 48.599 | 48.599 tok/s | +1.68% |
+
+All long output and token hashes matched the prior winner. MTP acceptance was
+0.780269 and mean accepted length was 2.56 throughout. The result is the new
+sm_75 winner, but the feature stays default-off pending broader shape tests and
+an independent sm_61 screen. A separate 64-token MTP-3 off/on check retained
+identical output/token hashes, acceptance 0.565217, and mean accepted length
+2.70; its single-run throughput changed from 39.895 to 40.460 tok/s, which is a
+correctness result rather than a performance claim. Artifacts are under
+`/tmp/concat-*20260806`.
+
+## Multi-token MoE rows-per-block screen
+
+The specialized ID-aware multi-token MMVQ kernel used two output rows per
+block for both fused Gate+Up and plain Down. Two default-off controls expose
+architecture-specific 1/2/4-row screens without changing dot-product or
+reduction order:
+
+```text
+GGML_CUDA_MMVQ_MOE_FUSED_ROWS
+GGML_CUDA_MMVQ_MOE_PLAIN_ROWS
+```
+
+With the flattened CONCAT winner active, one-run 512-token screens produced:
+
+| Fused rows | Plain rows | Decode | Decision |
+|---:|---:|---:|---|
+| 1 | default 2 | 47.081 tok/s | reject |
+| 4 | default 2 | 48.408 tok/s | neutral |
+| default 2 | 1 | 47.950 tok/s | reject |
+| default 2 | 4 | 48.583 tok/s | rescreen |
+
+The plain=4 rescreen produced 48.549, 48.486, and 48.465 tok/s, a 48.486
+median versus the 48.453 flattened-kernel screen (+0.07%). This is measurement
+noise and does not justify a long run or activation on the GTX 1660 Ti. The
+controls remain useful for the GTX 1080 and larger GPUs with different
+register/occupancy behavior. Artifacts are under `/tmp/mmvq-moe-*20260806`.
+
+## Post-CONCAT node profile and single-column MMVQ screens
+
+An Nsight Systems trace of the flattened-CONCAT winner isolated a decode-only
+window rather than aggregating model loading and prefill. The dominant kernel
+was the dense Q6_K single-column output projection:
+
+| Kernel/shape | Calls | Total | Mean |
+|---|---:|---:|---:|
+| Q6_K ncols=1, grid x=124160, block 32x2 | 106 | 159.623 ms | 1.506 ms |
+| Q8_0 ncols=3, all shapes | 1,088 | 26.309 ms | mixed |
+| Q8_0 ncols=1, all shapes | 738 | 21.307 ms | mixed |
+| flattened non-contiguous CONCAT | 60 | 1.442 ms | 0.024 ms |
+
+Thus the CONCAT optimization succeeded, but it also ceased to be a useful
+primary target. The profile artifacts are
+`/tmp/wackmall-mtp2-flat-node-20260806.{qdstrm,nsys-rep,sqlite}` and
+`/tmp/nsys-mtp2-flat-node-results-20260806`.
+
+Changing the number of cooperating warps in the Q6_K ncols=1 kernel retained
+the exact 32-token output/token hashes and MTP metrics. Repeated 512-token
+screens were nevertheless neutral:
+
+| Q6 rows | Cooperating warps | Three decode results | Median |
+|---:|---:|---|---:|
+| 2 | 1 | 48.494, 48.383, 48.281 | 48.383 tok/s |
+| 2 | 4 | 48.325, 48.389, 48.381 | 48.381 tok/s |
+
+The matching flattened baseline was 48.453 tok/s. The architecture default of
+two warps therefore remains the sm_75 choice.
+
+A separate default-off kernel assigned one Q6_K output row to each independent
+warp, eliminating cross-warp shared memory and synchronization. Modes with 2,
+4, 8, and 16 warp-rows were hash-identical. One-run 512-token values for 4, 8,
+and 16 were 48.432, 48.489, and 48.324 tok/s. None cleared the repeated-screen
+gate, so no long run was started. This also shows that block scheduling and
+cross-warp reduction are not large enough alone to close the gap to 50 tok/s.
+
+Finally, grouping two Q8_0 ncols=1 output rows initially reached 48.608 tok/s
+in one run, but the required three-run screen measured 48.460, 48.424, and
+48.395 tok/s (48.424 median). All hashes and MTP values matched. The option is
+neutral and remains off. During this screen the runner's CSV header was fixed
+to include the already-emitted `gpu_expert_ms` and `sync_wait_ms` columns.
+
+The current 48.599 tok/s sustained winner is unchanged. Reaching 50 tok/s on
+this workload now requires a material improvement to the Q6_K output
+projection itself (or a separately quality-gated output-weight quantization),
+not another small launch-geometry sweep.
+
+## Q6_K activation-reuse kernel and output-only quantization
+
+The dense Q6_K ncols=1 path was specialized to process two adjacent output
+rows while unpacking each Q8_1 activation fragment only once. The path is
+default-off behind `GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y=1`, retains the generic
+two-warp work distribution, and preserves each output row's reduction order.
+Its 32-token MTP-2 probe matched the baseline output hash
+`d9fdfc64eaeed536c06fff98c8c5e8dac40aaaabbe2fa6fdc2004359c167a373`,
+token hash `7f1751e2f0fd131bef0b898f721802694ee46c75e9bfc3a2c59213adcfe58dad`,
+acceptance 0.863636, and mean accepted length 2.73.
+
+The phase-matched 3x512 screen reached 48.449, 48.385, and 48.385 tok/s for a
+48.385 median. The matching flattened-CONCAT baseline was 48.453 tok/s. The
+specialization is therefore rejected on sm_75, but remains available for a
+separate sm_61 screen. Its compiled sm_75 resource use was 61 registers and
+256 bytes shared memory per thread block; lower register count did not turn
+into a throughput gain.
+
+The measured Q6_K output tensor is 397.852 MiB and the current one-column
+kernel averages 1.506 ms. Its effective read rate is about 264 GiB/s, already
+near the GTX 1660 Ti memory-bandwidth ceiling. This explains why the launch,
+warp, and activation-unpack variants did not materially improve it. Nsight
+Compute hardware counters could not be collected because the local driver
+disallows non-root counters (`ERR_NVGPUCTRPERM`) and unattended sudo requires a
+password. The failed profiler child was explicitly terminated before the
+subsequent benchmarks.
+
+As a separate quality-gated bound, the quantizer's COPY mode was extended so
+an explicit `--output-tensor-type` or `--token-embedding-type` still overrides
+the named tensor while all other tensors are copied byte-for-byte. A new model
+file was written; the source GGUF was not modified. Dry-run and conversion both
+showed only `output.weight` changing from 397.85 MiB Q6_K to 333.44 MiB Q5_K,
+reducing the full model from 21603.01 to 21538.59 MiB.
+
+Immediate fresh-server 512-token MTP-2 screens under the same sm_75 winner
+settings produced:
+
+| Output tensor | Decode | MTP acceptance | Mean accepted length | Decision |
+|---|---:|---:|---:|---|
+| original Q6_K | 47.806 tok/s | 0.698824 | 2.39 | control |
+| output-only Q5_K | 46.484 tok/s | 0.653846 | 2.31 | reject |
+
+The Q5_K run was 2.76% slower and necessarily changed output/token hashes.
+It therefore failed both the throughput screen and the unchanged-path quality
+precondition; no 2,000-token series was started. Artifacts are under
+`/tmp/q6-reuse-y-flat-3x512-20260806`,
+`/tmp/q5-output-screen-clean-20260806`, and
+`/tmp/q6-output-control-clean-20260806`.

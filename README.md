@@ -265,6 +265,84 @@ length (2.56) remained identical. Short no-MTP, MTP-1, MTP-2, and MTP-3
 off/on checks were also hash-identical. Both settings remain default-off and
 architecture-specific; test `1`, `2`, and `4` independently on each GPU.
 
+### Experimental non-contiguous CONCAT geometry
+
+The MTP-2 decode graph concatenates a small first dimension into a large
+strided tensor. On the tested Qwen graph the destination shape is
+`[5,8192,1,1]`. The generic kernel launched one 256-thread block for each of
+the 8,192 rows even though only five threads performed a copy. Two independent
+default-off controls are available:
+
+```bash
+GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE=32 \
+GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=0 \
+./build-kernel-sm75/bin/llama-server ...
+```
+
+The block-size control accepts `32`, `64`, `128`, or `256`. The flat `dim=0`
+kernel instead covers all logical elements with a one-dimensional grid while
+preserving every source/destination stride and copy exactly. Enable it with
+`GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=1`; it is used only for non-contiguous
+dimension-zero concatenation. For the observed decode tensor this reduces the
+grid from 8,192 blocks to 160 blocks at the default 256 threads.
+
+On the GTX 1660 Ti, the simple 32-thread launch improved the three-run
+2,000-token MTP-2 median from 47.794 to 48.353 tok/s (+1.17%). The flat kernel
+improved it to 48.599 tok/s (+1.68%). All output/token hashes, MTP acceptance
+(0.780269), and mean accepted length (2.56) were identical. The flat path is
+the current sm_75 winner, but remains default-off until other tensor shapes and
+the GTX 1080 have independent coverage.
+
+The specialized multi-token MoE kernel also exposes separate architecture
+screens for fused Gate+Up and plain Down operations:
+
+```bash
+GGML_CUDA_MMVQ_MOE_FUSED_ROWS=0 \
+GGML_CUDA_MMVQ_MOE_PLAIN_ROWS=0 \
+./build-kernel-sm75/bin/llama-server ...
+```
+
+Both accept `1`, `2`, or `4`; zero/unset retains two rows per block. On the
+GTX 1660 Ti, fused=1 and plain=1 regressed, while fused=4 and plain=4 were
+neutral. Keep both at zero on this GPU. They remain useful default-off tuning
+controls for Pascal and GPUs with different occupancy/register limits.
+
+The profiler identifies the single-column Q6_K output projection as the
+largest remaining decode kernel. Three additional default-off geometry probes
+are available for cross-architecture tuning:
+
+```bash
+GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS=0 \
+GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS=0 \
+GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y=0 \
+GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS=0 \
+./build-kernel-sm75/bin/llama-server ...
+```
+
+`Q6_K_NCOLS1_WARPS` accepts `1`, `2`, or `4`; zero retains the architecture
+table. `Q6_K_NCOLS1_WARP_ROWS` accepts `2`, `4`, `8`, or `16` and assigns one
+independent output row to each warp in a block. `Q8_NCOLS1_ROWS` accepts `1`,
+`2`, or `4`. Do not combine the independent-warp mode with the regular Q6_K
+row/warp overrides while tuning. All tested sm_75 variants retained exact
+output/token hashes, but none beat the existing Q6_K rows=2 winner over a
+repeated screen. They remain useful for sm_61 and newer cards, whose scheduler
+and occupancy balance differs.
+
+`Q6_K_NCOLS1_REUSE_Y=1` is a separate exact experiment for the dense output
+projection. It unpacks each Q8_1 activation fragment once and applies it to two
+adjacent Q6_K rows. On sm_75 it retained exact output/token hashes and MTP
+metrics, but its 3x512 median was 48.385 tok/s versus 48.453 tok/s for the
+current path. Keep it disabled on the GTX 1660 Ti; it remains available for an
+independent sm_61 screen.
+
+The measured output tensor is 397.852 MiB and the current Q6_K ncols=1 kernel
+averages 1.506 ms. That corresponds to roughly 264 GiB/s of effective reads,
+close to the GTX 1660 Ti's practical DRAM limit. This is why arithmetic and
+launch-only variants provide little headroom. A quality-gated model copy with
+only `output.weight` changed to Q5_K was also tested: it reduced that tensor to
+333.44 MiB, but the 512-token MTP-2 screen fell from 47.806 to 46.484 tok/s and
+changed the generated token stream. It is not a production recommendation.
+
 ### Experimental target backend sampling
 
 This tree contains a semantic port of llama.cpp PR #25532.  Add `-bs` to keep
@@ -587,7 +665,12 @@ Key portable controls:
 | `GGML_CUDA_MOE_COMBINE_FUSION` | 0 | Fuse exact F32 post-Down expert weighting and ordered Top-k reduction; experimental |
 | `GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS` | 0 | Override rows/block for non-ID Q8_0 three-column MMVQ (`1`, `2`, or `4`); `0` preserves automatic selection |
 | `GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS` | 0 | Override rows/block for plain non-ID Q6_K one-column MMVQ (`1`, `2`, or `4`) |
+| `GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y` | 0 | Reuse one Q8_1 activation unpack across two dense Q6_K output rows; experimental and slower on sm_75 |
 | `GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS` | 0 | Override rows/block for plain non-ID Q6_K three-column MMVQ (`1`, `2`, or `4`) |
+| `GGML_CUDA_MMVQ_MOE_FUSED_ROWS` | 0 | Override rows/block for multi-token fused MoE Gate+Up (`1`, `2`, or `4`) |
+| `GGML_CUDA_MMVQ_MOE_PLAIN_ROWS` | 0 | Override rows/block for multi-token plain MoE Down (`1`, `2`, or `4`) |
+| `GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE` | 0 | Override non-contiguous CONCAT block size (`32`, `64`, `128`, or `256`) |
+| `GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0` | 0 | Use flattened stride-preserving non-contiguous dimension-zero CONCAT |
 | `LLAMA_EXPERT_CPU_ASYNC` | 0 | Experimental CPU-cold/GPU-hot overlap; benchmark before use |
 
 The benchmark runner also accepts `CONTEXT`, `TARGET_TYPE_K`, and `TARGET_TYPE_V`. Their defaults remain `32768`, `q4_0`, and `q4_0` so existing benchmark commands retain their behavior.
