@@ -1602,8 +1602,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
-        if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        // A failed reserve (OOM) leaves a buffer unallocated: report it instead
+        // of placing tensors at NULL.
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids) ||
+                !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }

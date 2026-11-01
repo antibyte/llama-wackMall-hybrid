@@ -1116,6 +1116,18 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
         }
     }
 
+    // A failed reserve (OOM) leaves a needed buffer NULL; the next reserve retries.
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] != NULL) {
+            continue;
+        }
+        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+            if (ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > 0) {
+                return false;
+            }
+        }
+    }
+
     // reset buffers
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buffers[i] != NULL) {
