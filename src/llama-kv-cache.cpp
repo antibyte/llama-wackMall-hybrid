@@ -1016,7 +1016,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                 positions.push_back(ubatch.pos[i]);
             }
             if (!kvflash->can_map_positions(positions)) {
-                LLAMA_LOG_ERROR("%s: KVFlash micro-batch cannot fit safely in the resident pool\n", __func__);
+                std::sort(positions.begin(), positions.end());
+                if (std::adjacent_find(positions.begin(), positions.end()) != positions.end()) {
+                    // KVFlash maps each position to one slot
+                    LLAMA_LOG_ERROR("%s: KVFlash cannot store tokens that share a position (M-RoPE image tokens); run images without KVFlash\n", __func__);
+                } else {
+                    LLAMA_LOG_ERROR("%s: KVFlash micro-batch cannot fit safely in the resident pool\n", __func__);
+                }
                 return {};
             }
             res.emplace_back();

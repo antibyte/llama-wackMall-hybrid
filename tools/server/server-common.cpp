@@ -406,7 +406,8 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
-    GGML_ASSERT(!has_mtmd);
+    // without media chunks the tokens are the text tokens, also with an mmproj loaded
+    GGML_ASSERT(!has_mtmd || !has_media());
     return tokens;
 }
 

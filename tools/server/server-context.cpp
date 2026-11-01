@@ -4585,7 +4585,8 @@ private:
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                             slot.release();
-                            continue;
+                            // leave this slot: the loop would read the released task
+                            return;
                         }
 
                         slot.n_prompt_tokens_processed += n_tokens_out;
