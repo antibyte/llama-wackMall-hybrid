@@ -20,6 +20,9 @@
 #   draft-mtp n_max=2: 78.7 t/s vs 53.6 with spec off. n_max=4: 73.0.
 #   turbo4_k 55.4 t/s on a short prompt, behind MTP. ngram-simple 41 t/s.
 #   KVFlash loads at -c 32768.
+#   2026-11-01 MTP_PROCESS_CHUNK 8 -> 0 (no mmproj, as agollm): 6k prompt
+#   569/552 -> 675/662 t/s; decode and VRAM unchanged (verify batches < 8).
+#   With the mmproj loaded and MTP the server asserts in server_tokens::get_tokens().
 # Sampling follows the Qwen3.5 thinking card: temp=1.0 top_p=0.95 top_k=20
 # min_p=0 presence_penalty=1.5.
 # Download: ./download-frognano-4b.sh
@@ -86,6 +89,7 @@ LLAMA_KVFLASH_STATS="0"
 # NextN lives in this GGUF. n_max=2 was 78.7 t/s vs 53.6 with spec off; n_max=4 was 73.0.
 SPEC_MODE="mtp"
 SPEC_DRAFT_N_MAX="2"
+MTP_PROCESS_CHUNK="0" # tokens per MTP catch-up decode, 0 = draft ubatch (fork default 8)
 NGRAM_SIMPLE_SIZE_N=""
 NGRAM_SIMPLE_SIZE_M=""
 NGRAM_SIMPLE_MIN_HITS=""
@@ -175,6 +179,7 @@ case "$FLASH_ATTN" in on|off|auto) ;; *) die "FLASH_ATTN muss on, off oder auto 
 case "$FIT" in on|off|1|0|true|false) ;; *) die "FIT muss on oder off sein." ;; esac
 [[ "$CONTEXT" =~ ^[1-9][0-9]*$ ]] || die "CONTEXT muss eine positive Ganzzahl sein."
 [[ "$SPEC_DRAFT_N_MAX" =~ ^[1-9][0-9]*$ ]] || die "SPEC_DRAFT_N_MAX muss eine positive Ganzzahl sein."
+[[ "$MTP_PROCESS_CHUNK" =~ ^[0-9]+$ ]] || die "MTP_PROCESS_CHUNK muss eine nichtnegative Ganzzahl sein."
 [[ "$CMOE_PREFILL_BATCH" =~ ^[1-9][0-9]*$ ]] || die "CMOE_PREFILL_BATCH muss eine positive Ganzzahl sein."
 [[ "$CMOE_DECODE_BATCH" =~ ^[1-9][0-9]*$ ]] || die "CMOE_DECODE_BATCH muss eine positive Ganzzahl sein."
 [[ "$FIT_TARGET" =~ ^[0-9]+$ ]] || die "FIT_TARGET muss eine nichtnegative Ganzzahl sein."
@@ -254,6 +259,7 @@ env_args=(
     "LLAMA_ARG_BACKEND_SAMPLING=$TARGET_BACKEND_SAMPLING"
     "LLAMA_ARG_SPEC_TYPE=$SPEC_TYPE"
     "LLAMA_ARG_SPEC_DRAFT_N_MAX=$SPEC_DRAFT_N_MAX"
+    "LLAMA_MTP_PROCESS_CHUNK=$MTP_PROCESS_CHUNK"
     "LLAMA_ARG_CACHE_RAM=$CACHE_RAM"
     "LLAMA_ARG_CACHE_PROMPT=$CACHE_PROMPT"
     "LLAMA_ARG_CACHE_REUSE=$CACHE_REUSE"

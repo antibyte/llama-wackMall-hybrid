@@ -1610,6 +1610,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     //   chain_heads (step35): n_mtp_layers trained heads, one per draft step.
     //   neither (qwen35 / qwen35moe): a single trained MTP head.
     int32_t n_mtp_layers  = 1;
+    int32_t process_chunk_max = 8;   // LLAMA_MTP_PROCESS_CHUNK
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
 
@@ -1641,6 +1642,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+
+        // LLAMA_MTP_PROCESS_CHUNK: max tokens per MTP catch-up decode (0 = the draft ubatch)
+        if (const char * v = std::getenv("LLAMA_MTP_PROCESS_CHUNK"); v && v[0] != '\0') {
+            process_chunk_max = std::max(0, std::atoi(v));
+        }
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -1783,11 +1789,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             // The draft batch is the decode-sized context. Prefill ubatches are larger.
+            // Each chunk is one MTP decode with logits for its last row, so small
+            // chunks re-read the MTP weights and the LM head often during prefill.
             int32_t n_chunk_max = std::min(
                     (int32_t) llama_n_batch(ctx_dft),
                     (int32_t) llama_n_ubatch(ctx_dft));
-            if (n_chunk_max > 8) {
-                n_chunk_max = 8;
+            if (process_chunk_max > 0 && n_chunk_max > process_chunk_max) {
+                n_chunk_max = process_chunk_max;
             }
             n_chunk_max = std::max(1, n_chunk_max);
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
