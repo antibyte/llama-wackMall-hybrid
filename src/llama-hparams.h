@@ -156,6 +156,15 @@ struct llama_hparams {
     // for hybrid state space models
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_recr_impl;
 
+    // SenseNova-Loop residual stream routers: kind per layer (0 none,
+    // 1 enters the streams, 2 leaves them, 3 both, 4 inside). The loop block
+    // is stored once: layers [mhc_loop_start2, mhc_loop_start2 + mhc_loop_shift)
+    // reuse the tensors of the layer mhc_loop_shift before them.
+    uint32_t n_mhc_streams = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mhc_layer_kinds{};
+    uint32_t mhc_loop_start2 = 0;
+    uint32_t mhc_loop_shift  = 0;
+
     // for State Space Models
     uint32_t ssm_d_conv  = 0;
     uint32_t ssm_d_inner = 0;

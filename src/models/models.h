@@ -2143,6 +2143,15 @@ struct llama_model_qwen35 : public llama_model_base {
 };
 
 
+// SenseNova-Loop: the Qwen3.5 dense trunk with one block run twice and two
+// residual streams mixed by a router around every sublayer (mHC). The qwen35
+// loader and graph handle both; this only reads the loop and stream keys.
+struct llama_model_sensenova_loop : public llama_model_qwen35 {
+    llama_model_sensenova_loop(const struct llama_model_params & params) : llama_model_qwen35(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+};
+
+
 struct llama_model_qwen35moe : public llama_model_base {
     llama_model_qwen35moe(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

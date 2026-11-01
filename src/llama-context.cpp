@@ -3564,6 +3564,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_DORY) {
         // The file stores one copy of the shared block. The graph repeats it.
         res = std::max<uint32_t>(1024u, 128u * model.hparams.n_layer());
+    } else if (model.arch == LLM_ARCH_SENSENOVA_LOOP) {
+        // the stored loop block runs twice, plus two router nodes per sublayer
+        res = std::max<uint32_t>(n_tokens * 48, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||
