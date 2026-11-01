@@ -1217,6 +1217,12 @@ private:
     // The rest of that request stays on the decode ubatch.
     bool cmoe_prefill_oom    = false;
     bool cmoe_restart_prompt = false;
+    // LLAMA_CMOE_PREFILL_STEPDOWN (default 1): a prefill ubatch that does not
+    // fit is halved down to the decode ubatch before decode takes over.
+    // cmoe_prefill_cap keeps the size that fit until the slots go idle, so
+    // later batches do not retry a reserve that failed (-1 = decode only).
+    bool    cmoe_prefill_stepdown = true;
+    int32_t cmoe_prefill_cap      = 0;
     int32_t cmoe_prefill_batch  = 0;
     int32_t cmoe_prefill_ubatch = 0;
     int32_t cmoe_decode_batch   = 0;
@@ -1267,6 +1273,11 @@ private:
             return;
         }
 
+        if (const char * v = std::getenv("LLAMA_CMOE_PREFILL_STEPDOWN"); v && *v) {
+            cmoe_prefill_stepdown = std::atoi(v) != 0;
+        }
+        cmoe_prefill_cap = 0;
+
         cmoe_prefill_batch  = params_base.cmoe_n_batch_prefill;
         cmoe_prefill_ubatch = params_base.cmoe_n_ubatch_prefill;
         cmoe_decode_batch   = params_base.cmoe_n_batch_decode;
@@ -1298,10 +1309,10 @@ private:
         }
 
         cmoe_phase_batching = true;
-        SRV_INF("cmoe phase batching enabled: prefill=%d/%d decode=%d/%d reserve=%d/%d\n",
+        SRV_INF("cmoe phase batching enabled: prefill=%d/%d decode=%d/%d reserve=%d/%d stepdown=%d\n",
                 cmoe_prefill_batch, cmoe_prefill_ubatch,
                 cmoe_decode_batch, cmoe_decode_ubatch,
-                max_batch, max_ubatch);
+                max_batch, max_ubatch, cmoe_prefill_stepdown ? 1 : 0);
     }
 
     void set_cmoe_batch_phase(bool prefill) {
@@ -1311,8 +1322,15 @@ private:
             return;
         }
 
+        if (prefill && cmoe_prefill_cap < 0) {
+            prefill = false;
+        }
         int32_t batch = prefill ? cmoe_prefill_batch : cmoe_decode_batch;
         int32_t ubatch = prefill ? cmoe_prefill_ubatch : cmoe_decode_ubatch;
+        if (prefill && cmoe_prefill_cap > 0 && cmoe_prefill_cap < ubatch) {
+            ubatch = cmoe_prefill_cap;
+            batch = std::min(batch, ubatch);
+        }
         const bool cap_draft_ubatch = ctx_dft && (
                 std::any_of(params_base.speculative.types.begin(),
                         params_base.speculative.types.end(),
@@ -1320,20 +1338,38 @@ private:
                 std::find(params_base.speculative.types.begin(),
                         params_base.speculative.types.end(),
                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end());
-        const uint32_t draft_ubatch = cap_draft_ubatch ?
-                std::min<uint32_t>(ubatch, llama_n_ubatch(ctx_dft)) : (uint32_t) ubatch;
-        if (!llama_set_runtime_ubatch(ctx_tgt, (uint32_t) ubatch) ||
-                (ctx_dft && !llama_set_runtime_ubatch(ctx_dft, draft_ubatch))) {
+        auto activate = [&](int32_t u) {
+            const uint32_t draft_u = cap_draft_ubatch ?
+                    std::min<uint32_t>(u, llama_n_ubatch(ctx_dft)) : (uint32_t) u;
+            return llama_set_runtime_ubatch(ctx_tgt, (uint32_t) u) &&
+                    (!ctx_dft || llama_set_runtime_ubatch(ctx_dft, draft_u));
+        };
+        bool ok = activate(ubatch);
+        if (!ok && prefill && cmoe_prefill_stepdown) {
+            const int32_t want = ubatch;
+            for (int32_t u = ubatch / 2; u > cmoe_decode_ubatch; u /= 2) {
+                if (activate(u)) {
+                    SRV_WRN("cmoe prefill %d/%d failed to reserve; stepping down to %d\n",
+                            batch, want, u);
+                    ubatch = u;
+                    batch = std::min(batch, u);
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        if (prefill && cmoe_prefill_stepdown) {
+            // ubatch fit (maybe after the step down) or nothing above decode did
+            cmoe_prefill_cap = ok ? ubatch : -1;
+        }
+        if (!ok) {
             if (prefill && cmoe_decode_ubatch > 0) {
                 SRV_WRN("cmoe prefill %d/%d failed to reserve; falling back to decode %d/%d\n",
                         batch, ubatch, cmoe_decode_batch, cmoe_decode_ubatch);
                 prefill = false;
                 batch = cmoe_decode_batch;
                 ubatch = cmoe_decode_ubatch;
-                const uint32_t draft_decode = cap_draft_ubatch ?
-                        std::min<uint32_t>(ubatch, llama_n_ubatch(ctx_dft)) : (uint32_t) ubatch;
-                if (!llama_set_runtime_ubatch(ctx_tgt, (uint32_t) ubatch) ||
-                        (ctx_dft && !llama_set_runtime_ubatch(ctx_dft, draft_decode))) {
+                if (!activate(ubatch)) {
                     throw std::runtime_error(string_format(
                             "failed to activate cmoe decode batch %d/%d after prefill reserve OOM",
                             batch, ubatch));
@@ -3706,6 +3742,7 @@ private:
 
             if (all_idle) {
                 cmoe_prefill_oom = false;
+                cmoe_prefill_cap = 0;
                 SRV_TRC("%s", "all slots are idle\n");
                 power->idle();
                 return; // skip further processing
