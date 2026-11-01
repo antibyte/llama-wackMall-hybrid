@@ -1,3 +1,34 @@
+# SenseNova-Loop-9B-Preview Q3_K_M vom 2026-11-01
+
+**Ergebnis: Die Architektur `sensenova_loop` (Qwen3.5-9B-Hybrid, Schichten 4..27 laufen zweimal, zwei mHC-Residual-Streams mit Sinkhorn-Router um jede Teilschicht) ist in den Fork portiert und laeuft voll auf der 1660 Ti: Decode 23,2 t/s (erste Portierung 20,4), Prefill ~255 t/s, Code-Edits mit ngram-simple 63,8 t/s. CPU und GPU liefern denselben Greedy-Text. Nachgeruestet: der trainierte MTP-Kopf aus dem HF-Repo. ngram-simple plus MTP bringt mit Server-Sampling Code 29,5, Thinking 27,7-28,3, Edits 70,3 und deutsche Prosa 23,9 t/s (nur ngram: 22,2 / 20,8-21,6 / 64,6 / 22,6). Dafuer sinkt der Kontext auf 16384 mit f16-KV (VRAM-Spitze 5470-5516 MiB).**
+
+Messungen, Werkzeuge und Profile: `benchmark-results/sensenova-loop-9b-20261101/` (README). agollm war gestoppt.
+
+- **Portierung (aus GuideboardLabs/llama.cpp-sensenova-loop, dort nur CPU/Vulkan):**
+  - Neue Ops `ggml_mhc_route`/`ggml_mhc_merge` (hinter `GGML_OP_GLU` angehaengt, Sinkhorn-Iterationen und Epsilon als Op-Parameter), CPU und neue CUDA-Kernel (`ggml-cuda/mhc.cu`), `test-backend-ops` test_mhc.
+  - `llama_model_sensenova_loop` erbt von qwen35 und liest nur `mhc.streams`/`mhc.layer_kinds`. Der qwen35-Lader ueberspringt die Bloecke 28..51 und kopiert die Layer 4..27; der qwen35-Graph hat den Zwei-Stream-Pfad.
+  - `--decision-seqs 8` (Default) kostet hier 703 MiB Recurrent-State; Rezept und Skript setzen 0.
+- **Q3_K-Matvec ist der Engpass:** 57 % der Kernelzeit, 134 GB/s gegen 283 GB/s bei Q4_K; begrenzt durch Lade- und Integerbefehle, nicht durch DRAM.
+  - `ggml_cuda_vsub4_i8`: `((a | 0x80808080) - b) ^ 0x80808080` statt `__vsubss4`, das NVIDIA seit Maxwell emuliert. An allen 14 Stellen (Q3_K/Q6_K-Matvec, MMQ-Loader Q4_0/Q5_0/Q3_K/Q6_K, FA-Dequant Q4_0/Q5_0) sind die Bytes kleiner 0x80 und keine Spur saettigt, das Ergebnis ist gleich. `-DGGML_CUDA_SWAR_VSUB=0` schaltet zurueck.
+  - Q3_K-MMVQ mit VDR 2 (`GGML_CUDA_Q3_K_MMVQ_VDR`): zwei benachbarte ints teilen Skalen und q8_1-Bloecke. VDR 1: 22,57, VDR 2: 23,21, VDR 4: 21,30 t/s.
+  - `GGML_CUDA_MMVQ_Q3_K_NCOLS1_ROWS=2` im Rezept und Skript (0: 20,7, 1: 20,0, 2: 23,2, 4: 20,9 t/s). Der Default bleibt 0, weil derselbe Knopf geroutetes Q3_K (MUL_MAT_ID) trifft.
+- **A/B gegen die alten Kernel** (gleiche CMake-Optionen inkl. `GGML_CUDA_TURING_MMQ_DP4A`, A/B/A/B): SenseNova tg128 21,13 -> 22,79 (+7,9 %), Spark-X2.6 Q6_K 62,5 -> 64,0 (+2,5 %), FrogNano 55,5 -> 56,0 (+0,9 %), Prefill unveraendert. Ein Build mit Standardoptionen hat kein DP4A-MMQ (Prefill 290 statt 800 t/s) und taugt nicht als Vergleich.
+- **Nicht uebernommen:** Router-Reduktion auf 8/16 Bloecke verteilt plus Abschlusskernel und Sinkhorn parallel zum Schreiben (beides 23,1-23,4 t/s, Router nur 3,7 % der Zeit). CUDA-Graphen fuer dichte Modelle wieder einschalten (`llama-expert-tier` setzt `GGML_CUDA_DISABLE_GRAPHS=1` fuer jedes Modell): MiMo 40,7 / 40,7, FrogNano 55,0 / 54,9 t/s, kein Gewinn.
+- **Kontext:** f16-KV schlaegt q8_0 (tg128 23,2 / 22,0; bei 16k 21,2 / 18,8; q8_0 bei 32k 16,4). ctx 20480 f16: 17,5k-Prompt mit 221 t/s, Decode 20,9 t/s, 5468 MiB; ctx 24576 erreichte 5696 von 5748 MiB. KVFlash aus (LRU nimmt verdraengte Bloecke aus der Attention).
+- **Spekulation:** ngram-simple Code-Edit 63,8 t/s (855/1200 angenommen) gegen 22,7 ohne, Prosa -1 bis -3 %; ngram-mod (n-match 16) 47,9 t/s. Die Greedy-Ausgabe weicht erst an einer Beinahe-Gleichheit ab (Batch-Verify-Rundung).
+- **MTP-Kopf:** Die guideboardlabs-GGUF laesst ihn weg; `mtp.safetensors` (243M Parameter, BF16) liegt im HF-Repo, die Modellkarte nennt MTP trainiert.
+  - `scripts/sensenova_loop_add_mtp.py` haengt ihn als Block 56 an (Norm +1 wie der Rumpf, per Range-Request an Schicht 3 geprueft); `download-sensenova-loop-9b.sh` laedt und baut ihn (Q4_0, +131 MiB; gleiche Trefferquote wie Q8_0).
+  - Fork: `sensenova_loop` bekommt fuer den MTP-Kontext den reinen Attention-KV-Cache wie qwen35.
+  - `LLAMA_MTP_PROCESS_CHUNK` (Default 8 wie bisher, 0 = Draft-Ubatch): Der MTP-Nachlauf rechnete in 8er-Haeppchen mit Logits je Haeppchen und las so bei einem 13k-Prompt 1668-mal den LM-Kopf. Mit 0: Prefill 199,8 -> 221,8 t/s (nur ngram 225,4), Edit 63,2 -> 70,1 t/s, Trefferquote gleich. Rezept und Skript setzen 0.
+  - FrogNano (nur MTP, ohne mmproj wie in agollm), A/B/A/B: 6k-Prompt 569/552 -> 675/662 t/s (+19 %); Decode, Trefferquote und VRAM gleich, weil die Verify-Batches (3 Tokens) unter 8 liegen. `start-frognano-4b.sh` und das agollm-Rezept setzen 0.
+  - Nebenbefund: `start-frognano-4b.sh` startet mit mmproj nicht mehr. Auf der GPU reicht der Speicher nicht (Fit bricht wegen ngl 99 ab), auf der CPU schlaegt mit MTP `GGML_ASSERT(!has_mtmd)` in `server_tokens::get_tokens()` fehl. agollm laedt den Projektor fuer FrogNano nicht und ist nicht betroffen.
+  - Greedy, ctx 8192: MTP n_max 1 Edit 31,0, Deutsch 24,7 (57 % angenommen), Code 29,5; n_max 2 Deutsch 21,0 (34 %); p_min 0,5/0,75 nicht besser. Abweichungen zum Lauf ohne Spekulation nur an Beinahe-Gleichstaenden (0,445 gegen 0,439; ngram kippt dasselbe Token).
+  - VRAM: Kopf 131, zweiter Recurrent-State-Slot fuer den Rollback 88 MiB, dazu KV und Compute. ctx 20480 5712 MiB (zu knapp), 18432 5590, 16384 5470-5516. Prefill-Ubatch 256 statt 512: gleich schnell, 70 MiB weniger.
+- **Qualitaetsprobe (Thinking an):** 5/6 (Schlaeger/Ball, Werktage Maerz 2024, drei deutsche Saetze mit "Im", Tool-Call, merge_intervals; roemische Zahlen nach 4928 Tokens falsch).
+- **agollm:** Rezept `sensenova-loop-9b` (Aliase `sensenova`, `sensenova-loop`), nur manuell waehlbar (alle Skills 1), mit MTP-GGUF, `ngram-simple,draft-mtp`, ctx 16384. `workers/llama` aus `build-main-sm75` aktualisiert, Backups `runtime/llama-build-before-sensenova-20261101T012802Z` und `...-before-sensenova-mtp-20261101T121302Z`. Test ueber agollm: 38,8 t/s mit Thinking, 200 von 247 Drafts angenommen.
+
+Dateien: `download-sensenova-loop-9b.sh`, `start-sensenova-loop-9b.sh`, `scripts/sensenova_loop_add_mtp.py`.
+
 # Systemebene: PCIe, Treiber, Kernel, Kuehlung vom 2026-10-31
 
 **Ergebnis: Kein wirksamer Software-Hebel. Die PCIe-Paketgroesse (Max Payload 256 statt 128 Byte per `pci=pcie_bus_perf`) aenderte nach einem Neustart weder Bandbreite noch Qwen-Prefill und wurde wieder entfernt. Alles andere ist Hardwaregrenze oder schon optimal; die CPU laeuft unter Qwen-Last thermisch begrenzt.**
