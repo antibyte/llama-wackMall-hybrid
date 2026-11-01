@@ -1,3 +1,17 @@
+# CMOE-Prefill bei knappem VRAM vom 2026-11-01
+
+**Ergebnis: Passte der Prefill-Ubatch nach einer Decode-Phase nicht mehr in den VRAM, fiel der Server direkt auf den Decode-Ubatch 64 zurueck und versuchte vor jedem 64er-Batch erneut die volle Reservierung. In agollm rechnete Clover-35B so einen 36,7k-Tokens-Prompt mit 30 t/s (20 Minuten). Neu: `LLAMA_CMOE_PREFILL_STEPDOWN` (Default 1) halbiert den Prefill-Ubatch bis knapp ueber den Decode-Ubatch und behaelt die passende Groesse, bis die Slots leer laufen. Unter gleicher Klemme (500 MiB belegt) 222,5 statt 40,0 t/s.**
+
+- **Ursache:** Der Decode-Wechsel schrumpft den Compute-Puffer (gallocr-Shrink). Waehrenddessen belegen CUDA-Pool, Expertenpuffer und der DFlash-Draft den freien Platz; der naechste Prefill braucht 606 MiB fuer Ubatch 3072 und bekommt sie nicht. Jeder Fehlversuch raeumt zusaetzlich die CUDA-Graphen ab.
+- **Test** (Clover-Rezept auf eigenem Port, `hog` haelt per cudaMalloc 500 MiB nach dem ersten Decode, frei bleiben 358 MiB):
+  - Neu: 3072 und 1536 scheitern, 768 passt. 9852-Token-Prompt 222,5 t/s, 3276 Tokens 205,9 t/s.
+  - Alt (`LLAMA_CMOE_PREFILL_STEPDOWN=0`): 3276 Tokens 40,0 t/s, 48 gescheiterte Reservierungen.
+  - Ohne Klemme danach: wieder 3072, 9852 Tokens 405,7 t/s (Grenze wird beim Leerlauf zurueckgesetzt).
+- **Absturz behoben:** Bei so wenig VRAM scheiterte danach die Reservierung des DFlash-Draft-Graphen (41 MiB). `ggml_backend_sched_alloc_splits` ignorierte den Rueckgabewert von `ggml_gallocr_reserve_n`, `ggml_gallocr_alloc_graph` legte die Tensoren in einen NULL-Puffer (Segfault). Jetzt meldet beides einen Fehler, der Draft schreibt "llama_decode returned -2" und das Modell decodiert ohne Entwurf weiter.
+- Alle Startskripte mit CMOE-Prefill setzen den Knopf, ebenso die 18 agollm-Rezepte. Ein leerer Wert gilt als Default.
+
+Messprogramme: scratch `stepdown/hog.cu`, `run.sh`, `long.json`/`mid.json`.
+
 # SenseNova-Loop-9B-Preview Q3_K_M vom 2026-11-01
 
 **Ergebnis: Die Architektur `sensenova_loop` (Qwen3.5-9B-Hybrid, Schichten 4..27 laufen zweimal, zwei mHC-Residual-Streams mit Sinkhorn-Router um jede Teilschicht) ist in den Fork portiert und laeuft voll auf der 1660 Ti: Decode 23,2 t/s (erste Portierung 20,4), Prefill ~255 t/s, Code-Edits mit ngram-simple 63,8 t/s. CPU und GPU liefern denselben Greedy-Text. Nachgeruestet: der trainierte MTP-Kopf aus dem HF-Repo. ngram-simple plus MTP bringt mit Server-Sampling Code 29,5, Thinking 27,7-28,3, Edits 70,3 und deutsche Prosa 23,9 t/s (nur ngram: 22,2 / 20,8-21,6 / 64,6 / 22,6). Dafuer sinkt der Kontext auf 16384 mit f16-KV (VRAM-Spitze 5470-5516 MiB).**

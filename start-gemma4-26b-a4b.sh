@@ -53,6 +53,7 @@ export LLAMA_EXPERT_SKIP_SENTINEL="1"
 
 export LLAMA_CMOE_PREFILL_BATCH="512"
 export LLAMA_CMOE_PREFILL_UBATCH="512"
+export LLAMA_CMOE_PREFILL_STEPDOWN="${LLAMA_CMOE_PREFILL_STEPDOWN:-1}"  # prefill ubatch that does not fit: halve it before decode takes over
 export LLAMA_CMOE_DECODE_BATCH="32"
 export LLAMA_CMOE_DECODE_UBATCH="32"
 

@@ -115,6 +115,7 @@ CMOE_UBATCH="128"  # physical decode ubatch; keep equal to CMOE_BATCH
 # the target prompt graph; DFlash processes larger prompts in 64-token chunks.
 CMOE_PREFILL_BATCH="1024"  # measured fast target prompt-processing batch
 CMOE_PREFILL_UBATCH="1024"  # physical target prompt ubatch
+CMOE_PREFILL_STEPDOWN="1"  # prefill ubatch that does not fit: halve it before decode takes over
 CMOE_DECODE_BATCH="128"  # optional logical batch used only during token generation
 CMOE_DECODE_UBATCH="128"  # optional physical ubatch used only during token generation
 
@@ -534,6 +535,7 @@ fi
 # Phase-specific batching is opt-in by editing the four values above.
 [[ -n "$CMOE_PREFILL_BATCH" ]] && env_args+=("LLAMA_CMOE_PREFILL_BATCH=$CMOE_PREFILL_BATCH")
 [[ -n "$CMOE_PREFILL_UBATCH" ]] && env_args+=("LLAMA_CMOE_PREFILL_UBATCH=$CMOE_PREFILL_UBATCH")
+[[ -n "$CMOE_PREFILL_STEPDOWN" ]] && env_args+=("LLAMA_CMOE_PREFILL_STEPDOWN=$CMOE_PREFILL_STEPDOWN")
 [[ -n "$CMOE_DECODE_BATCH" ]] && env_args+=("LLAMA_CMOE_DECODE_BATCH=$CMOE_DECODE_BATCH")
 [[ -n "$CMOE_DECODE_UBATCH" ]] && env_args+=("LLAMA_CMOE_DECODE_UBATCH=$CMOE_DECODE_UBATCH")
 [[ -n "$THREADS_HTTP" ]] && env_args+=("LLAMA_ARG_THREADS_HTTP=$THREADS_HTTP")
@@ -636,6 +638,7 @@ fi
 [[ -n "$CHAT_TEMPLATE_FILE" ]] || unset_args+=(-u LLAMA_ARG_CHAT_TEMPLATE_FILE)
 [[ -n "$CMOE_PREFILL_BATCH" ]] || unset_args+=(-u LLAMA_CMOE_PREFILL_BATCH)
 [[ -n "$CMOE_PREFILL_UBATCH" ]] || unset_args+=(-u LLAMA_CMOE_PREFILL_UBATCH)
+[[ -n "$CMOE_PREFILL_STEPDOWN" ]] || unset_args+=(-u LLAMA_CMOE_PREFILL_STEPDOWN)
 [[ -n "$CMOE_DECODE_BATCH" ]] || unset_args+=(-u LLAMA_CMOE_DECODE_BATCH)
 [[ -n "$CMOE_DECODE_UBATCH" ]] || unset_args+=(-u LLAMA_CMOE_DECODE_UBATCH)
 [[ -n "$LLAMA_TURBO4_Q8_FALLBACK_LAYERS" ]] || unset_args+=(-u LLAMA_TURBO4_Q8_FALLBACK_LAYERS)

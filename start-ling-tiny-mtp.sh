@@ -141,6 +141,7 @@ CMOE_UBATCH="64"  # physical base ubatch; keep equal to CMOE_BATCH
 # after set_runtime_ubatch.
 CMOE_PREFILL_BATCH="2048"  # Ling measured winner; 4096 only reserved VRAM, runtime clamped to 2048
 CMOE_PREFILL_UBATCH="2048"  # physical target prompt ubatch
+CMOE_PREFILL_STEPDOWN="1"  # prefill ubatch that does not fit: halve it before decode takes over
 CMOE_DECODE_BATCH="64"  # logical batch during generation
 CMOE_DECODE_UBATCH="64"  # physical decode ubatch; phase switch frees prefill peak
 
@@ -633,6 +634,7 @@ fi
 # Phase-specific batching is opt-in by editing the four values above.
 [[ -n "$CMOE_PREFILL_BATCH" ]] && env_args+=("LLAMA_CMOE_PREFILL_BATCH=$CMOE_PREFILL_BATCH")
 [[ -n "$CMOE_PREFILL_UBATCH" ]] && env_args+=("LLAMA_CMOE_PREFILL_UBATCH=$CMOE_PREFILL_UBATCH")
+[[ -n "$CMOE_PREFILL_STEPDOWN" ]] && env_args+=("LLAMA_CMOE_PREFILL_STEPDOWN=$CMOE_PREFILL_STEPDOWN")
 [[ -n "$CMOE_DECODE_BATCH" ]] && env_args+=("LLAMA_CMOE_DECODE_BATCH=$CMOE_DECODE_BATCH")
 [[ -n "$CMOE_DECODE_UBATCH" ]] && env_args+=("LLAMA_CMOE_DECODE_UBATCH=$CMOE_DECODE_UBATCH")
 [[ -n "$THREADS_HTTP" ]] && env_args+=("LLAMA_ARG_THREADS_HTTP=$THREADS_HTTP")
@@ -751,6 +753,7 @@ fi
 [[ -n "$THREADS_HTTP" ]] || unset_args+=(-u LLAMA_ARG_THREADS_HTTP)
 [[ -n "$CMOE_PREFILL_BATCH" ]] || unset_args+=(-u LLAMA_CMOE_PREFILL_BATCH)
 [[ -n "$CMOE_PREFILL_UBATCH" ]] || unset_args+=(-u LLAMA_CMOE_PREFILL_UBATCH)
+[[ -n "$CMOE_PREFILL_STEPDOWN" ]] || unset_args+=(-u LLAMA_CMOE_PREFILL_STEPDOWN)
 [[ -n "$CMOE_DECODE_BATCH" ]] || unset_args+=(-u LLAMA_CMOE_DECODE_BATCH)
 [[ -n "$CMOE_DECODE_UBATCH" ]] || unset_args+=(-u LLAMA_CMOE_DECODE_UBATCH)
 [[ -n "$LLAMA_TURBO4_Q8_FALLBACK_LAYERS" ]] || unset_args+=(-u LLAMA_TURBO4_Q8_FALLBACK_LAYERS)

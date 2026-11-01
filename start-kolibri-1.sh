@@ -93,6 +93,7 @@ export LLAMA_EXPERT_PAGE_PREFETCH="${LLAMA_EXPERT_PAGE_PREFETCH:-0}"
 # Every ubatch reads nearly all experts, so prefill wants one large ubatch.
 export LLAMA_CMOE_PREFILL_BATCH="${LLAMA_CMOE_PREFILL_BATCH:-2048}"
 export LLAMA_CMOE_PREFILL_UBATCH="${LLAMA_CMOE_PREFILL_UBATCH:-2048}"
+export LLAMA_CMOE_PREFILL_STEPDOWN="${LLAMA_CMOE_PREFILL_STEPDOWN:-1}"  # prefill ubatch that does not fit: halve it before decode takes over
 export LLAMA_CMOE_DECODE_BATCH="${LLAMA_CMOE_DECODE_BATCH:-64}"
 export LLAMA_CMOE_DECODE_UBATCH="${LLAMA_CMOE_DECODE_UBATCH:-64}"
 

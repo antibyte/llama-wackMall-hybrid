@@ -59,6 +59,7 @@ export GGML_SCHED_DEDUP_DST_SYNC=1
 # export GGML_SCHED_PREFETCH_EXPERTS=1  # n-cpu-moe prefill overlap; keep off without -ncmoe
 export LLAMA_CMOE_PREFILL_BATCH="$PREFILL"
 export LLAMA_CMOE_PREFILL_UBATCH="$PREFILL"
+export LLAMA_CMOE_PREFILL_STEPDOWN="${LLAMA_CMOE_PREFILL_STEPDOWN:-1}"  # prefill ubatch that does not fit: halve it before decode takes over
 export LLAMA_CMOE_DECODE_BATCH="$DECODE"
 export LLAMA_CMOE_DECODE_UBATCH="$DECODE"
 export LLAMA_KVFLASH="$KVFLASH"
