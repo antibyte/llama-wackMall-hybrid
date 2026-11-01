@@ -48,6 +48,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
+#include "ggml-cuda/mhc.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
@@ -3567,6 +3568,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
+        case GGML_OP_MHC_ROUTE:
+            ggml_cuda_op_mhc_route(ctx, dst);
+            break;
+        case GGML_OP_MHC_MERGE:
+            ggml_cuda_op_mhc_merge(ctx, dst);
+            break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
             break;
@@ -6688,6 +6695,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return op->src[0]->ne[0] == 16 && op->src[0]->ne[1] == 1 && op->src[0]->ne[2] % 128 == 0 && op->src[4]->ne[1] == 1;
             }
         }
+        case GGML_OP_MHC_ROUTE:
+        case GGML_OP_MHC_MERGE:
+            // the graph builders check types and unit stride; two streams only
+            return op->src[0]->ne[3] == 1;
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
             if (op->src[0]->ne[1] % 128 != 0) {

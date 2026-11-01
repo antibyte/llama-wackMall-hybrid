@@ -3923,6 +3923,39 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 
 
 // GGML_OP_SSM_CONV
+// GGML_OP_MHC_ROUTE + GGML_OP_MHC_MERGE: the streams are the two halves of
+// one buffer, as they come out of the previous merge
+struct test_mhc : public test_case {
+    const int64_t d;
+    const int64_t n_tok;
+    const int64_t n_seq;
+
+    std::string vars() override {
+        return VARS_TO_STR3(d, n_tok, n_seq);
+    }
+
+    test_mhc(int64_t d = 64, int64_t n_tok = 3, int64_t n_seq = 1)
+        : d(d), n_tok(n_tok), n_seq(n_seq) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ab   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*d, n_tok, n_seq);
+        ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_tok, n_seq);
+        ggml_tensor * w    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*d, 8);
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+        ggml_set_name(ab, "ab");
+
+        ggml_tensor * a = ggml_view_3d(ctx, ab, d, n_tok, n_seq, ab->nb[1], ab->nb[2], 0);
+        ggml_tensor * b = ggml_view_3d(ctx, ab, d, n_tok, n_seq, ab->nb[1], ab->nb[2], d*sizeof(float));
+
+        ggml_tensor * packed = ggml_mhc_route(ctx, a, b, w, bias, 20, 1e-6f);
+        ggml_set_name(packed, "packed");
+
+        ggml_tensor * out = ggml_mhc_merge(ctx, a, b, x, packed);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_ssm_conv : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -8967,6 +9000,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_mhc(64, 3, 1));
+    test_cases.emplace_back(new test_mhc(4096, 1, 1));
+    test_cases.emplace_back(new test_mhc(4096, 37, 1));
+    test_cases.emplace_back(new test_mhc(1000, 5, 2));
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
@@ -9941,6 +9978,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // SenseNova-Loop router pair: decode and a prefill ubatch
+    test_cases.emplace_back(new test_mhc(4096, 1, 1));
+    test_cases.emplace_back(new test_mhc(4096, 512, 1));
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;

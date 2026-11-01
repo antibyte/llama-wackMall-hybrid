@@ -12066,3 +12066,116 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_mhc_route / mhc_merge
+//
+// SenseNova-Loop residual stream routers for two streams. The streams may be
+// views (halves of the previous merge result), so rows go through nb[1] and
+// nb[2]; elements inside a row are unit stride.
+
+void ggml_compute_forward_mhc_route(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * a    = dst->src[0];
+    const ggml_tensor * b    = dst->src[1];
+    const ggml_tensor * w    = dst->src[2];
+    const ggml_tensor * bias = dst->src[3];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t d     = a->ne[0];
+    const int64_t n_tok = a->ne[1];
+    const int64_t n_row = a->ne[1]*a->ne[2];
+
+    const int   n_iter = ggml_get_op_params_i32(dst, 0);
+    const float eps    = ggml_get_op_params_f32(dst, 1);
+
+    const float * pw = (const float *) w->data;
+    const float * pb = (const float *) bias->data;
+
+    for (int64_t r = params->ith; r < n_row; r += params->nth) {
+        const int64_t t = r % n_tok;
+        const int64_t s = r / n_tok;
+
+        const float * va = (const float *) ((const char *) a->data + t*a->nb[1] + s*a->nb[2]);
+        const float * vb = (const float *) ((const char *) b->data + t*b->nb[1] + s*b->nb[2]);
+        float       * po = (float *) dst->data + r*(d + 6);
+
+        float ss = 0.0f;
+        float lg[8] = { 0 };
+        for (int64_t i = 0; i < d; ++i) {
+            const float xa = va[i];
+            const float xb = vb[i];
+            ss += xa*xa + xb*xb;
+            for (int k = 0; k < 8; ++k) {
+                lg[k] += pw[k*2*d + i]*xa + pw[k*2*d + d + i]*xb;
+            }
+        }
+        const float rms = 1.0f/sqrtf(ss/(2.0f*d) + eps);
+        for (int k = 0; k < 8; ++k) {
+            lg[k] = lg[k]*rms + pb[k];
+        }
+
+        const float pre0 = 1.0f/(1.0f + expf(-lg[0]));
+        const float pre1 = 1.0f/(1.0f + expf(-lg[1]));
+
+        // sinkhorn in log space: rows, then columns
+        float m[2][2] = { { lg[4], lg[5] }, { lg[6], lg[7] } };
+        for (int it = 0; it < n_iter; ++it) {
+            for (int i = 0; i < 2; ++i) {
+                const float mx  = fmaxf(m[i][0], m[i][1]);
+                const float lse = mx + logf(expf(m[i][0] - mx) + expf(m[i][1] - mx));
+                m[i][0] -= lse;
+                m[i][1] -= lse;
+            }
+            for (int j = 0; j < 2; ++j) {
+                const float mx  = fmaxf(m[0][j], m[1][j]);
+                const float lse = mx + logf(expf(m[0][j] - mx) + expf(m[1][j] - mx));
+                m[0][j] -= lse;
+                m[1][j] -= lse;
+            }
+        }
+
+        for (int64_t i = 0; i < d; ++i) {
+            po[i] = pre0*va[i] + pre1*vb[i];
+        }
+        po[d + 0] = 2.0f/(1.0f + expf(-lg[2]));
+        po[d + 1] = 2.0f/(1.0f + expf(-lg[3]));
+        po[d + 2] = expf(m[0][0]);
+        po[d + 3] = expf(m[0][1]);
+        po[d + 4] = expf(m[1][0]);
+        po[d + 5] = expf(m[1][1]);
+    }
+}
+
+void ggml_compute_forward_mhc_merge(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * x = dst->src[2];
+    const ggml_tensor * p = dst->src[3];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t d     = a->ne[0];
+    const int64_t n_tok = a->ne[1];
+    const int64_t n_row = a->ne[1]*a->ne[2];
+
+    for (int64_t r = params->ith; r < n_row; r += params->nth) {
+        const int64_t t = r % n_tok;
+        const int64_t s = r / n_tok;
+
+        const float * va = (const float *) ((const char *) a->data + t*a->nb[1] + s*a->nb[2]);
+        const float * vb = (const float *) ((const char *) b->data + t*b->nb[1] + s*b->nb[2]);
+        const float * vx = (const float *) ((const char *) x->data + t*x->nb[1] + s*x->nb[2]);
+        const float * vp = (const float *) ((const char *) p->data + t*p->nb[1] + s*p->nb[2]);
+        float       * vo = (float *) dst->data + r*2*d;
+
+        const float post0 = vp[d + 0];
+        const float post1 = vp[d + 1];
+        const float m00 = vp[d + 2], m01 = vp[d + 3];
+        const float m10 = vp[d + 4], m11 = vp[d + 5];
+
+        for (int64_t i = 0; i < d; ++i) {
+            vo[i]     = m00*va[i] + m01*vb[i] + post0*vx[i];
+            vo[d + i] = m10*va[i] + m11*vb[i] + post1*vx[i];
+        }
+    }
+}

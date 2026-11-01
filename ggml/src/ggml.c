@@ -1118,9 +1118,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MHC_ROUTE",
+    "MHC_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,9 +1238,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "mhc_route(a, b, w, bias)",
+    "mhc_merge(a, b, x, packed)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
 static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
@@ -5758,6 +5764,63 @@ struct ggml_tensor * ggml_ssm_conv_tree(
     const int64_t n_s = result->ne[2];
     GGML_ASSERT(ggml_nelements(parent_ids) == n_t * n_s);
     result->src[2] = parent_ids;
+    return result;
+}
+
+// ggml_mhc_route
+
+struct ggml_tensor * ggml_mhc_route(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * bias,
+        int                   n_iter,
+        float                 eps) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(a, b) && a->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(w) && w->ne[0] == 2*a->ne[0] && w->ne[1] == 8);
+    GGML_ASSERT(ggml_is_contiguous(bias) && ggml_nelements(bias) == 8);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a->ne[0] + 6, a->ne[1], a->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, n_iter);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_MHC_ROUTE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = w;
+    result->src[3] = bias;
+
+    return result;
+}
+
+// ggml_mhc_merge
+
+struct ggml_tensor * ggml_mhc_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * packed) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && packed->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float));
+    GGML_ASSERT(x->nb[0] == sizeof(float) && packed->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, x) && a->ne[3] == 1);
+    GGML_ASSERT(packed->ne[0] == a->ne[0] + 6 && packed->ne[1] == a->ne[1] && packed->ne[2] == a->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*a->ne[0], a->ne[1], a->ne[2]);
+
+    result->op     = GGML_OP_MHC_MERGE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = x;
+    result->src[3] = packed;
+
     return result;
 }
 

@@ -623,6 +623,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MHC_ROUTE,
+        GGML_OP_MHC_MERGE,
+
         GGML_OP_COUNT,
     };
 
@@ -2584,6 +2587,31 @@ extern "C" {
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
             struct ggml_tensor  * ids);
+
+    // SenseNova-Loop residual stream router for two streams a and b
+    // [d, n_tokens, n_seqs]: an RMS norm over both streams, eight logits
+    // (w [2*d, 8], bias [8]), sigmoid gates and a 2x2 mix that n_iter sinkhorn
+    // passes make doubly stochastic.
+    // Result [d + 6, n_tokens, n_seqs]: rows 0..d-1 are the gated branch
+    // input, d and d+1 the two output gates, d+2..d+5 the mixing matrix.
+    GGML_API struct ggml_tensor * ggml_mhc_route(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   n_iter,
+            float                 eps);
+
+    // Mixes the streams with the 2x2 matrix from ggml_mhc_route and adds the
+    // gated sublayer output x. Result [2*d, n_tokens, n_seqs]: the new stream
+    // a in rows 0..d-1, stream b in rows d..2*d-1.
+    GGML_API struct ggml_tensor * ggml_mhc_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * packed);
 
     // partition into non-overlapping windows with padding if needed
     // example:
