@@ -443,12 +443,19 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
     return sumf + d8*sumf_d8;
 }
 
-#define VDR_Q3_K_Q8_1_MMVQ 1
+// Ints of qs per vec_dot call. Up to four neighbouring ints share their
+// scales and q8_1 blocks, so a larger value decodes them once for more weights.
+#ifndef GGML_CUDA_Q3_K_MMVQ_VDR
+#define GGML_CUDA_Q3_K_MMVQ_VDR 2
+#endif
+#define VDR_Q3_K_Q8_1_MMVQ GGML_CUDA_Q3_K_MMVQ_VDR
+static_assert(VDR_Q3_K_Q8_1_MMVQ == 1 || VDR_Q3_K_Q8_1_MMVQ == 2 || VDR_Q3_K_Q8_1_MMVQ == 4,
+              "Q3_K MMVQ VDR must be 1, 2 or 4");
 #define VDR_Q3_K_Q8_1_MMQ  2
 
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
-    const int & vl, const int & vh, const int * __restrict__ u, const uint8_t * __restrict__ scales,
+    const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const uint8_t * __restrict__ scales,
     const int & scale_offset, const float & d3, const float * __restrict__ d8) {
 
     float sumf = 0.0f;
@@ -467,13 +474,16 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int sc = (sc_low | sc_high) - 32;
 
-        const int vil = (vl >> (2*i)) & 0x03030303;
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < VDR_Q3_K_Q8_1_MMVQ; ++j) {
+            const int vil = (vl[j] >> (2*i)) & 0x03030303;
+            const int vih = ((vh[j] >> i) << 2) & 0x04040404;
+            const int vi  = ggml_cuda_vsub4_i8(vil, vih);
+            sumi = ggml_cuda_dp4a(vi, u[i*VDR_Q3_K_Q8_1_MMVQ + j], sumi); // SIMD dot product
+        }
 
-        const int vih = ((vh >> i) << 2) & 0x04040404;
-
-        const int vi = __vsubss4(vil, vih);
-
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * (sumi * sc);
     }
 
     return d3 * sumf;
@@ -638,7 +648,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
-        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+        const int vi = ggml_cuda_vsub4_i8((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
@@ -893,17 +903,26 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
 
     const float d = bq3_K->d;
 
-    const int vl = get_int_b2(bq3_K->qs, iqs);
+    // iqs is a multiple of the VDR: the ints iqs..iqs+VDR-1 share bq8_offset
+    // and scale_offset
+    int vl[VDR_Q3_K_Q8_1_MMVQ];
+    int vh[VDR_Q3_K_Q8_1_MMVQ];
+#pragma unroll
+    for (int j = 0; j < VDR_Q3_K_Q8_1_MMVQ; ++j) {
+        vl[j] = get_int_b2(bq3_K->qs, iqs + j);
+        // invert the mask with ~ so that a 0/1 results in 4/0 being subtracted
+        vh[j] = ~get_int_b2(bq3_K->hmask, (iqs + j) % (QI3_K/2)) >> bq8_offset;
+    }
 
-    // invert the mask with ~ so that a 0/1 results in 4/0 being subtracted
-    const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
-
-    int    u[QR3_K];
+    int    u[QR3_K*VDR_Q3_K_Q8_1_MMVQ];
     float d8[QR3_K];
 
 #pragma unroll
     for (int i = 0; i < QR3_K; ++i) {
-        u[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+#pragma unroll
+        for (int j = 0; j < VDR_Q3_K_Q8_1_MMVQ; ++j) {
+            u[i*VDR_Q3_K_Q8_1_MMVQ + j] = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1 + j);
+        }
         d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
     }
 

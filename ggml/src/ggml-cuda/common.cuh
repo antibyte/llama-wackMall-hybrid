@@ -702,6 +702,22 @@ static __device__ __forceinline__ uint32_t __hgt2_mask(const half2 a, const half
 }
 #endif // (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || (defined(MUSART_VERSION) && MUSART_VERSION < MUSART_HMASK)
 
+// Per-byte a - b for the dequantization offsets: every byte of a is below
+// 0x80 and every result fits in int8, so no lane saturates. NVIDIA GPUs since
+// Maxwell emulate __vsubss4 with a dozen instructions; setting bit 7 first
+// keeps the borrow inside each byte and gives the same result in three.
+// Build with -DGGML_CUDA_SWAR_VSUB=0 to compare against __vsubss4.
+#ifndef GGML_CUDA_SWAR_VSUB
+#define GGML_CUDA_SWAR_VSUB 1
+#endif
+static __device__ __forceinline__ int ggml_cuda_vsub4_i8(const int a, const int b) {
+#if GGML_CUDA_SWAR_VSUB && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    return ((a | 0x80808080) - b) ^ 0x80808080;
+#else
+    return __vsubss4(a, b);
+#endif
+}
+
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
 #if defined(GGML_USE_HIP)
 #if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
