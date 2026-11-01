@@ -68,6 +68,8 @@ GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH="2"  # GTX1080 ideas suite: keep 2
 GGML_CUDA_TURBO4_FAST_F16_CONVERT="0"  # cvt1/cvt2 did not beat 0 on GTX1080
 GGML_CUDA_TURBO4_WHT_SHUFFLE="0"  # wht1 flat/slightly worse; keep original WHT
 MTP_N="2"  # used only when SPEC_MODE=mtp
+MTP_PROCESS_CHUNK="8"  # tokens per MTP catch-up decode, 0 = draft ubatch (fork default 8)
+# Same Qwen3.6 MTP head as start1660.sh: 0 gave no reliable gain there and +180 MiB VRAM; stays 8.
 LLAMA_MTP_REQUANTIZE_OUTPUT="none"  # none is the measured low-VRAM winner
 LLAMA_MTP_HEAD_TRACE="0"  # 1 prints the selected MTP-head source/type once
 # Trained DFlash block_size is 16 -> n_max clamp is 15. Load order: target weights
@@ -258,6 +260,7 @@ fi
 case "$SPEC_MODE" in none|mtp|dflash) ;; *) die "SPEC_MODE muss none, mtp oder dflash sein." ;; esac
 case "$MTP_N" in 0|1|2|3) ;; *) die "MTP_N muss 0, 1, 2 oder 3 sein." ;; esac
 [[ "$SPEC_DRAFT_N_MAX" =~ ^[1-9][0-9]*$ ]] || die "SPEC_DRAFT_N_MAX muss eine positive Ganzzahl sein."
+[[ "$MTP_PROCESS_CHUNK" =~ ^[0-9]+$ ]] || die "MTP_PROCESS_CHUNK muss eine nichtnegative Ganzzahl sein."
 [[ "$SPEC_DRAFT_N_MIN" =~ ^[0-9]+$ ]] || die "SPEC_DRAFT_N_MIN muss eine nichtnegative Ganzzahl sein."
 (( SPEC_DRAFT_N_MIN <= SPEC_DRAFT_N_MAX )) || die "SPEC_DRAFT_N_MIN darf SPEC_DRAFT_N_MAX nicht ueberschreiten."
 [[ "$SPEC_DRAFT_P_MIN" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] || die "SPEC_DRAFT_P_MIN muss zwischen 0 und 1 liegen."
@@ -579,6 +582,7 @@ if [[ "$SPEC_MODE" == dflash ]]; then
     )
 elif [[ "$SPEC_MODE" == mtp && "$MTP_N" != 0 ]]; then
     env_args+=("LLAMA_ARG_SPEC_DRAFT_N_MAX=$EFFECTIVE_SPEC_DRAFT_N_MAX")
+    env_args+=("LLAMA_MTP_PROCESS_CHUNK=$MTP_PROCESS_CHUNK")
 fi
 [[ -n "$API_KEY" ]] && server_args+=(--api-key "$API_KEY")
 [[ -n "$API_KEY_FILE" ]] && server_args+=(--api-key-file "$API_KEY_FILE")

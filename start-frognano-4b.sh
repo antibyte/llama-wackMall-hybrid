@@ -22,7 +22,14 @@
 #   KVFlash loads at -c 32768.
 #   2026-11-01 MTP_PROCESS_CHUNK 8 -> 0 (no mmproj, as agollm): 6k prompt
 #   569/552 -> 675/662 t/s; decode and VRAM unchanged (verify batches < 8).
-#   With the mmproj loaded and MTP the server asserts in server_tokens::get_tokens().
+#   Vision 2026-11-01: images need LLAMA_KVFLASH=0 (KVFlash maps each position to
+#   one slot; M-RoPE image tokens share one). The MTP draft context gets no
+#   KVFlash and holds the whole CONTEXT (f16: 1024 MiB at 262144). mmproj on the
+#   GPU does not fit (OOM at 32768); on the CPU a 300-token image takes ~3.3 s.
+#   ctx 49152: 35k prompt 431 t/s, decode 45 t/s at that depth, peak 5432 MiB;
+#   65536 fails to create the MTP context. Draft KV q8_0 needs a 205 MiB FA
+#   conversion buffer (peak 5494 MiB), so it stays f16.
+#   Text only like agollm: MMPROJ="" LLAMA_KVFLASH="8192" CONTEXT="262144".
 # Sampling follows the Qwen3.5 thinking card: temp=1.0 top_p=0.95 top_k=20
 # min_p=0 presence_penalty=1.5.
 # Download: ./download-frognano-4b.sh
@@ -38,7 +45,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"
 MODEL="$HOME/models/frognano-4b-2609/FrogNano-4B-2609-Q6_K_L.gguf"
-MMPROJ="$HOME/models/frognano-4b-2609/mmproj-FrogNano-4B-2609-f16.gguf"
+MMPROJ="$HOME/models/frognano-4b-2609/mmproj-FrogNano-4B-2609-f16.gguf"  # empty = text only (KVFlash possible)
 CHAT_TEMPLATE_FILE=""  # GGUF Jinja; generation prompt opens <think>
 
 # Network / OpenWebUI
@@ -61,7 +68,7 @@ CUDA_VISIBLE_DEVICES_VALUE="0"
 N_PARALLEL="1"
 N_GPU_LAYERS="99"
 CPU_MOE="0"
-MMPROJ_OFFLOAD="1"
+MMPROJ_OFFLOAD="0"  # GPU: no room next to the model (OOM at ctx 32768)
 UI="0"
 CONT_BATCHING="1"
 OP_OFFLOAD="1"
@@ -70,16 +77,20 @@ FIT_TARGET="80"
 FIT_CTX="2048"
 
 # Context, KV, Flash Attention
-CONTEXT="262144"
+CONTEXT="49152"  # with images and without KVFlash; 65536 does not fit
 N_PREDICT="32768"
 TARGET_TYPE_K="q8_0"
 TARGET_TYPE_V="q8_0"
+# MTP draft context KV. It gets no KVFlash and always holds the whole CONTEXT.
+DRAFT_TYPE_K="f16"
+DRAFT_TYPE_V="f16"
 FLASH_ATTN="on"
 KV_OFFLOAD="1"
 LOAD_MODE="mmap"
 OFFLINE="1"
 # Resident KV tokens. 8192 keeps the 262k logical ctx inside 6 GiB; 0 disables paging.
-LLAMA_KVFLASH="8192"
+# Images need 0 (see above).
+LLAMA_KVFLASH="0"
 LLAMA_KVFLASH_MAX_POOL="8192"
 LLAMA_KVFLASH_TAU="64"
 LLAMA_KVFLASH_POLICY="lru"
@@ -163,7 +174,10 @@ fi
 
 [[ -x "$SERVER" ]] || die "llama-server nicht ausfuehrbar: $SERVER"
 [[ -f "$MODEL" ]] || die "Modell nicht gefunden: $MODEL (zuerst ./download-frognano-4b.sh)"
-[[ -f "$MMPROJ" ]] || die "mmproj nicht gefunden: $MMPROJ (zuerst ./download-frognano-4b.sh)"
+[[ -z "$MMPROJ" || -f "$MMPROJ" ]] || die "mmproj nicht gefunden: $MMPROJ (zuerst ./download-frognano-4b.sh)"
+if [[ -n "$MMPROJ" && "$LLAMA_KVFLASH" != 0 ]]; then
+    die "Bilder und KVFlash schliessen sich aus (die M-RoPE-Bildtokens teilen eine Position): LLAMA_KVFLASH=0 oder MMPROJ leer."
+fi
 if [[ -n "$CHAT_TEMPLATE_FILE" ]]; then
     [[ -f "$CHAT_TEMPLATE_FILE" ]] || die "Chat-Template nicht gefunden: $CHAT_TEMPLATE_FILE"
     [[ "$JINJA" == 1 ]] || die "CHAT_TEMPLATE_FILE benoetigt JINJA=1."
@@ -221,7 +235,7 @@ llama-wackMall-hybrid start (frognano-4b-2609)
   GPU:       $CUDA_VISIBLE_DEVICES_VALUE
   context:   $CONTEXT
   spec:      $SPEC_MODE ($SPEC_TYPE) n_max=$SPEC_DRAFT_N_MAX
-  KV:        $TARGET_TYPE_K/$TARGET_TYPE_V
+  KV:        $TARGET_TYPE_K/$TARGET_TYPE_V draft $DRAFT_TYPE_K/$DRAFT_TYPE_V
   KVFlash:   $LLAMA_KVFLASH (max=$LLAMA_KVFLASH_MAX_POOL policy=$LLAMA_KVFLASH_POLICY)
   ngl:       $N_GPU_LAYERS  cpu-moe=$CPU_MOE  mmproj-offload=$MMPROJ_OFFLOAD  fit=$FIT/$FIT_TARGET/$FIT_CTX
   phase:     prefill=$CMOE_PREFILL_BATCH/$CMOE_PREFILL_UBATCH decode=$CMOE_DECODE_BATCH/$CMOE_DECODE_UBATCH
@@ -259,6 +273,8 @@ env_args=(
     "LLAMA_ARG_BACKEND_SAMPLING=$TARGET_BACKEND_SAMPLING"
     "LLAMA_ARG_SPEC_TYPE=$SPEC_TYPE"
     "LLAMA_ARG_SPEC_DRAFT_N_MAX=$SPEC_DRAFT_N_MAX"
+    "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K=$DRAFT_TYPE_K"
+    "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V=$DRAFT_TYPE_V"
     "LLAMA_MTP_PROCESS_CHUNK=$MTP_PROCESS_CHUNK"
     "LLAMA_ARG_CACHE_RAM=$CACHE_RAM"
     "LLAMA_ARG_CACHE_PROMPT=$CACHE_PROMPT"
@@ -269,7 +285,6 @@ env_args=(
     "LLAMA_ARG_FIT=$FIT"
     "LLAMA_ARG_FIT_TARGET=$FIT_TARGET"
     "LLAMA_ARG_FIT_CTX=$FIT_CTX"
-    "LLAMA_ARG_MMPROJ=$MMPROJ"
     "LLAMA_CMOE_BATCH=$CMOE_BATCH"
     "LLAMA_CMOE_UBATCH=$CMOE_UBATCH"
     "LLAMA_CMOE_PREFILL_BATCH=$CMOE_PREFILL_BATCH"
@@ -299,6 +314,7 @@ if [[ "$CPU_MOE" == 1 ]]; then
 else
     env_args+=("LLAMA_ARG_NO_CPU_MOE=1")
 fi
+[[ -n "$MMPROJ" ]] && env_args+=("LLAMA_ARG_MMPROJ=$MMPROJ")
 if [[ "$MMPROJ_OFFLOAD" == 1 ]]; then
     env_args+=("LLAMA_ARG_MMPROJ_OFFLOAD=1")
 else
@@ -344,6 +360,7 @@ unset_args=(
     -u LLAMA_ARG_MMPROJ_URL
     -u LLAMA_ARG_NO_MMPROJ
 )
+[[ -n "$MMPROJ" ]] || unset_args+=(-u LLAMA_ARG_MMPROJ)
 if [[ "$LLAMA_KVFLASH" == 0 ]]; then
     unset_args+=(
         -u LLAMA_KVFLASH

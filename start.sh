@@ -76,6 +76,8 @@ GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH="2"  # tested MTP-2 crossover: multi-toke
 GGML_CUDA_TURBO4_FAST_F16_CONVERT="0"  # generic converter is the SM75 winner; 1/2 were slower experiments
 GGML_CUDA_TURBO4_WHT_SHUFFLE="0"  # original WHT is the SM75 winner; shuffle-first was neutral/slower
 MTP_N="2"  # inactive DFlash fallback; used only after switching SPEC_MODE to mtp
+MTP_PROCESS_CHUNK="8"  # tokens per MTP catch-up decode, 0 = draft ubatch (fork default 8)
+# Same Qwen3.6 MTP head as start1660.sh: 0 gave no reliable gain there and +180 MiB VRAM; stays 8.
 LLAMA_MTP_REQUANTIZE_OUTPUT="none"  # none is the 6-GiB winner; q4_K/q5_K add a draft-only LM head but consume 273/334 MiB VRAM
 LLAMA_MTP_HEAD_TRACE="0"  # 1 prints the selected MTP-head source/type once; diagnostic only
 SPEC_DRAFT_N_MAX="8"  # DFlash-only draft block size
@@ -268,6 +270,7 @@ fi
 case "$SPEC_MODE" in none|mtp|dflash) ;; *) die "SPEC_MODE muss none, mtp oder dflash sein." ;; esac
 case "$MTP_N" in 0|1|2|3) ;; *) die "MTP_N muss 0, 1, 2 oder 3 sein." ;; esac
 [[ "$SPEC_DRAFT_N_MAX" =~ ^[1-9][0-9]*$ ]] || die "SPEC_DRAFT_N_MAX muss eine positive Ganzzahl sein."
+[[ "$MTP_PROCESS_CHUNK" =~ ^[0-9]+$ ]] || die "MTP_PROCESS_CHUNK muss eine nichtnegative Ganzzahl sein."
 [[ "$SPEC_DRAFT_N_MIN" =~ ^[0-9]+$ ]] || die "SPEC_DRAFT_N_MIN muss eine nichtnegative Ganzzahl sein."
 (( SPEC_DRAFT_N_MIN <= SPEC_DRAFT_N_MAX )) || die "SPEC_DRAFT_N_MIN darf SPEC_DRAFT_N_MAX nicht ueberschreiten."
 [[ "$SPEC_DRAFT_P_MIN" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] || die "SPEC_DRAFT_P_MIN muss zwischen 0 und 1 liegen."
@@ -418,6 +421,7 @@ env_args=(
     "GGML_CUDA_TURBO4_WHT_SHUFFLE=$GGML_CUDA_TURBO4_WHT_SHUFFLE"
     "LLAMA_ARG_SPEC_TYPE=$SPEC_TYPE"
     "LLAMA_ARG_SPEC_DRAFT_N_MAX=$EFFECTIVE_SPEC_DRAFT_N_MAX"
+    "LLAMA_MTP_PROCESS_CHUNK=$MTP_PROCESS_CHUNK"
     "LLAMA_MTP_REQUANTIZE_OUTPUT=$LLAMA_MTP_REQUANTIZE_OUTPUT"
     "LLAMA_MTP_HEAD_TRACE=$LLAMA_MTP_HEAD_TRACE"
     "LLAMA_ARG_N_GPU_LAYERS_DRAFT=$DRAFT_NGL"

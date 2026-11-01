@@ -96,6 +96,9 @@ GGML_CUDA_TURBO4_F16_PREFILL_MIN_BATCH="2"  # tested MTP-2 crossover: multi-toke
 GGML_CUDA_TURBO4_FAST_F16_CONVERT="0"  # generic converter is the SM75 winner; 1/2 were slower experiments
 GGML_CUDA_TURBO4_WHT_SHUFFLE="0"  # original WHT is the SM75 winner; shuffle-first was neutral/slower
 MTP_N="2"  # inactive DFlash fallback; used only after switching SPEC_MODE to mtp
+MTP_PROCESS_CHUNK="8"  # tokens per MTP catch-up decode, 0 = draft ubatch (fork default 8)
+# 2026-11-01 SPEC_MODE=mtp, A/B/A/B: 0 or 256 leave the 6k prefill unchanged (405 vs 411 t/s),
+# decode +2-4 % (noise level), but the VRAM peak rises 5390 -> 5570 MiB; stays 8.
 LLAMA_MTP_REQUANTIZE_OUTPUT="none"  # none is the 6-GiB winner; q4_K/q5_K add a draft-only LM head but consume 273/334 MiB VRAM
 LLAMA_MTP_HEAD_TRACE="0"  # 1 prints the selected MTP-head source/type once; diagnostic only
 SPEC_DRAFT_N_MAX="4"  # short-prompt A/B 2026-08-17: 35.3 tok/s vs 32.6 at n_max=6
@@ -306,6 +309,7 @@ fi
 case "$SPEC_MODE" in none|mtp|dflash) ;; *) die "SPEC_MODE muss none, mtp oder dflash sein." ;; esac
 case "$MTP_N" in 0|1|2|3) ;; *) die "MTP_N muss 0, 1, 2 oder 3 sein." ;; esac
 [[ "$SPEC_DRAFT_N_MAX" =~ ^[1-9][0-9]*$ ]] || die "SPEC_DRAFT_N_MAX muss eine positive Ganzzahl sein."
+[[ "$MTP_PROCESS_CHUNK" =~ ^[0-9]+$ ]] || die "MTP_PROCESS_CHUNK muss eine nichtnegative Ganzzahl sein."
 [[ "$SPEC_DRAFT_N_MIN" =~ ^[0-9]+$ ]] || die "SPEC_DRAFT_N_MIN muss eine nichtnegative Ganzzahl sein."
 (( SPEC_DRAFT_N_MIN <= SPEC_DRAFT_N_MAX )) || die "SPEC_DRAFT_N_MIN darf SPEC_DRAFT_N_MAX nicht ueberschreiten."
 [[ "$SPEC_DRAFT_P_MIN" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] || die "SPEC_DRAFT_P_MIN muss zwischen 0 und 1 liegen."
@@ -502,6 +506,7 @@ env_args=(
     "LLAMA_ARG_DECISION_SEQS=$DECISION_SEQS"
     "LLAMA_DFLASH_ADAPTIVE=$EFFECTIVE_DFLASH_ADAPTIVE"
     "LLAMA_ARG_SPEC_DRAFT_N_MAX=$EFFECTIVE_SPEC_DRAFT_N_MAX"
+    "LLAMA_MTP_PROCESS_CHUNK=$MTP_PROCESS_CHUNK"
     "LLAMA_MTP_REQUANTIZE_OUTPUT=$LLAMA_MTP_REQUANTIZE_OUTPUT"
     "LLAMA_MTP_HEAD_TRACE=$LLAMA_MTP_HEAD_TRACE"
     "LLAMA_ARG_N_GPU_LAYERS_DRAFT=$DRAFT_NGL"
