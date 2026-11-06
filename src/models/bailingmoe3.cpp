@@ -1,5 +1,7 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-expert-lookahead.h"
+#include "llama-expert-tier.h"
 
 #include <string>
 
@@ -235,6 +237,67 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
+    const bool lookahead_active = llama_expert_lookahead::graph_enabled(ubatch.n_tokens, ubatch.n_seqs, false);
+    const int  lookahead_distance = lookahead_active ? llama_expert_lookahead::distance() : 0;
+    const int  lookahead_top_m    = lookahead_active ? llama_expert_lookahead::top_m((int) n_expert) : 0;
+    const bool lookahead_trace    = lookahead_active && llama_expert_lookahead::enabled();
+    const int  prefetch_top_m     = llama_expert_tier::page_prefetch_top_m(ubatch.n_tokens);
+
+    // The first layers are dense and have no router, so nothing can be predicted for them.
+    const auto is_moe_layer = [&](int l) {
+        return l >= (int) hparams.n_layer_dense_lead && l < n_layer;
+    };
+
+    // Predicts the routing of a later layer from this layer's residual stream:
+    // the target layer's ffn_norm weight and router on the current hidden state.
+    // bailingmoe3 routes in groups: the two best experts of a group score the group,
+    // the best n_group_used groups survive, and the best experts of those groups win.
+    // The prediction mirrors that selection, a plain global top-k would predict
+    // experts from groups that the router drops.
+    auto build_predicted_experts = [&](ggml_tensor * source, int target_layer, int top_m) {
+        const auto & target = model.layers[target_layer];
+        ggml_tensor * predictor_input = build_norm(source, target.ffn_norm, nullptr, LLM_NORM_RMS, target_layer);
+        ggml_tensor * logits = build_lora_mm(target.ffn_gate_inp, predictor_input);
+        ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+        ggml_tensor * probs = ggml_sigmoid(ctx0, logits);
+        ggml_tensor * selection = ggml_add(ctx0, probs, target.ffn_exp_probs_b);
+        cb(selection, "lookahead_probs", target_layer);
+
+        if (hparams.n_expert_groups <= 1) {
+            return ggml_top_k(ctx0, selection, top_m);
+        }
+
+        const int64_t n_pred_tokens = selection->ne[1];
+        const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
+        ggml_tensor * groups = ggml_reshape_3d(ctx0, selection, n_exp_per_group, hparams.n_expert_groups, n_pred_tokens);
+        ggml_tensor * top2 = ggml_top_k(ctx0, groups, 2);
+        ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, groups, 1, groups->ne[0], groups->ne[1], groups->ne[2]), top2);
+        ggml_tensor * gscore = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, vals, vals->ne[1], vals->ne[2], vals->ne[3]));
+        gscore = ggml_reshape_2d(ctx0, gscore, gscore->ne[1], gscore->ne[2]);
+        ggml_tensor * gsel = ggml_top_k(ctx0, gscore, hparams.n_group_used);
+        ggml_tensor * masked = ggml_set_rows(ctx0, ggml_fill(ctx0, groups, -INFINITY),
+                ggml_get_rows(ctx0, groups, gsel), gsel);
+        masked = ggml_reshape_2d(ctx0, masked, n_expert, n_pred_tokens);
+        return ggml_top_k(ctx0, masked, top_m);
+    };
+
+    auto build_lookahead_prediction = [&](ggml_tensor * source, int source_layer) {
+        if (!lookahead_active || lookahead_top_m <= 0) {
+            return;
+        }
+        const int target_layer = source_layer + lookahead_distance;
+        if (!is_moe_layer(target_layer) || !llama_expert_lookahead::predictor_enabled(target_layer)) {
+            return;
+        }
+        ggml_tensor * predicted_ids = build_predicted_experts(source, target_layer, lookahead_top_m);
+        cb(predicted_ids, "lookahead_topk", target_layer);
+        ggml_build_forward_expand(gf, predicted_ids);
+        if (lookahead_trace) {
+            ggml_set_output(predicted_ids);
+            res->add_lookahead_prediction({ source_layer, target_layer, lookahead_top_m, predicted_ids, nullptr, nullptr });
+        }
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
         ggml_tensor * inpSA = inpL;
@@ -350,6 +413,20 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
+        if (llama_expert_lookahead::point() == llama_expert_lookahead::prediction_point::post_attn) {
+            build_lookahead_prediction(ffn_inp, il);
+        }
+
+        // read the next layer's predicted cold experts from disk while this layer computes
+        ggml_tensor * page_prefetch = nullptr;
+        if (prefetch_top_m > 0 && is_moe_layer(il + 1)) {
+            const auto & next = model.layers[il + 1];
+            ggml_tensor * predicted = build_predicted_experts(ffn_inp, il + 1, prefetch_top_m);
+            cb(predicted, "page_prefetch_ids", il + 1);
+            page_prefetch = llama_expert_tier::build_page_prefetch(ctx0,
+                    next.ffn_gate_exps, next.ffn_up_exps, next.ffn_down_exps, predicted);
+        }
+
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             cur = build_ffn(cur,
                     layer.ffn_up, nullptr, nullptr,
@@ -357,6 +434,8 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
                     layer.ffn_down, nullptr, nullptr,
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
         } else {
+            ggml_tensor * actual_ids = nullptr;
+            ggml_tensor * actual_weights = nullptr;
             ggml_tensor * moe = build_moe_ffn(cur,
                     layer.ffn_gate_inp,
                     layer.ffn_up_exps,
@@ -368,7 +447,22 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
                     hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    lookahead_trace ? &actual_ids : nullptr,
+                    lookahead_trace ? &actual_weights : nullptr,
+                    lookahead_trace && llama_expert_lookahead::layer_enabled(il),
+                    page_prefetch);
+            if (lookahead_trace && llama_expert_lookahead::layer_enabled(il)) {
+                // the allocator reuses the router buffers before the trace reads them
+                ggml_tensor * ids_snapshot = ggml_dup(ctx0, actual_ids);
+                ggml_tensor * weights_snapshot = ggml_dup(ctx0, actual_weights);
+                ggml_set_output(ids_snapshot);
+                ggml_set_output(weights_snapshot);
+                ggml_build_forward_expand(gf, ids_snapshot);
+                ggml_build_forward_expand(gf, weights_snapshot);
+                res->set_lookahead_actual(il, ids_snapshot, weights_snapshot);
+            }
             ggml_tensor * shared = build_ffn(cur,
                     layer.ffn_up_shexp, nullptr, nullptr,
                     layer.ffn_gate_shexp, nullptr, nullptr,
@@ -380,6 +474,11 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
         cur = ggml_add(ctx0, cur, ffn_inp);
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+
+        if (llama_expert_lookahead::point() == llama_expert_lookahead::prediction_point::post_moe) {
+            build_lookahead_prediction(cur, il);
+        }
+
         inpL = cur;
     }
 

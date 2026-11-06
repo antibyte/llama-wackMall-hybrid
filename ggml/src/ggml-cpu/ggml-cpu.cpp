@@ -852,6 +852,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_set_moe_fetch_hook") == 0) {
         return (void *)ggml_set_moe_fetch_hook;
     }
+    if (strcmp(name, "ggml_set_moe_file_resolver") == 0) {
+        return (void *)ggml_set_moe_file_resolver;
+    }
     if (strcmp(name, "ggml_set_route_trace") == 0) {
         return (void *)ggml_set_route_trace;
     }

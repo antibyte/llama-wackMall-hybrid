@@ -231,6 +231,7 @@ struct ggml_cuda_mmq_config {
     }                                                                                                                                     \
 
 #include "mmq-config-pascal.cuh"
+#include "mmq-config-turing.cuh"
 #include "mmq-config-ampere.cuh"
 #include "mmq-config-blackwell.cuh"
 
@@ -254,7 +255,7 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
     if (ggml_cuda_mmq_use_turing_dp4a(cc)) {
-        return ggml_cuda_mmq_get_config_pascal(type, J, fallback);
+        return ggml_cuda_mmq_get_config_turing(type, J, fallback);
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
@@ -275,7 +276,7 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #ifdef BLACKWELL_MMA_AVAILABLE
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
 #elif defined(GGML_CUDA_TURING_MMQ_DP4A) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
-    return ggml_cuda_mmq_get_config_pascal(type, J, fallback);
+    return ggml_cuda_mmq_get_config_turing(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 #else
