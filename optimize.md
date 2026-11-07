@@ -1,3 +1,89 @@
+# RAM-Lock und Cache-Ram: die Prefill-Byte-Menge sinkt, der Decode haengt nicht an der SSD vom 2026-11-07
+
+**Ergebnis: der RAM-Lock (`LLAMA_EXPERT_RAM_LOCK_GIB=12`) bringt gepaart +14,7 % Prefill (36,67 gegen 32,04 t/s, Ausgabe-SHA in allen Armen identisch), `LLAMA_ARG_CACHE_RAM=0` bringt weitere +7,8 % (34,49 t/s). Runde 6 hat den Lock skaliert: das Optimum liegt bei 12 GiB (+15,3 % gegen den frischen Basisarm, 6 GiB nur +3,9 %, 18 GiB +13,0 % mit bereits 744,8 MB/s Gereterate), und die Kombination mit `CACHE_RAM=0` bringt nichts zusaetzlich. Beide Hebel greifen an derselben Stelle: sie nehmen dem Page-Cache das RAM, das das 72-GiB-Modell zum Nachladen braucht. Der Decode dagegen haengt weder an der SSD noch am VRAM - dort sind nur 10,9 % der Tokenzeit Fault-Warten, und weder Lock (+1,0 %) noch Async (-0,4 %) noch Cache-Ram (-0,1 %) noch ein groesserer Hot-Set bringen etwas. `LLAMA_EXPERT_TMAX=4096` ist im Prefill schaedlich (-40 %), weil der warme VRAM-Pfad dann fuer 2048 Tokens admitted wird und der Prefill-Compute in ein OOM laeuft. Und die Methode selbst hat einen Fehler, der jede Decode-Messung dieser Maschine bisher verdorben hat: die SSD liefert spaetere Arme schneller, weil sie die zuletzt gelesenen Bloecke aus ihrem eigenen Cache nimmt - ohne Cache-Leerung lag der Basisarm am Ende 33 % schneller als am Anfang.**
+
+| Prefill (5192 Token) | pp t/s | gegen Basis A | gegen Basis B | SSD MB/s | fehlende Slabs | Fault-Wait |
+|---|---|---|---|---|---|---|
+| Basis A | 32,04 | - | -1,9 % | 830,2 | 67,16 % | 211.272 ms |
+| RAM-Lock 12 GiB | **36,67** | **+14,7 %** | **+16,9 %** | 813,7 | **58,35 %** | 192.998 ms |
+| TMAX 4096 | 19,22 | -40,0 % | -38,8 % | 916,3 | 23,15 % | 404.362 ms |
+| Cache-Ram 0 | 34,49 | +7,8 % | +9,9 % | 883,0 | 66,93 % | 193.369 ms |
+| Basis B | 31,42 | - | - | 863,3 | 66,89 % | 202.144 ms |
+
+| Decode (MEAN tg, go/code/essay, 256 Token je Prompt) | tg t/s | gegen Basis A | gegen Basis B | fehlende Slabs | Fault-Wait |
+|---|---|---|---|---|---|
+| Basis A | 6,92 | - | -1,0 % | 20,95 % | 96.477 ms |
+| RAM-Lock 12 GiB | 6,92 | 0,0 % | -1,0 % | 19,91 % | 90.135 ms |
+| Async | 6,89 | -0,4 % | -1,4 % | 21,19 % | 95.406 ms |
+| Basis B | 6,99 | - | - | 20,92 % | 99.346 ms |
+
+  Vor jedem Arm beide Caches geleert: Page-Cache des Modells per `--evict`, SSD-Cache per 48-GB-O_DIRECT-Schreibvorgang (`tools/flush_drive.sh`). Der Cache-Buster kostet dem Prefill etwa 12 % gegenueber einem Lauf ohne (Runde 4: 36,3 t/s, Runde 5: 32,0 t/s) - die paarweisen Vergleiche bleiben gueltig, die Absolutwerte sind pessimistischer als im Betrieb. Die Drift zwischen den beiden Basisarmen liegt bei -1,9 % (Prefill) und +1,0 % (Decode), beide Effekte liegen deutlich darueber.
+
+**Runde 6 hat den Lock skaliert und die Hebel kombiniert.** Die vier "frischen" Arme (Basis A, Lock 6, Lock 12, Lock 18) liefen alle direkt nach einem Cache-Buster und sind untereinander vergleichbar; der Basisarm B kam nach den Lock-Armen und hatte einen warmen Page-Cache (die gelockten Seiten bleiben nach dem Prozessende im Cache), er ist deshalb als Kontrollarm zu hoch.
+
+| Prefill Runde 6 (5192 Token) | pp t/s | gegen Basis A | gegen Basis B | SSD MB/s | fehlende Slabs | Lock-Zeit |
+|---|---|---|---|---|---|---|
+| Basis A | 30,70 | - | -5,5 % | 833,8 | 67,25 % | - |
+| RAM-Lock 6 GiB | 31,90 | +3,9 % | -1,8 % | 807,8 | 61,51 % | 8,1 s |
+| RAM-Lock 12 GiB | **35,40** | **+15,3 %** | **+8,9 %** | 810,9 | 58,53 % | 15,4 s |
+| RAM-Lock 18 GiB | 34,70 | +13,0 % | +6,8 % | 744,8 | **53,12 %** | 22,7 s |
+| Basis B | 32,50 | +5,9 % | - | 859,4 | 67,65 % | - |
+| Lock 12 GiB + Cache-Ram 0 | 35,40 | +15,3 % | +8,9 % | 777,6 | 58,46 % | 15,4 s |
+
+| Decode Runde 6 (MEAN tg, go/code/essay) | tg t/s | gegen Basis A | gegen Basis B | fehlende Slabs |
+|---|---|---|---|---|
+| Basis A | 7,02 | - | -0,6 % | 20,59 % |
+| Cache-Ram 0 | 7,01 | -0,1 % | -0,7 % | 20,89 % |
+| RAM-Lock 12 GiB | 7,09 | +1,0 % | +0,4 % | 19,62 % |
+| Hot-Set S 16 (geklemmt auf 12) | 6,96 | -0,9 % | -1,4 % | 20,69 % |
+| Basis B | 7,06 | +0,6 % | - | 20,86 % |
+
+  Das Optimum liegt bei **12 GiB**: 6 GiB bringt fast nichts (+3,9 %, das liegt in der Drift), 18 GiB liefert zwar die wenigsten fehlenden Slabs (53,12 %), aber die SSD-Rate faellt auf 744,8 MB/s, weil dem Page-Cache nur noch rund 12 GB RAM bleiben. Der Lock ist damit kein "mehr ist besser"-Hebel, sondern ein Gleichgewicht zwischen gesicherten Experten im RAM und Page-Cache fuer den Rest. Die Kombination mit `CACHE_RAM=0` bringt **nichts zusaetzlich** (35,40 wie Lock 12 allein): beide Hebel greifen an derselben Stelle, dem RAM fuer den Page-Cache, und der Lock hat den Vorrang. Im Decode sind beide neutral (Lock +1,0 %, Cache-Ram -0,1 %, Drift +0,6 %) - die im Rezept notierte "-4 %" des RAM-Prompt-Caches ist im Mittel ueber drei Prompts nicht zu sehen, die Einzelwerte streuen (go -0,8 %, code -4,0 %, essay +4,4 %).
+
+- **Der RAM-Lock senkt die Byte-Menge, die vom SSD kommen muss.** Die 12,04 GiB (10833 Slabs, in 16,0 s gelockt) sind vom Page-Cache nicht mehr verdraengbar. Die Folge: 58,35 % statt 67,16 % fehlende Slabs, 192.998 statt 211.272 ms Fault-Wait, 20,5 s weniger Wanduhr. Die SSD-Rate sinkt dabei leicht (813,7 gegen 830,2 MB/s) - es werden weniger Bytes geliefert, aber die verbleibenden kommen schneller durch, weil der Kernel nicht mehr um den Platz der Modellseiten kaempft. **Der Preis: 12 GiB RAM sind dauerhaft nicht verfuegbar**, und die Lock-Zeit faellt einmalig beim Serverstart an (16,0 s). Im Betrieb amortisiert sie sich ueber jeden weiteren Prefill; nebenbei leiden die anderen Modelle desselben Hosts, weil der Swap-Druck steigt. Der Decode zahlt nichts dafuer - dort sind 12 GiB nur 10 Token Material.
+- **Der RAM-Prompt-Cache kostet Prefill.** `LLAMA_ARG_CACHE_RAM=8192` (der Wert im agollm-Rezept) reserviert 8 GiB RAM fuer gespeicherte Chats. Bei einem 72-GiB-Modell in 30 GB RAM ist das der Page-Cache, der dem Nachladen fehlt: mit `CACHE_RAM=0` steigt die SSD-Rate von 830,2 auf 883,0 MB/s und die Fault-Wait sinkt von 211.272 auf 193.369 ms, bei **gleicher** Slab-Fehlerrate (66,93 % gegen 67,16 %). Der Mechanismus ist hier also nicht die Byte-Menge, sondern der Speicherdruck: weniger Reclaim, mehr Bandbreite. Das Rezept nennt fuer den Cache-Ram bisher nur die Decode-Seite ("decode -4 %"), der Prefill-Gegenwert ist neu.
+- **Der Decode haengt nicht an der SSD, und er haengt auch nicht am VRAM.** 768 Tokens in 111 s sind 144,5 ms je Token, davon 15,7 ms Fault-Warten (10,9 %, Thread-Summe durch 8 Threads). Der Rest ist CPU-Rechnen und Host-RAM-Bandbreite. Die "fehlenden Slabs" sind **Host-RAM-Fehler, keine VRAM-Luecken**: der `mincore`-Test in `ggml-cpu.c:1836` prueft die Residentz im Page-Cache, und der Cold-Kern rechnet direkt aus dem Host-mmap (`ggml-cpu.c:2565`). Der VRAM-Hot-Store (`w_hot`, 1,73 GiB fuer 12 Experten je Layer) wird ausschliesslich von der GPU-Seite gelesen (`src/llama-expert-tier.cpp:2787`), die CPU-Seite bekommt nie VRAM-Gewichte; der PCIe-Verkehr je Token liegt bei rund 6,7 MB (D2H der Router-Ids und Layer-Inputs, H2D des Cold-Ergebnisses, Logits) und damit bei etwa 1 ms. **Ein groesserer VRAM-Hot-Set ist deshalb kein Decode-Hebel**, sondern eine Verlagerung von CPU- auf GPU-Rechenzeit. Daraus folgt: (1) der RAM-Lock senkt die Fault-Wait um 6,6 %, bringt aber keine Wanduhr - die gesparte Wartezeit fliesst in Rechenzeit, (2) `LLAMA_EXPERT_CPU_ASYNC` ist ein No-op, (3) der Decode-Hebel ist die CPU-Rechenzeit der kalten Experten und die Host-RAM-Bandbreite (15,2 GB/s bei 8 Threads gegen rund 1,07 GiB Gewicht je Token), nicht die SSD.
+- **Der Decode laeuft ueber MTP-Spec-Decoding.** Je 256 dekodierte Tokens zaehlt der Serverlog 255 Verify-Schritte (151,75 ms je Schritt), der groesste Teil der Tokenzeit steckt also im Verify-Schritt. Dessen Zeit waechst mit dem Kontext (127,46 ms bei 69 Token Prompt, 154,48 ms bei 306 Token Prompt). Das ist bei kuenftigen Decode-Vergleichen zu beachten: die Tokenzeit ist keine konstante, und der Prompt-Anteil liegt bei 136 ms je Token.
+- **`LLAMA_EXPERT_TMAX=4096` sprengt den VRAM im Prefill.** `LLAMA_EXPERT_TMAX` (Default 16) sperrt im Prefill drei Dinge: den fusionierten `MOE_COLD`-Pfad (`begin_moe_cold`), den Layer-voraus-Prefetch (`page_prefetch_top_m`) und die Warm-Admission (`warm_admit_from_counts`: peak_count <= tmax). Mit 4096 sind alle drei frei - und der warme Pfad fuer 2048 Tokens passt nicht mehr in den VRAM: `prefill compute OOM (ret = -2); falling back to decode ubatch`. Der Prefill zerfaellt in 64-Token-Stuecke, laeuft mit 19,2 t/s statt 35 (-40 %) und liest dabei nur 23,15 % fehlende Slabs mit einer praktisch leeren Warteschlange (qd 17,6 statt 350). **Der Layer-voraus-Prefetch ist im Prefill ueber TMAX also nicht erreichbar**, ohne den VRAM zu sprengen; dafuer braucht es einen eigenen Grenzwert, der nur den Prefetch freigibt.
+- **Huge Pages sind auf dieser Maschine nicht verfuegbar.** THP steht auf `madvise`, aber der Kernel hat kein `CONFIG_READ_ONLY_THP_FOR_FS`: `madvise(MADV_HUGEPAGE)` auf dem Modell-Mapping wird akzeptiert (`VmFlags: ... hg`), erzeugt aber keine Huge Pages (smaps: kein `FileThp`, `AnonHugePages: 0 kB`). Ein Codeeingriff in `src/llama-mmap.cpp` (ein `madvise` mehr) bringt hier also nichts.
+- **Der fadvise-Hinweis bringt 27 %, und seine Fenstergroesse ist bereits richtig.** Der Ist-Pfad legt je fehlendem Experten-Slab 128-KiB-Fenster mit `POSIX_FADV_WILLNEED` auf die Datei und faultet danach jede 4-KiB-Seite einzeln (`ggml-cpu.c:1847`). `tools/sweep_fadvise_chunk.sh` misst genau diesen Durchgang (8 Threads, 2 GiB aus der Modelldatei, vor jedem Durchgang die ganze Datei per `fadvise(DONTNEED)` aus dem Page-Cache und der SSD-Cache geleert):
+
+| Fenster des Hinweises | Gesamtzeit | langsamster Thread | Rate |
+|---|---|---|---|
+| keiner (nur 4-KiB-Faults) | 0,78 s | 0,78 s | 2.615,5 MiB/s |
+| 64 KiB | 0,57 s | 0,09 s | 3.574,7 MiB/s |
+| **128 KiB (Ist-Pfad)** | **0,57 s** | **0,08 s** | **3.562,0 MiB/s** |
+| 256 KiB | 0,86 s | 0,62 s | 2.370,4 MiB/s |
+| 512 KiB | 0,75 s | 0,63 s | 2.739,5 MiB/s |
+| 1 MiB | 0,75 s | 0,69 s | 2.724,7 MiB/s |
+
+  Der Hinweis ist asynchron, deshalb wartet der langsamste Thread bei 64/128 KiB nur noch 0,08 bis 0,09 s statt 0,78 s: die SSD liefert im Hintergrund, der Rechen-Thread wartet nicht. **Groessere Fenster sind schlechter**, nicht besser (0,75 bis 0,86 s): je groesser der Einzel-Hinweis, desto laenger wartet der eigene Thread auf seinen Anteil, und die Gesamtzeit steigt ueber die 128-KiB-Marke. Der Ist-Pfad liegt mit 128 KiB genau auf dem Optimum - **an der Fenstergroesse ist nichts zu holen.** Die Einzelzahl 82,5 MiB/s aus dem THP-Versuch gilt nur fuer einen Thread und 8 MB (4-KiB-Faults ohne Vorlauf); mit 8 Threads und 2 GiB sind es ohne jeden Hinweis 2.615 MiB/s.
+- **Der VRAM begrenzt den Hot-Set, nicht die Messung.** `LLAMA_EXPERT_S=16` wird vom Server abgelehnt: "init: manual S = 16 exceeds free VRAM, clamping to 12" (`src/llama-expert-tier.cpp`, Clamp beim Init). Bei 6 GiB VRAM und 1,73 GiB fuer 12 Experten je Layer sind 16 Slots nicht darstellbar. **Im agollm-Betrieb kostet der 4,7-GiB-GPU-Preload eines anderen Dienstes Ling zusatzliche Hot-Slots** - ein Verkleinern dieses Preloads ist damit ein Decode-Hebel, den man bisher nicht gesehen hat. Der Arm selbst ist ein No-op (gleiche Konfiguration wie die Basis) und dient nur als Driftmessung.
+- **Die SSD-Cache-Drift hat jede Decode-Messung dieser Maschine verdorben.** Ohne Cache-Leerung wird ein spaeterer Arm schneller, weil die Platte die zuletzt gelesenen Bloecke aus ihrem eigenen Cache liefert. In Runde 4 lag der Basisarm am Ende bei 7,26 gegen 5,45 t/s am Anfang (+33 %) bei identischer Konfiguration. Deshalb sind die Decode-Zahlen dieser Maschine ohne Cache-Leerung nicht vergleichbar - die Runde-5-Zahlen (6,89 bis 6,99 t/s, Drift +1,0 %) sind die belastbaren.
+
+Messprogramme: `benchmark-results/tensorfold-review-20261106/ling-ab/runs/r5{p,d}-*/` und `runs/r6{p,d}-*/` (Serverlog mit Phasen, `summary.json`, `.disk` mit der SSD-Rate je Sekunde), `tools/round5.sh` und `tools/round6.sh` (Prefill und Decode mit Cache-Leerung vor jedem Arm), `tools/summarize_rounds.py` (Tabelle ueber alle Runden), `tools/flush_drive.sh` (SSD-Cache leeren) - alle Messskripte liegen unter `benchmark-results/tensorfold-review-20261106/ling-ab/tools/` und damit im gitignorierten Messbereich. Allgemein nuetzlich sind die drei Werkzeuge im Repo: `tools/bench_thp_file.c` (THP-Nachweis), `tools/bench_fadvise_chunk.c` (Fenster-Groesse des fadvise-Hinweises), `tools/evict_file.py` (Page-Cache leeren).
+
+# Ling-Prefill-Phasen: der Prefill liest das ganze Modell vom SSD vom 2026-11-07
+
+**Ergebnis: der Prefill haengt noch staerker am SSD als der Decode. Von 166 s Wanduhr fuer 5192 Token (31,3 t/s) entfallen 10,7 s auf die CPU-Rechenzeit der kalten MoE-Knoten (6,5 %, davon nur 2,4 s in den drei gemessenen Phasen) - der Rest ist Warten auf die Platte: 172 GB bei 890 MB/s, mittlere Warteschlange qd 283, 66,8 % der geprueften Experten-Slabs fehlten. `vm.swappiness=0` bringt gepaart +9,7 % Prefill (A/B/A, Ausgabe-SHA in allen Armen identisch). Die Idee aus tandem.cpp - den Mehrspalten-Dot-Product auf beliebige Spalten zu verallgemeinern - zielt am Prefill auf die falsche Stelle: sie greift auf die 6,5 % Rechenanteil, nicht auf die 93 % Wartezeit.**
+
+| Arm | swappiness | Prefill 5192 Token | Wanduhr | CPU-MoE-Knoten | davon Rechnen | SSD | fehlende Slabs |
+|---|---|---|---|---|---|---|---|
+| Referenz (vorheriger Lauf) | 180 | 31,2 t/s | 166 s | 10,72 s | 2,38 s | 890,9 MB/s | 66,79 % |
+| A | 180 | 31,1 t/s | 167 s | 10,54 s | 2,47 s | 865,7 MB/s | 66,77 % |
+| B | **0** | **33,8 t/s** | 154 s | 10,90 s | 2,49 s | **928,8 MB/s** | 67,04 % |
+| C | 180 | 30,5 t/s | 170 s | 12,78 s | 2,71 s | 840,4 MB/s | 67,28 % |
+
+  Gepaart, Arm-Reihenfolge A/B/A, vor jedem Lauf der Page-Cache des Modells geleert (`--evict`), gleiche Prompts und Seeds, Greedy-Ausgabe per SHA `a8933235e37195a3` in allen vier Laeufen identisch. Die beiden 180-Arme liegen 2 % auseinander (Drift), der 0-Arm liegt **+8,7 %** ueber A und **+10,8 %** ueber C, im Mittel **+9,7 %**. Der Gewinn kommt von der hoeheren Geraeterate (865,7 und 840,4 gegen 928,8 MB/s), nicht von weniger Bytes: die Zahl der fehlenden Slabs ist in allen Armen gleich.
+
+- **Der Prefill liest das Modell von vorn bis hinten.** Der Prompt (5192 Token aus `data/long.txt`, 16000 Zeichen) laeuft in drei CMOE-Batches (2048/2048/1096). Jeder Batch beruehrt praktisch alle 512 Experten je Layer: 32 Experten-Layer (10 bis 41) x 512 x 3,64 MiB = **78,3 GiB** je Batch, theoretisch 235 GiB fuer die drei Batches. Die SSD lieferte 172 GB - der Page-Cache steuerte rund 63 GiB bei, also etwa 27 % Wiederverwendung, der Rest kam von der Platte. Die Rate liegt durchgehend bei 890 bis 1300 MB/s (Maximum 2643 MB/s), die Warteschlange bei qd 200 bis 283 (Maximum 1920), 7707 IOPS. **Die Platte laeuft die ganze Zeit durch.**
+- **Die CPU rechnet nur 6,5 % der Prefill-Zeit.** Das Phasen-Profiling (`LLAMA_EXPERT_TIMING=1` plus `LLAMA_EXPERT_STATS=1`) misst je Layer die Wanduhr des kalten MoE-Knotens (`cpu_cold_ms`, enthaelt die Fault-Phase) und die drei Phasen darin: `cpu_gate_up_ms` 1,45 s, `cpu_activation_ms` 0,04 s, `cpu_down_ms` 0,89 s ueber alle Layer und Laeufe. Die restlichen 8,34 s des Knotens sind Kopie, Barrieren und die Teile des Pfads ausserhalb der drei Phasen. Der Decode hat zum Vergleich 33,6 ms Rechenzeit bei 138 ms Tokenzeit (24 %) - **der Prefill ist also noch staerker SSD-gebunden als der Decode**, und die Rechenphase des Decodes liegt zu 76 % im Warten.
+- **Der Swap-Sturm ist im Prefill groesser als im Decode.** `tools/vmstat_delta.py` ueber den Lauf: `pgscan_direct` **+11.927.048 Seiten** (46,5 GB direct reclaim, zum Vergleich +2.940.843 im Decode), `pgsteal_direct` +5.498.252 (21 GB), `allocstall_normal` **+103.078** (im Decode +8.540), `pswpout` +194.785 (761 MB), `pswpin` +29.600 (116 MB). Der Kernel verdraengt die Modell-Seiten aus dem Page-Cache, waehrend die SSD sie nachliefern soll - genau der Effekt, den `vm.swappiness=0` im Decode mit +7,4 % ausgeraeumt hat. Im Prefill ist er mit **+9,7 %** groesser, weil dort die Bytesmenge um eine Groessenordnung hoeher ist.
+- **Die fehlenden Slabs nehmen zum Ende der Layers hin ab:** Layer 12 bei 96,4 %, Layer 25 bei 79,6 %, Layer 40 bei 51,4 % (heisser gewordener Hot-Set). Ueber alle Layer 78,6 % von 1.371.904 Pruefungen. Der Hot-Set liegt mit S = 12 von 512 Experten je Layer im VRAM (2,13 GB frei von 5,61 GB), der Rest muss je Batch ueber RAM oder SSD kommen.
+- **Was das fuer die Hebel bedeutet.** (1) `vm.swappiness=0` ist bereits als `MemorySwapMax=0` in agollm aktiv - die Prefill-Zahl hier (31 t/s bei 180) ist also der Zustand ohne den Hebel. (2) Der Rechenanteil (6,5 %) laesst sich mit dem asynchronen Ueberlapp (`LLAMA_EXPERT_CPU_ASYNC`, im Rezept aus) hinter das Plattenwarten legen - gedeckelt bei etwa 6 %. (3) Der groesste Hebel ist die Byte-Menge: der Page-Cache thrasht ueber 78,3 GiB, weil pro Batch alles gebraucht wird und die RAM 30 GB nur ein Drittel fasst. Der Gegenzug liegt im RAM-Lock (`LLAMA_EXPERT_RAM_LOCK_GIB`, im Rezept 0), der die kalten Experten mit den besten Seed-Scores per `mlock` im RAM haelt, statt sie zwischen den Batches zu verdraengigen - der naechste Messkandidat. (4) **Die Mehrspalten-Optimierung aus tandem.cpp ist fuer den Prefill tot:** der Decode hat je Experten-Slot genau eine Spalte (kein Amortisationsfaktor), und im Prefill ist der Rechenanteil nur 6,5 % - selbst eine Halbierung der Dekodierkosten braeuchte 3 %.
+
+Messprogramme: `benchmark-results/tensorfold-review-20261106/ling-ab/runs/prefill-{timing-1,sw180-a,sw0-b,sw180-c}/` (Serverlog mit Phasen, `summary.json`, `.disk` mit der SSD-Rate je Sekunde), `benchmark-results/tensorfold-review-20261106/ling-ab/tools/prefill_phases.sh` und `tools/prefill_ab.sh` (Prefill-Lauf mit Phasen-Profiling, vmstat-Differenz und SSD-Statistik je Lauf, A/B/A ueber `vm.swappiness`).
+
 # Integration der Sieger in agollm vom 2026-11-06
 
 **Ergebnis: die drei belegten Sieger der Runde vom 2026-11-06 sind in agollm aktiv - Swap-Limit in der Service-Unit, `posix_fadvise` im Ling-Rezept, MMQ-Kachel J_MAX 128 in den vendierten CUDA-Libs. Der private Experten-Puffer mit `pread` (die erste Wahl des Auftrags) und der Layer-voraus-Prefetch bleiben draussen: der Puffer ist ein Nettoverlust, der Prefetch liest 40 % mehr Bytes, ohne die Wanduhr zu gewinnen.** Verifiziert nach dem Neustart: Dienst `active`, `MemorySwapMax=0`, `MemorySwapCurrent=0`, `LimitMEMLOCK=infinity`, Router `/health` HTTP 200, VRAM 4706 MiB vom GPU-Preload, Ling mit dem neuen Rezept 7,65 t/s auf "go" bei unveraenderter Ausgabe (SHA `ed287f50e17fa16b`).
@@ -107,6 +193,27 @@ Messprogramme: `benchmark-results/tensorfold-review-20261106/ling-ab/` (`tools/c
 - **B4 - CLOCK-Eviction: simuliert, zu schwach, nicht implementiert.** `tools/simulate_expert_clock_cache.py` rechnet CLOCK (nach `zig/src/core/fsr/cache.zig:126-148`) ueber den Lookahead-Trace (Qwen3.6-35B-A3B, 40 Layer, 256 Experten, top-8, 4953 Records) gegen LRU: pro Layer -0,4 bis -2,2 %, global -1,6 bis -5,3 % (bester Fall 9632 -> 9122 Misses). TensorFold nennt 11 % weniger Disk und 8 % weniger Zeit - weniger als die Haelfte, und ohne Implementierungsaufwand in `llama-expert-tier.cpp` nicht zu holen.
 
 Messprogramme: `benchmark-results/tensorfold-review-20261106/` (`ling-ab/` mit `tools/abn.sh`, `round.sh`, `trace.sh`, `summarize.py`, `mbench.py`, `run.sh`; `fa-tile-sweep/`; `fa-longkv-server/`), Werkzeuge `tools/gguf_attn_scan.py`, `tools/gguf_attn_config.py`, `tools/simulate_expert_clock_cache.py`, `tools/bench_fa_longkv.py`.
+
+# Mage-VL-Cowork: Bildzeit vom 2026-11-02
+
+Mage-VL-Cowork 4B (Q4_K_M, Q8_0-mmproj, Projektor `magevl` aus PR 26796 portiert). Bildzeit = Encode + Prefill der Bild-Token bei gecachtem System-Prompt, 1920x1080:
+
+| | GTX 1660 Ti | Vega 7 |
+|---|---:|---:|
+| vorher | 5,97 s | 37,7 s |
+| volle Aufloesung | 5,16 s | 32,0 s |
+| `--image-max-tokens 1024` | 2,24 s | 12,6 s |
+| `--image-max-tokens 768` | 1,55 s | 8,5 s |
+
+- CUDA Tile-FA Kopfgroesse 64 / 32 Spalten: 128 statt 256 Threads (Encode 2,78 -> 2,42 s, LFM2.5 unveraendert). Zurueck mit `-DGGML_CUDA_FATTN_TILE_D64_NTHREADS=256`.
+- `half_kq`: K*Q-Summen mit hfma2 fuer Kopfgroesse 40/64/72/80, nur wenn die Op keine F32-Praezision verlangt. Die LLM-Graphen verlangen sie immer; mtmd nur ohne `LLAMA_MTMD_FA_PREC=f16`. Aus mit `GGML_CUDA_FA_TILE_HALF_KQ=0`. Encode -10 %.
+- RoPE im magevl-Graph ohne Permute/Cont: identische Ausgabe, -4 %.
+- `GGML_VK_FA_SCALAR_{BR,BC,WG,ROW_SPLIT,OCC}`: Overrides der Vulkan-Scalar-FA fuer grosse Batches; die Defaults sind auf Vega fast optimal.
+- `--image-max-tokens` wirkt jetzt bei magevl. Auf Vega sind FA (600 GFLOPS) und Prefill (135 t/s) rechengebunden; dort hilft nur die Tokenzahl.
+- Die GPU-FA-Kernel bilden K*Q in FP16; beim Mage-ViT weicht das deutlich von der CPU ab (Cosinus 0,984 CUDA, 0,991 Vulkan, Q8_0-mmproj 0,982). Klick- und Lesetests aendern sich dadurch nicht.
+
+Artefakte (gitignored): `benchmark-results/mage-vl-cowork-20261102/` (`vlbench.py`, `embdump.cpp`, `README.md`). Start: `start-mage-vl-cowork.sh`.
+
 # CMOE-Prefill bei knappem VRAM vom 2026-11-01
 
 **Ergebnis: Passte der Prefill-Ubatch nach einer Decode-Phase nicht mehr in den VRAM, fiel der Server direkt auf den Decode-Ubatch 64 zurueck und versuchte vor jedem 64er-Batch erneut die volle Reservierung. In agollm rechnete Clover-35B so einen 36,7k-Tokens-Prompt mit 30 t/s (20 Minuten). Neu: `LLAMA_CMOE_PREFILL_STEPDOWN` (Default 1) halbiert den Prefill-Ubatch bis knapp ueber den Decode-Ubatch und behaelt die passende Groesse, bis die Slots leer laufen. Unter gleicher Klemme (500 MiB belegt) 222,5 statt 40,0 t/s.**

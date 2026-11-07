@@ -106,12 +106,27 @@ buffers that an in-flight graph reads causes corruption).
 - Re-pin: per layer, hottest cold expert ec replaces coldest hot slot si
   iff score[ec] > 1.5 * score[slot_expert[si]] AND the incumbent has dwelt
   >= 32 updates. Empty slots fill first. Promotion H2D source uses ptrs
-  (pool copy when resident) then frees the pool slot. DONTNEED on the mmap
-  source via madvise (gated by weights_discardable).
+  (pool copy when resident) then frees the pool slot. The pool copy and the
+  DONTNEED on the mmap source are gone with the demand pool (section 6).
 - Warm start: optional heat CSV via LLAMA_EXPERT_HOT; LLAMA_EXPERT_USAGE
   dumps counts at exit, reusable as the next session's seed.
 
-## 6. Demand RAM pool (LLAMA_EXPERT_RAMPOOL)
+## 6. Demand RAM pool (LLAMA_EXPERT_RAMPOOL) - REMOVED
+
+**Stand 2026-11-07: dieser Abschnitt beschreibt einen Zustand, den es nicht mehr
+gibt.** `LLAMA_EXPERT_RAMPOOL`, `LLAMA_EXPERT_MADVISE` und der Demand-Pool
+(`ptrs`-Tabelle, FILLING/READY-Zustaende, `madvise(DONTNEED)` nach dem Fill)
+existieren im Code nicht mehr; `grep -r "RAMPOOL\|MADV_DONTNEED" src/ ggml/`
+findet nichts. Der RAM-Pool wurde entfernt, weil die memcpy-Kopie in den Pool
+bei Modellen, die groesser als der RAM sind, ein Nettoverlust ist: Lings Decode
+kopiert 1,19 GB Gewicht je Token, das kostet bei 15,2 GB/s RAM-Bandbreite 78 ms
+je Token und damit mehr als die halbe Tokenzeit (Messung vom 2026-11-06, siehe
+`optimize.md`).
+
+Der heutige Ersatz ist `LLAMA_EXPERT_RAM_LOCK_GIB`: kein Pool, sondern `mlock`
+auf den bereits gemappten Experten-Slabs, den die Page-Cache-Abschreibung nicht
+verdraengen kann. Der Preis ist, dass der Speicher nicht mehr zur Verfuegung
+steht (im Rezept auf 0 gesetzt). Der urspruengliche Text folgt zur Historie.
 
 Intermediate cache tier between VRAM and mmap. Per-layer contiguous blocks,
 one slot = one expert x all its tiered tensors (64B-aligned slices).
@@ -137,6 +152,23 @@ one slot = one expert x all its tiered tensors (64B-aligned slices).
 
 ## 7. Pre-gated predictive prefetch (LLAMA_EXPERT_PREDICT, LLAMA_EXPERT_PREFETCH_GB)
 
+**Stand 2026-11-07: die Schalternamen dieses Abschnitts sind veraltet.**
+`LLAMA_EXPERT_PREDICT`, `LLAMA_EXPERT_PREFETCH_GB`, `LLAMA_EXPERT_PREFETCH_MB`
+und `LLAMA_EXPERT_PREFETCH_THREADS` gibt es nicht mehr. Der Pre-Gate-Predictor
+lebt in `src/llama-expert-lookahead.cpp` und wird ueber die Familie
+`LLAMA_EXPERT_LOOKAHEAD_*` gesteuert: `LLAMA_EXPERT_LOOKAHEAD` (ein/aus),
+`_DISTANCE`, `_TOP_M`, `_POINT` (`post-attn` oder `post-moe`), `_NORM` (`target`
+oder `source`), `_LAYER_MIN`, `_LAYER_MAX`, `_TRACE`, `_TRACE_JSON`,
+`_STREAMS`, `_MAX_INFLIGHT`, `_MTP_EXPERIMENTAL`. Der separate Speculative Pool
+mit dem Speicherzustandsautomat (FREE/FILLING/READY/RESIDENT) aus dem Text
+unten existiert nicht mehr.
+
+Der produktive Prefetch-Pfad im Betrieb ist ein anderer: `LLAMA_EXPERT_PAGE_PREFETCH`
+(Top-M der vorhergesagten Experten der naechsten Layer) und
+`LLAMA_EXPERT_LOOKAHEAD_PREFETCH`. Der former ist im Rezept aus, weil er 40 %
+mehr Bytes von der SSD liest, ohne die Wanduhr zu gewinnen (Messung vom
+2026-11-06). Der urspruengliche Text folgt zur Historie.
+
 Pre-gate predictor: runs layer L+1's exact router on layer L's hidden state
 (one step ahead of demand). No learned parameters — the model's own gating
 function applied early. Norm reconstruction is exact: norm_{L+1} * (x / norm_L),
@@ -160,6 +192,11 @@ back to ptrs/mmap transparently. byte-identical correctness.
   (default 64 MiB in-flight cap).
 
 ## 8. Learned router heads (NEXT — DESIGN.md sec 13)
+
+**Stand 2026-11-07: `LLAMA_EXPERT_TRACEX` gibt es nicht mehr**, der Dump-Schalter
+heisst `LLAMA_EXPERT_TRACE` (Routing-IDs pro Graph) und `LLAMA_EXPERT_USAGE`
+(Heat-CSV). Die gelernten Router-Kopfzeilen sind weiterhin nicht implementiert;
+der Pre-Gate-Predictor aus Abschnitt 7 rechnet weiterhin mit exaktem Router.
 
 Per-layer MLP heads trained on frozen hidden states to predict P(expert
 fires). Replaces the stateless pre-gate exact-router lookahead with learned
