@@ -1,3 +1,110 @@
+# Der Eingriff in die Fault-Phase: die Hinweise stehen lassen, den Touch-Pass streichen vom 2026-11-08
+
+**Ergebnis: der freigegebene Eingriff - die fehlenden Cold-Slabs ueber einen atomaren Index verteilen statt statisch round-robin - ist implementiert und wirkt, bringt aber nur +3,5 % (7,36 gegen 7,11 t/s). Der Hebel ist ein anderer: der Touch-Pass. Die Fault-Phase besteht aus zwei Teilen, der Residenzpruefung mit Device-Hinweis (`posix_fadvise(WILLNEED)`) und dem Touch-Pass, der die Slabs einholt und danach an der Barriere wartet. **Loescht man nur den Touch-Pass (`GGML_CPU_EXPERT_FAULT_TOUCH=0`), holen die Hinweise die Daten weiterhin asynchron und tief in die Device-Queue, aber die Rechnung wartet nicht mehr an der Barriere auf den langsamsten Thread: Decode +14,6 % im frischen Zustand (8,00 gegen 6,97 und 6,99 t/s) und +13,3 % im belasteten Zustand (8,53 und 8,14 gegen 7,36 t/s), der Prefill bleibt bei 36,3 t/s, die Ausgabe-SHA sind in allen Armen identisch.** Der Eingriff in die Verteilung ist damit nicht der Produktionshebel, die reine Weglassung des Touch-Passes ist es - und sie ist eine Konfigurationszeile, kein Umbau.**
+
+| Decode Runde 10 (frischer Cache, MEAN tg, go/code/essay, 256 Token je Prompt) | tg t/s | go | code | essay | fehlende Slabs | Fault-Wait | gegen die eingeklammerte Basis |
+|---|---|---|---|---|---|---|---|
+| a statisch (Basis) | 7,25 | 7,80 | 6,85 | 7,11 | 23,54 % | 115.564 ms | - |
+| b dynamisch | 7,36 | 8,49 | 6,83 | 6,77 | 21,17 % | 119.780 ms | **+3,5 %** |
+| c statisch (Basis) | 6,97 | 8,16 | 6,35 | 6,39 | 21,14 % | 82.645 ms | - |
+| d nur Hinweise | 8,00 | 8,87 | 7,78 | 7,34 | 20,05 % | 201 ms | **+14,6 %** |
+| e Schwelle 16 | 8,22 | 9,81 | 7,44 | 7,41 | 0 % | 0 ms | +17,8 % |
+| f statisch (Basis) | 6,99 | 7,62 | 6,59 | 6,75 | 20,81 % | 80.243 ms | - |
+
+| Decode Runde 15 (belasteter Cache, gleicher Aufbau) | tg t/s | go | code | essay |
+|---|---|---|---|---|
+| nur Hinweise | 8,53 | 8,87 | 8,29 | 8,42 |
+| statisch (Basis) | 7,36 | 8,56 | 6,37 | 7,14 |
+| nur Hinweise | 8,14 | 8,59 | 7,95 | 7,90 |
+
+  Die drei Basisarme in Runde 10 (7,25 / 6,97 / 6,99) sind die Kontrollgruppe: jede Variante sitzt zwischen zwei Basisarmen, der Vergleich gilt gegen deren Mittel (b gegen a und c: 7,11; d und e gegen c und f: 6,98). Der Eingriff ist in `ggml_fault_expert_slabs` (`ggml/src/ggml-cpu/ggml-cpu.c`): die Threads schreiben jeden fehlenden Slab in eine geteilte Liste und nehmen sie nach einer Barriere einzeln von dort, statt jeden nur die eigenen Experten zu faulten. **Er wirkt, ist aber der kleinere Hebel.** Der Grund steht in den Phasenzeiten aus Runde 7b: von den 91 ms "Rest" je Token sind nur rund 13 ms die nachweisbare Touch-Wartezeit - der Rest ist die Barriere selbst. Die Verteilung des Touchs auf acht Threads zu optimieren kann deshalb hoechstens einen Teil dieser 13 ms holen; die Barriere wegzunehmen holt die ganzen 91 ms.
+
+**Die Schwellenvariante ist ein Gegenbeispiel zur Nachfrage-Variante, obwohl beide im frischen Zustand gleich gut dastehen.** `GGML_CPU_EXPERT_FAULT_MIN_TOKENS=16` laesst die ganze Fault-Phase fuer Knoten mit einem Token entfallen (Runde 10: 8,22 t/s, +17,8 %), der Kernel laedt die Slabs beim Zugriff nach. Im belasteten Zustand ist dieselbe Konfiguration aber **28 % langsamer** (Runde 14: 5,14 und 4,89 gegen 7,10 t/s statisch): der Page-Fault landet jetzt im Rechenpfad, und steht der Cache unter Druck, kostet jeder Fault zusaetzlich den Reclaim. Die Variante "nur Hinweise" leidet nicht darunter, weil die Reads asynchron im Geraet stehen und die Rechnung nicht auf sie wartet.
+
+| Zustand | statisch | dynamisch | nur Hinweise | Schwelle 16 |
+|---|---|---|---|---|
+| frischer Cache (Runde 10) | 6,97 - 7,25 | 7,36 | **8,00** | 8,22 |
+| belasteter Cache (Runde 14/15) | 7,10 / 7,36 | - | **8,53 / 8,14** | 5,14 / 4,89 |
+
+**Was der belastete Zustand ist.** Ab dem Neustart am 2026-11-08 um 15:26 kippte das Verhalten der Maschine: derselbe Arm las dieselbe Byte-Menge (129 GB) mit derselben aktiven Geraeterate (1017 MB/s), aber die SSD war in 242 von 286 Proben leer statt in 25 von 154. **Der Prozess wartet, waehrend das Geraet nichts liefert** - der Engpass war nicht das Geraet. Ausgeschlossen als Ursache: die CPU-Temperatur (Mittel 89-93 Grad, Maximum 103-109 Grad in allen Armen), die SSD-Temperatur (41 Grad, keine Drosselung, keine Warnzeit), der Swap (20,7 von 20,9 GB frei) und konkurrierende Prozesse (agollm gestoppt, keine weiteren Worker). Zwei Fehler in der Messkette wurden dabei gefunden und behoben: ein liegengebliebener Messserver blockierte den VRAM ("unable to allocate CUDA0 buffer"), seitdem prueft jedes Messskript den VRAM vor dem Arm; und nach einem Prefill-Arm (50 GB gelesen) reicht der 48-GB-Cache-Buster nicht mehr, weil die Bloecke den Device-Cache fuellen - solche Arme sind nicht mit den uebrigen vergleichbar.
+
+| Prefill (5192 Token, Cache vor dem Arm geleert) | pp t/s | Ausgabe-SHA |
+|---|---|---|
+| statisch (Runde 10) | 36,3 | a8933235e37195a3 |
+| nur Hinweise (Runde 10) | 36,3 | a8933235e37195a3 |
+| Schwelle 16 (Runde 11) | 36,4 | a8933235e37195a3 |
+
+  Der Touch-Pass ist also auch im Prefill entbehrlich: die Hinweise allein ergeben dieselbe Rate bei 56 % fehlenden Slabs. Die Schwelle fasst den Decode-Knoten nicht an (ein Token je Knoten), den Prefill-Knoten schon (2048 Tokens je Knoten, 73 % fehlende Slabs in Runde 11) - so bleiben beide Phasen bei ihrer jeweiligen Bestform.
+
+**Produktionsempfehlung: `GGML_CPU_EXPERT_FAULT_TOUCH=0`.** Der Schalter liegt in `libggml-cpu.so.0` und muss mit der Bibliothek in den agollm-Worker (`workers/llama/`); das Rezept setzt ihn neben `GGML_CPU_EXPERT_READAHEAD`. Die drei Schalter sind in `ARCHITECTURE.md` Abschnitt 3 beschrieben, alle mit dem bisherigen Verhalten als Vorgabe.
+
+**Der Rollout ist vor dem Produktionseinsatz geprueft (Runde 16).** Der Worker in agollm laeuft nicht mit dem Build des Forks, sondern mit vendorierten Bibliotheken (libllama und libggml-cuda vom 06.11., libggml-base vom 02.11.). Deshalb wurde die Kombination aus dem vendorierten Stand und der neuen libggml-cpu vorab gemessen: das vendoriert gebaute llama-server mit der neuen Bibliothek gegen den alten Worker-Stand, echtes Rezept, Cache vor jedem Arm geleert, Greedy-Ausgabe per SHA verglichen.
+
+| Runde 16 (Produktionskombination) | tg t/s | fehlende Slabs | Fault-Wartezeit | Ausgabe-SHA |
+|---|---|---|---|---|
+| vendoriert (06.11.) | 6,86 | 21,65 % | 89.305 ms | 3x identisch |
+| neue Lib, ohne Schalter | 7,10 | 20,54 % | 86.199 ms | 3x identisch |
+| **neue Lib, `GGML_CPU_EXPERT_FAULT_TOUCH=0`** | **7,83** | 20,10 % | **204,7 ms** | 3x identisch |
+
+  Vor dem Kopieren geprueft: die neue Lib braucht kein Symbol, das das vendoriert gebaute libggml-base (02.11.) nicht auch hat (45 ggml_-Importe, alle vorhanden); die Importe von libllama und libggml-cuda sind mit der neuen Lib genauso aufgeloest wie mit dem alten Stand, es kommt kein neues Symbol dazu; der Resolver moe_file_resolver liegt im vendorierten libllama an derselben Adresse (0x149bd0) wie im Fork-Build, also dieselbe ABI. Der erste Kopierversuch hat den Symlink des Build-Verzeichnisses statt der Datei kopiert und damit einen toten Symlink im Worker hinterlassen - das Skript kopiert jetzt mit -L und prueft die Ziel-Datei.
+
+**Im laufenden Dienst gemessen (Produktions-A/B/A).** Der Worker im Dienst laeuft mit dem echten Rezept (RAM-Lock 12 GiB, Hot-Set S=12, FADVISE an); die Messung lief direkt am Worker-Port 18080, weil der Router bei den Chat-Werkzeugen in eine Schleife laeuft und den Vergleich gestoert haette. Je Arm Dienstneustart, Worker ueber den Preload-Endpunkt geladen, dann drei Anfragen mit dem Benchmark-Prompt "go" (256 Tokens, greedy, Cache-Waerme wie im Dienst).
+
+| Produktions-A/B/A | 1. Anfrage | 2. Anfrage | 3. Anfrage | Mittel 2+3 | Ausgabe-SHA |
+|---|---|---|---|---|---|
+| nur Hinweise (Schalter 0) | 8,39 | 11,99 | 12,65 | **12,32** | 8510841615eb2a81 |
+| Touch-Pass (Schalter 1) | 7,64 | 11,16 | 10,52 | 10,84 | 8510841615eb2a81 |
+| nur Hinweise (Schalter 0) | 9,06 | 12,28 | 12,32 | **12,30** | 8510841615eb2a81 |
+
+  Die beiden Hinten-Arme liegen bei 12,32 und 12,30 t/s, der Touch-Pass-Arm bei 10,84 t/s: **+13,6 %** gegen den eingeklammerten Mittelarm, mit identischem Text in allen neun Anfragen (SHA 8510841615eb2a81, derselbe Wert wie in den Messarmen und im Sandbox-Test). Die erste Anfrage nach dem Neustart ist immer langsamer, weil der Cache erst gefuellt wird - die Folgeanfrage ist der Zustand, der im Dienst zaehlt.
+
+Messprogramme: `tools/round10.sh` (Varianten des Fault-Pfads, Decode und Prefill), `tools/round11.sh` (Verifikation der Schwelle), `tools/round12.sh` bis `tools/round15.sh` (Ausreisser, Zustandsvergleich und der finale A/B/A-Vergleich), `tools/summarize_round89.py` (t/s, SSD-Rate, Queue-Depth, Temperatur je Arm), `tools/vendor_fault_switch.sh` (gezieltes Kopieren der Bibliothek in den Worker).
+
+# Die Fault-Phase trennt I/O und Rechnen: ohne sie +18 % Decode, aber -56 % Prefill vom 2026-11-07
+
+**Ergebnis: der Decode wartet nicht an der SSD, sondern an der Barriere hinter der Fault-Phase. Abschalten der expliziten Fault-Phase (`GGML_CPU_EXPERT_READAHEAD=0`) bringt gepaart +18,2 % Decode (8,33 gegen 7,01 und 7,08 t/s, Ausgabe-SHA in allen Armen identisch), kostet aber im Prefill 56 % (14,4 gegen 32,8 t/s). Der Unterschied ist die Queue-Depth: die `posix_fadvise(WILLNEED)`-Hinweise der Fault-Phase fuellen die Device-Queue (qd 205, 818 MB/s), der bedarfsgesteuerte Kernel-Readahead laesst sie leer (qd 3,8, 419 MB/s). Im Decode ist die tiefe Queue kein Vorteil, weil die Barriere hinter der Fault-Phase das Rechnen erst nach dem Nachladen beginnen laesst; im Prefill ist sie der ganze Unterschied. Die beiden anderen Kandidaten sind damit tot: der VRAM-Hot-Set kann die Cold-Slabs strukturell nicht abdecken (Top-12 trifft 23,1 %, Top-16 26,4 %, Top-32 36,7 % der Selektionen), und der RAM-Lock haelt die falschen Experten fest (die fehlenden Slabs sinken nur von 20,59 % auf 19,62 %). Der Arbeitssatz des Decodes ist 55 bis 64 GiB bei 30 GiB RAM - der Decode ist ein Streaming-Workload, und die Frage ist nur, wie die Schreibspitze behandelt wird.**
+
+| Decode Runde 8 (MEAN tg, go/code/essay, 256 Token je Prompt) | tg t/s | go | code | essay | SSD MB/s | qd | fehlende Slabs |
+|---|---|---|---|---|---|---|---|
+| Basis A | 7,01 | 8,21 | 6,29 | 6,54 | 862 | 7,13 | 21,08 % |
+| **ohne Fault-Phase** | **8,33** | **10,17** | **7,46** | **7,37** | 810 | 3,28 | - |
+| Basis B | 7,08 | 7,88 | 6,65 | 6,73 | 870 | 6,27 | 20,69 % |
+
+  Die Fault-Phase ist der Block in `ggml_compute_forward_moe_cold`, der vor der Rechnung die Cold-Slabs prueft (`mincore`), dem Geraet die Reads vorlaeuft (`posix_fadvise(WILLNEED)` je 128-KiB-Chunk) und sie dann mit einem Touch-Pass einholt; danach kommt die Barriere. Der Arm ohne sie laesst den Kernel die Slabs beim Zugriff nachladen. Beide Basisarme stimmen auf 7,01 und 7,08 t/s, der Variantenarm liegt zwischen ihnen: **+18,2 % gegen Basis A, +17,7 % gegen Basis B** - der Unterschied ist also nicht der thermische Drift, den der Arm zwischen zwei Basen eingeklammert hat. Die Ausgabe-SHAs sind in allen drei Armen identisch (`8510841615eb2a81`, `5f8f0f8d01004f3b`, `2ba13b0b87b14003`): der Eingriff aendert nur den I/O-Pfad, nicht die Rechnung.
+
+| Prefill Runde 9 (5192 Token, Cache vor dem Arm geleert) | pp t/s | SSD MB/s | IOPS | qd | Ausgabe-SHA |
+|---|---|---|---|---|---|
+| Fault-Phase an | **32,8** | 817,9 | 7.142 | **205,5** | a8933235e37195a3 |
+| Fault-Phase aus | 14,4 | 418,8 | 48.487 | 3,84 | a8933235e37195a3 |
+
+  Der Prefill braucht die Hinweisphase, weil sie die Geraete-Queue tief fuellt: ein Prefill-Batch beruehrt je Layer fast alle 512 Experten, die Hinweise legen die Reads des ganzen Layers vor, und das Geraet laeuft mit 818 MB/s. Ohne die Hinweise bleibt die Queue bei qd 3,8, das Geraet liefert nur 419 MB/s, und der Prefill braucht 1,8-mal so lange. Im Decode ist es umgekehrt: dort beruehrt ein Knoten nur acht Experten, die Queue ist mit den Hinweisen nicht tiefer als mit dem Kernel, und die Barriere kostet die Ueberlappung von I/O und Rechnen. **Der Hebel ist deshalb nicht "Fault-Phase an" oder "aus", sondern "welche Phase fuer welche Knotengroesse"** - genau das setzt der Eingriff in Runde 10 um.
+
+**Der VRAM-Hot-Set ist als Hebel tot - offline geprueft, ohne Messlauf.** Das Chat-Profil des Rezepts (14 agollm-Prompts, 3,3k Tokens, 479 verschiedene Experten je Layer) deckt mit den Top-12 je Layer 23,1 % der Selektionen. Das Profil aus dem Benchmark selbst (`LLAMA_EXPERT_USAGE`, `LLAMA_EXPERT_USAGE_MODE=session`) deckt 22,7 % - **die Heat-Datei ist also fast optimal, es gibt nichts zu verbessern**. Selbst das Profil trifft den Nachbarprompt nur zu 12,8 %, weil Lings Routing sehr flach ist: 512 Experten, Top-8, und die Verteilung hat kaum eine Zipf-Form.
+
+| S (Slots je Layer) | Abdeckung der Selektionen | VRAM-Bedarf | erreichbar? |
+|---|---|---|---|
+| 8 | 19,1 % | 1,06 GiB | ja |
+| 12 (Auto-Fit) | 23,1 % | 1,60 GiB | ja |
+| 16 | 26,4 % | 2,13 GiB | nein: 2,13 GB frei, 2,27 GiB noetig |
+| 32 | 36,7 % | 4,26 GiB | nein |
+| 64 | 51,3 % | 8,51 GiB | nein |
+
+  Der Auto-Fit sitzt bei S=12 (`init: AUTO-FIT ENGINE -> set S = 12 (Free VRAM: 2.13 / 5.61 GB, per-slot size: 136.23 MB)`), und der geklemmte S=16-Arm aus Runde 6 (6,96 t/s) ist deshalb sinnlos: selbst S=16 bruechte nur 26,4 % Abdeckung, und S=16 passt nicht in den VRAM. Der Versuch mit einem zum Benchmark passenden Heat-Profil (`LLAMA_EXPERT_HOT=profiles/profile_bench.csv`, Abdeckung 22,7 %) brachte 7,16 t/s gegen 7,01 und 7,08 der Basis - keine Wirkung, dazu ein **anderer Ausgabe-SHA** (`e53738a670b758a9` statt `8510841615eb2a81`): die Ausgabe haengt am VRAM-Hot-Set, weil die heissen Experten auf der GPU und die kalten auf der CPU gerechnet werden, und das Rundungsunterschied ist. Ein Profilwechsel ist damit keine Messung mit identischer Ausgabe, sondern ein anderes Modell im Wortlaut.
+
+**Der RAM-Lock haelt die falschen Experten fest.** Der Lock nimmt die 94 Experten mit dem hoechsten Seed-Score (die besten nach dem Chat-Profil) und haelt 12,04 GiB mit `mlock` im RAM. Der Decode verlangt aber gerade die *anderen* Experten: die fehlenden Slabs sinken nur von 20,59 % auf 19,62 %, die Wanduhr von 7,02 auf 7,09 t/s (+1,0 %, innerhalb der Drift). Zum Vergleich: der Prefill braucht den Lock (+15,3 %), weil dort dieselben Experten wiederholt werden.
+
+**Der Arbeitssatz des Decodes ist grosser als der RAM.** Das Benchmark-Profil zaehlt 16.537 Experten-Layer mit je 3,41 MB (136,23 MB je Slot ueber alle 40 Layer) = **55,0 GiB**; das Chat-Profil 19.156 = 63,7 GiB. Der RAM hat 30 GiB, davon rund 26 GiB Page-Cache. Der Decode kann den Arbeitssatz also nicht einloesen, er streamt - die Frage ist nur, ob das Geraet die Spitze vertraegt.
+
+| Thread-Sweep Runde 9 (Decode, Fault-Phase aus) | tg t/s |
+|---|---|
+| 8 Threads | 6,41 und 7,66 (zwei Arme, gleiche Konfiguration) |
+| 12 Threads | 5,39 |
+| 16 Threads | 2,8 (abgebrochen) |
+
+  Die Maschine hat 8 physische Kerne (16 logische CPUs, `nproc` = 16). Mehr Threads als physische Kerne machen den Decode langsamer, nicht schneller - die I/O-Wartezeit laesst sich mit den Rechenkernen nicht beliebig ueberdecken, und SMT kostet Rechenleistung. **Der Rezeptwert 8 bleibt richtig.** Der Sweep zeigt zugleich die Messunsicherheit dieser Maschine: derselbe Arm liefert 6,41 und 7,66 t/s (Tctl zwischen 94 und 105 Grad). Nur gepaarte Vergleiche zaehlen, die Absolutwerte sind ohne Belastung des Rezeptes zu pessimistisch.
+
+Messprogramme: `tools/round8.sh` (Decode-Varianten), `tools/round9.sh` (Prefill-A/B und Thread-Sweep), `tools/heat_coverage.py` und `tools/heat_cross.py` (Abdeckung der Heat-Dateien offline, ohne Messlauf), `tools/summarize_round89.py` (t/s, SSD-Rate, Queue-Depth je Arm). Die Rohdaten liegen in `runs/r8d-*/` und `runs/r9d-*/`, `runs/r9p-*/`; das Benchmark-Profil in `profiles/profile_bench.csv`.
+
 # Decode-Phasen: der Decode wartet auf den langsamsten Thread, nicht auf die SSD vom 2026-11-07
 
 **Ergebnis: Lings Decode verbringt 75,9 % der kalten Knotenzeit mit Warten und nur 24,1 % mit Rechnen - aber die nachweisbare SSD-Wartezeit ist davon nur rund ein Zehntel. Die restlichen gut 80 ms je Token entstehen an der Barriere nach der Fault-Phase, weil die kalten Experten-Slabs statisch round-robin auf die acht Threads verteilt werden: der Thread mit den kaltesten Slots wartet, die anderen warten auf ihn. Das erklaert im Nachhinein alle bisherigen Negativbefunde im Decode (RAM-Lock, Async, Cache-Ram, groesserer Hot-Set): sie machen die wartenden Threads schneller, aber sie aendern nicht das Maximum. Der Hebel ist die Verteilung der Fault-Arbeit, nicht die SSD und nicht die Rechenzeit - ein umrissener Codeeingriff in `ggml_fault_expert_slabs`.**

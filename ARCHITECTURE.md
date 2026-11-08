@@ -74,6 +74,27 @@ the same per-layer count buffer.
 
 All three are registered ggml CPU ops with explicit get_n_tasks cases.
 
+d) FAULT PHASE (opt-in, GGML_CPU_EXPERT_READAHEAD=1). Before the cold experts
+are computed, every thread checks the residency of its own experts (mincore
+over the expert slab) and hints the device for the missing ones
+(posix_fadvise(WILLNEED) in 128 KiB chunks, or madvise without a file
+descriptor). A second pass touches the missing slabs so the compute finds them
+in RAM. The hints fill the device queue (measured qd 205 in the prefill
+against 3.8 without them, 818 against 419 MB/s), which is what the prefill
+needs; in the decode the barrier after the fault phase separates the I/O from
+the compute and costs about 18 % of the decode rate. Three switches tune it,
+all with the previous behaviour as default:
+
+- GGML_CPU_EXPERT_FAULT_DYNAMIC=1: the missing slabs are written into a
+  shared list and taken from it over an atomic index, so the device reads are
+  spread evenly over the threads instead of following the round-robin over
+  the expert indices.
+- GGML_CPU_EXPERT_FAULT_TOUCH=0: only the residency check and the hints, no
+  touch pass. The compute pulls the slabs in, so the I/O overlaps the compute.
+- GGML_CPU_EXPERT_FAULT_MIN_TOKENS=N: the explicit fault phase only for nodes
+  with at least N tokens. The prefill (2048 tokens per ubatch) keeps the
+  phase, the decode (one or two tokens per node) does without it.
+
 ## 4. Hardware-aware auto-fit
 
 Three-stage init at context creation:
@@ -96,7 +117,7 @@ offload, np=1, and threads.
 
 Graphs are built once and reused, so the learning hook is not in the graph:
 it runs after each graph_compute at ubatch granularity. The hook runs only
-after a full scheduler synchronize (graph_compute is async — swapping
+after a full scheduler synchronize (graph_compute is async - swapping
 buffers that an in-flight graph reads causes corruption).
 
 - Counting: the cold kernels increment counts[expert] (plus a total); the
@@ -132,12 +153,12 @@ Intermediate cache tier between VRAM and mmap. Per-layer contiguous blocks,
 one slot = one expert x all its tiered tensors (64B-aligned slices).
 
 - ptrs table (i64[n_expert]): each entry is the full memory address of that
-  expert's weight slice — pool slot if resident, else mmap fallback address.
+  expert's weight slice - pool slot if resident, else mmap fallback address.
   Cold ops read weights through ptrs transparently.
 - Fill: hottest non-pooled cold expert by score, memcpy from mmap into a free
   pool slot, then DONTNEED the mmap range (pool = sole resident copy).
   Fill budget: 16 MiB per layer per update() call (v3 fix: per-layer, not
-  global — v2's global budget starved layers 6+).
+  global - v2's global budget starved layers 6+).
 - Eviction: same hysteresis as hot tier (dwell >= 32, score > 1.5x coldest
   pooled). After eviction, ptrs[e] restored to mmap fallback.
 - Promotion: when a pooled expert becomes hot, the H2D copy reads from the
@@ -147,7 +168,7 @@ one slot = one expert x all its tiered tensors (64B-aligned slices).
   score are pre-filled into the pool at init.
 - Page hints (LLAMA_EXPERT_MADVISE, default 1): madvise(DONTNEED) on mmap
   pages after pool fill; madvise(WILLNEED) on demotion back to cold.
-  Gated by weights_discardable() — only mmap-backed, non-mlocked weights.
+  Gated by weights_discardable() - only mmap-backed, non-mlocked weights.
   Frees ~5.4 GiB VmRSS on 35B models.
 
 ## 7. Pre-gated predictive prefetch (LLAMA_EXPERT_PREDICT, LLAMA_EXPERT_PREFETCH_GB)
@@ -170,7 +191,7 @@ mehr Bytes von der SSD liest, ohne die Wanduhr zu gewinnen (Messung vom
 2026-11-06). Der urspruengliche Text folgt zur Historie.
 
 Pre-gate predictor: runs layer L+1's exact router on layer L's hidden state
-(one step ahead of demand). No learned parameters — the model's own gating
+(one step ahead of demand). No learned parameters - the model's own gating
 function applied early. Norm reconstruction is exact: norm_{L+1} * (x / norm_L),
 eps-guarded for zeroed REAP weights.
 
@@ -181,7 +202,7 @@ eps-guarded for zeroed REAP weights.
 Speculative pool (LLAMA_EXPERT_PREFETCH_GB): separate from the demand pool.
 Worker threads drain the prediction queue mid-step: claim FREE spec slots
 via CAS (FREE->FILLING), memcpy from mmap, release-store READY. Cold ops
-probe READY slots via moe_cold_addr — hit costs one atomic load, miss falls
+probe READY slots via moe_cold_addr - hit costs one atomic load, miss falls
 back to ptrs/mmap transparently. byte-identical correctness.
 
 - State machine: 0 FREE / 1 FILLING / 2 READY / 3 RESIDENT.
@@ -191,7 +212,7 @@ back to ptrs/mmap transparently. byte-identical correctness.
 - Env: LLAMA_EXPERT_PREFETCH_THREADS (default 2), LLAMA_EXPERT_PREFETCH_MB
   (default 64 MiB in-flight cap).
 
-## 8. Learned router heads (NEXT — DESIGN.md sec 13)
+## 8. Learned router heads (NEXT - DESIGN.md sec 13)
 
 **Stand 2026-11-07: `LLAMA_EXPERT_TRACEX` gibt es nicht mehr**, der Dump-Schalter
 heisst `LLAMA_EXPERT_TRACE` (Routing-IDs pro Graph) und `LLAMA_EXPERT_USAGE`
@@ -201,7 +222,7 @@ der Pre-Gate-Predictor aus Abschnitt 7 rechnet weiterhin mit exaktem Router.
 Per-layer MLP heads trained on frozen hidden states to predict P(expert
 fires). Replaces the stateless pre-gate exact-router lookahead with learned
 scores. Persisted per-model to disk. Training uses LLAMA_EXPERT_TRACEX dumps
-— offline, single pass, consumer-GPU feasible. No backprop through the base
+- offline, single pass, consumer-GPU feasible. No backprop through the base
 model.
 
 ## 9. Integration invariants

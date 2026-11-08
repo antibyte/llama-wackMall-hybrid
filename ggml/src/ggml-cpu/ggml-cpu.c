@@ -1782,8 +1782,89 @@ static bool ggml_expert_readahead_enabled(void) {
 #endif
 }
 
+// Dynamic hand-out of the missing slabs (GGML_CPU_EXPERT_FAULT_DYNAMIC=1).
+//
+// The static round-robin gives every thread the same number of experts, but
+// not the same amount of work: a slab that is missing in the page cache costs
+// a device read, a resident one does not. The barrier after the fault phase
+// therefore waits for the thread that drew the slow slabs.
+//
+// With the dynamic path the threads first check the residency of their own
+// experts and write every missing slab into a shared list. After a barrier
+// they take the missing slabs from that list one by one, so the device reads
+// are spread evenly over the threads and the barrier waits for the average
+// instead of the slowest thread.
+//
+// The lists are reset by the caller (thread 0, before the barrier that
+// publishes the expert selection), one list per weight tensor of the node.
+#define GGML_MOE_FAULT_LISTS      3
+#define GGML_MOE_FAULT_MAX_EXPERTS 1024
+
+static struct {
+    atomic_uint count;  // missing slabs written by the residency check
+    atomic_uint next;   // hand-out index of the touch phase
+    uint32_t   expert[GGML_MOE_FAULT_MAX_EXPERTS];
+} g_fault_slab_list[GGML_MOE_FAULT_LISTS];
+
+static void ggml_fault_slab_list_reset(int slots) {
+    for (int s = 0; s < slots; ++s) {
+        atomic_store_explicit(&g_fault_slab_list[s].count, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_fault_slab_list[s].next,  0, memory_order_relaxed);
+    }
+}
+
+static bool ggml_expert_fault_dynamic(void) {
+    static atomic_int enabled = -1;
+    int value = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (value < 0) {
+        const char * env = getenv("GGML_CPU_EXPERT_FAULT_DYNAMIC");
+        value = env != NULL && atoi(env) != 0;
+        atomic_store_explicit(&enabled, value, memory_order_relaxed);
+    }
+    return value != 0;
+}
+
+// GGML_CPU_EXPERT_FAULT_MIN_TOKENS: the explicit fault phase pays off when a
+// node touches many experts (the prefill). There the hints queue the reads
+// deep, the device stays busy and the fault phase runs once per big batch.
+// A decode node touches about eight experts; there the barrier after the fault
+// phase makes every layer wait for the slowest read, while the kernel reads
+// the slabs on demand and overlaps the I/O with the compute. With a threshold
+// above one the explicit phase is skipped for such nodes.
+static int ggml_expert_fault_min_tokens(void) {
+    static atomic_int value = -1;
+    int v = atomic_load_explicit(&value, memory_order_relaxed);
+    if (v < 0) {
+        const char * env = getenv("GGML_CPU_EXPERT_FAULT_MIN_TOKENS");
+        v = env != NULL ? atoi(env) : 0;
+        if (v < 0) {
+            v = 0;
+        }
+        atomic_store_explicit(&value, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+// GGML_CPU_EXPERT_FAULT_TOUCH=0: only the residency check and the device
+// hints, no touch pass. The hints queue the reads deep (measured queue depth
+// 205 with them against 3.8 without them in the prefill, the device rate
+// 818 against 419 MB/s), but the slabs are pulled in by the compute itself:
+// the I/O overlaps the compute instead of being separated from it by the
+// barrier at the end of the fault phase.
+static int ggml_expert_fault_touch(void) {
+    static atomic_int value = -1;
+    int v = atomic_load_explicit(&value, memory_order_relaxed);
+    if (v < 0) {
+        const char * env = getenv("GGML_CPU_EXPERT_FAULT_TOUCH");
+        v = env != NULL ? atoi(env) : 1;
+        atomic_store_explicit(&value, v, memory_order_relaxed);
+    }
+    return v != 0;
+}
+
 static void ggml_fault_expert_slabs(
-        const void * base, size_t stride, const int64_t * counts, int n_expert, int ith, int nth) {
+        const void * base, size_t stride, const int64_t * counts, int n_expert, int ith, int nth,
+        ggml_threadpool_t tp, int slot) {
 #if defined(__linux__)
     if (base == NULL || counts == NULL || nth <= 0 || stride < 4096 || stride > ((size_t) 8 << 20)) {
         return;
@@ -1813,49 +1894,93 @@ static void ggml_fault_expert_slabs(
     if (g_moe_file_resolver) {
         g_moe_file_resolver(base, &fd, &file_offset);
     }
-    for (int pass = 0; pass < 2; ++pass) {
-        if (pass == 1) {
-            t_touch = ggml_time_us();
+    // The dynamic path hands the missing slabs out over a shared index, the
+    // static path keeps the round-robin over the expert indices.
+    const bool dynamic = ggml_expert_fault_dynamic() && slot >= 0 && slot < GGML_MOE_FAULT_LISTS;
+
+    // Phase 0: every thread checks the residency of its own experts and hints
+    // the device for the missing ones. The hint is issued before the barrier,
+    // so the device reads while the other threads still check.
+    for (int e = ith; e < n_expert; e += nth) {
+        if (counts[e] == 0) {
+            continue;
         }
+        const uintptr_t addr = (uintptr_t) base + (size_t) e * stride;
+        n_checked++;
+        if (ggml_slab_recently_resident(addr, now)) {
+            continue;
+        }
+        const uintptr_t start = addr & ~(page - 1);
+        const uintptr_t end = (addr + stride + page - 1) & ~(page - 1);
+        unsigned char vec[2048];
+        const size_t n_pages = (end - start) / page;
+        if (n_pages <= sizeof(vec) && mincore((void *) start, end - start, vec) == 0) {
+            size_t i = 0;
+            while (i < n_pages && (vec[i] & 1)) {
+                ++i;
+            }
+            if (i == n_pages) {
+                ggml_slab_mark_resident(addr, now);
+                continue;
+            }
+        }
+        n_missing++;
+        if (fd >= 0) {
+            for (uintptr_t c = start; c < end; c += chunk) {
+                const uint64_t len = MIN(chunk, end - c);
+                posix_fadvise(fd, file_offset + (c - (uintptr_t) base), len, POSIX_FADV_WILLNEED);
+            }
+        } else {
+            for (uintptr_t c = start; c < end; c += chunk) {
+                madvise((void *) c, MIN(chunk, end - c), MADV_WILLNEED);
+            }
+        }
+        if (dynamic) {
+            const uint32_t idx = atomic_fetch_add_explicit(&g_fault_slab_list[slot].count, 1, memory_order_relaxed);
+            if (idx < GGML_MOE_FAULT_MAX_EXPERTS) {
+                g_fault_slab_list[slot].expert[idx] = e;
+            }
+        }
+    }
+
+    if (dynamic) {
+        // Phase 1: the missing slabs are taken from the shared list one by one,
+        // so a thread that drew a slow slab does not hold up the other threads.
+        t_touch = ggml_time_us();
+        if (ggml_expert_fault_touch()) {
+            ggml_barrier(tp);
+            const uint32_t count = atomic_load_explicit(&g_fault_slab_list[slot].count, memory_order_relaxed);
+            uint32_t idx;
+            while ((idx = atomic_fetch_add_explicit(&g_fault_slab_list[slot].next, 1, memory_order_relaxed)) < count) {
+                const int e = (int) g_fault_slab_list[slot].expert[idx];
+                const uintptr_t addr = (uintptr_t) base + (size_t) e * stride;
+                if (ggml_slab_recently_resident(addr, now)) {
+                    continue;
+                }
+                const uintptr_t start = addr & ~(page - 1);
+                const uintptr_t end = (addr + stride + page - 1) & ~(page - 1);
+                const volatile unsigned char * bytes = (const volatile unsigned char *) start;
+                unsigned char acc = 0;
+                for (size_t off = 0; off < (size_t) (end - start); off += page) {
+                    acc |= bytes[off];
+                }
+                __asm__ __volatile__("" : "+r"(acc) :: "memory");
+                ggml_slab_mark_resident(addr, now);
+            }
+        }
+    } else if (ggml_expert_fault_touch()) {
+        // Phase 1: every thread touches the missing slabs of its own experts.
+        t_touch = ggml_time_us();
         for (int e = ith; e < n_expert; e += nth) {
             if (counts[e] == 0) {
                 continue;
             }
             const uintptr_t addr = (uintptr_t) base + (size_t) e * stride;
-            if (pass == 0) {
-                n_checked++;
-            }
             if (ggml_slab_recently_resident(addr, now)) {
                 continue;
             }
             const uintptr_t start = addr & ~(page - 1);
             const uintptr_t end = (addr + stride + page - 1) & ~(page - 1);
-            if (pass == 0) {
-                unsigned char vec[2048];
-                const size_t n_pages = (end - start) / page;
-                if (n_pages <= sizeof(vec) && mincore((void *) start, end - start, vec) == 0) {
-                    size_t i = 0;
-                    while (i < n_pages && (vec[i] & 1)) {
-                        ++i;
-                    }
-                    if (i == n_pages) {
-                        ggml_slab_mark_resident(addr, now);
-                        continue;
-                    }
-                }
-                n_missing++;
-                if (fd >= 0) {
-                    for (uintptr_t c = start; c < end; c += chunk) {
-                        const uint64_t len = MIN(chunk, end - c);
-                        posix_fadvise(fd, file_offset + (c - (uintptr_t) base), len, POSIX_FADV_WILLNEED);
-                    }
-                } else {
-                    for (uintptr_t c = start; c < end; c += chunk) {
-                        madvise((void *) c, MIN(chunk, end - c), MADV_WILLNEED);
-                    }
-                }
-                continue;
-            }
             const volatile unsigned char * bytes = (const volatile unsigned char *) start;
             unsigned char acc = 0;
             for (size_t off = 0; off < (size_t) (end - start); off += page) {
@@ -1864,6 +1989,10 @@ static void ggml_fault_expert_slabs(
             __asm__ __volatile__("" : "+r"(acc) :: "memory");
             ggml_slab_mark_resident(addr, now);
         }
+    } else {
+        // No touch pass: the compute pulls the slabs in, the hints above have
+        // already queued the reads.
+        t_touch = ggml_time_us();
     }
     if (n_checked > 0) {
         atomic_fetch_add_explicit(&g_fault_checked, n_checked, memory_order_relaxed);
@@ -1874,6 +2003,7 @@ static void ggml_fault_expert_slabs(
     }
 #else
     (void) base; (void) stride; (void) counts; (void) n_expert; (void) ith; (void) nth;
+    (void) tp; (void) slot;
 #endif
 }
 
@@ -2021,6 +2151,7 @@ static void ggml_compute_forward_mul_mat_id(
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        ggml_fault_slab_list_reset(1);
 
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
@@ -2047,8 +2178,8 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
-    if (ggml_expert_readahead_enabled()) {
-        ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth);
+    if (ggml_expert_readahead_enabled() && ids->ne[1] >= ggml_expert_fault_min_tokens()) {
+        ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth, params->threadpool, 0);
         ggml_barrier(params->threadpool);
     }
 
@@ -2206,6 +2337,7 @@ static void ggml_compute_forward_mul_mat_id_cold(
 
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        ggml_fault_slab_list_reset(1);
 
         // group rows by src0 matrix, skipping hot experts
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
@@ -2232,8 +2364,8 @@ static void ggml_compute_forward_mul_mat_id_cold(
 
     ggml_barrier(params->threadpool);
 
-    if (ggml_expert_readahead_enabled()) {
-        ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth);
+    if (ggml_expert_readahead_enabled() && ids->ne[1] >= ggml_expert_fault_min_tokens()) {
+        ggml_fault_expert_slabs(src0->data, nb02, matrix_row_counts, n_as, ith, nth, params->threadpool, 0);
         ggml_barrier(params->threadpool);
     }
 
@@ -2464,6 +2596,7 @@ static void ggml_compute_forward_moe_cold(
     if (ith == 0) {
         memset(dst->data, 0, ggml_nbytes(dst));
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        ggml_fault_slab_list_reset(GGML_MOE_FAULT_LISTS);
 
         int32_t * cnt = counts ? (int32_t *) counts->data : NULL;
 
@@ -2541,12 +2674,12 @@ static void ggml_compute_forward_moe_cold(
     }
 
     ggml_barrier(params->threadpool);
-    if (ggml_expert_readahead_enabled()) {
-        ggml_fault_expert_slabs(w_gate->data, w_gate->nb[2], matrix_row_counts, n_as, ith, nth);
+    if (ggml_expert_readahead_enabled() && n_tokens >= ggml_expert_fault_min_tokens()) {
+        ggml_fault_expert_slabs(w_gate->data, w_gate->nb[2], matrix_row_counts, n_as, ith, nth, params->threadpool, 0);
         if (w_up != w_gate) {
-            ggml_fault_expert_slabs(w_up->data, w_up->nb[2], matrix_row_counts, n_as, ith, nth);
+            ggml_fault_expert_slabs(w_up->data, w_up->nb[2], matrix_row_counts, n_as, ith, nth, params->threadpool, 1);
         }
-        ggml_fault_expert_slabs(w_down->data, w_down->nb[2], matrix_row_counts, n_as, ith, nth);
+        ggml_fault_expert_slabs(w_down->data, w_down->nb[2], matrix_row_counts, n_as, ith, nth, params->threadpool, 2);
         ggml_barrier(params->threadpool);
     }
     if (profile_phases) {
