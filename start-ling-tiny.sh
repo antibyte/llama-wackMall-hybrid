@@ -77,8 +77,8 @@ N_PREDICT="32768"  # CLI/server generation limit; API requests may impose a lowe
 #   q4_0/q4_0         = lower VRAM
 #   turbo4_k/turbo4_k = Qwen/DFlash path; keep off for Ling MLA
 # Nur die beiden folgenden Zeilen aendern; Turbo4-Guards nur bei turbo4_k auf 1.
-TARGET_TYPE_K="q8_0"  # Ling target K cache
-TARGET_TYPE_V="q8_0"  # Ling target V cache
+TARGET_TYPE_K="f16"  # Ling target K cache; f16 skips the per-token q8_0->f16 conversion of the MLA cache and takes GGML_CUDA_FA_MLA_DEC (+25 MiB)
+TARGET_TYPE_V="f16"  # Ling target V cache (a view of K for MLA)
 DRAFT_TYPE_K="q8_0"  # unused while SPEC_MODE=ngram
 DRAFT_TYPE_V="q8_0"  # unused while SPEC_MODE=ngram
 LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy; inert with q8_0 KV
@@ -248,10 +248,16 @@ GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS="0"  # independent warp-row kernels did not
 GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y="0"  # shared Q8_1 unpack was exact but slightly slower on sm_75
 GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS="4"  # Q6_K output projection, multi-token verify graph
 GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS="4"
+GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS="4"  # routed Q6_K experts (K=512), 0 = one row per block; +1.5..2.8 % decode
 GGML_CUDA_MMVQ_MOE_FUSED_ROWS="0"  # fused MoE rows/block sweep was neutral or slower
 GGML_CUDA_MMVQ_MOE_PLAIN_ROWS="0"  # plain MoE rows/block sweep was neutral or slower
 GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE="128"  # start1660 / Ling
 GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0="1"  # start1660 / Ling
+GGML_CUDA_CPY_2D_MIN_ROW_BYTES="64"  # narrower strided copies (GDN conv state) take the copy kernel, 0 = always cudaMemcpy2DAsync; +2.5 %
+GGML_CUDA_TOPK_MOE_GROUPED_FAST="1"  # register-only grouped top-k, same ids; +1.4 %
+GGML_CUDA_FA_MLA_DEC="1"  # MLA decode attention kernel for F16 KV instead of the tile kernel; +8.4 % at 7.5k context
+GGML_CUDA_FA_MLA_DEC_MAX_TOKENS="32"  # query tokens up to which the MLA decode kernel runs (faster than tile up to 32)
+GGML_CUDA_FA_MLA_DEC_MIN_ROWS="32"  # fewest KV rows per block
 GGML_CUDA_ASYNC_HOST_COPY="1"  # pinned split H2D
 GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate
 GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner
@@ -368,10 +374,16 @@ case "$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS" in 0|2|4|8|16) ;; *) die "GGML_CUDA
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y" in 0|1) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS" in 0|1|4) ;; *) die "GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS muss 0, 1 oder 4 sein." ;; esac
+case "$GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_MOE_FUSED_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_MOE_FUSED_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_MMVQ_MOE_PLAIN_ROWS" in 0|1|2|4) ;; *) die "GGML_CUDA_MMVQ_MOE_PLAIN_ROWS muss 0, 1, 2 oder 4 sein." ;; esac
 case "$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE" in 0|32|64|128|256) ;; *) die "GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE muss 0, 32, 64, 128 oder 256 sein." ;; esac
 case "$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0" in 0|1) ;; *) die "GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 muss 0 oder 1 sein." ;; esac
+[[ "$GGML_CUDA_CPY_2D_MIN_ROW_BYTES" =~ ^[0-9]+$ ]] || die "GGML_CUDA_CPY_2D_MIN_ROW_BYTES muss eine Byte-Zahl >= 0 sein."
+case "$GGML_CUDA_TOPK_MOE_GROUPED_FAST" in 0|1) ;; *) die "GGML_CUDA_TOPK_MOE_GROUPED_FAST muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_FA_MLA_DEC" in 0|1) ;; *) die "GGML_CUDA_FA_MLA_DEC muss 0 oder 1 sein." ;; esac
+[[ "$GGML_CUDA_FA_MLA_DEC_MAX_TOKENS" =~ ^[0-9]+$ ]] || die "GGML_CUDA_FA_MLA_DEC_MAX_TOKENS muss eine Zahl >= 0 sein."
+[[ "$GGML_CUDA_FA_MLA_DEC_MIN_ROWS" =~ ^[0-9]+$ ]] || die "GGML_CUDA_FA_MLA_DEC_MIN_ROWS muss eine Zahl >= 0 sein."
 case "$GGML_CUDA_ASYNC_HOST_COPY" in 0|1) ;; *) die "GGML_CUDA_ASYNC_HOST_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_ASYNC_D2H_COPY" in 0|1) ;; *) die "GGML_SCHED_ASYNC_D2H_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_DEDUP_DST_SYNC" in 0|1) ;; *) die "GGML_SCHED_DEDUP_DST_SYNC muss 0 oder 1 sein." ;; esac
@@ -605,10 +617,16 @@ env_args=(
     "GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y"
     "GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS"
     "GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS=$GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS"
+    "GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS=$GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS"
     "GGML_CUDA_MMVQ_MOE_FUSED_ROWS=$GGML_CUDA_MMVQ_MOE_FUSED_ROWS"
     "GGML_CUDA_MMVQ_MOE_PLAIN_ROWS=$GGML_CUDA_MMVQ_MOE_PLAIN_ROWS"
     "GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE"
     "GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0"
+    "GGML_CUDA_CPY_2D_MIN_ROW_BYTES=$GGML_CUDA_CPY_2D_MIN_ROW_BYTES"
+    "GGML_CUDA_TOPK_MOE_GROUPED_FAST=$GGML_CUDA_TOPK_MOE_GROUPED_FAST"
+    "GGML_CUDA_FA_MLA_DEC=$GGML_CUDA_FA_MLA_DEC"
+    "GGML_CUDA_FA_MLA_DEC_MAX_TOKENS=$GGML_CUDA_FA_MLA_DEC_MAX_TOKENS"
+    "GGML_CUDA_FA_MLA_DEC_MIN_ROWS=$GGML_CUDA_FA_MLA_DEC_MIN_ROWS"
     "GGML_CUDA_ASYNC_HOST_COPY=$GGML_CUDA_ASYNC_HOST_COPY"
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
     "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"
@@ -718,6 +736,7 @@ llama-wackMall-hybrid start (ling-tiny)
   CUDA rows:    Q8n1=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS Q8n2=$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS Q8n3=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS Q8n5=$GGML_CUDA_MMVQ_Q8_NCOLS5_ROWS Q4n1=$GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS Q6n1=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS Q6n3=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS Q6n4=$GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS
   Q6 probes:    warps=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS warp-rows=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS reuse-y=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y
   CUDA concat:  flat-dim0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 block=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
+  CUDA decode:  q6k-ids-rows=$GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS cpy-2d-min=$GGML_CUDA_CPY_2D_MIN_ROW_BYTES topk-fast=$GGML_CUDA_TOPK_MOE_GROUPED_FAST mla-dec=$GGML_CUDA_FA_MLA_DEC (max-tokens=$GGML_CUDA_FA_MLA_DEC_MAX_TOKENS min-rows=$GGML_CUDA_FA_MLA_DEC_MIN_ROWS)
   split copies: async-h2d=$GGML_CUDA_ASYNC_HOST_COPY async-d2h=$GGML_SCHED_ASYNC_D2H_COPY dedup-dst-sync=$GGML_SCHED_DEDUP_DST_SYNC
   n-cpu-moe:    register-host=$GGML_CUDA_REGISTER_HOST prefetch-experts=$GGML_SCHED_PREFETCH_EXPERTS
   skip sentinel: $LLAMA_EXPERT_SKIP_SENTINEL (1=MMVQ early-exit on cold sentinel slots)
