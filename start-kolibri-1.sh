@@ -56,6 +56,11 @@ export LLAMA_ARG_DECISION_SEQS="${LLAMA_ARG_DECISION_SEQS:-0}"
 export LLAMA_MMAP_PREFETCH=0
 # Read missing expert slabs ahead in parallel before the CPU matmul touches them.
 export GGML_CPU_EXPERT_READAHEAD="${GGML_CPU_EXPERT_READAHEAD:-1}"
+# 2026-11-09 (Ling winners, A/B/A/B, same tokens): hints through the file and no touch pass,
+# so the compute pulls the slabs in and the reads overlap it. Kolibri:
+# decode +3.7 % (12 GiB lock), prefill of a 1k-token prompt +10 %.
+export LLAMA_EXPERT_FADVISE="${LLAMA_EXPERT_FADVISE:-1}"
+export GGML_CPU_EXPERT_FAULT_TOUCH="${GGML_CPU_EXPERT_FAULT_TOUCH:-0}"
 # Static hot set from profiles/kolibri-1-chat.csv; S is auto-fit unless LLAMA_EXPERT_S is set.
 # ADAPT=0 keeps CUDA graphs. A 256 MiB reserve left no room to regrow the
 # prefill buffer after decode; the server then fell back to ubatch 64.

@@ -1,3 +1,60 @@
+# Grosse Modelle: zweiter und dritter Experten-Prefetch-Slot im Prefill, Kolibri-Fault-Pfad vom 2026-11-09
+
+**Ergebnis: Der Prefill der 35B-MoE-Modelle mit DFlash-Draft (Qwen3.6, Clover) lief mit nur einem Prefetch-Slot fuer die Experten-Uploads ueber PCIe. Upload und Matmul wechselten sich deshalb strikt ab: Im nsys-Profil eines 3,4k-Prompts belegte die Kopie 5,96 s und die Kernels 4,8 s, ueberlappt haben sie sich nur 1,2 s. Mit 4 statt 8 Warm-Slots passt ein zweiter Slot: Prefill +15 bis +28 %, Decode -4 bis -5 % (Entscheidung des Nutzers: uebernommen). Nex und Sage hatten schon zwei Slots und bekommen ohne Decode-Preis einen dritten: Prefill bis +22 % bzw. +14 %. Kolibri uebernimmt die Ling-Sieger `LLAMA_EXPERT_FADVISE=1` und `GGML_CPU_EXPERT_FAULT_TOUCH=0`: Decode +3,7 bis +8,0 %, Prefill +10 bis +17 %. In allen Armen ist die Ausgabe-SHA innerhalb einer Konfiguration identisch.**
+
+| Prefill (t/s, Worker-Libs, Rezept vorher -> nachher) | ~2,6k Tokens | ~3,4k Tokens |
+|---|---|---|
+| Qwen3.6-35B-A3B (W8 -> W4, 1 -> 2 Slots) | 438 -> **562** | 339 -> **401** |
+| Clover-35B (W8 -> W4, 1 -> 2 Slots) | 439 -> **564** | ~345 -> **401** |
+| Nex-N2.5-mini (2 -> 3 Slots) | 553 -> **670** | 417 -> **464** |
+| Sage-A1.5 (2 -> 3 Slots) | 602 -> **664** | 421 -> **456** |
+
+**Warum nur ein Slot.** `ggml_backend_sched_prefetch_init` legt Slot 0 bei der Reservierung an, weitere Slots erst im ersten Prefill aus dem dann freien VRAM, und nur wenn `Slotgroesse + 256 MiB` frei sind. Der groesste Experten-Tensor von Qwen (Q6_K-`down` in einigen Layern) braucht 210 MiB. Mit S=20, W=8 und dem DFlash-Draft waren beim Anlegen nur 124 MiB frei (`expert prefetch reduced to 1 slot(s)`). Die Meldung nennt jetzt Slotgroesse, freien VRAM und Headroom. Die Zeitachse eines Layers (~149 ms) zeigt die Folge: Der Gate-Upload laeuft parallel zu Attention/GDN, der Up-Upload startet aber erst nach dem Gate-Matmul und der Down-Upload erst nach dem Up-Matmul. Holo4, Nex und Sage haben ohne Draft genug VRAM und liefen schon mit zwei Slots, Holo4 gleicher Bauart wie Qwen mit 614 statt 438 t/s.
+
+| Qwen gemischte Last (A/B/A/B, Prompts 1,1k/2,6k/3,4k/6,2k plus Decode 256 Tokens, Spekulation an) | A: W8, 1 Slot | B: W4, 2 Slots, Headroom 64 |
+|---|---|---|
+| Prefill 1,1k | 287 / 285 | 329 / 329 (**+15 %**) |
+| Prefill 2,6k | 438 / 437 | 563 / 560 (**+28 %**) |
+| Prefill 3,4k | 339 / 338 | 405 / 405 (**+20 %**) |
+| Prefill 6,2k (2 Ubatches) | 473 / 474 | 597 / 595 (**+26 %**) |
+| Decode-Mittel | 45,3 / 44,4 | 42,4 / 43,1 (**-4,7 %**) |
+| Decode ohne Spekulation (eigene A/B/A/B) | 37,1 / 36,7 | 36,1 / 34,7 (**-4,0 %**) |
+
+  Je Slot braucht es etwa vier Hot- oder Warm-Slots pro Layer (72,9 MiB je Slot ueber alle Layer). S=16 statt W4 kostete im Decode -3,4 % bei gleichem Prefill, W0 mit drei Slots brachte +45 % Prefill, scheiterte aber nach einigen Anfragen (siehe unten). Beispielrechnung fuer den Nutzer: 2,6k-Prompt plus 500 Tokens Antwort wird 0,8 s schneller, 1k-Prompt plus 900 Tokens Thinking 0,5 s langsamer.
+
+| Dritter Slot (nur im Prefill belegt, kein Decode-Preis) | 1,1k | 2,6k | 3,4k | 6,2k |
+|---|---|---|---|---|
+| Nex 2 -> 3 | 346 -> 361 | 553 -> 674 (**+22 %**) | 417 -> 463 | 604 -> 723 (**+20 %**) |
+| Sage 2 -> 3 | 334 -> 334 | 602 -> 668 (**+11 %**) | 421 -> 453 | 640 -> 730 (**+14 %**) |
+| Holo4 2 -> 3 (Headroom 128) | 329 | 679, spaeter 612 | 450, spaeter 426 | 632 |
+
+  Holo4 fiel im Robustheitstest nach einigen Anfragen auf zwei Slots zurueck und bleibt beim Rezept. Robustheitstest: je 12 Prefills und Decodes mit abwechselnd greedy und Rezept-Sampling (mit Backend-Sampling loest ein Sampler-Wechsel eine Neureservierung aus): Qwen W4, Nex, Sage, Holo4 ohne Fehler.
+
+| Kolibri-1 (A/B, Seiten-Cache vor jedem Arm geleert) | Decode A -> B | Prefill 1k-Prompt A -> B |
+|---|---|---|
+| Paar 1 (A1/B1, mlock 3,84 GiB) | 15,66 -> 16,92 (**+8,0 %**) | 59-64 -> 71-73 (**+17 %**) |
+| Paar 2 (B2/A2, mlock 12 GiB wie im Dienst) | 17,08 -> 17,71 (**+3,7 %**) | 63-64 -> 70 (**+10 %**) |
+
+  B = `LLAMA_EXPERT_FADVISE=1` + `GGML_CPU_EXPERT_FAULT_TOUCH=0`. Die Fault-Wartezeit faellt von 184 s auf 0,16 s (Thread-Summe). Paar 2 lief B vor A, die SSD-Drift beguenstigt also A2.
+
+**Codeaenderungen** (Fork, nicht committet; Libs in `workers/llama`, ORIGIN-Eintrag `bigmodel-prefetch=20261109T155837Z`):
+- `GGML_SCHED_PREFETCH_HEADROOM_MIB` (`ggml/src/ggml-backend.cpp`, Default 256 = bisher): freier VRAM, der neben einem zusaetzlichen Prefetch-Slot bleiben muss. Qwen/Clover setzen 64; mit W4 sind 416 MiB frei, nach Slot 1 bleiben 206 MiB fuer den MMQ-Pool.
+- Die Warnung `expert prefetch reduced to N slot(s)` nennt Slotgroesse, freien VRAM und Headroom.
+- `llama_context::sched_reserve` gibt die Prefetch-Slots vor der Worst-Case-Reservierung frei, wie es `set_runtime_ubatch` schon tat. Ein Sampler-Wechsel kann die Reservierung mitten im Decode ausloesen. Die Slots entstehen beim naechsten Prefill neu.
+
+**Verworfen, mit Zahlen** (Patches in `benchmark-results/bigmodel-opt-20261109/rejected-*.patch`):
+- `LLAMA_EXPERT_PREFILL_COUNT_SKIP`: Mit Warm-Slots haengt im Prefill an jedem MoE-Layer ein CPU-`MOE_COUNT`, und bei `ADAPT=0` werden diese Zaehlungen gar nicht verwendet (`admit_graph` ist bei breiten Graphen false). Ohne den Op und den GPU-Sync pro Layer wurde der Prefill aber **langsamer**: -10 % (2,6k), -8 % (3,4k), mit einem und mit zwei Slots. Der Sync haelt den Host-Loop zurueck, das ordnet die Uploads guenstiger.
+- `GGML_CPU_EXPERT_FAULT_ORDERED` (ein Thread gibt die Hinweise aller fehlenden Slabs in Dateireihenfolge): Kolibri-Prefill -14 % (3,4k) und -30 % (1k). Der eine Thread wird selbst zum Engpass (Seitenallokation, Reclaim), die anderen warten an der Barriere.
+- Privater O_DIRECT-Puffer fuer den SSD-Prefill: Die SSD ist ueber die volle Modellspanne selbst langsam. `tools/bench_odirect_span.c`, Kolibri-GGUF, Zufallsreads 1 MiB: 1,39 GB/s ueber 8 GiB, 0,83-0,87 GB/s ueber 44 GiB (8, 16 oder 32 Threads, 128 KiB oder 1 MiB). Das ist die In-situ-Rate von Ling und Kolibri; der Page-Cache-Pfad ist nicht die Grenze. Ein einzelner sequenzieller Strom schaffte 1,1-1,8 GB/s, zwei bis vier parallele nur 0,62-0,66 GB/s (Laufwerk `K3`, `hmpre=0`).
+
+**Fallstricke der Messung:**
+- Die Login-Shell hat `ulimit -l` 3,84 GiB, der agollm-Dienst `LimitMEMLOCK=infinity`. Ohne Anheben scheitert der Kolibri-RAM-Lock (`mlock failed after 3.84 GiB`) und das `cudaHostRegister` des Modells. `tools/arm.sh` setzt das Limit per `sudo -n prlimit`.
+- nsys 2022.4 findet seinen Importer nicht; `/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter -i prof.qdstrm` direkt aufrufen, dann `nsys export --type sqlite`. Auswertung: `tools/nsys_window.py`.
+- `LLAMA_EXPERT_STATS=1` schreibt beim Beenden per SIGTERM nichts.
+- Mit W0 schrumpft der freie VRAM von Prefill zu Prefill (240 -> 230 -> 120 MiB), bis der Prefill-Puffer (609 MiB) beim Phasenwechsel nicht mehr passt. Vermutlich waechst der CUDA-VMM-Pool in frei gewordenen Speicher und gibt ihn nicht zurueck. Mit W8/W4 tritt das nicht auf, ungeklaert.
+
+Messprogramme: `benchmark-results/bigmodel-opt-20261109/tools/` (`arm.sh`, `mbench.py` mit `--sampling alt`, `kolibri_fault.sh`, `qwen_prof.sh`, `qwen_pp*.sh`, `qwen_tg*.sh`, `qwen_final.sh`, `robust.sh`, `span_bench.sh`, `nsys_window.py`), Laeufe in `runs/`. Ein Haengenbleiber vom Vortag (`llama-cli`-Smoke-Test im Interaktivmodus auf `/dev/null`, 17 h, 95 % eines Kerns, 68-GB-Log) wurde vor den Messungen beendet.
+
 # Der Eingriff in die Fault-Phase: die Hinweise stehen lassen, den Touch-Pass streichen vom 2026-11-08
 
 **Ergebnis: der freigegebene Eingriff - die fehlenden Cold-Slabs ueber einen atomaren Index verteilen statt statisch round-robin - ist implementiert und wirkt, bringt aber nur +3,5 % (7,36 gegen 7,11 t/s). Der Hebel ist ein anderer: der Touch-Pass. Die Fault-Phase besteht aus zwei Teilen, der Residenzpruefung mit Device-Hinweis (`posix_fadvise(WILLNEED)`) und dem Touch-Pass, der die Slabs einholt und danach an der Barriere wartet. **Loescht man nur den Touch-Pass (`GGML_CPU_EXPERT_FAULT_TOUCH=0`), holen die Hinweise die Daten weiterhin asynchron und tief in die Device-Queue, aber die Rechnung wartet nicht mehr an der Barriere auf den langsamsten Thread: Decode +14,6 % im frischen Zustand (8,00 gegen 6,97 und 6,99 t/s) und +13,3 % im belasteten Zustand (8,53 und 8,14 gegen 7,36 t/s), der Prefill bleibt bei 36,3 t/s, die Ausgabe-SHA sind in allen Armen identisch.** Der Eingriff in die Verteilung ist damit nicht der Produktionshebel, die reine Weglassung des Touch-Passes ist es - und sie ist eine Konfigurationszeile, kein Umbau.**

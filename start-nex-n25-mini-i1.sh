@@ -257,7 +257,7 @@ GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate: +0.48% q4 and +
 GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner: 47.340 -> 47.713 token/s (+0.79%)
 GGML_SCHED_DEFER_HOST_INPUTS="1"  # launch the hot branch before the synchronous CPU split; same tokens as cold-first alone
 GGML_CUDA_REGISTER_HOST="1"  # mmap pin; 21 GiB cudaHostRegister failed on 1660 Ti (host RAM, not VRAM)
-GGML_SCHED_PREFETCH_EXPERTS="2"  # persistent staging; 2 slots overlap prefill copies. S does not size this.
+GGML_SCHED_PREFETCH_EXPERTS="3"  # 2026-11-09: third slot fits beside the hot set: prefill +4..22 %, same tokens
 
 # ============================================================================
 # End of editable configuration

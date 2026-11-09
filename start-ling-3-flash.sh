@@ -38,6 +38,11 @@ export LLAMA_ARG_DECISION_SEQS="${LLAMA_ARG_DECISION_SEQS:-0}"
 export LLAMA_MMAP_PREFETCH=0
 # Read missing expert slabs ahead in parallel before the CPU matmul touches them.
 export GGML_CPU_EXPERT_READAHEAD="${GGML_CPU_EXPERT_READAHEAD:-1}"
+# 2026-11-09 (Ling winners, A/B/A/B, same tokens): hints through the file and no touch pass,
+# so the compute pulls the slabs in and the reads overlap it. Ling:
+# fadvise decode +3.7 % (2026-11-06), no touch pass +13.6 % in the service (2026-11-08).
+export LLAMA_EXPERT_FADVISE="${LLAMA_EXPERT_FADVISE:-1}"
+export GGML_CPU_EXPERT_FAULT_TOUCH="${GGML_CPU_EXPERT_FAULT_TOUCH:-0}"
 # Static hot set from profiles/ling-3-flash-chat.csv; S is auto-fit unless LLAMA_EXPERT_S is set.
 # bailingmoe3 tiers only with a hot set or an explicit S. ADAPT=1 measured 7.41 vs 7.52 t/s.
 export LLAMA_EXPERT_HOT="${LLAMA_EXPERT_HOT-$PROJECT_ROOT/profiles/ling-3-flash-chat.csv}"

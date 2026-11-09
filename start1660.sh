@@ -178,8 +178,8 @@ LLAMA_EXPERT_CPU_FUSED_GATE_UP="1"  # exact AVX2 dual-dot; +0.21% median was bel
 # Fitted: slot budget 36, 2.06 GiB pinned, seed 59.7%. First prompt 45.04 t/s / 3781 tok / accept 0.806.
 # cpu-heavy q*=0.103. DFlash does not take the MTP warm guard. CUDA graphs off while W>0.
 LLAMA_EXPERT_BW_PROFILE="$PROJECT_ROOT/profiles/gtx1660-expert-bw.json"
-LLAMA_EXPERT_WARM_SLOTS="8"  # measured DFlash winner with frequency/200 admission
-LLAMA_EXPERT_WARM_AUTO_MAX="8"  # cap for W=auto; raise only after VRAM measurements
+LLAMA_EXPERT_WARM_SLOTS="4"  # 2026-11-09: 8 -> 4 frees the second prefetch slot: prefill +15..28 %, decode -4..5 %
+LLAMA_EXPERT_WARM_AUTO_MAX="4"  # cap for W=auto; raise only after VRAM measurements
 LLAMA_EXPERT_WARM_POLICY="lru"  # replacement policy; currently only lru is supported
 LLAMA_EXPERT_WARM_RESET="request"  # LRU ages reset per request; long think is one request
 LLAMA_EXPERT_WARM_ADMISSION="frequency"  # live trial; immediate thrashed on this GPU
@@ -260,6 +260,7 @@ GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner: 47.340 -> 47.713 token/s (+0
 GGML_SCHED_DEFER_HOST_INPUTS="1"  # launch the hot branch before the synchronous CPU split; same tokens as cold-first alone
 GGML_CUDA_REGISTER_HOST="1"  # mmap pin; 21 GiB cudaHostRegister failed on 1660 Ti (host RAM, not VRAM)
 GGML_SCHED_PREFETCH_EXPERTS="2"  # persistent staging; 2 slots overlap prefill copies. S does not size this.
+GGML_SCHED_PREFETCH_HEADROOM_MIB="64"  # 2026-11-09: free VRAM kept beside a slot; 256 kept W4 at one slot (416 MiB free)
 # Compute buffers shrink only to at most RATIO and by at least MIN_MIB (2026-10-31): verify/decode switches
 # reallocated CUDA0 12.6 <-> 13.3 MiB every time; rebuild 4.5 -> 3.7 ms, same tokens. 0 / 1 = shrink on any decrease.
 GGML_ALLOC_SHRINK_MIN_MIB="64"
@@ -385,6 +386,7 @@ case "$GGML_SCHED_DEFER_HOST_INPUTS" in 0|1) ;; *) die "GGML_SCHED_DEFER_HOST_IN
 case "$LLAMA_EXPERT_COLD_FIRST" in 0|1) ;; *) die "LLAMA_EXPERT_COLD_FIRST muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_REGISTER_HOST" in 0|1) ;; *) die "GGML_CUDA_REGISTER_HOST muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_PREFETCH_EXPERTS" in 0|1|2|3|4|5|6|7|8) ;; *) die "GGML_SCHED_PREFETCH_EXPERTS muss 0 oder 1..8 sein." ;; esac
+[[ "$GGML_SCHED_PREFETCH_HEADROOM_MIB" =~ ^[0-9]+$ ]] || die "GGML_SCHED_PREFETCH_HEADROOM_MIB muss eine ganze Zahl >= 0 sein."
 [[ "$GGML_ALLOC_SHRINK_MIN_MIB" =~ ^[0-9]+$ ]] || die "GGML_ALLOC_SHRINK_MIN_MIB muss eine ganze Zahl >= 0 sein."
 [[ "$GGML_ALLOC_SHRINK_RATIO" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || die "GGML_ALLOC_SHRINK_RATIO muss zwischen 0 und 1 liegen."
 [[ "$LLAMA_GRAPH_SMALL_TOKENS" =~ ^[0-9]+$ ]] || die "LLAMA_GRAPH_SMALL_TOKENS muss eine ganze Zahl >= 0 sein."
@@ -610,6 +612,7 @@ env_args=(
     "GGML_SCHED_DEFER_HOST_INPUTS=$GGML_SCHED_DEFER_HOST_INPUTS"
     "GGML_CUDA_REGISTER_HOST=$GGML_CUDA_REGISTER_HOST"
     "GGML_SCHED_PREFETCH_EXPERTS=$GGML_SCHED_PREFETCH_EXPERTS"
+    "GGML_SCHED_PREFETCH_HEADROOM_MIB=$GGML_SCHED_PREFETCH_HEADROOM_MIB"
     "GGML_ALLOC_SHRINK_MIN_MIB=$GGML_ALLOC_SHRINK_MIN_MIB"
     "GGML_ALLOC_SHRINK_RATIO=$GGML_ALLOC_SHRINK_RATIO"
     "LLAMA_GRAPH_SMALL_TOKENS=$LLAMA_GRAPH_SMALL_TOKENS"
@@ -705,7 +708,7 @@ llama-wackMall-hybrid start
   Q6 probes:    warps=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS warp-rows=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS reuse-y=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y
   CUDA concat:  flat-dim0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 block=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
   split copies: async-h2d=$GGML_CUDA_ASYNC_HOST_COPY async-d2h=$GGML_SCHED_ASYNC_D2H_COPY dedup-dst-sync=$GGML_SCHED_DEDUP_DST_SYNC defer-host=$GGML_SCHED_DEFER_HOST_INPUTS cold-first=$LLAMA_EXPERT_COLD_FIRST
-  n-cpu-moe:    register-host=$GGML_CUDA_REGISTER_HOST prefetch-experts=$GGML_SCHED_PREFETCH_EXPERTS
+  n-cpu-moe:    register-host=$GGML_CUDA_REGISTER_HOST prefetch-experts=$GGML_SCHED_PREFETCH_EXPERTS headroom=${GGML_SCHED_PREFETCH_HEADROOM_MIB} MiB
   graphs:       small-shapes=$LLAMA_GRAPH_SMALL_SHAPES (<= $LLAMA_GRAPH_SMALL_TOKENS tokens) shrink=${GGML_ALLOC_SHRINK_MIN_MIB} MiB/x$GGML_ALLOC_SHRINK_RATIO
   skip sentinel: $LLAMA_EXPERT_SKIP_SENTINEL (1=MMVQ early-exit on cold sentinel slots)
   shared hot IDs: $LLAMA_EXPERT_SHARED_HOT_IDS
