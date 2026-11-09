@@ -1597,6 +1597,33 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// GGML_CUDA_MEM_TRACE=1 logs every device buffer, pool growth and graph instantiation
+// with the free VRAM; "other" is what the driver holds outside of ggml's own allocations.
+static std::atomic<int64_t> g_cuda_trace_buffers{0};
+static std::atomic<int64_t> g_cuda_trace_pools{0};
+
+static bool ggml_cuda_mem_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MEM_TRACE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_mem_trace(const char * what, int64_t delta, const void * owner, int64_t aux) {
+    size_t free_b = 0;
+    size_t total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+    const double mib = 1024.0 * 1024.0;
+    const int64_t buffers = g_cuda_trace_buffers.load();
+    const int64_t pools   = g_cuda_trace_pools.load();
+    const int64_t other   = (int64_t) total_b - (int64_t) free_b - buffers - pools;
+    GGML_LOG_INFO("cuda_mem: %-12s %+9.2f MiB %p aux=%lld | buffers %.2f pools %.2f other %.2f free %.2f MiB\n",
+        what, delta / mib, owner, (long long) aux, buffers / mib, pools / mib, other / mib, free_b / mib);
+}
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -1626,6 +1653,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr != nullptr) {
                 CUDA_CHECK(cudaFree(b.ptr));
                 pool_size -= b.size;
+                if (ggml_cuda_mem_trace_enabled()) {
+                    g_cuda_trace_pools -= (int64_t) b.size;
+                }
                 b.ptr  = nullptr;
                 b.size = 0;
             }
@@ -1695,6 +1725,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        if (ggml_cuda_mem_trace_enabled()) {
+            g_cuda_trace_pools += (int64_t) look_ahead_size;
+            ggml_cuda_mem_trace("pool_leg", (int64_t) look_ahead_size, this, (int64_t) pool_size);
+        }
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -1715,6 +1749,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+        if (ggml_cuda_mem_trace_enabled()) {
+            g_cuda_trace_pools -= (int64_t) size;
+        }
     }
 };
 
@@ -1750,6 +1787,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemUnmap(pool_addr, pool_size));
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
+            if (ggml_cuda_mem_trace_enabled()) {
+                g_cuda_trace_pools -= (int64_t) pool_size;
+                ggml_cuda_mem_trace("pool_vmm_del", -(int64_t) pool_size, this, 0);
+            }
         }
     }
 
@@ -1844,6 +1885,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             // add to the pool
             pool_size += reserve_size;
+            if (ggml_cuda_mem_trace_enabled()) {
+                g_cuda_trace_pools += (int64_t) reserve_size;
+                ggml_cuda_mem_trace("pool_vmm", (int64_t) reserve_size, this, (int64_t) pool_size);
+            }
 
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
@@ -1878,6 +1923,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int                  device,
                                                                                [[maybe_unused]] int stream_no) {
+    if (ggml_cuda_mem_trace_enabled()) {
+        ggml_cuda_mem_trace("pool_new", 0, nullptr, stream_no);
+    }
 #if defined(GGML_USE_VMM)
     if (ggml_cuda_info().devices[device].vmm) {
         return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
@@ -1916,7 +1964,71 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
+        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+            if (cublas_workspaces[i][j] != nullptr) {
+                ggml_cuda_set_device(i);
+                CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
+            }
+        }
     }
+}
+
+// With the default workspace pool, cuBLAS allocates a new workspace (4 MiB below Hopper) for every
+// stream capture and keeps it until cublasDestroy: each CUDA graph holding a GEMM (e.g. an F32 matmul
+// in a 17-token verify batch) pins 4 MiB for the life of the context, also after the graph is evicted.
+// A fixed workspace per stream stops that. GGML_CUDA_CUBLAS_WORKSPACE_MIB sets its size, 0 keeps
+// the default pool.
+[[maybe_unused]] static size_t ggml_cuda_cublas_workspace_size(int device) {
+    static const long env_mib = [] {
+        const char * env = getenv("GGML_CUDA_CUBLAS_WORKSPACE_MIB");
+        return env != nullptr ? atol(env) : -1l;
+    }();
+    if (env_mib >= 0) {
+        return (size_t) env_mib * 1024 * 1024;
+    }
+    // the size of cuBLAS's own default pool
+    return (size_t) (ggml_cuda_info().devices[device].cc >= GGML_CUDA_CC_HOPPER ? 32 : 4) * 1024 * 1024;
+}
+
+void ggml_backend_cuda_context::cublas_set_stream(int device, cudaStream_t stream) {
+    cublasHandle_t handle = cublas_handle(device);
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(handle);
+    return;
+#else
+    const size_t ws_size = ggml_cuda_cublas_workspace_size(device);
+    if (ws_size == 0) {
+        return;
+    }
+    int slot = -1;
+    for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+        if (streams[device][i] == stream) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0 || cublas_workspace_failed[device][slot]) {
+        return; // a stream this context does not own keeps the default pool
+    }
+    void *& ws = cublas_workspaces[device][slot];
+    if (ws == nullptr) {
+        ggml_cuda_set_device(device);
+        if (cudaMalloc(&ws, ws_size) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ws = nullptr;
+            cublas_workspace_failed[device][slot] = true;
+            GGML_LOG_WARN("%s: no %zu MiB cuBLAS workspace for stream %d, using the default pool\n",
+                __func__, ws_size / (1024 * 1024), slot);
+            return;
+        }
+        if (ggml_cuda_mem_trace_enabled()) {
+            g_cuda_trace_buffers += (int64_t) ws_size;
+            ggml_cuda_mem_trace("cublas_ws", (int64_t) ws_size, ws, slot);
+        }
+    }
+    CUBLAS_CHECK(cublasSetWorkspace(handle, ws, ws_size));
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 
@@ -1932,8 +2044,14 @@ struct ggml_backend_cuda_buffer_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+    size_t size = 0;
+
     ~ggml_backend_cuda_buffer_context() {
         CUDA_CHECK(cudaFree(dev_ptr));
+        if (ggml_cuda_mem_trace_enabled()) {
+            g_cuda_trace_buffers -= (int64_t) size;
+            ggml_cuda_mem_trace("buf_free", -(int64_t) size, dev_ptr, 0);
+        }
     }
 };
 
@@ -2094,6 +2212,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+    ctx->size = size;
+    if (ggml_cuda_mem_trace_enabled()) {
+        g_cuda_trace_buffers += (int64_t) size;
+        ggml_cuda_mem_trace("buf_alloc", (int64_t) size, dev_ptr, 0);
+    }
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
@@ -2617,7 +2740,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
+    ctx.cublas_set_stream(ctx.device, main_stream);
 
     const size_t src0_ts = ggml_type_size(src0->type);
     GGML_ASSERT(nb00 == src0_ts);
@@ -3797,6 +3920,34 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// logs a graph instantiation that moved the driver-side memory by 1 MiB or more
+static void ggml_cuda_graph_mem_trace(ggml_backend_cuda_context * cuda_ctx, cudaGraph_t cgraph) {
+    static int64_t last_other = 0;
+    size_t free_b = 0;
+    size_t total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    const int64_t other = (int64_t) total_b - (int64_t) free_b - g_cuda_trace_buffers.load() - g_cuda_trace_pools.load();
+    const int64_t delta = other - last_other;
+    last_other = other;
+    if (std::llabs(delta) < 1024 * 1024) {
+        return;
+    }
+    int64_t n_inst = 0;
+    for (const auto & [key, graph] : cuda_ctx->cuda_graphs) {
+        n_inst += graph && graph->instance != nullptr;
+    }
+    size_t n_nodes = 0;
+    if (cudaGraphGetNodes(cgraph, nullptr, &n_nodes) != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+    GGML_LOG_INFO("cuda_mem: graph_inst   %+9.2f MiB %p inst=%lld nodes=%zu | other %.2f free %.2f MiB\n",
+        delta / (1024.0 * 1024.0), (void *) cuda_ctx, (long long) n_inst, n_nodes,
+        other / (1024.0 * 1024.0), free_b / (1024.0 * 1024.0));
+}
+
 static void ggml_cuda_evict_graphs(ggml_backend_cuda_context * cuda_ctx, const void * keep_key) {
     for (auto it = cuda_ctx->cuda_graphs.begin(); it != cuda_ctx->cuda_graphs.end(); ) {
         if (keep_key != nullptr && it->first == keep_key) {
@@ -5657,6 +5808,9 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 return false;
             }
             CUDA_CHECK(err);
+            if (ggml_cuda_mem_trace_enabled()) {
+                ggml_cuda_graph_mem_trace(cuda_ctx, graph->graph);
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -6071,7 +6225,11 @@ void ggml_backend_cuda_evict_graphs(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 #ifdef USE_CUDA_GRAPH
+    const size_t n_graphs = cuda_ctx->cuda_graphs.size();
     ggml_cuda_evict_graphs(cuda_ctx, nullptr);
+    if (ggml_cuda_mem_trace_enabled()) {
+        ggml_cuda_mem_trace("graph_evict", 0, cuda_ctx, (int64_t) n_graphs);
+    }
 #else
     GGML_UNUSED(cuda_ctx);
 #endif

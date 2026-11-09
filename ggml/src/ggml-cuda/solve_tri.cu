@@ -65,7 +65,7 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
     get_batch_pointers<<<(total_batches + 255) / 256, 256, 0, stream>>>(A, X, A_ptrs_dev, X_ptrs_dev, ne02,
                                                                         total_batches, s02, s03, s2, s3);
 
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+    ctx.cublas_set_stream(id, stream);
 
     // Yes, this is necessary, without this we get RMSE errors
     CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(id), CUBLAS_DEFAULT_MATH));

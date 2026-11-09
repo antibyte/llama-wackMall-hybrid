@@ -682,7 +682,7 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
         ggml_cuda_pool_alloc<half> w(ctx.pool(), size_t(rows_per_chunk) * k);
         const float alpha = 1.0f;
         const float beta  = 0.0f;
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+        ctx.cublas_set_stream(ctx.device, stream);
         for (int row0 = 0; row0 < n; row0 += rows_per_chunk) {
             const int rows = std::min(rows_per_chunk, n - row0);
             ggml_cuda_exl3_reconstruct_rows(src0, row0, row0 + rows, w.get(), stream);

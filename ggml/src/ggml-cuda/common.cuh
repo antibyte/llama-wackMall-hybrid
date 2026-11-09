@@ -1443,6 +1443,9 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+    // one cuBLAS workspace per stream, see cublas_set_stream
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+    bool   cublas_workspace_failed[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { false } };
 
     int curr_stream_no = 0;
     // EXL3 int8 gemv: one zeroed counter block per stream. Freed by the context destructor.
@@ -1533,6 +1536,9 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handle() {
         return cublas_handle(device);
     }
+
+    // cublasSetStream, then this stream's own workspace (cublasSetStream resets it to the default pool)
+    void cublas_set_stream(int device, cudaStream_t stream);
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
