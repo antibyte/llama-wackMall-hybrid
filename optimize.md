@@ -1,3 +1,25 @@
+# Schrumpfender VRAM bei W0: cuBLAS legt pro Graph-Capture einen Workspace an, vom 2026-11-09
+
+**Ergebnis: Nicht der VMM-Pool war die Ursache, sondern cuBLAS. Ohne eigenen Workspace legt cuBLAS bei jeder Stream-Capture einen neuen Workspace an (4 MiB unterhalb von Hopper) und gibt ihn erst bei `cublasDestroy` frei. ggml ruft vor jedem GEMM `cublasSetStream` auf, und das setzt den Workspace auf den Default-Pool zurueck. Bei Qwen mit W0 laufen die 17-Token-Verify-Batches der ngram-Entwuerfe als CUDA-Graphen. Jeder Layer-Split, der dabei einen Float-Matmul ueber cuBLAS rechnet, haelt danach 4 MiB, auch wenn der Graph beim Phasenwechsel verworfen wird: rund 320 MiB je Anfrage mit 16er-Entwurf. Neu ist ein fester Workspace pro Stream (`GGML_CUDA_CUBLAS_WORKSPACE_MIB`, Default = Groesse des cuBLAS-Pools, 0 = altes Verhalten). Damit laeuft der W0-Robustheitstest fehlerfrei durch.**
+
+| Qwen W0, 3 Prefetch-Slots, 12 Anfragen, Sampling abwechselnd | Treiberanteil ausserhalb von ggml ("other") | Ende |
+|---|---|---|
+| ohne Fix (auch: Fix-Binary mit `GGML_CUDA_CUBLAS_WORKSPACE_MIB=0`) | 114 -> 261 -> 583 -> 902 -> 1163 MiB | 609-MiB-Prefill-Puffer passt nicht mehr, Step-down auf 1536, danach HTTP 500 im Decode |
+| mit Fix | 114 -> 261 MiB, danach konstant | fehlerfrei, ab der 6,1k-Anfrage zwei statt drei Slots |
+
+- **Messung:** `GGML_CUDA_MEM_TRACE=1` (neu, Default aus, im Log ab `-lv 4`) protokolliert jeden ggml-Puffer, jedes Pool-Wachstum, jedes Verwerfen der Graphen und jede Graph-Instanziierung, die den Treiberanteil um 1 MiB oder mehr veraendert, jeweils mit dem freien VRAM. "other" ist belegt minus ggml-Puffer minus Pools. Der VMM-Pool waechst nur bis zur Hochwassermarke des Prefills (104 MiB).
+- **Eingrenzung:** Teuer waren genau die 17-Token-Graphen (82 je Decode-Phase, je 3,9-4,0 MiB), die 1- und 5-Token-Graphen kosteten nichts. Ein Backtrace von `cublasSetStream` waehrend einer Capture zeigt `ggml_cuda_mul_mat_cublas` aus `ggml_cuda_compute_forward`. Isoliert (`cublasSgemm` in 20 Graph-Captures) bleiben 80 MiB auch nach dem Zerstoeren der Graphen belegt, mit `cublasSetWorkspace` sind es 0 MiB. Die Gegenprobe mit derselben Binary und `..._MIB=0` bringt das Leck zurueck.
+- cuBLAS startet seine Kernels ueber die Driver-API. `cudaGraphKernelNodeGetParams` liefert fuer sie keinen Funktionszeiger, und eine Kernelliste ueber die Runtime-Zeiger uebersieht sie. Die erste Zuordnung (MMQ in allen teuren Graphen) war deshalb nur eine Korrelation.
+- **Betroffen** sind Konfigurationen, deren Verify-Splits als CUDA-Graph laufen und einen Float-Matmul ueber cuBLAS enthalten. Die agollm-Rezepte von Qwen und Clover (W4) sind es nicht: Dort laufen diese Splits eager (MUL_MAT_ID mit Warm-Slots). In 18 Anfragen blieb der Treiberanteil mit und ohne Fix bei 105 MiB, der Prefill war identisch, Decode 36,8 / 37,0 t/s. SenseNova (ngram-simple + MTP) blieb ebenfalls flach.
+- **W0 bleibt keine Alternative zu W4.** Der Treiber haelt danach ~260 MiB fuer bis zu ~2200 gleichzeitig lebende Graph-Instanzen. Das ist eine Hochwassermarke, die wiederverwendet wird. Fuer den dritten Slot fehlen dann ~40 MiB. Mit drei Slots ist der Prefill um 11-14 % schneller als bei W4 (1,2k / 2,6k / 3,4k: 364 / 637 / 451 gegen 329 / 561 / 403 t/s), mit zwei Slots nicht mehr (349 / 538 / 405 und 6,1k 572 gegen 335 / 569 / 404 / 596 t/s). Decode ist gleich (36,6 gegen 37,0 t/s).
+
+**Codeaenderungen** (Fork, nicht committet; nicht in `workers/llama`, weil die aktuellen Rezepte nicht betroffen sind und die dortige `libggml-cuda` vom 2026-11-06 stammt):
+- `ggml-cuda/common.cuh`, `ggml-cuda.cu`: `ggml_backend_cuda_context::cublas_set_stream(device, stream)` ersetzt die vier `cublasSetStream`-Aufrufe (`mul_mat_cublas`, `out_prod`, `exl3`, `solve_tri`). Der Workspace pro Stream wird beim ersten GEMM per `cudaMalloc` angelegt und im Kontext-Destruktor freigegeben. Scheitert `cudaMalloc`, behaelt dieser Stream den Default-Pool (Warnung). HIP/MUSA unveraendert.
+- `GGML_CUDA_MEM_TRACE`: die Speicherspur oben.
+- `test-backend-ops -b CUDA0`: MUL_MAT 1177/1177, OUT_PROD 71/71, SOLVE_TRI 24/24.
+
+Laeufe: `benchmark-results/bigmodel-opt-20261109/runs/vt-*` (`vt-w0-n3b`: Spur, `vt-w0-n3-fix`/`-final`: Fix, `vt-w0-n3-ws0`: Gegenprobe, `vt-w4-old`/`-fix`: Produktionsrezept), Einzeltests in `tools/vram/` (`cb.cu`: cuBLAS in Graph-Captures, `g.cu`/`s.cu`/`l.cu`: Graph-Speicher ohne cuBLAS, `gg.cpp`: ggml-Graphen).
+
 # Grosse Modelle: zweiter und dritter Experten-Prefetch-Slot im Prefill, Kolibri-Fault-Pfad vom 2026-11-09
 
 **Ergebnis: Der Prefill der 35B-MoE-Modelle mit DFlash-Draft (Qwen3.6, Clover) lief mit nur einem Prefetch-Slot fuer die Experten-Uploads ueber PCIe. Upload und Matmul wechselten sich deshalb strikt ab: Im nsys-Profil eines 3,4k-Prompts belegte die Kopie 5,96 s und die Kernels 4,8 s, ueberlappt haben sie sich nur 1,2 s. Mit 4 statt 8 Warm-Slots passt ein zweiter Slot: Prefill +15 bis +28 %, Decode -4 bis -5 % (Entscheidung des Nutzers: uebernommen). Nex und Sage hatten schon zwei Slots und bekommen ohne Decode-Preis einen dritten: Prefill bis +22 % bzw. +14 %. Kolibri uebernimmt die Ling-Sieger `LLAMA_EXPERT_FADVISE=1` und `GGML_CPU_EXPERT_FAULT_TOUCH=0`: Decode +3,7 bis +8,0 %, Prefill +10 bis +17 %. In allen Armen ist die Ausgabe-SHA innerhalb einer Konfiguration identisch.**
@@ -51,7 +73,7 @@
 - Die Login-Shell hat `ulimit -l` 3,84 GiB, der agollm-Dienst `LimitMEMLOCK=infinity`. Ohne Anheben scheitert der Kolibri-RAM-Lock (`mlock failed after 3.84 GiB`) und das `cudaHostRegister` des Modells. `tools/arm.sh` setzt das Limit per `sudo -n prlimit`.
 - nsys 2022.4 findet seinen Importer nicht; `/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter -i prof.qdstrm` direkt aufrufen, dann `nsys export --type sqlite`. Auswertung: `tools/nsys_window.py`.
 - `LLAMA_EXPERT_STATS=1` schreibt beim Beenden per SIGTERM nichts.
-- Mit W0 schrumpft der freie VRAM von Prefill zu Prefill (240 -> 230 -> 120 MiB), bis der Prefill-Puffer (609 MiB) beim Phasenwechsel nicht mehr passt. Vermutlich waechst der CUDA-VMM-Pool in frei gewordenen Speicher und gibt ihn nicht zurueck. Mit W8/W4 tritt das nicht auf, ungeklaert.
+- Mit W0 schrumpft der freie VRAM von Prefill zu Prefill (240 -> 230 -> 120 MiB), bis der Prefill-Puffer (609 MiB) beim Phasenwechsel nicht mehr passt. Geklaert und behoben: cuBLAS-Workspace pro Graph-Capture (Abschnitt "Schrumpfender VRAM bei W0").
 
 Messprogramme: `benchmark-results/bigmodel-opt-20261109/tools/` (`arm.sh`, `mbench.py` mit `--sampling alt`, `kolibri_fault.sh`, `qwen_prof.sh`, `qwen_pp*.sh`, `qwen_tg*.sh`, `qwen_final.sh`, `robust.sh`, `span_bench.sh`, `nsys_window.py`), Laeufe in `runs/`. Ein Haengenbleiber vom Vortag (`llama-cli`-Smoke-Test im Interaktivmodus auf `/dev/null`, 17 h, 95 % eines Kerns, 68-GB-Log) wurde vor den Messungen beendet.
 
