@@ -912,7 +912,9 @@ bool ggml_cuda_topk_moe_grouped_fusion(const struct ggml_cgraph * cgraph, int no
     return ggml_cuda_topk_moe_grouped_match_nodes(cgraph, node_idx, args, match);
 }
 
-template <int n_experts, int n_groups, int n_group_used, int n_expert_used, int group_top, bool has_bias>
+// fast: segmented top-2 for the group scores and no dynamically indexed register arrays (those
+// went through local memory, 48 bytes of stack). Same selection and weights as the default path.
+template <int n_experts, int n_groups, int n_group_used, int n_expert_used, int group_top, bool has_bias, bool fast = false>
 __launch_bounds__(WARP_SIZE, 1)
 __global__ void topk_moe_grouped_cuda(const float * logits, float * weights, int32_t * ids,
                                       const float * bias, int n_rows, float clamp_val,
@@ -957,6 +959,29 @@ __global__ void topk_moe_grouped_cuda(const float * logits, float * weights, int
     }
 
     float group_score[n_groups];
+    if constexpr (fast) {
+        static_assert(group_top == 2 && n_exp_per_group == WARP_SIZE / 2, "fast path: top-2 over half warps");
+        // group 2*slot + half holds the lanes [16*half, 16*half + 16) of sel[slot]: one segmented
+        // top-2 over 16 lanes scores both groups of a slot
+        float slot_score[experts_per_thread];
+#pragma unroll
+        for (int slot = 0; slot < experts_per_thread; ++slot) {
+            float m1 = sel[slot];
+            float m2 = -INFINITY;
+#pragma unroll
+            for (int mask = WARP_SIZE / 4; mask > 0; mask /= 2) {
+                const float o1 = __shfl_xor_sync(0xFFFFFFFF, m1, mask, WARP_SIZE);
+                const float o2 = __shfl_xor_sync(0xFFFFFFFF, m2, mask, WARP_SIZE);
+                m2 = fmaxf(fminf(m1, o1), fmaxf(m2, o2));
+                m1 = fmaxf(m1, o1);
+            }
+            slot_score[slot] = (0.f + m1) + m2;
+        }
+#pragma unroll
+        for (int g = 0; g < n_groups; ++g) {
+            group_score[g] = __shfl_sync(0xFFFFFFFF, slot_score[g / 2], (g & 1) * (WARP_SIZE / 2), WARP_SIZE);
+        }
+    } else
 #pragma unroll
     for (int g = 0; g < n_groups; ++g) {
         const int  slot     = g / 2;
@@ -1008,7 +1033,16 @@ __global__ void topk_moe_grouped_cuda(const float * logits, float * weights, int
             }
         }
         kept[k]   = max_g;
-        gs[max_g] = -INFINITY;
+        if constexpr (fast) {
+#pragma unroll
+            for (int g = 0; g < n_groups; ++g) {
+                if (g == max_g) {
+                    gs[g] = -INFINITY;
+                }
+            }
+        } else {
+            gs[max_g] = -INFINITY;
+        }
     }
 
 #pragma unroll
@@ -1054,7 +1088,16 @@ __global__ void topk_moe_grouped_cuda(const float * logits, float * weights, int
         }
 
         if ((max_expert & (WARP_SIZE - 1)) == lane) {
-            sel[max_expert / WARP_SIZE] = -INFINITY;
+            if constexpr (fast) {
+#pragma unroll
+                for (int i = 0; i < experts_per_thread; ++i) {
+                    if (i == max_expert / WARP_SIZE) {
+                        sel[i] = -INFINITY;
+                    }
+                }
+            } else {
+                sel[max_expert / WARP_SIZE] = -INFINITY;
+            }
         }
         if (lane == k) {
             ids[k] = max_expert;
@@ -1146,11 +1189,16 @@ void ggml_cuda_op_topk_moe_grouped(ggml_backend_cuda_context & ctx,
     const ggml_cuda_kernel_launch_params launch_params =
         ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
+    // GGML_CUDA_TOPK_MOE_GROUPED_FAST=1: the register-only variant (same ids and weights)
+    static const bool fast = [] {
+        const char * env = getenv("GGML_CUDA_TOPK_MOE_GROUPED_FAST");
+        return env != nullptr && atoi(env) != 0;
+    }();
     if (bias) {
-        ggml_cuda_kernel_launch(topk_moe_grouped_cuda<128, 8, 4, 8, 2, true>, launch_params,
-            logits_d, weights_d, ids_d, bias_d, n_rows, clamp_val, scale_val, weight_eps, with_norm);
+        ggml_cuda_kernel_launch(fast ? topk_moe_grouped_cuda<128, 8, 4, 8, 2, true, true> : topk_moe_grouped_cuda<128, 8, 4, 8, 2, true>,
+            launch_params, logits_d, weights_d, ids_d, bias_d, n_rows, clamp_val, scale_val, weight_eps, with_norm);
     } else {
-        ggml_cuda_kernel_launch(topk_moe_grouped_cuda<128, 8, 4, 8, 2, false>, launch_params,
-            logits_d, weights_d, ids_d, bias_d, n_rows, clamp_val, scale_val, weight_eps, with_norm);
+        ggml_cuda_kernel_launch(fast ? topk_moe_grouped_cuda<128, 8, 4, 8, 2, false, true> : topk_moe_grouped_cuda<128, 8, 4, 8, 2, false>,
+            launch_params, logits_d, weights_d, ids_d, bias_d, n_rows, clamp_val, scale_val, weight_eps, with_norm);
     }
 }

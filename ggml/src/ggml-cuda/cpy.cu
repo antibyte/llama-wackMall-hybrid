@@ -426,6 +426,18 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     return spitch >= width && dpitch >= width;
 }
 
+// The copy engine pays per row: 2048 rows of 12 bytes (a GDN conv state) take ~6 us as a
+// cudaMemcpy2DAsync graph node, the scalar kernel ~2 us. Rows narrower than
+// GGML_CUDA_CPY_2D_MIN_ROW_BYTES take the kernel; 0 keeps the 2D copy for every row width.
+static size_t ggml_cuda_cpy_2d_min_row_bytes() {
+    static const size_t value = [] {
+        const char * env = getenv("GGML_CUDA_CPY_2D_MIN_ROW_BYTES");
+        const long v = env ? atol(env) : 0;
+        return (size_t) (v > 0 ? v : 0);
+    }();
+    return value;
+}
+
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
@@ -473,7 +485,11 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         {
             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
         }
-    } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+    } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch) &&
+               (mc_width >= ggml_cuda_cpy_2d_min_row_bytes() ||
+                // only these same-type copies have a strided kernel below
+                !(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+                  src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_I32))) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {

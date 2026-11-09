@@ -88,6 +88,15 @@ static int get_q6_k_ncols1_rows_override() {
     return value;
 }
 
+// MUL_MAT_ID: routed Q6_K experts. With K=512 (Ling down_exps) one row per block holds two
+// superblocks, so the block overhead dominates (143 GB/s). 0 keeps one row per block.
+static int get_q6_k_ids_ncols1_rows_override() {
+    static const int value = [] {
+        return get_rows_override("GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS", 0);
+    }();
+    return value;
+}
+
 static int get_q6_k_ncols3_rows_override() {
     static const int value = [] {
         return get_rows_override("GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS", 0);
@@ -1225,7 +1234,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 rows_override = !use_small_k ? get_q5_k_ncols1_rows_override() : 0;
                 rows_override_name = "Q5_K";
             } else if constexpr (type == GGML_TYPE_Q6_K) {
-                rows_override = !ids && !use_small_k ? get_q6_k_ncols1_rows_override() : 0;
+                rows_override = use_small_k ? 0 : !ids ? get_q6_k_ncols1_rows_override() : get_q6_k_ids_ncols1_rows_override();
                 rows_override_name = "Q6_K";
             } else if constexpr (type == GGML_TYPE_Q8_0) {
                 rows_override = !ids && !has_fusion && !use_small_k ? get_q8_0_ncols1_rows_override() : 0;
