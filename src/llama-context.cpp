@@ -1334,6 +1334,11 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+    // the expert prefetch slots beyond slot 0 take post-graph free memory; give it back
+    // before the worst-case graph is reserved again (a sampler change can trigger this mid-decode)
+    if (sched) {
+        ggml_backend_sched_prefetch_release(sched.get());
+    }
 
     struct dflash_reserve_scope {
         dflash_bridge * bridge;
