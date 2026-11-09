@@ -1,3 +1,80 @@
+# MLA-Decode-Kernel fuer Ling-3.0-tiny vom 2026-11-09
+
+**Ergebnis: Ein eigener CUDA-Kernel fuer die MLA-Attention im Decode (D=576/512, 16 Koepfe auf einem latenten KV-Kopf, F16-KV) ersetzt den Tile-Kernel und ist auf der GTX 1660 Ti 2,3- bis 2,6-mal schneller (7,5k Kontext: 160,6 + 7,9 us -> 51,4 + 4,4 us je Layer inklusive Zusammenfuehren). Im Ling-tiny-Rezept: +8,4 % Decode bei 7,5k Kontext (128,4 -> 139,1 t/s), +1,9 % bei kurzem Kontext (144,8 -> 147,5 t/s), Prefill unveraendert. Hinter `GGML_CUDA_FA_MLA_DEC` (Default 0 = Tile-Kernel wie bisher).**
+
+| Op-Zeit (test-backend-ops perf, us) | 1 Token | 2 | 4 | 9 | 32 |
+|---|---|---|---|---|---|
+| KV 1024: Tile / MLA | 45,9 / 20,0 | 49,7 / 27,3 | 90,8 / 42,5 | 178,4 / 93,7 | 459,9 / 301,4 |
+| KV 7680: Tile / MLA | 168,6 / 65,8 | 245,8 / 112,7 | 415,5 / 209,4 | 932,7 / 580,4 | 3197 / 2272 |
+| KV 16384: Tile / MLA | 336,7 / 127,6 | 520,4 / 230,2 | 857,5 / 430,6 | 1922 / 1230 | 6717 / 4835 |
+
+Ende-zu-Ende (`ling-tiny`-Rezept mit den Knoepfen der GPU-Kernel-Runde und F16-KV, A/B/A/B, greedy):
+
+| | ohne Spekulation | mit Spekulation (Rezept) |
+|---|---|---|
+| kurz, 3 Prompts x 256 Tokens | 145,8 -> 148,0 t/s (+1,5 %) | 144,8 -> 147,5 t/s (+1,9 %) |
+| 7,5k Kontext, 128 Tokens | 128,8 -> 139,7 t/s (+8,5 %) | 128,4 -> 139,1 t/s (+8,4 %) |
+
+Die ngram-Spekulation hat in diesen Laeufen praktisch nichts angenommen (255 Verify-Schritte fuer 256 Tokens); fuer Verify-Batches gilt die Op-Tabelle.
+
+**Qualitaet** (`llama-perplexity` auf `long.txt`, 3 x 4096 Tokens, F16-KV, `-ub 4`, damit der Decode-Kernel greift; Referenz = Tile-Kernel mit `-ub 4`):
+
+| | KLD | gleicher Top-Token | PPL-Verhaeltnis |
+|---|---|---|---|
+| MLA-Kernel | 0,0052 | 96,6 % | 0,998 +- 0,002 |
+| Tile-Kernel mit `-ub 512` (Prefill-Pfad, Rauschboden) | 0,0111 | 95,1 % | 0,997 +- 0,003 |
+
+Der neue Kernel weicht weniger vom heutigen Decode ab als der heutige Prefill-Pfad. Die Ausgabe-SHA aendert sich, ist aber zwischen Wiederholungen stabil.
+
+**Warum der Tile-Kernel langsam war:** Er schiebt K und die Scores durch den Shared Memory und erreicht nur ~30 % der FP16-Rechenleistung; bei kurzem Kontext laufen ausserdem nur 4 Bloecke auf 24 SMs (37 us je Layer bei ~1k Kontext im Lauf).
+
+**Der Kernel** (`ggml/src/ggml-cuda/fattn-mla-dec.cu`, Einstieg in `ggml_cuda_flash_attn_ext`): Jeder Warp rechnet 4 Koepfe eines Tokens, die Warps eines Blocks lesen dieselben K-Zeilen (ab dem zweiten aus L1), das V-Produkt nutzt die K-Register (V ist die Sicht auf die ersten 512 K-Werte). Je Schritt 8 KV-Zeilen mit 16-Byte-Loads; die 32 Scores eines Schritts werden mit einer transponierten Butterfly-Reduktion verteilt, sodass jede Lane genau einen haelt. Produkte laufen in half2 ueber Ketten von 9 je Lane (der Tile-Kernel rechnet ebenfalls halbe Produkte), danach float; V summiert 32 Zeilen in half2, dann float. Der KV-Bereich wird auf eine Welle von Bloecken verteilt (min. 32 Zeilen je Block), ein kleiner Kernel fuehrt die als normiertes half gespeicherten Teilergebnisse zusammen. Mehrere Tokens (Spekulation): 2 Tokens je Block, weitere in weiteren Bloecken.
+
+Knoepfe: `GGML_CUDA_FA_MLA_DEC` (0/1, Default 0), `GGML_CUDA_FA_MLA_DEC_MAX_TOKENS` (Default 32, bis dahin schneller als Tile), `GGML_CUDA_FA_MLA_DEC_MIN_ROWS` (Default 32; 16-64 gleich, 128 kostet bei 1k Kontext 60 %). Greift nur bei F16-K/V mit V als Sicht auf K, Maske, ohne Sinks/ALiBi/Softcap und bei einem Vielfachen von 4 Koepfen je KV-Kopf; sonst Tile wie bisher. Q8_0-KV nimmt weiter den Tile-Pfad, das Rezept braucht also `CACHE_TYPE_K/V=f16`.
+
+Verworfen beziehungsweise gemessen (Op-Zeit bei 7,5k, 1 Token, inkl. Zusammenfuehren):
+- Erste Fassung (Q in Registern, 4 Zeilen je Schritt, 4-Byte-Loads): 72,6 us; 253 Register, 2 Warps je Scheduler, Issue-Slots zu 50 % belegt.
+- Vorabladen der naechsten 4 Zeilen (Q dafuer in den Shared Memory): 75 us, keine Verbesserung.
+- 16-Byte-Loads fuer K und Q: 72,8 us (LSU-Auslastung 63 -> 33 %, aber nicht der Engpass).
+- 8 Zeilen je Schritt (doppelte Arbeit fuer die Latenzketten Shuffle/Max/Exp): 65 us. Gewaehlt.
+- 4 Zeilen mit 168 Registern fuer 3 Bloecke je SM: 78 us, langsamer.
+- Zusammenfuehren: 12 Teile je Thread liefen im seriellen Rest der `#pragma unroll 16`-Schleife (7,9 -> 4,4 us mit praedizierten 16er-Runden).
+
+Rest: Der Kernel liegt bei ~57 % der FP16-Pipe (229 Register, 8 Warps je SM, Latenz der Shuffle-Ketten); das Zusammenfuehren kostet 4,4 us je Layer. Ling-3.0-flash (32 Koepfe je KV-Kopf) nutzt denselben Pfad (8 Warps je Block), ist aber SSD-gebunden.
+
+Laeufe: `benchmark-results/gpu-kernels-20261109/runs/` (`ma*`/`mb*` ohne, `sa*`/`sb*` mit Spekulation; `mla-ab1.log`, `mla-ab2.log`). Tests: `test-backend-ops -o FLASH_ATTN_EXT -p hsk=576` 72/72 mit `GGML_CUDA_FA_MLA_DEC=1` (neue Faelle: 16 Koepfe auf einem KV-Kopf, KV bis 1024; Perf-Faelle KV 1024/7680/16384 x 1-32 Tokens).
+
+# GPU-Kernels fuer Ling-3.0-tiny: Kopierpfad, Q6_K-MoE, gruppiertes Top-k, ssm_a, F16-KV vom 2026-11-09
+
+**Ergebnis: Ling-3.0-tiny ist das am haeufigsten geladene CUDA-Modell (217 Ladevorgaenge in 14 Tagen, Koordinator) und liegt komplett auf der GPU, die Kernels bestimmen also direkt das Tempo. Fuenf Aenderungen bringen im Rezept mit Spekulation +6,6 % Decode bei kurzem Kontext (135,7 -> 144,7 t/s) und +10,0 % bei 7,5k Kontext (116,7 -> 128,5 t/s), A/B/A/B gegen die alten Binaries, Prefill unveraendert (~1215 t/s bei 7,5k). Die Ausgabe-SHA aendert sich nur durch den F16-KV-Cache.**
+
+| Decode-Profil kurz (nsys, Knoten-Trace, 250 Tokens) | Anteil |
+|---|---|
+| Matvec (MMVQ/MMVF), 0,85 GB Gewichte je Token, im Mittel 205 GB/s | ~64 % der Kernelzeit |
+| `quantize_q8_1`, 268 Aufrufe je Token | 7 % |
+| D2D-Kopierknoten, 104 je Token | ~6 % |
+| gruppiertes MoE-Top-k, 23 je Token | 3,6 % |
+| MLA-Attention (4 Bloecke bei kurzem Kontext) | 3,4 % (bei 7,5k: 13 %) |
+| Kernels je Token / davon kuerzer als 5 us | 1123 / 71 % |
+| GPU leer zwischen zwei Tokens (Host) | ~0,5-0,9 ms |
+
+Die Bandbreite: `lm_head` (Q6_K, 198 MB) laeuft mit 297 GB/s am Speicherlimit (6501 MHz, 312 GB/s), die gerouteten Q4_K-Experten mit 226 GB/s, Q8_0-K/V mit 241 GB/s.
+
+**Aenderungen** (alle mit identischer Ausgabe-SHA ausser F16-KV):
+- **Kopierpfad** (`ggml-cuda/cpy.cu`, `GGML_CUDA_CPY_2D_MIN_ROW_BYTES`, Default 0 = bisher): Die Fork-Abkuerzung ueber `cudaMemcpy2DAsync` kopierte den GDN-Conv-State (2048 Zeilen zu 12 Byte, 54 je Token) in 6,2 us je Kopie ueber die Copy-Engine. Schmalere Zeilen als die Schwelle nehmen jetzt den Kernel (nur F32/F16/BF16/I32, quantisierte Typen behalten den 2D-Pfad). 64: **+2,5 %**.
+- **Q6_K-MoE-Matvec** (`ggml-cuda/mmvq.cu`, `GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS`, Default 0 = eine Zeile je Block): Die Mehrzeilen-Variante war fuer MUL_MAT_ID bei Q6_K ausgeschlossen (bei Q4_K nicht). Mit K=512 hielt jeder Block zwei Superbloecke, 143 GB/s. 4 Zeilen: **+1,5 bis 2,8 %**. Q5_K/Q6_K ohne IDs mit 2 oder 4 Zeilen: kein Gewinn.
+- **Gruppiertes Top-k** (`ggml-cuda/topk-moe.cu`, `GGML_CUDA_TOPK_MOE_GROUPED_FAST`, Default 0): Dynamische Indizes in Register-Arrays legten 48 Byte Stack an, jeder Schritt der abhaengigen Kette ging ueber den lokalen Speicher. Die Variante rechnet die Gruppen-Scores als segmentiertes Top-2 ueber 16 Lanes und indiziert nur noch statisch: 33 statt 80 Register. **+1,4 %**.
+- **`ssm_a` auf der GPU** (`src/models/bailingmoe3.cpp`, `kimi-linear.cpp`, immer an): Das Gewicht war als `SSM_A` mit Op `SSM_SCAN` angelegt. Diese Form kann CUDA nicht, also lag es im CPU-Puffer, und der Scheduler kopierte es vor jedem Token 18 Mal synchron auf die GPU. Benutzt wird es in einem `MUL`, deshalb jetzt `SSM_A_NOSCAN` wie bei Qwen3.5/3.6. **+0,55 %**; gilt auch fuer Ling-3.0-flash.
+- **F16-KV** (Rezept): Der KVFlash-Pool haelt 8192 MLA-Zellen auf der GPU (Q8_0 28,7 MiB, F16 ~54 MiB). Die Tile-Attention fuer D=576 wandelt Q8_0 vor jedem Token komplett nach F16 um (bei 7,5k 51 us je Layer). F16: **+4 %** bei 7,5k, kurz unveraendert. Nebenbefund: Mit Q8_0 waren zwei Langkontext-Laeufe nicht bit-gleich, mit F16 schon.
+
+**Offene Hebel** (nicht umgesetzt, geschaetzt aus dem Profil):
+- MLA-Decode-Attention (D=576/512, 16 Koepfe auf einem KV-Kopf): 165 us je Layer bei 7,5k, nur ~52 GB/s und weit unter dem FP16-Rechenlimit. Umgesetzt, siehe "MLA-Decode-Kernel fuer Ling-3.0-tiny" oben.
+- `quantize_q8_1`: q/k/v jeder GDN-Schicht quantisieren dieselbe Aktivierung dreimal; teilen oder in `rms_norm` fusionieren: ~1,5-3 %.
+- Host zwischen den Tokens: 6 weitere synchronisierte Eingabe-Uploads (`set_tensor` = Kopie plus `cudaStreamSynchronize`), `llama_batch_allocr::init` ~0,1 ms je Token bei einem Token, Pruefung der Graph-Eigenschaften: zusammen ~3-5 %.
+- Kurze Elementkernel (`concat` -> `ssm_conv`, Sigmoid/Mul/Scale des Gates, `l2_norm`): 71 % der Starts sind kuerzer als 5 us, Fusion ~2-4 %.
+
+Laeufe: `benchmark-results/gpu-kernels-20261109/runs/` (`lt-nsys`: Knoten-Profil, `lc-nsys`: 7,5k Kontext, `lt-cpu`: CPU-Samples, `ssma-*`, `r-*`, `c-*`, `t-*`, `kq8-*`/`kf16-*`, `fa*`/`fb*`: Endvergleich). Werkzeuge: `tools/decode_kernels.py` (Kernelanteile je Token aus nsys), `tools/cpu_samples.py` (CPU-Samples in der Host-Luecke). Tests: `test-backend-ops -b CUDA0` CPY 243/243 (mit Schwelle 64 und 100000), MUL_MAT_ID 863/863 (mit Q6_K-IDS 4).
+
 # Schrumpfender VRAM bei W0: cuBLAS legt pro Graph-Capture einen Workspace an, vom 2026-11-09
 
 **Ergebnis: Nicht der VMM-Pool war die Ursache, sondern cuBLAS. Ohne eigenen Workspace legt cuBLAS bei jeder Stream-Capture einen neuen Workspace an (4 MiB unterhalb von Hopper) und gibt ihn erst bei `cublasDestroy` frei. ggml ruft vor jedem GEMM `cublasSetStream` auf, und das setzt den Workspace auf den Default-Pool zurueck. Bei Qwen mit W0 laufen die 17-Token-Verify-Batches der ngram-Entwuerfe als CUDA-Graphen. Jeder Layer-Split, der dabei einen Float-Matmul ueber cuBLAS rechnet, haelt danach 4 MiB, auch wenn der Graph beim Phasenwechsel verworfen wird: rund 320 MiB je Anfrage mit 16er-Entwurf. Neu ist ein fester Workspace pro Stream (`GGML_CUDA_CUBLAS_WORKSPACE_MIB`, Default = Groesse des cuBLAS-Pools, 0 = altes Verhalten). Damit laeuft der W0-Robustheitstest fehlerfrei durch.**
