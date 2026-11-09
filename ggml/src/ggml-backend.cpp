@@ -1705,14 +1705,19 @@ static bool ggml_backend_sched_prefetch_init(
     GGML_UNUSED(total_mem);
 
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
+    // Leave MMQ/FA scratch for the 1856-wide prefill; a 210 MiB slot that
+    // fits still OOMs cuMemCreate during ggml_cuda_mul_mat_q on 6 GiB.
+    // GGML_SCHED_PREFETCH_HEADROOM_MIB overrides the 256 MiB.
+    static const size_t mmq_headroom = [] {
+        const char * env = getenv("GGML_SCHED_PREFETCH_HEADROOM_MIB");
+        const long mib = env ? atol(env) : 256;
+        return (size_t) (mib > 0 ? mib : 0) * 1024 * 1024;
+    }();
     for (int i = 0; i < n_slots; i++) {
         if (sched->prefetch_slots[i] != NULL &&
                 ggml_backend_buffer_get_size(sched->prefetch_slots[i]) >= size) {
             continue;
         }
-        // Leave MMQ/FA scratch for the 1856-wide prefill; a 210 MiB slot that
-        // fits still OOMs cuMemCreate during ggml_cuda_mul_mat_q on 6 GiB.
-        const size_t mmq_headroom = 256ull * 1024 * 1024;
         if (size + mmq_headroom > free_mem) {
             break;
         }
@@ -1742,7 +1747,8 @@ static bool ggml_backend_sched_prefetch_init(
     if (!slot0_only && n_ready < sched->prefetch_n_slots) {
         sched->prefetch_n_slots = n_ready;
         sched->prefetch_cur = 0;
-        GGML_LOG_WARN("%s: expert prefetch reduced to %d slot(s)\n", __func__, n_ready);
+        GGML_LOG_WARN("%s: expert prefetch reduced to %d slot(s) (slot %zu MiB, free %zu MiB, headroom %zu MiB)\n",
+            __func__, n_ready, size / (1024 * 1024), free_mem / (1024 * 1024), mmq_headroom / (1024 * 1024));
     }
     return true;
 }
