@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -66,7 +67,61 @@ struct common_reasoning_budget_ctx {
 
     int32_t end_match;        // index into end_matcher.seqs of the sequence that transitioned to DONE, -1 if none
     bool    exhausted;        // true once this request has already spent its budget
+
+    std::vector<llama_token> eog_ids = {}; // sorted, filled on the first masked step
+    bool eog_scanned = false;
 };
+
+// LLAMA_REASONING_EOG_MASK_FAST=0 restores the is_eog lookup for every candidate
+static bool common_reasoning_budget_eog_fast() {
+    static const bool fast = [] {
+        const char * e = getenv("LLAMA_REASONING_EOG_MASK_FAST");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return fast;
+}
+
+static void common_reasoning_budget_mask_eog(common_reasoning_budget_ctx * ctx, llama_token_data_array * cur_p) {
+    if (!common_reasoning_budget_eog_fast()) {
+        for (size_t i = 0; i < cur_p->size; i++) {
+            if (llama_vocab_is_eog(ctx->vocab, cur_p->data[i].id)) {
+                cur_p->data[i].logit = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    if (!ctx->eog_scanned) {
+        const int32_t n_vocab = llama_vocab_n_tokens(ctx->vocab);
+        for (llama_token id = 0; id < n_vocab; id++) {
+            if (llama_vocab_is_eog(ctx->vocab, id)) {
+                ctx->eog_ids.push_back(id);
+            }
+        }
+        ctx->eog_scanned = true;
+    }
+
+    // usually applied first, on the full vocabulary in id order
+    bool by_id = true;
+    for (const llama_token id : ctx->eog_ids) {
+        if ((size_t) id >= cur_p->size || cur_p->data[id].id != id) {
+            by_id = false;
+            break;
+        }
+    }
+    if (by_id) {
+        for (const llama_token id : ctx->eog_ids) {
+            cur_p->data[id].logit = -INFINITY;
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < cur_p->size; i++) {
+        if (std::binary_search(ctx->eog_ids.begin(), ctx->eog_ids.end(), cur_p->data[i].id)) {
+            cur_p->data[i].logit = -INFINITY;
+        }
+    }
+}
 
 static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
     return "reasoning-budget";
@@ -187,11 +242,7 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
     // mid-sentence and never reaches the tool call after </think>.
     if (common_reasoning_budget_think_open(ctx->state)) {
         if (ctx->vocab != nullptr) {
-            for (size_t i = 0; i < cur_p->size; i++) {
-                if (llama_vocab_is_eog(ctx->vocab, cur_p->data[i].id)) {
-                    cur_p->data[i].logit = -INFINITY;
-                }
-            }
+            common_reasoning_budget_mask_eog(ctx, cur_p);
         }
         return;
     }
