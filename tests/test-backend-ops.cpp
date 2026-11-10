@@ -9611,6 +9611,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2047, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {157184, 1, 1, 1}, k)); // vocabulary
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {157184, 3, 1, 1}, k, true));
     }
 
     // exhaustive top_k tests
@@ -10186,6 +10188,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
+    // backend sampling over a 157k vocabulary
+    for (int k : { 1, 20 }) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {157184, 1, 1, 1}, k));
+    }
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 157184, 157184, 1, 1, false));
+
     // MLA prefill: absorbed (one latent KV head) vs decompressed per head, see LLAMA_MLA_MHA_MIN_TOKENS
     for (int kv : { 2048, 8192 }) {
         test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

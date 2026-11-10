@@ -100,6 +100,154 @@ static bool top_k_f32_i32_cuda_ordered(
 #undef GGML_CUDA_TOP_K_CASE
 }
 
+#ifndef CUB_TOP_K_AVAILABLE
+// Large rows with small k (e.g. sampling over the vocabulary): every warp selects the k best of
+// its part of a slice, the lists are merged per block and then across blocks. Ranking is
+// (value desc, column asc), so ties resolve to the lower column.
+static constexpr int top_k_large_nthreads = 256;
+static constexpr int top_k_large_nwarps   = top_k_large_nthreads/WARP_SIZE;
+static constexpr int top_k_large_nblocks  = 64;
+
+static __device__ __forceinline__ bool top_k_large_before(float v0, int c0, float v1, int c1) {
+    return c0 != INT_MAX && (c1 == INT_MAX || v0 > v1 || (v0 == v1 && c0 < c1));
+}
+
+static __device__ __forceinline__ void top_k_large_warp_max(float & v, int & c, int & l) {
+#pragma unroll
+    for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+        const float ov = __shfl_xor_sync(0xFFFFFFFF, v, mask, WARP_SIZE);
+        const int   oc = __shfl_xor_sync(0xFFFFFFFF, c, mask, WARP_SIZE);
+        const int   ol = __shfl_xor_sync(0xFFFFFFFF, l, mask, WARP_SIZE);
+        if (top_k_large_before(ov, oc, v, c)) {
+            v = ov;
+            c = oc;
+            l = ol;
+        }
+    }
+}
+
+// one warp merges nl <= 2*WARP_SIZE sorted lists of length k (stride k) into the k best
+static __device__ __forceinline__ void top_k_large_merge(
+        const float * lv, const int * lc, const int nl, const int k, float * out_v, int * out_c) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    int h0 = 0;
+    int h1 = 0;
+    for (int r = 0; r < k; ++r) {
+        float v = -INFINITY;
+        int   c = INT_MAX;
+        int   l = -1;
+        if (lane < nl && h0 < k) {
+            v = lv[lane*k + h0];
+            c = lc[lane*k + h0];
+            l = lane;
+        }
+        if (lane + WARP_SIZE < nl && h1 < k) {
+            const float v1 = lv[(lane + WARP_SIZE)*k + h1];
+            const int   c1 = lc[(lane + WARP_SIZE)*k + h1];
+            if (top_k_large_before(v1, c1, v, c)) {
+                v = v1;
+                c = c1;
+                l = lane + WARP_SIZE;
+            }
+        }
+        top_k_large_warp_max(v, c, l);
+        h0 += l == lane;
+        h1 += l == lane + WARP_SIZE;
+        if (lane == 0) {
+            if (out_v) {
+                out_v[r] = v;
+            }
+            out_c[r] = c;
+        }
+    }
+}
+
+static __global__ void top_k_large_pass1(const float * src, float * tmp_v, int * tmp_c, const int ncols, const int k) {
+    extern __shared__ float slice[];
+    __shared__ float wl_v[top_k_large_nwarps*WARP_SIZE];
+    __shared__ int   wl_c[top_k_large_nwarps*WARP_SIZE];
+    const int row   = blockIdx.y;
+    const int chunk = (ncols + gridDim.x - 1) / gridDim.x;
+    const int c0    = blockIdx.x * chunk;
+    const int n     = max(0, min(chunk, ncols - c0));
+    const float * x = src + (int64_t) row * ncols + c0;
+    for (int i = threadIdx.x; i < n; i += top_k_large_nthreads) {
+        const float v = x[i];
+        slice[i] = isnan(v) ? -FLT_MAX : v;
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int sub  = (n + top_k_large_nwarps - 1) / top_k_large_nwarps;
+    const int i0   = warp*sub;
+    const int i1   = min(n, i0 + sub);
+    float pv = INFINITY;
+    int   pc = -1;
+    for (int r = 0; r < k; ++r) {
+        float v = -INFINITY;
+        int   c = INT_MAX;
+        for (int i = i0 + lane; i < i1; i += WARP_SIZE) {
+            const float vi = slice[i];
+            const int   ci = c0 + i;
+            if ((vi < pv || (vi == pv && ci > pc)) && top_k_large_before(vi, ci, v, c)) {
+                v = vi;
+                c = ci;
+            }
+        }
+        int l = 0;
+        top_k_large_warp_max(v, c, l);
+        if (lane == 0) {
+            wl_v[warp*k + r] = v;
+            wl_c[warp*k + r] = c;
+        }
+        pv = v;
+        pc = c;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int64_t o = ((int64_t) row * gridDim.x + blockIdx.x) * k;
+        top_k_large_merge(wl_v, wl_c, top_k_large_nwarps, k, tmp_v + o, tmp_c + o);
+    }
+}
+
+static __global__ void top_k_large_pass2(const float * tmp_v, const int * tmp_c, int * dst, const int nl, const int k) {
+    __shared__ float lv[2*WARP_SIZE*WARP_SIZE];
+    __shared__ int   lc[2*WARP_SIZE*WARP_SIZE];
+    const int row = blockIdx.x;
+    for (int i = threadIdx.x; i < nl*k; i += WARP_SIZE) {
+        lv[i] = tmp_v[(int64_t) row*nl*k + i];
+        lc[i] = tmp_c[(int64_t) row*nl*k + i];
+    }
+    __syncwarp();
+    top_k_large_merge(lv, lc, nl, k, nullptr, dst + (int64_t) row*k);
+}
+
+// GGML_CUDA_TOP_K_LARGE: rows from this many columns use the two-pass kernel for k <= 32 (0 = off)
+static bool top_k_f32_i32_cuda_large(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols,
+        const int nrows, const int k, cudaStream_t stream) {
+    static const int min_cols = [] {
+        const char * e = getenv("GGML_CUDA_TOP_K_LARGE");
+        return e ? atoi(e) : 4096;
+    }();
+    if (min_cols <= 0 || ncols < min_cols || k > WARP_SIZE || nrows > 65535) {
+        return false;
+    }
+    // slices of at least 2*k and at most 8192 columns, at most 2*WARP_SIZE lists to merge
+    const int nblocks = std::max((ncols + 8191) / 8192, std::min(top_k_large_nblocks, ncols / (2*k)));
+    const int chunk   = (ncols + nblocks - 1) / nblocks;
+    if (nblocks < 1 || nblocks > 2*WARP_SIZE) {
+        return false;
+    }
+    ggml_cuda_pool_alloc<float> tmp_v(pool, (size_t) nrows*nblocks*k);
+    ggml_cuda_pool_alloc<int>   tmp_c(pool, (size_t) nrows*nblocks*k);
+    top_k_large_pass1<<<dim3(nblocks, nrows), top_k_large_nthreads, chunk*sizeof(float), stream>>>(
+        src, tmp_v.get(), tmp_c.get(), ncols, k);
+    top_k_large_pass2<<<nrows, WARP_SIZE, 0, stream>>>(tmp_v.get(), tmp_c.get(), dst, nblocks, k);
+    return true;
+}
+#endif // CUB_TOP_K_AVAILABLE
+
 #ifdef CUB_TOP_K_AVAILABLE
 
 static void top_k_cub(ggml_cuda_pool & pool,
@@ -162,6 +310,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #else  // CUB_TOP_K_AVAILABLE
     if (top_k_f32_i32_cuda_ordered(src0_d, dst_d, ncols, nrows, k, stream)) {
+        return;
+    }
+    if (top_k_f32_i32_cuda_large(pool, src0_d, dst_d, ncols, nrows, k, stream)) {
         return;
     }
 #if defined(GGML_CUDA_USE_CUB)
