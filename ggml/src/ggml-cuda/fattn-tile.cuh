@@ -1292,7 +1292,9 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
             launch_fattn_tile_switch_ncols1<DKQ, DV,  8, use_logit_softcap>(ctx, dst);
             return;
         }
-        GGML_ABORT("flash-attn tile (192/128): expected GQA ratio multiple of 8");
+        // MHA layout, e.g. MLA with the latent cache decompressed per head
+        launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap>(ctx, dst);
+        return;
     }
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {

@@ -444,11 +444,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
             break;
         case 192:
-            if (V->ne[0] != 128 || !gqa_opt_applies) {
+            if (V->ne[0] != 128) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (gqa_ratio % 8 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
+            if (!gqa_opt_applies || gqa_ratio % 8 != 0) {
+                // only the tile kernel has a 192/128 instance without GQA packing
+                const bool kv_ok = K->type == V->type && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_F32);
+                return kv_ok && (!mask || mask->ne[2] == 1) ? BEST_FATTN_KERNEL_TILE : BEST_FATTN_KERNEL_NONE;
             }
             break;
         case 320:

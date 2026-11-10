@@ -1258,6 +1258,22 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // MLA with the latent cache (K = [latent | k_pe], V = view of K) as multi-head attention:
+    // the cached latents are decompressed with wk_b/wv_b instead of absorbing wk_b into Q.
+    // Fewer FLOPs than the absorbed form for large batches, see build_attn_mla_use_mha().
+    ggml_tensor * build_attn_mla_mha(
+            llm_graph_input_attn_k * inp,
+            ggml_tensor * q_nope, // [n_embd_head_qk_nope, n_head, n_tokens]
+            ggml_tensor * q_pe,   // [n_rot, n_head, n_tokens]
+            ggml_tensor * k_cur,  // [kv_lora_rank + n_rot, 1, n_tokens]
+            ggml_tensor * wk_b,   // [n_embd_head_qk_nope, kv_lora_rank, n_head]
+            ggml_tensor * wv_b,   // [kv_lora_rank, n_embd_head_v, n_head]
+                  float   kq_scale,
+                    int   il) const;
+
+    // LLAMA_MLA_MHA_MIN_TOKENS: ubatch size from which build_attn_mla_mha is used (0 = never)
+    bool build_attn_mla_use_mha(const ggml_tensor * wk_b) const;
+
     llm_graph_input_attn_k_dsa * build_attn_inp_k_dsa() const;
 
     ggml_tensor * build_attn(

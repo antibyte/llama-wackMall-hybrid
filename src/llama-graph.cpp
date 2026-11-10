@@ -3203,6 +3203,91 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+bool llm_graph_context::build_attn_mla_use_mha(const ggml_tensor * wk_b) const {
+    static const int64_t min_tokens = [] {
+        const char * e = getenv("LLAMA_MLA_MHA_MIN_TOKENS");
+        return e ? (int64_t) atoll(e) : (int64_t) 0;
+    }();
+    if (min_tokens <= 0 || n_tokens < min_tokens) {
+        return false;
+    }
+    // wk_b is transposed via a cast to F32, which the backends support only for these types
+    switch (wk_b->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+            return true;
+        default:
+            return false;
+    }
+}
+
+ggml_tensor * llm_graph_context::build_attn_mla_mha(
+        llm_graph_input_attn_k * inp,
+        ggml_tensor * q_nope,
+        ggml_tensor * q_pe,
+        ggml_tensor * k_cur,
+        ggml_tensor * wk_b,
+        ggml_tensor * wv_b,
+            float     kq_scale,
+            int       il) const {
+    const int64_t n_nope   = wk_b->ne[0];
+    const int64_t n_latent = wk_b->ne[1];
+    const int64_t n_head_k = wk_b->ne[2];
+    const int64_t n_v      = wv_b->ne[1];
+    const int64_t n_pe     = k_cur->ne[0] - n_latent;
+
+    ggml_build_forward_expand(gf, q_nope);
+    ggml_build_forward_expand(gf, q_pe);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+
+    // [n_latent + n_pe, 1, n_kv, n_stream]
+    ggml_tensor * k_cache = mctx_cur->get_k(ctx0, il);
+    const int64_t n_kv = k_cache->ne[2];
+    const int64_t n_stream = k_cache->ne[3];
+
+    ggml_tensor * latent = ggml_view_3d(ctx0, k_cache, n_latent, n_kv, n_stream, k_cache->nb[2], k_cache->nb[3], 0);
+    latent = ggml_cast(ctx0, latent, GGML_TYPE_F32);
+    cb(latent, "mla_latent", il);
+
+    // wk_b contracts over its second dimension: transpose it once per graph
+    ggml_tensor * wk_b_t = ggml_cast(ctx0, wk_b, GGML_TYPE_F32);
+    wk_b_t = ggml_cont(ctx0, ggml_permute(ctx0, wk_b_t, 1, 0, 2, 3));
+    wk_b_t = ggml_reshape_2d(ctx0, wk_b_t, n_latent, n_nope*n_head_k);
+
+    ggml_tensor * k_nope = ggml_mul_mat(ctx0, wk_b_t, latent);
+    k_nope = ggml_reshape_4d(ctx0, k_nope, n_nope, n_head_k, n_kv, n_stream);
+    cb(k_nope, "mla_k_nope", il);
+
+    ggml_tensor * k_pe = ggml_view_4d(ctx0, k_cache, n_pe, 1, n_kv, n_stream,
+            k_cache->nb[1], k_cache->nb[2], k_cache->nb[3], ggml_row_size(k_cache->type, n_latent));
+    k_pe = ggml_cast(ctx0, k_pe, GGML_TYPE_F32);
+    k_pe = ggml_repeat_4d(ctx0, k_pe, n_pe, n_head_k, n_kv, n_stream);
+
+    ggml_tensor * k = ggml_cast(ctx0, ggml_concat(ctx0, k_nope, k_pe, 0), GGML_TYPE_F16);
+    cb(k, "mla_k", il);
+
+    ggml_tensor * v = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, wv_b, n_latent, n_v*n_head_k), latent);
+    v = ggml_cast(ctx0, ggml_reshape_4d(ctx0, v, n_v, n_head_k, n_kv, n_stream), GGML_TYPE_F16);
+    cb(v, "mla_v", il);
+
+    ggml_tensor * q = ggml_concat(ctx0, q_nope, q_pe, 0);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, inp->get_kq_mask(), nullptr, nullptr, kq_scale, il);
+    cb(cur, "kqv_out", il);
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_k_dsa * inp,
         ggml_tensor * wo,

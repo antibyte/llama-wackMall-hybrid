@@ -386,16 +386,22 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
                     ext_factor, attn_factor, beta_fast, beta_slow);
             kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
 
-            q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
-            q_nope = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
-            q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
+            if (build_attn_mla_use_mha(layer.wk_b)) {
+                kv = ggml_reshape_3d(ctx0, kv, kv_lora_rank, 1, n_tokens);
+                ggml_tensor * k = ggml_concat(ctx0, kv, k_pe, 0);
+                cur = build_attn_mla_mha(inp_attn, q_nope, q_pe, k, layer.wk_b, layer.wv_b, kq_scale, il);
+            } else {
+                q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
+                q_nope = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
+                q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
 
-            ggml_tensor * q = ggml_concat(ctx0, q_nope, q_pe, 0);
-            kv = ggml_reshape_3d(ctx0, kv, kv_lora_rank, 1, n_tokens);
-            ggml_tensor * k = ggml_concat(ctx0, kv, k_pe, 0);
+                ggml_tensor * q = ggml_concat(ctx0, q_nope, q_pe, 0);
+                kv = ggml_reshape_3d(ctx0, kv, kv_lora_rank, 1, n_tokens);
+                ggml_tensor * k = ggml_concat(ctx0, kv, k_pe, 0);
 
-            cur = build_attn(inp_attn, nullptr, nullptr, nullptr,
-                    q, k, kv, nullptr, nullptr, layer.wv_b, kq_scale, il);
+                cur = build_attn(inp_attn, nullptr, nullptr, nullptr,
+                        q, k, kv, nullptr, nullptr, layer.wv_b, kq_scale, il);
+            }
 
             ggml_tensor * attn_gate = ggml_mul_mat(ctx0, layer.wqkv_gate, attn_input);
             attn_gate = ggml_sigmoid(ctx0, ggml_reshape_3d(ctx0, attn_gate, 1, n_head, n_tokens));
