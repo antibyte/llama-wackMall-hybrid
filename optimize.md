@@ -1,3 +1,61 @@
+# GPU-Auslastung Ling-3.0-tiny: MLA-Prefill entpackt, Reasoning-Budget, top-k und get_rows vom 2026-11-10
+
+**Ergebnis: Vier Aenderungen, A/B/A/B gegen die deployten Binaries (Rezept `ling-tiny`, Sampling wie agollm: temp 1,0 / top_k 20 / top_p 0,95, Anfragen mit Tools): Prefill +21 % bei ~4k Tokens (1420 -> 1724 t/s) und +46 % bei ~9,5k (1191 -> 1742 t/s), Decode +11 % (130,6 -> 145,2 t/s). Groesster Hebel fuer pps ist die MLA-Attention im Prefill, fuer tps im Betrieb ein CPU-Durchlauf ueber das ganze Vokabular je Token im Reasoning-Budget-Sampler.**
+
+| Ausgangslage (nsys, deployte Libs) | |
+|---|---|
+| Prefill 9,5k: Tile-Attention D=576 (6 MLA-Layer) | 45 % der Kernelzeit (3,4 von 7,4 s), 2,9 TFLOPS |
+| Prefill 9,5k: MMQ / `gated_delta_net` | 34 % / 8 % |
+| agollm-Betrieb (Journal): 4k neue Tokens auf 6-10k Kontext | ~950 t/s Prefill |
+| Decode kurz: Kernelzeit / Wall | 6,17 / 6,76 ms je Token, 1192 Kernel, 74 % kuerzer als 5 us |
+| Decode mit Tools (Grammar -> CPU-Sampling) gegen ohne | 133,4 gegen 147,3 t/s |
+
+**Aenderungen:**
+- **MLA-Prefill als Multi-Head-Attention** (`src/llama-graph.cpp` `build_attn_mla_mha`, eingebunden in `src/models/bailingmoe3.cpp`; Knopf `LLAMA_MLA_MHA_MIN_TOKENS`, Default 0 = absorbiert wie bisher, Rezept 128): Ab dieser Ubatch-Groesse werden die latenten Cache-Zeilen mit `wk_b`/`wv_b` je Kopf entpackt (K 192, V 128, 16 KV-Koepfe) statt `wk_b` in Q zu absorbieren (576/512 auf einem KV-Kopf). Das sind 640 statt 2176 FLOPs je Paar und Kopf; das Entpacken kostet je KV-Zeile 4,2 MFLOP, verteilt auf 2048 Query-Tokens. Der Tile-Kernel bekommt dafuer eine 192/128-Instanz ohne GQA-Packung (`fattn-tile.cuh`, Auswahl in `fattn.cu`). Op (KV 8192, 2048 Tokens): 204 -> 53 ms. Ende-zu-Ende (nur dieser Knopf, A/B/A/B): ~2k Tokens 1645 -> 1842 t/s (+12 %), ~4k 1496 -> 1812 (+21 %), ~9,5k 1217 -> 1758 (+44 %); Decode unveraendert. KLD gegen den Decode-Pfad 0,0113 (heutiger Prefill-Pfad 0,0111), PPL-Verhaeltnis 1,000. VRAM-Spitze 5132 -> 5082 MiB (die Zwischenpuffer der 16x512-Attention fallen weg). Greift nur fuer `wk_b`-Typen, die das Backend nach F32 casten kann (F32/F16/BF16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1).
+- **Reasoning-Budget** (`common/reasoning-budget.cpp`; `LLAMA_REASONING_EOG_MASK_FAST`, Default 1, 0 = alter Pfad): Die Fork-Sperre fuer EOG-Tokens waehrend des Denkens rief fuer jeden der 157k Kandidaten `llama_vocab_is_eog` (Set-Lookup) auf, ~0,7 ms je Token auf dem Host, waehrend die GPU wartet. Betroffen ist jede Anfrage mit CPU-Sampling, also alle Tool-Anfragen von agollm (Grammar schaltet das Backend-Sampling ab). Jetzt werden die EOG-IDs einmal je Anfrage gesammelt und direkt gesperrt. Tools: 134,1 -> 147,4 t/s (+9,9 %); Chat mit CPU-Sampling 133,5 -> 147,1 (+10 %), Ausgabe identisch (4/4 Laeufe).
+- **top-k ueber das Vokabular** (`ggml-cuda/top-k.cu`; `GGML_CUDA_TOP_K_LARGE`, Default 4096 Spalten, 0 = aus): CUDA 12.0 hat kein `DeviceTopK`, top-k lief als kompletter Radix-Sort (4 Durchlaeufe ueber 157k). Neu: zwei Stufen (je Warp die k besten, Merge je Block, Merge ueber die Bloecke) fuer k <= 32. k=1: 158 -> 7,9 us, k=20: 155 -> 67 us. Backend-Sampling: greedy 147,2 -> 150,3 t/s (+2,1 %), top_k 20 147,2 -> 148,6 (+1,0 %), Ausgabe identisch.
+- **get_rows mit schmalen Zeilen** (`ggml-cuda/getrows.cu`; `GGML_CUDA_GET_ROWS_NARROW`, Default 8 Elemente, 0 = aus): Der Backend-top-p-Sampler sortiert die Logits per `get_rows` auf [1, 157184]; der Kernel startete dafuer 157184 Bloecke mit je einem Element (2,0 ms je Token). Jetzt ein Thread je Element: 14 us. Trifft Clients mit `top_k=0`: 102,0 -> 129,3 t/s (+27 %).
+
+Gesamtvergleich (A/B/A/B, alte Libs aus `workers/llama` gegen neuen Build mit `LLAMA_MLA_MHA_MIN_TOKENS=128`, Tool-Anfragen):
+
+| | alt | neu |
+|---|---|---|
+| Decode kurz (go, code; 256 Tokens) | 130,6 t/s | 145,2 t/s (+11,2 %) |
+| Prefill ~4k Tokens | 1420 t/s | 1724 t/s (+21,4 %) |
+| Prefill ~9,5k Tokens | 1191 t/s | 1742 t/s (+46,3 %) |
+| Decode nach ~4k / ~9,5k Prompt | 124,9 / 123,9 t/s | 133,5 / 137,2 t/s |
+
+Verworfen: Prefill-Ubatch 4096 statt 2048 (~4k: -5 %, 9,5k: +-0). F16-cuBLAS statt MMQ: auf der 1660 Ti 1,85 TFLOPS gegen 9,1 TOPS (MMQ dp4a, Q4_K, 4096x14336, 512 Spalten); die MoE-Matmuls im Prefill laufen schon mit ~8,6 TOPS.
+
+**Offene Hebel** (geschaetzt aus den Profilen, nicht umgesetzt):
+- Host zwischen den Tokens, ~0,45 ms (~7 %): 9 synchrone Eingabe-Uploads (je ~17 us), 6 ueberfluessige Stream-Syncs, `llama_batch_allocr::init` ~0,1 ms; im CPU-Sampling-Pfad zusaetzlich `set_logits` (157k Kandidaten, ~0,2 ms) und der top-k-Partial-Sort (~0,1 ms).
+- Kleine Matvecs: Shared Expert, MLA-Projektionen, Router (F32), `attn_output` (Q5_K) laufen mit 90-180 GB/s; zur Bandbreitengrenze fehlen ~1 ms je Token, realistisch 0,3-0,5 ms (5-7 %).
+- `quantize_q8_1`: 268 Aufrufe je Token (0,47 ms), etwa die Haelfte quantisiert eine schon quantisierte Eingabe noch einmal (q/k/v/f/g der KDA-Layer): ~3 %.
+- Kurze Elementkernel (~1,2 ms je Token): Fusion 2-4 %.
+- Prefill: `gated_delta_net` rechnet sequenziell (3,4 us je Token und Layer, nach der MLA-Aenderung 12 % bei 9,5k), ein Chunk-Kernel spart geschaetzt ~7 %. Der 192/128-Tile-Kernel liegt bei 3,2 TFLOPS (30 % FP16). Das Entpacken von `wk_b` laeuft als F32-SGEMM (128 ms bei 9,5k).
+- Tool-Anfragen sind auch mit greedy und gleicher Binary nicht reproduzierbar (Chat ohne Tools schon); Ursache offen.
+
+Laeufe: `benchmark-results/gpu-util-20261110/runs/` (`u-*-nsys`: Profile, `p-*`/`pab-*`: MLA-Prefill, `e-*`/`e4-*`: Reasoning-Budget, `tk*`: top-k, `gr-*`: get_rows, `f-*`: Gesamtvergleich, `s-*`: Sampling-Modi). Werkzeuge: `tools/mbench.py` (neu: `--samp`, `--tools`, `--chat`), `tools/prefill_kernels.py`. Tests: `test-backend-ops -b CUDA0` FLASH_ATTN_EXT alle Faelle OK (192/128 jetzt auch ohne GQA), TOP_K 457/457 (neu: 157184 Spalten), GET_ROWS (auch mit `GGML_CUDA_GET_ROWS_NARROW=64`).
+
+## Einbau und andere Modelle (2026-11-10, Nachmittag)
+
+**Eingebaut:** `ling-tiny.yaml` und `start-ling-tiny.sh` setzen alle vier Knoepfe (`LLAMA_MLA_MHA_MIN_TOKENS=128`, die drei uebrigen mit ihren Defaults), `config_test.go` prueft die beiden wichtigen. Deployt nach agollm `workers/llama`: `libggml-cuda.so.0`, `libllama.so.0`, `libllama-common.so.0` aus `build-main-sm75` (ORIGIN `gpu-util=20261110T122939Z`, Backup `runtime/llama-build-before-gpu-util-20261110T122939Z`). Die uncommitteten Aenderungen anderer Sessions in diesen Libs sind aelter als der Deploy vom 2026-11-09 und damit unveraendert; `libllama-common` ist seit dem 2026-11-02 nur um `reasoning-budget.cpp` gewachsen. Im laufenden Worker: 4747 Tokens Prefill mit 1745 t/s, Decode mit Tools 141,7 t/s.
+
+**Andere Modelle** (A/B/A/B auf dem neuen Build, Ausgabe-SHA in allen Faellen gleich):
+
+| Aenderung | betrifft | gemessen |
+|---|---|---|
+| EOG-Maske im Reasoning-Budget | jede Anfrage mit CPU-Sampling und offenem Denkblock: Tools (Grammar) oder Rezepte ohne Backend-Sampling; Kosten wachsen mit dem Vokabular (Qwen3.5-Familie 248k, Gemma4 262k) | Sage-A1.5 Tools 34,8 -> 38,2 t/s (+9,8 %), FrogNano-4B Chat 63,2 -> 68,9 (+9,1 %), MiMo-9B Tools 39,3 -> 40,2 (+2,2 %), Mage-VL Chat +-0 (Budget dort nicht aktiv) |
+| MLA-Prefill entpackt | nur bailingmoe3 (Ling-tiny, Ling-3.0-flash) | Ling-3.0-flash bleibt absorbiert (`LLAMA_MLA_MHA_MIN_TOKENS=0` im Rezept): 32k Zellen ohne KVFlash braeuchten mehr als 1 GiB fuer die entpackten K/V, der Prefill ist SSD-gebunden (Attention-Anteil geschaetzt unter 3 %) |
+| top-k ueber das Vokabular | nur k <= 32; die anderen Rezepte nutzen den Server-Default top_k 40 und bleiben beim Radix-Sort (bei 248k und ~35 t/s unter 1 %) | - |
+| get_rows schmal | alle Rezepte mit Backend-Sampling, wenn ein Client `top_k=0` schickt | - |
+
+Die Hybrid-Modelle sampeln mit MTP/DFlash mehrere Tokens je Schritt, deshalb wirkt die EOG-Maske dort staerker als die reine Tokenzeit vermuten laesst. Im Journal der letzten 14 Tage liefen 757 Ling-, 209 Sage-, 56 MiMo-, 37 Clover- und 33 Qwen3.6-Anfragen ueber den Grammar-Pfad. Explizit gesetzt ist `LLAMA_REASONING_EOG_MASK_FAST=1` in `sage-a1.5`, `frognano-4b-2609`, `mimo-v2.6-9b`, `qwen3.6-35b-a3b-hybrid`, `clover-35b-a3b-hybrid`, `holo4-35b-a3b` sowie in `start1660.sh` und `start-frognano-4b.sh`; alle uebrigen Rezepte bekommen den Default 1.
+
+Nachkontrolle mit den deployten Libs: Sage gleiche SHA wie im A/B; Mellum-MTP Drafts unveraendert (108/146, 110/144), Decode mit Abkuehlpausen 51,1 gegen 49,9 t/s (alt), ohne Pausen thermisch verrauscht.
+
+Laeufe: `runs/o-*` (andere Modelle), `runs/dep2-*` (Deploy-Satz), `runs/mel*` (Mellum alt gegen neu).
+
 # MLA-Decode-Kernel fuer Ling-3.0-tiny vom 2026-11-09
 
 **Ergebnis: Ein eigener CUDA-Kernel fuer die MLA-Attention im Decode (D=576/512, 16 Koepfe auf einem latenten KV-Kopf, F16-KV) ersetzt den Tile-Kernel und ist auf der GTX 1660 Ti 2,3- bis 2,6-mal schneller (7,5k Kontext: 160,6 + 7,9 us -> 51,4 + 4,4 us je Layer inklusive Zusammenfuehren). Im Ling-tiny-Rezept: +8,4 % Decode bei 7,5k Kontext (128,4 -> 139,1 t/s), +1,9 % bei kurzem Kontext (144,8 -> 147,5 t/s), Prefill unveraendert. Hinter `GGML_CUDA_FA_MLA_DEC` (Default 0 = Tile-Kernel wie bisher).**

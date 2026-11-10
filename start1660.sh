@@ -110,6 +110,7 @@ DFLASH_ADAPTIVE="1"  # compare draft caps 2/4 by wall time per emitted token; 0 
 DRAFT_NGL="all"  # the measured winner keeps all six DFlash layers on the GPU
 REASONING="1"  # let the model template select reasoning mode
 REASONING_BUDGET="6000"  # measured quality/latency compromise; clients may request another value
+REASONING_EOG_MASK_FAST="1"  # think-block EOG mask without a vocabulary scan per token (0 = old scan); identical output, +2-10 % decode with CPU sampling
 REASONING_PRESERVE="1"  # preserve reasoning in history: 1 enabled, 0 disabled
 LOAD_MODE="mmap"  # measured loading/runtime winner; "none" was 1.87% slower and reduced S to 32
 OFFLINE="1"  # prevent network model/template downloads when set to 1
@@ -320,6 +321,7 @@ case "$DFLASH_COMBINED" in 0|1) ;; *) die "DFLASH_COMBINED muss 0 oder 1 sein." 
 case "$TARGET_BACKEND_SAMPLING" in 0|1) ;; *) die "TARGET_BACKEND_SAMPLING muss 0 oder 1 sein." ;; esac
 case "$DRAFT_BACKEND_SAMPLING" in 0|1) ;; *) die "DRAFT_BACKEND_SAMPLING muss 0 oder 1 sein." ;; esac
 case "$REASONING_PRESERVE" in 0|1) ;; *) die "REASONING_PRESERVE muss 0 oder 1 sein." ;; esac
+case "$REASONING_EOG_MASK_FAST" in 0|1) ;; *) die "REASONING_EOG_MASK_FAST muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_V_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_V_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_MTP_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_MTP_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
 case "$LLAMA_TURBO4_DFLASH_EXPERIMENTAL" in 0|1) ;; *) die "LLAMA_TURBO4_DFLASH_EXPERIMENTAL muss 0 oder 1 sein." ;; esac
@@ -519,6 +521,7 @@ env_args=(
     "LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING=$EFFECTIVE_SPEC_DRAFT_BACKEND_SAMPLING"
     "LLAMA_ARG_REASONING=$REASONING"
     "LLAMA_ARG_THINK_BUDGET=$REASONING_BUDGET"
+    "LLAMA_REASONING_EOG_MASK_FAST=$REASONING_EOG_MASK_FAST"
     "LLAMA_ARG_REASONING_PRESERVE=$REASONING_PRESERVE"
     "LLAMA_ARG_THINK=$REASONING_FORMAT"
     "LLAMA_ARG_FLASH_ATTN=$FLASH_ATTN"
@@ -714,7 +717,7 @@ llama-wackMall-hybrid start
   shared hot IDs: $LLAMA_EXPERT_SHARED_HOT_IDS
   CPU fused GU: $LLAMA_EXPERT_CPU_FUSED_GATE_UP
   bridge:       consume=$GGML_CUDA_EXPERT_BRIDGE_CONSUME device-quant=$GGML_CUDA_EXPERT_BRIDGE_DEVICE_QUANT hit-only=$GGML_CUDA_EXPERT_BRIDGE_HIT_ONLY cache=${GGML_CUDA_EXPERT_BRIDGE_CACHE_LAYERS:-off}/$GGML_CUDA_EXPERT_BRIDGE_CACHE_SLOTS
-  reasoning:    $REASONING_BUDGET format=$REASONING_FORMAT
+  reasoning:    $REASONING_BUDGET format=$REASONING_FORMAT eog-mask-fast=$REASONING_EOG_MASK_FAST
   chat template: ${CHAT_TEMPLATE_FILE:-<model metadata>}
 EOF
 

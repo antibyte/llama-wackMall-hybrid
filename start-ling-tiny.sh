@@ -258,6 +258,10 @@ GGML_CUDA_TOPK_MOE_GROUPED_FAST="1"  # register-only grouped top-k, same ids; +1
 GGML_CUDA_FA_MLA_DEC="1"  # MLA decode attention kernel for F16 KV instead of the tile kernel; +8.4 % at 7.5k context
 GGML_CUDA_FA_MLA_DEC_MAX_TOKENS="32"  # query tokens up to which the MLA decode kernel runs (faster than tile up to 32)
 GGML_CUDA_FA_MLA_DEC_MIN_ROWS="32"  # fewest KV rows per block
+LLAMA_MLA_MHA_MIN_TOKENS="128"  # ubatch size from which MLA prefill decompresses the latent cache per head (0 = absorbed); +21 % prefill at 4k, +46 % at 9.5k
+LLAMA_REASONING_EOG_MASK_FAST="1"  # think-block EOG mask without a full-vocabulary scan per token; +10 % decode on tool requests (CPU sampling)
+GGML_CUDA_TOP_K_LARGE="4096"  # rows from this width use the two-pass top-k instead of a radix sort (0 = off); +1-2 % decode with backend sampling
+GGML_CUDA_GET_ROWS_NARROW="8"  # get_rows rows up to this width use one thread per element (0 = off); backend top-p without top-k +27 %
 GGML_CUDA_ASYNC_HOST_COPY="1"  # pinned split H2D
 GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate
 GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner
@@ -384,6 +388,10 @@ case "$GGML_CUDA_TOPK_MOE_GROUPED_FAST" in 0|1) ;; *) die "GGML_CUDA_TOPK_MOE_GR
 case "$GGML_CUDA_FA_MLA_DEC" in 0|1) ;; *) die "GGML_CUDA_FA_MLA_DEC muss 0 oder 1 sein." ;; esac
 [[ "$GGML_CUDA_FA_MLA_DEC_MAX_TOKENS" =~ ^[0-9]+$ ]] || die "GGML_CUDA_FA_MLA_DEC_MAX_TOKENS muss eine Zahl >= 0 sein."
 [[ "$GGML_CUDA_FA_MLA_DEC_MIN_ROWS" =~ ^[0-9]+$ ]] || die "GGML_CUDA_FA_MLA_DEC_MIN_ROWS muss eine Zahl >= 0 sein."
+[[ "$LLAMA_MLA_MHA_MIN_TOKENS" =~ ^[0-9]+$ ]] || die "LLAMA_MLA_MHA_MIN_TOKENS muss eine Zahl >= 0 sein."
+case "$LLAMA_REASONING_EOG_MASK_FAST" in 0|1) ;; *) die "LLAMA_REASONING_EOG_MASK_FAST muss 0 oder 1 sein." ;; esac
+[[ "$GGML_CUDA_TOP_K_LARGE" =~ ^[0-9]+$ ]] || die "GGML_CUDA_TOP_K_LARGE muss eine Zahl >= 0 sein."
+[[ "$GGML_CUDA_GET_ROWS_NARROW" =~ ^[0-9]+$ ]] || die "GGML_CUDA_GET_ROWS_NARROW muss eine Zahl >= 0 sein."
 case "$GGML_CUDA_ASYNC_HOST_COPY" in 0|1) ;; *) die "GGML_CUDA_ASYNC_HOST_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_ASYNC_D2H_COPY" in 0|1) ;; *) die "GGML_SCHED_ASYNC_D2H_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_DEDUP_DST_SYNC" in 0|1) ;; *) die "GGML_SCHED_DEDUP_DST_SYNC muss 0 oder 1 sein." ;; esac
@@ -627,6 +635,10 @@ env_args=(
     "GGML_CUDA_FA_MLA_DEC=$GGML_CUDA_FA_MLA_DEC"
     "GGML_CUDA_FA_MLA_DEC_MAX_TOKENS=$GGML_CUDA_FA_MLA_DEC_MAX_TOKENS"
     "GGML_CUDA_FA_MLA_DEC_MIN_ROWS=$GGML_CUDA_FA_MLA_DEC_MIN_ROWS"
+    "LLAMA_MLA_MHA_MIN_TOKENS=$LLAMA_MLA_MHA_MIN_TOKENS"
+    "LLAMA_REASONING_EOG_MASK_FAST=$LLAMA_REASONING_EOG_MASK_FAST"
+    "GGML_CUDA_TOP_K_LARGE=$GGML_CUDA_TOP_K_LARGE"
+    "GGML_CUDA_GET_ROWS_NARROW=$GGML_CUDA_GET_ROWS_NARROW"
     "GGML_CUDA_ASYNC_HOST_COPY=$GGML_CUDA_ASYNC_HOST_COPY"
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
     "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"
@@ -736,7 +748,8 @@ llama-wackMall-hybrid start (ling-tiny)
   CUDA rows:    Q8n1=$GGML_CUDA_MMVQ_Q8_NCOLS1_ROWS Q8n2=$GGML_CUDA_MMVQ_Q8_NCOLS2_ROWS Q8n3=$GGML_CUDA_MMVQ_Q8_NCOLS3_ROWS Q8n5=$GGML_CUDA_MMVQ_Q8_NCOLS5_ROWS Q4n1=$GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS Q6n1=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS Q6n3=$GGML_CUDA_MMVQ_Q6_K_NCOLS3_ROWS Q6n4=$GGML_CUDA_MMVQ_Q6_K_NCOLS4_ROWS
   Q6 probes:    warps=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARPS warp-rows=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_WARP_ROWS reuse-y=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_REUSE_Y
   CUDA concat:  flat-dim0=$GGML_CUDA_CONCAT_NONCONT_FLAT_DIM0 block=$GGML_CUDA_CONCAT_NONCONT_BLOCK_SIZE
-  CUDA decode:  q6k-ids-rows=$GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS cpy-2d-min=$GGML_CUDA_CPY_2D_MIN_ROW_BYTES topk-fast=$GGML_CUDA_TOPK_MOE_GROUPED_FAST mla-dec=$GGML_CUDA_FA_MLA_DEC (max-tokens=$GGML_CUDA_FA_MLA_DEC_MAX_TOKENS min-rows=$GGML_CUDA_FA_MLA_DEC_MIN_ROWS)
+  CUDA decode:  q6k-ids-rows=$GGML_CUDA_MMVQ_Q6_K_IDS_NCOLS1_ROWS cpy-2d-min=$GGML_CUDA_CPY_2D_MIN_ROW_BYTES topk-fast=$GGML_CUDA_TOPK_MOE_GROUPED_FAST mla-dec=$GGML_CUDA_FA_MLA_DEC (max-tokens=$GGML_CUDA_FA_MLA_DEC_MAX_TOKENS min-rows=$GGML_CUDA_FA_MLA_DEC_MIN_ROWS) mla-mha-min=$LLAMA_MLA_MHA_MIN_TOKENS
+  sampling:     eog-mask-fast=$LLAMA_REASONING_EOG_MASK_FAST top-k-large=$GGML_CUDA_TOP_K_LARGE get-rows-narrow=$GGML_CUDA_GET_ROWS_NARROW
   split copies: async-h2d=$GGML_CUDA_ASYNC_HOST_COPY async-d2h=$GGML_SCHED_ASYNC_D2H_COPY dedup-dst-sync=$GGML_SCHED_DEDUP_DST_SYNC
   n-cpu-moe:    register-host=$GGML_CUDA_REGISTER_HOST prefetch-experts=$GGML_SCHED_PREFETCH_EXPERTS
   skip sentinel: $LLAMA_EXPERT_SKIP_SENTINEL (1=MMVQ early-exit on cold sentinel slots)
