@@ -1510,6 +1510,9 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    // non-adjacent fusions and q8_1 reuse of one graph evaluation, see graph-fusion.cuh
+    struct ggml_cuda_graph_fusion * graph_fusion = nullptr;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

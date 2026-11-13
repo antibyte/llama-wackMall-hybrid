@@ -1,8 +1,10 @@
 #include "mmvq.cuh"
+#include "graph-fusion.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -1756,12 +1758,43 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_graph_fusion * gfu = ctx.graph_fusion;
+    const bool q8_1_reuse = gfu != nullptr && gfu->q8_1_active && ctx.curr_stream_no == 0 && q8_1_size <= GGML_CUDA_Q8_1_REUSE_BYTES;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const void * src1_q8_1_d = nullptr;
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        if (q8_1_reuse) {
+            const int64_t key[8] = { (int64_t) (uintptr_t) src1_d, ne10, ne11, ne12, ne13, s11, s12, s13 };
+            if (gfu->q8_1_buf == nullptr) {
+                CUDA_CHECK(cudaMalloc(&gfu->q8_1_buf, GGML_CUDA_Q8_1_REUSE_BYTES));
+            }
+            const bool hit = gfu->q8_1_valid && std::equal(key, key + 8, gfu->q8_1_key);
+            if (!hit) {
+                quantize_row_q8_1_cuda(src1_d, nullptr, gfu->q8_1_buf, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                std::copy(key, key + 8, gfu->q8_1_key);
+                gfu->q8_1_valid = true;
+                gfu->q8_1_lo    = (const char *) src1_d;
+                gfu->q8_1_hi    = (const char *) src1_d + (ne13 - 1)*src1->nb[3] + (ne12 - 1)*src1->nb[2] + (ne11 - 1)*src1->nb[1] + ne10*ts_src1;
+            }
+            src1_q8_1_d = gfu->q8_1_buf;
+            static const bool trace = getenv("GGML_CUDA_GRAPH_FUSION_TRACE") != nullptr;
+            if (trace) {
+                static int64_t n_hit = 0;
+                static int64_t n_all = 0;
+                n_hit += hit;
+                if (++n_all % 2000 == 0) {
+                    fprintf(stderr, "ggml_cuda: q8_1 reuse: %lld of %lld matvecs\n", (long long) n_hit, (long long) n_all);
+                }
+            }
+        } else {
+            src1_q8_1.alloc(q8_1_size);
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            src1_q8_1_d = src1_q8_1.get();
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1787,7 +1820,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

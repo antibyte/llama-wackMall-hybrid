@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
+#include "graph-fusion.cuh"
 
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
@@ -213,6 +214,110 @@ static void ssm_conv_tree_f32_cuda(const float * src0, const float * src1, const
     }
 }
 
+// ssm_conv_f32 reading its window straight from the concat sources (conv state, new tokens)
+// instead of the concat result; also writes the copied conv-state windows into the cache.
+// A row reads all of its inputs before writing, so dst may alias the new tokens with the same layout.
+template <bool apply_silu, size_t split_d_inner, size_t d_conv, int max_n_t>
+static __global__ void ssm_conv_concat_f32(const ggml_cuda_ssm_conv_concat cc, const float * src1_ptr,
+                                           const float * bias_ptr, const int src1_nb1,
+                                           float * dst_ptr, const int dst_nb0, const int dst_nb1, const int dst_nb2,
+                                           const int64_t n_t) {
+    const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
+    const float * GGML_CUDA_RESTRICT bias = bias_ptr;
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+    const int row  = bidy * split_d_inner + tid;
+
+    const char * a = cc.a + bidx * cc.a_nb2 + row * cc.a_nb1;
+    const char * b = cc.b + bidx * cc.b_nb2 + row * cc.b_nb1;
+    constexpr int ne0_a = d_conv - 1;
+
+    const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
+    float *       y_block = (float *) ((char *) dst_ptr + bidx * dst_nb2 + bidy * split_d_inner * dst_nb0);
+
+    const int stride_w = src1_nb1 / sizeof(float);
+    const int stride_y = dst_nb1 / sizeof(float);
+
+    float w[d_conv] = { 0.0f };
+    float xs[ne0_a + max_n_t];
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_block[tid * stride_w + j];
+    }
+#pragma unroll
+    for (int c = 0; c < ne0_a; c++) {
+        xs[c] = *(const float *) (a + c * cc.a_nb0);
+    }
+#pragma unroll
+    for (int t = 0; t < max_n_t; t++) {
+        if (t < n_t) {
+            xs[ne0_a + t] = *(const float *) (b + t * cc.b_nb0);
+        }
+    }
+
+    float bv = bias != nullptr ? bias[row] : 0.0f;
+
+    float x[d_conv] = { 0.0f };
+    for (int64_t i = 0; i < n_t; i++) {
+        float sumf = 0.0f;
+
+        if (i == 0) {
+            for (size_t j = 0; j < d_conv; j++) {
+                x[j] = xs[j];
+            }
+        } else {
+            x[(i - 1) % d_conv] = xs[i + d_conv - 1];
+        }
+
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += x[(i + j) % d_conv] * w[j];
+        }
+        sumf += bv;
+        y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+    }
+
+    for (int k = 0; k < cc.n_cpy; k++) {
+        float * state = (float *) (cc.cpy_dst[k] + bidx * cc.cpy_seq_stride[k]) + row * ne0_a;
+#pragma unroll
+        for (int j = 0; j < ne0_a; j++) {
+            state[j] = xs[cc.cpy_col[k] + j];
+        }
+    }
+}
+
+template <bool apply_silu>
+static void ssm_conv_concat_f32_cuda(const ggml_cuda_ssm_conv_concat & cc, const float * src1, const float * bias,
+                                     const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
+                                     const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
+                                     const int64_t n_s, cudaStream_t stream) {
+    const int threads = 128;
+    GGML_ASSERT(nr % threads == 0);
+    GGML_ASSERT(n_t <= 32);
+    const dim3 blocks(n_s, nr / threads, 1);
+    auto launch_kernel = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        if (n_t <= 8) {
+            ssm_conv_concat_f32<apply_silu, threads, kNC, 8><<<blocks, threads, 0, stream>>>(
+                cc, src1, bias, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+        } else {
+            ssm_conv_concat_f32<apply_silu, threads, kNC, 32><<<blocks, threads, 0, stream>>>(
+                cc, src1, bias, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+        }
+    };
+    switch (nc) {
+        case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
+        case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+    }
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
@@ -284,6 +389,21 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(bias->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(bias));
         GGML_ASSERT(ggml_nelements(bias) == nr);
+    }
+
+    // src0 is a concat skipped by ggml_cuda_graph_fusion_plan: read its sources instead
+    const ggml_cuda_ssm_conv_concat * cc = ggml_cuda_graph_fusion_conv(ctx, dst);
+    if (cc != nullptr) {
+        GGML_ASSERT(dst->src[2] == nullptr);
+        GGML_ASSERT(cc->ne0_a == nc - 1);
+        if (fuse_silu) {
+            ssm_conv_concat_f32_cuda<true>(*cc, src1_d, bias_d, src1->nb[1], dst_d, out->nb[0], out->nb[1], out->nb[2],
+                                           nc, nr, n_t, n_s, stream);
+        } else {
+            ssm_conv_concat_f32_cuda<false>(*cc, src1_d, bias_d, src1->nb[1], dst_d, out->nb[0], out->nb[1], out->nb[2],
+                                            nc, nr, n_t, n_s, stream);
+        }
+        return;
     }
 
     // Optional src[2] = parent_ids (i32) enables tree mode (no bias fusion).
