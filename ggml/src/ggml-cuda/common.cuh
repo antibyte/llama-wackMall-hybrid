@@ -1560,7 +1560,28 @@ struct ggml_backend_cuda_context {
     }
 };
 
+// Output epilogues of a one-column quantized matvec: work of the nodes behind it, applied to the finished value of
+// each row (planned in ggml_cuda_graph_fusion_plan, applied by mmv_fusion_epilogue in mmvq.cu).
+struct ggml_cuda_mm_epilogue {
+    const float *   chan_weight = nullptr; // result *= chan_weight[dst channel]             (mul by MoE expert weights)
+    const float *   out_mul     = nullptr; // result = sigmoid(result) * out_mul[row]        (sigmoid + mul)
+    const float *   bias        = nullptr; // result += bias[row]                            (add, GGML_CUDA_MMVQ_EPI_BIAS)
+    // causal conv with kernel size 4 over [state row | result], optional silu, new state row(s) written back
+    const float *   conv_w      = nullptr; // [4] per row
+    const float *   conv_state  = nullptr; // [3] per row; with conv_ids the row conv_ids[0] of a cache
+    const int32_t * conv_ids    = nullptr;
+    int64_t         conv_row_stride = 0;   // elements between cache rows
+    float *         conv_dst[2]     = { nullptr, nullptr }; // new state rows, nullptr = unused
+    int32_t         conv_dst_col[2] = { 0, 0 };             // first column (0 or 1) of [state | result] copied to conv_dst
+    int32_t         conv_silu       = 0;
+
+    bool any() const {
+        return chan_weight != nullptr || out_mul != nullptr || bias != nullptr || conv_w != nullptr;
+    }
+};
+
 struct ggml_cuda_mm_fusion_args_host {
+    ggml_cuda_mm_epilogue epi;
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
@@ -1573,6 +1594,7 @@ struct ggml_cuda_mm_fusion_args_host {
     int32_t skip_slot = -1;
 };
 struct ggml_cuda_mm_fusion_args_device {
+    ggml_cuda_mm_epilogue epi;
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;

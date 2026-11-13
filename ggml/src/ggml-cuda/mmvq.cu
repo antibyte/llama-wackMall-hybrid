@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 
 #include <algorithm>
+#include <type_traits>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -664,7 +665,90 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, int rows_per_block_override = 0>
+// Planned output epilogues of one row, see ggml_cuda_mm_epilogue. One kernel variant per kind: the code of another
+// kind in the same kernel slows the dot product down even when it never runs (Q6_K experts 21.9 -> 26.2 us).
+// The inputs are loaded before the dot product, then applied to the finished value. Each kind is written as the
+// kernel it replaces computes it: bin_bcast mul, unary_gated_op_kernel with sigmoid, ssm_conv_concat_f32.
+enum mmv_epilogue_kind {
+    MMV_EPILOGUE_NONE   = 0,
+    MMV_EPILOGUE_WEIGHT = 1,
+    MMV_EPILOGUE_GATE   = 2,
+    MMV_EPILOGUE_CONV   = 3,
+    MMV_EPILOGUE_BIAS   = 4,
+};
+
+static mmv_epilogue_kind mmv_epilogue_kind_of(const ggml_cuda_mm_epilogue & epi) {
+    return epi.conv_w != nullptr ? MMV_EPILOGUE_CONV : epi.out_mul != nullptr ? MMV_EPILOGUE_GATE :
+           epi.chan_weight != nullptr ? MMV_EPILOGUE_WEIGHT : epi.bias != nullptr ? MMV_EPILOGUE_BIAS : MMV_EPILOGUE_NONE;
+}
+
+struct mmv_epilogue_inputs {
+    float m;              // expert weight or gate factor
+    float w0, w1, w2, w3; // conv kernel
+    float x0, x1, x2;     // conv state
+};
+
+template <int kind>
+static __device__ __forceinline__ void mmv_fusion_epilogue_load(
+        const ggml_cuda_mm_epilogue & epi, const uint32_t row, const uint32_t channel, mmv_epilogue_inputs & in) {
+    if constexpr (kind == MMV_EPILOGUE_WEIGHT) {
+        in.m = epi.chan_weight[channel];
+    } else if constexpr (kind == MMV_EPILOGUE_GATE) {
+        in.m = epi.out_mul[row];
+    } else if constexpr (kind == MMV_EPILOGUE_BIAS) {
+        in.m = epi.bias[row];
+    } else if constexpr (kind == MMV_EPILOGUE_CONV) {
+        const float * w = epi.conv_w + 4 * row;
+        const float * s = epi.conv_state + (epi.conv_ids != nullptr ? (int64_t) epi.conv_ids[0] * epi.conv_row_stride : 0) + 3 * row;
+        in.w0 = w[0];
+        in.w1 = w[1];
+        in.w2 = w[2];
+        in.w3 = w[3];
+        in.x0 = s[0];
+        in.x1 = s[1];
+        in.x2 = s[2];
+    }
+    GGML_UNUSED_VARS(epi, row, channel, in);
+}
+
+template <int kind>
+static __device__ __forceinline__ float mmv_fusion_epilogue(
+        const ggml_cuda_mm_epilogue & epi, const mmv_epilogue_inputs & in, float result, const uint32_t row) {
+    if constexpr (kind == MMV_EPILOGUE_WEIGHT) {
+        result = result * in.m;
+    } else if constexpr (kind == MMV_EPILOGUE_GATE) {
+        result = (1.0f / (1.0f + expf(-result))) * in.m;
+    } else if constexpr (kind == MMV_EPILOGUE_BIAS) {
+        result += in.m;
+    } else if constexpr (kind == MMV_EPILOGUE_CONV) {
+        const float x3 = result;
+        const float bv = 0.0f;
+        float sumf = 0.0f;
+        sumf += in.x0 * in.w0;
+        sumf += in.x1 * in.w1;
+        sumf += in.x2 * in.w2;
+        sumf += x3 * in.w3;
+        sumf += bv;
+        // scalars and a fixed trip count: an indexed local array would put every thread of the kernel on the stack
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+            if (epi.conv_dst[k] != nullptr) {
+                float *    state = epi.conv_dst[k] + 3 * row;
+                const bool shift = epi.conv_dst_col[k] != 0;
+                state[0] = shift ? in.x1 : in.x0;
+                state[1] = shift ? in.x2 : in.x1;
+                state[2] = shift ? x3 : in.x2;
+            }
+        }
+        result = epi.conv_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+    }
+    GGML_UNUSED_VARS(epi, in, row);
+    return result;
+}
+
+// epilogue: plain matvec (no gate / bias fusion, whose kernel is slower) plus one kind of fusion.epi on each finished row
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, int rows_per_block_override = 0,
+          int epilogue = MMV_EPILOGUE_NONE>
 __launch_bounds__(
         calc_nwarps(type, ncols_dst, get_device_table_id(), small_k)*ggml_cuda_get_physical_warp_size(),
         (type == GGML_TYPE_Q4_K && ncols_dst == 1) ? 2 : 1)
@@ -798,6 +882,15 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
+    [[maybe_unused]] mmv_epilogue_inputs epi_in = {};
+    if constexpr (epilogue != MMV_EPILOGUE_NONE) {
+        // only the thread that writes the row
+        if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            mmv_fusion_epilogue_load<epilogue>(fusion.epi, row0 + threadIdx.x, channel_dst, epi_in);
+        }
+    }
+
     // partial sum for each thread
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
@@ -900,6 +993,9 @@ static __global__ void mul_mat_vec_q(
                                 break;
                         }
                     }
+                }
+                if constexpr (epilogue != MMV_EPILOGUE_NONE) {
+                    result = mmv_fusion_epilogue<epilogue>(fusion.epi, epi_in, result, row0 + i);
                 }
                 dst[j*stride_col_dst + i] = result;
             }
@@ -1044,6 +1140,25 @@ static void mul_mat_vec_q_switch_fusion(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
     if constexpr (c_ncols_dst == 1) {
+        const mmv_epilogue_kind kind = mmv_epilogue_kind_of(fusion.epi);
+        if (kind != MMV_EPILOGUE_NONE) {
+            GGML_ASSERT(!has_fusion && "epilogues are planned for plain matvecs only");
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+            const auto launch = [&](auto kind_c) {
+                ggml_cuda_kernel_launch(
+                     mul_mat_vec_q<type, c_ncols_dst, false, small_k, rows_per_block_override, decltype(kind_c)::value>, launch_params,
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            };
+            switch (kind) {
+                case MMV_EPILOGUE_WEIGHT: launch(std::integral_constant<int, MMV_EPILOGUE_WEIGHT>{}); break;
+                case MMV_EPILOGUE_GATE:   launch(std::integral_constant<int, MMV_EPILOGUE_GATE>{});   break;
+                case MMV_EPILOGUE_BIAS:   launch(std::integral_constant<int, MMV_EPILOGUE_BIAS>{});   break;
+                default:                  launch(std::integral_constant<int, MMV_EPILOGUE_CONV>{});   break;
+            }
+            return;
+        }
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, rows_per_block_override>, launch_params,
@@ -1738,6 +1853,16 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.skip_slot = fusion->skip_slot;
+        fusion_local.epi = fusion->epi;
+
+        // a bias alone: the plain kernel with an add epilogue instead of the gate / bias kernel
+        static const bool epi_bias = getenv("GGML_CUDA_MMVQ_EPI_BIAS") != nullptr && atoi(getenv("GGML_CUDA_MMVQ_EPI_BIAS")) != 0;
+        if (epi_bias && !ids && fusion_local.x_bias != nullptr && fusion_local.gate == nullptr && fusion_local.gate_bias == nullptr &&
+                fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr && !fusion_local.epi.any() &&
+                dst->ne[2] == 1 && dst->ne[3] == 1) {
+            fusion_local.epi.bias = (const float *) fusion_local.x_bias;
+            fusion_local.x_bias   = nullptr;
+        }
     }
 
     // Non-fused MUL_MAT_ID carries the skip slot on the destination op_params.
@@ -1769,18 +1894,14 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s13 = src1->nb[3] / ts_src1;
         if (q8_1_reuse) {
             const int64_t key[8] = { (int64_t) (uintptr_t) src1_d, ne10, ne11, ne12, ne13, s11, s12, s13 };
-            if (gfu->q8_1_buf == nullptr) {
-                CUDA_CHECK(cudaMalloc(&gfu->q8_1_buf, GGML_CUDA_Q8_1_REUSE_BYTES));
-            }
-            const bool hit = gfu->q8_1_valid && std::equal(key, key + 8, gfu->q8_1_key);
+            ggml_cuda_q8_1_slot * slot = gfu->q8_1_find(key);
+            const bool hit = slot != nullptr;
             if (!hit) {
-                quantize_row_q8_1_cuda(src1_d, nullptr, gfu->q8_1_buf, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-                std::copy(key, key + 8, gfu->q8_1_key);
-                gfu->q8_1_valid = true;
-                gfu->q8_1_lo    = (const char *) src1_d;
-                gfu->q8_1_hi    = (const char *) src1_d + (ne13 - 1)*src1->nb[3] + (ne12 - 1)*src1->nb[2] + (ne11 - 1)*src1->nb[1] + ne10*ts_src1;
+                slot = &gfu->q8_1_claim(key, (const char *) src1_d,
+                    (const char *) src1_d + (ne13 - 1)*src1->nb[3] + (ne12 - 1)*src1->nb[2] + (ne11 - 1)*src1->nb[1] + ne10*ts_src1);
+                quantize_row_q8_1_cuda(src1_d, nullptr, slot->buf, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
             }
-            src1_q8_1_d = gfu->q8_1_buf;
+            src1_q8_1_d = slot->buf;
             static const bool trace = getenv("GGML_CUDA_GRAPH_FUSION_TRACE") != nullptr;
             if (trace) {
                 static int64_t n_hit = 0;

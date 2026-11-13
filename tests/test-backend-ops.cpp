@@ -4325,6 +4325,175 @@ struct test_ssm_conv_concat_state : public test_case {
     }
 };
 
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats);
+
+// One decode token through a KDA layer as bailingmoe3 builds it: residual add, rms_norm * weight, three projections
+// with causal conv on cached conv states, gate and beta activations, gated_delta_net on a cached state, output norm,
+// sigmoid gate, output projection plus residual. The CUDA backend folds most of the small nodes into the kernels
+// around them (matvec epilogues, norm row, gated_delta_net prologue); the cache contents are part of the output.
+struct test_kda_decode_layer : public test_case {
+    const ggml_type type_w;
+    const int64_t   n_head;
+    const int64_t   head_dim;
+    const int32_t   src_row;
+    const int32_t   dst_row;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "KDA_DECODE_LAYER";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, n_head, head_dim, src_row, dst_row);
+    }
+
+    test_kda_decode_layer(ggml_type type_w = GGML_TYPE_Q8_0, int64_t n_head = 8, int64_t head_dim = 64, int32_t src_row = 1,
+            int32_t dst_row = 1)
+        : type_w(type_w), n_head(n_head), head_dim(head_dim), src_row(src_row), dst_row(dst_row) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d_inner = n_head * head_dim;
+        const int64_t n_embd  = 512;
+        const int64_t d_conv  = 4;
+        const int64_t n_conv  = (d_conv - 1) * d_inner;
+        const int64_t n_state = head_dim * head_dim * n_head;
+
+        ggml_tensor * x_in     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * res      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * w_norm   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * w_onorm  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor * w_qkv[3] = { ggml_new_tensor_2d(ctx, type_w, n_embd, d_inner), ggml_new_tensor_2d(ctx, type_w, n_embd, d_inner),
+                                   ggml_new_tensor_2d(ctx, type_w, n_embd, d_inner) };
+        ggml_tensor * w_conv[3] = { ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner),
+                                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner),
+                                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner) };
+        ggml_tensor * w_f      = ggml_new_tensor_2d(ctx, type_w, n_embd, d_inner);
+        ggml_tensor * dt_b     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d_inner);
+        ggml_tensor * ssm_a    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+        ggml_tensor * w_beta   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_head);
+        ggml_tensor * w_g      = ggml_new_tensor_2d(ctx, type_w, n_embd, d_inner);
+        ggml_tensor * w_o      = ggml_new_tensor_2d(ctx, type_w, d_inner, n_embd);
+        ggml_tensor * conv_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * n_conv, 3);
+        ggml_tensor * states   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, 3);
+        ggml_tensor * ids      = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(ssm_a, "ssm_a");
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * sum = ggml_add(ctx, x_in, res);
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, sum, 1e-6f), w_norm);
+
+        ggml_tensor * conv_state_all = ggml_get_rows(ctx, conv_cache, ids);
+        ggml_tensor * qkv[3];
+        ggml_tensor * side = nullptr; // conv state copies, in front of everything else like in the model graph
+        for (int64_t i = 0; i < 3; ++i) {
+            ggml_tensor * conv_state = ggml_view_3d(ctx, conv_state_all, d_conv - 1, d_inner, 1,
+                    (d_conv - 1) * ggml_element_size(conv_state_all), 3 * n_conv * ggml_element_size(conv_state_all),
+                    i * n_conv * ggml_element_size(conv_state_all));
+            ggml_tensor * proj   = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_qkv[i], cur), d_inner, 1, 1);
+            ggml_tensor * conv_x = ggml_concat(ctx, conv_state, ggml_transpose(ctx, proj), 0);
+            ggml_tensor * last   = ggml_view_3d(ctx, conv_x, d_conv - 1, d_inner, 1, conv_x->nb[1], conv_x->nb[2], conv_x->nb[0]);
+            ggml_tensor * cpy    = ggml_cpy(ctx, last, ggml_view_3d(ctx, conv_cache, d_conv - 1, d_inner, 1,
+                    (d_conv - 1) * ggml_element_size(conv_cache), 3 * n_conv * ggml_element_size(conv_cache),
+                    (dst_row * 3 * n_conv + i * n_conv) * ggml_element_size(conv_cache)));
+            ggml_tensor * out    = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_x, w_conv[i]));
+            ggml_tensor * part   = ggml_concat(ctx, ggml_reshape_1d(ctx, cpy, n_conv), ggml_reshape_1d(ctx, out, d_inner), 0);
+            side   = side == nullptr ? part : ggml_concat(ctx, side, part, 0);
+            qkv[i] = ggml_reshape_4d(ctx, out, head_dim, n_head, 1, 1);
+        }
+
+        ggml_tensor * gate = ggml_add(ctx, ggml_mul_mat(ctx, w_f, cur), dt_b);
+        gate = ggml_reshape_3d(ctx, gate, head_dim, n_head, 1);
+        gate = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_mul(ctx, gate, ggml_reshape_3d(ctx, ssm_a, 1, n_head, 1))), -5.0f);
+        gate = ggml_reshape_4d(ctx, gate, head_dim, n_head, 1, 1);
+
+        ggml_tensor * beta = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_beta, cur), 1, n_head, 1, 1));
+
+        ggml_tensor * q = ggml_l2_norm(ctx, qkv[0], 1e-6f);
+        ggml_tensor * k = ggml_l2_norm(ctx, qkv[1], 1e-6f);
+
+        ggml_tensor * state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, states, ids), head_dim, head_dim, n_head, 1);
+        ggml_tensor * gdn   = ggml_gated_delta_net(ctx, q, k, qkv[2], gate, beta, state, 1);
+        ggml_tensor * attn  = ggml_view_4d(ctx, gdn, head_dim, n_head, 1, 1, head_dim * ggml_element_size(gdn),
+                d_inner * ggml_element_size(gdn), d_inner * ggml_element_size(gdn), 0);
+        ggml_tensor * new_state = ggml_view_1d(ctx, gdn, n_state, d_inner * ggml_element_size(gdn));
+        ggml_tensor * out       = ggml_cont(ctx, attn);
+        ggml_tensor * state_cpy = ggml_cpy(ctx, new_state, ggml_view_1d(ctx, states, n_state, dst_row * states->nb[1]));
+
+        ggml_tensor * out_gate = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_g, cur), head_dim, n_head, 1);
+        out = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_3d(ctx, out, head_dim, n_head, 1), 1e-6f), w_onorm);
+        out = ggml_mul(ctx, out, ggml_sigmoid(ctx, out_gate));
+        ggml_tensor * y = ggml_add(ctx, ggml_mul_mat(ctx, w_o, ggml_cont_2d(ctx, out, d_inner, 1)), sum);
+
+        ggml_tensor * result = ggml_concat(ctx, side, ggml_reshape_1d(ctx, state_cpy, n_state), 0);
+        result = ggml_concat(ctx, result, ggml_reshape_1d(ctx, y, n_embd), 0);
+        ggml_set_name(result, "out");
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                ggml_backend_tensor_set(t, &src_row, 0, sizeof(src_row));
+            } else if (strcmp(t->name, "ssm_a") == 0) {
+                init_tensor_uniform(t, 0.1f, 2.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_MUL_MAT_ID of one token + GGML_OP_MUL by one weight per used expert (MoE down projection;
+// the CUDA backend scales the rows inside the matvec)
+struct test_mul_mat_id_weighted : public test_case {
+    const ggml_type type_a;
+    const int       n_mats;
+    const int       n_used;
+    const int64_t   m;
+    const int64_t   k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_WEIGHTED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, n_mats, n_used, m, k);
+    }
+
+    test_mul_mat_id_weighted(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = 16, int n_used = 8, int64_t m = 384, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, 1);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, 1, ids->nb[1], 0);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, 1);
+        ggml_set_name(b, "b");
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, 1);
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul_mat_id(ctx, as, b, ids), weights);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_GET_ROWS (recurrent state of one sequence) + l2_norm(q), l2_norm(k) + GGML_OP_GATED_DELTA_NET,
 // optionally writing the new state back into the cache (the CUDA backend folds the gather and the norms)
 struct test_gated_delta_net_state_rows : public test_case {
@@ -10057,6 +10226,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_ssm_conv_concat_state(3, 128, 1, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_concat_state(4, 256, 33, 1, 1));
+    for (ggml_type type_w : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K }) {
+        test_cases.emplace_back(new test_kda_decode_layer(type_w, 8, 64, 1, 1));
+        test_cases.emplace_back(new test_kda_decode_layer(type_w, 4, 128, 0, 2));
+        test_cases.emplace_back(new test_mul_mat_id_weighted(type_w, 16, 8, 384, 256));
+        test_cases.emplace_back(new test_mul_mat_id_weighted(type_w, 16, 8, 1536, 512));
+    }
+
     for (bool kda : { false, true }) {
         for (int64_t n_tok : { 1, 4 }) {
             test_cases.emplace_back(new test_gated_delta_net_state_rows(4, 64, n_tok, kda, 1, -1));

@@ -1,5 +1,7 @@
 #include "norm.cuh"
+#include "graph-fusion.cuh"
 #include <cstdint>
+#include <type_traits>
 
 template <int block_size>
 static __global__ void norm_f32(
@@ -152,6 +154,58 @@ static __global__ void rms_norm_f32(const float * x,
             dst[col] = scale * x[col];
         }
     }
+}
+
+// One row y = rms_norm(x) * w of a decode token with the work around it that the plan folds in (ggml_cuda_norm_row):
+// x = a + b written to sum first, q8_1 copy of y. Same arithmetic as k_bin_bcast add, rms_norm_f32 and quantize_q8_1.
+// ncols and block_size are multiples of 32, so every warp holds whole q8_1 blocks and runs the loops as one.
+// The second pass starts after the block barrier: y may lie on a or b.
+template <int block_size, bool do_add, bool do_q8_1>
+static __global__ void rms_norm_row_f32(const float * x, const float * add_b, float * sum, const float * w, float * dst,
+                                        void * q8_1, const int ncols, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        float xi = x[col];
+        if constexpr (do_add) {
+            xi = xi + add_b[col];
+            sum[col] = xi;
+        }
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    const float * xs = do_add ? sum : x;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float yi = scale * xs[col] * w[col];
+        dst[col] = yi;
+        if constexpr (do_q8_1) {
+            block_q8_1 * y = (block_q8_1 *) q8_1;
+            float amax = fabsf(yi);
+            float qsum = yi;
+
+            amax = warp_reduce_max<QK8_1>(amax);
+            qsum = warp_reduce_sum<QK8_1>(qsum);
+
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(yi / d);
+
+            y[col / QK8_1].qs[col % QK8_1] = q;
+            if (col % QK8_1 == 0) {
+                y[col / QK8_1].ds = make_half2(d, qsum);
+            }
+        }
+    }
+    GGML_UNUSED_VARS(add_b, sum, q8_1);
 }
 
 template <int block_size>
@@ -509,6 +563,14 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const float * mul_d = nullptr;
     const ggml_tensor * mul_src = nullptr;
 
+    // the input of a dropped cont, see ggml_cuda_graph_fusion_plan
+    if (ctx.graph_fusion != nullptr && !ctx.graph_fusion->norm_src.empty()) {
+        const auto it = ctx.graph_fusion->norm_src.find(dst);
+        if (it != ctx.graph_fusion->norm_src.end()) {
+            src0_d = it->second;
+        }
+    }
+
     if (mul_tensor->src[0] == dst) {
         mul_d = (float *) mul_tensor->src[1]->data;
         mul_src = mul_tensor->src[1];
@@ -531,6 +593,47 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t ne01 = rms_norm_src->ne[1];
     const int64_t ne02 = rms_norm_src->ne[2];
     const int64_t ne03 = rms_norm_src->ne[3];
+
+    // one row with folded work around the norm, see ggml_cuda_graph_fusion_plan
+    const ggml_cuda_norm_row * row = ggml_cuda_graph_fusion_norm(ctx, dst);
+    if (row != nullptr) {
+        ggml_cuda_graph_fusion * gfu = ctx.graph_fusion;
+        // the add may have run with the node in front of it
+        const bool do_add  = row->sum != nullptr && !gfu->ran_idx[row->add_idx];
+        const bool do_q8_1 = row->q8_1 && gfu->q8_1_active && ctx.curr_stream_no == 0;
+        if (do_add || do_q8_1) {
+            void * q8_1_d = nullptr;
+            if (do_q8_1) {
+                const int64_t key[8] = { (int64_t) (uintptr_t) dst_d, mul_tensor->ne[0], mul_tensor->ne[1], mul_tensor->ne[2],
+                                         mul_tensor->ne[3], (int64_t) (mul_tensor->nb[1] / sizeof(float)),
+                                         (int64_t) (mul_tensor->nb[2] / sizeof(float)), (int64_t) (mul_tensor->nb[3] / sizeof(float)) };
+                ggml_cuda_q8_1_slot & slot = gfu->q8_1_claim(key, (const char *) dst_d, (const char *) dst_d + ne00 * sizeof(float));
+                slot.fresh = true;
+                q8_1_d     = slot.buf;
+            }
+            const float * x_d = do_add ? row->add_a : src0_d;
+            const dim3 block_dims(ne00 < 1024 ? 256 : 1024, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params{dim3(1, 1, 1), block_dims, 32 * sizeof(float), stream};
+            const auto launch = [&](auto add_c, auto q8_1_c) {
+                if (ne00 < 1024) {
+                    ggml_cuda_kernel_launch(rms_norm_row_f32<256, decltype(add_c)::value, decltype(q8_1_c)::value>, launch_params,
+                        x_d, row->add_b, row->sum, mul_d, dst_d, q8_1_d, (int) ne00, eps);
+                } else {
+                    ggml_cuda_kernel_launch(rms_norm_row_f32<1024, decltype(add_c)::value, decltype(q8_1_c)::value>, launch_params,
+                        x_d, row->add_b, row->sum, mul_d, dst_d, q8_1_d, (int) ne00, eps);
+                }
+            };
+            if (do_add && do_q8_1) {
+                launch(std::true_type{}, std::true_type{});
+            } else if (do_add) {
+                launch(std::true_type{}, std::false_type{});
+            } else {
+                launch(std::false_type{}, std::true_type{});
+            }
+            return;
+        }
+    }
 
     const size_t ts0 = ggml_type_size(rms_norm_src->type);
     GGML_ASSERT(rms_norm_src->nb[0] == ts0);
