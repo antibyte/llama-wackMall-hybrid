@@ -4448,6 +4448,47 @@ struct test_kda_decode_layer : public test_case {
     }
 };
 
+// sum of the 8 rows of one tensor (weighted MoE expert outputs) + GGML_OP_MUL_MAT of another input (shared expert):
+// the CUDA backend adds the rows up inside the matvec
+struct test_mul_mat_bias_sum : public test_case {
+    const ggml_type type_a;
+    const int64_t   m;
+    const int64_t   k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_BIAS_SUM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_a, m, k);
+    }
+
+    test_mul_mat_bias_sum(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 1536, int64_t k = 512)
+        : type_a(type_a), m(m), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, 8, 1);
+        ggml_tensor * a    = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_set_name(rows, "rows");
+
+        // the matvec input is another view of the same data, so that the rows are a graph node like in the model
+        ggml_tensor * scaled = ggml_scale(ctx, rows, 0.5f);
+        ggml_tensor * sum    = ggml_view_2d(ctx, scaled, m, 1, scaled->nb[2], 0);
+        for (int i = 1; i < 8; ++i) {
+            sum = ggml_add(ctx, sum, ggml_view_2d(ctx, scaled, m, 1, scaled->nb[2], i * scaled->nb[1]));
+        }
+        ggml_tensor * out = ggml_add(ctx, sum, ggml_mul_mat(ctx, a, b));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID of one token + GGML_OP_MUL by one weight per used expert (MoE down projection;
 // the CUDA backend scales the rows inside the matvec)
 struct test_mul_mat_id_weighted : public test_case {
@@ -10231,6 +10272,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kda_decode_layer(type_w, 4, 128, 0, 2));
         test_cases.emplace_back(new test_mul_mat_id_weighted(type_w, 16, 8, 384, 256));
         test_cases.emplace_back(new test_mul_mat_id_weighted(type_w, 16, 8, 1536, 512));
+        test_cases.emplace_back(new test_mul_mat_bias_sum(type_w, 1536, 512));
+        test_cases.emplace_back(new test_mul_mat_bias_sum(type_w, 384, 256));
     }
 
     for (bool kda : { false, true }) {

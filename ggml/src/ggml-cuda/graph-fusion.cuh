@@ -85,6 +85,9 @@ struct ggml_cuda_graph_fusion {
     std::unordered_map<const ggml_tensor *, ggml_cuda_norm_row>        norm; // keyed by the RMS_NORM node
     // rms_norm * weight that reads its input here instead of from a dropped cont, keyed by the RMS_NORM node
     std::unordered_map<const ggml_tensor *, const float *>             norm_src;
+    // matvec bias that is the left-to-right sum of 8 rows of one tensor (skipped add chain), keyed by the bias tensor:
+    // first row and stride in elements
+    std::unordered_map<const ggml_tensor *, std::pair<const float *, int64_t>> bias_sum;
 
     bool                q8_1_active = false;
     int                 q8_1_n      = 1; // slots in use (GGML_CUDA_Q8_1_REUSE_SLOTS)

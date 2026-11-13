@@ -1840,6 +1840,47 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // GGML_SCHED_ASYNC_USER_INPUTS=<bytes>: user inputs up to this size are handed to the split backend, which takes
+    // the data over and copies all of them at once on its compute stream in front of the split, instead of one
+    // blocking copy each (0 = off).
+    static const size_t async_user_inputs = [] {
+        const char * env = getenv("GGML_SCHED_ASYNC_USER_INPUTS");
+        return env != NULL ? (size_t) std::max(0, atoi(env)) : (size_t) 0;
+    }();
+    typedef bool (*set_tensor_staged_t)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t size);
+    typedef void (*flush_staged_t)(ggml_backend_t backend);
+    set_tensor_staged_t set_tensor_staged[GGML_SCHED_MAX_BACKENDS] = {};
+    flush_staged_t      flush_staged[GGML_SCHED_MAX_BACKENDS]      = {};
+    bool                staged_known[GGML_SCHED_MAX_BACKENDS]      = {};
+    bool                staged_pending[GGML_SCHED_MAX_BACKENDS]    = {};
+    auto copy_user_input = [&](int backend_id, ggml_backend_t backend, struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
+        if (async_user_inputs > 0 && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+                ggml_nbytes(input) <= async_user_inputs) {
+            if (!staged_known[backend_id]) {
+                staged_known[backend_id] = true;
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                ggml_backend_reg_t reg = dev != NULL ? ggml_backend_dev_backend_reg(dev) : NULL;
+                if (reg != NULL) {
+                    set_tensor_staged[backend_id] = (set_tensor_staged_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensor_staged");
+                    flush_staged[backend_id]      = (flush_staged_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_flush_staged");
+                }
+            }
+            if (set_tensor_staged[backend_id] != NULL && flush_staged[backend_id] != NULL &&
+                    set_tensor_staged[backend_id](backend, input_cpy, input->data, ggml_nbytes(input))) {
+                staged_pending[backend_id] = true;
+                return;
+            }
+        }
+        ggml_backend_tensor_copy(input, input_cpy);
+    };
+    // must run before anything else is queued on the backend
+    auto flush_user_inputs = [&](int backend_id, ggml_backend_t backend) {
+        if (staged_pending[backend_id]) {
+            flush_staged[backend_id](backend);
+            staged_pending[backend_id] = false;
+        }
+    };
+
     // Copy CPU-produced activations into a device split only before their
     // first consumer. The independent head of that split (e.g. hot experts)
     // is launched before the preceding CPU split runs, so both overlap.
@@ -1938,7 +1979,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     synchronize_copy_slot(split_backend_id, split_backend);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                copy_user_input(split_backend_id, split_backend, input, input_cpy);
             } else {
                 // Large-batch MoE: skip routing-id readback and upload the full
                 // expert tensor on a second stream so it overlaps prior compute.
@@ -2091,6 +2132,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
+
+        flush_user_inputs(split_backend_id, split_backend);
 
         if (!sched->callback_eval) {
             if (dedup_dst_sync) {

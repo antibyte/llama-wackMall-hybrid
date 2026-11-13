@@ -20,6 +20,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-kv-cache.h"
 
+#include <chrono>
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -2351,6 +2352,74 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// LLAMA_DECODE_TIMING=1: host time of the stages of one-token decode calls, printed every 256 calls.
+// "outside" is everything between two decode calls (GPU wait, sampling, server).
+namespace {
+struct decode_timing {
+    enum stage { OUTSIDE, BATCH_INIT, MEM_UPDATE, MEM_BATCH, UBATCH, PLAN_USE, PLAN_SYNC, PLAN_INPUTS, GRAPH_REUSE, SET_INPUTS, COMPUTE, TAIL, N_STAGES };
+
+    const bool enabled = [] {
+        const char * env = getenv("LLAMA_DECODE_TIMING");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    int64_t t_last        = 0;
+    int64_t acc[N_STAGES] = {};
+    int     n_calls       = 0;
+    bool    active        = false;
+
+    static int64_t now() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void mark(stage st) {
+        if (!active) {
+            return;
+        }
+        const int64_t t = now();
+        acc[st] += t - t_last;
+        t_last   = t;
+    }
+
+    void begin(bool one_token) {
+        active = enabled && one_token;
+        if (!active) {
+            t_last = 0;
+            return;
+        }
+        if (t_last == 0) {
+            t_last = now();
+        } else {
+            mark(OUTSIDE);
+        }
+    }
+
+    void end() {
+        if (!active) {
+            return;
+        }
+        mark(TAIL);
+        active = false;
+        if (++n_calls == 256) {
+            static const char * names[N_STAGES] = { "outside", "batch init", "memory update", "memory batch", "ubatch", "plan use", "plan sync",
+                                                    "sampler inputs", "graph reuse", "set inputs", "compute", "tail" };
+            std::string line;
+            int64_t     total = 0;
+            for (int i = 0; i < N_STAGES; ++i) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), " %s %.1f", names[i], acc[i] / 1e3 / n_calls);
+                line  += buf;
+                total += acc[i];
+                acc[i] = 0;
+            }
+            // stderr: the server filters the library log
+            fprintf(stderr, "llama: decode timing (us per call):%s, total %.1f\n", line.c_str(), total / 1e3 / n_calls);
+            n_calls = 0;
+        }
+    }
+};
+decode_timing g_decode_timing;
+} // namespace
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     llama_expert_tier::graph_guard tier_graph_guard;
 
@@ -2399,16 +2468,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    g_decode_timing.mark(decode_timing::UBATCH);
     bool reuse = !graph_reuse_disable && res->can_reuse(gparams);
     if (reuse && gf_res_active != res) {
         // another graph ran since: replay this one's kept split and allocation if the buffers have not moved
         reuse = small && ggml_backend_sched_plan_use(sched.get(), gf);
+        g_decode_timing.mark(decode_timing::PLAN_USE);
         if (reuse) {
             if (gf_res_active != nullptr) {
                 // the inputs set below may overlap memory the previous graph still reads
                 ggml_backend_sched_synchronize(sched.get());
             }
+            g_decode_timing.mark(decode_timing::PLAN_SYNC);
             res->restore_sampler_inputs();
+            g_decode_timing.mark(decode_timing::PLAN_INPUTS);
         }
     }
 
@@ -2469,12 +2542,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        g_decode_timing.mark(decode_timing::GRAPH_REUSE);
         res->set_inputs(&ubatch);
+        g_decode_timing.mark(decode_timing::SET_INPUTS);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    g_decode_timing.mark(decode_timing::COMPUTE);
     if (dflash != nullptr) {
         dflash->t_process_ubatch_us += ggml_time_us() - t_pu0;
         dflash->n_process_ubatch++;
@@ -2753,6 +2829,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    g_decode_timing.begin(batch_inp.n_tokens == 1);
+    struct decode_timing_scope {
+        ~decode_timing_scope() { g_decode_timing.end(); }
+    } timing_scope;
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2810,6 +2891,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
+    g_decode_timing.mark(decode_timing::BATCH_INIT);
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -2842,6 +2924,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // handle any pending shifts/copies
     memory_update(false);
+    g_decode_timing.mark(decode_timing::MEM_UPDATE);
 
     struct dflash_batch_scope {
         dflash_bridge * bridge;
@@ -2861,6 +2944,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     while (true) {
         mctx = memory->init_batch(*balloc, runtime_n_ubatch, output_all);
+        g_decode_timing.mark(decode_timing::MEM_BATCH);
         if (!mctx) {
             return -2;
         }

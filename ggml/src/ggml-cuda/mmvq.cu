@@ -675,11 +675,13 @@ enum mmv_epilogue_kind {
     MMV_EPILOGUE_GATE   = 2,
     MMV_EPILOGUE_CONV   = 3,
     MMV_EPILOGUE_BIAS   = 4,
+    MMV_EPILOGUE_SUM    = 5,
 };
 
 static mmv_epilogue_kind mmv_epilogue_kind_of(const ggml_cuda_mm_epilogue & epi) {
     return epi.conv_w != nullptr ? MMV_EPILOGUE_CONV : epi.out_mul != nullptr ? MMV_EPILOGUE_GATE :
-           epi.chan_weight != nullptr ? MMV_EPILOGUE_WEIGHT : epi.bias != nullptr ? MMV_EPILOGUE_BIAS : MMV_EPILOGUE_NONE;
+           epi.chan_weight != nullptr ? MMV_EPILOGUE_WEIGHT : epi.sum_src != nullptr ? MMV_EPILOGUE_SUM :
+           epi.bias != nullptr ? MMV_EPILOGUE_BIAS : MMV_EPILOGUE_NONE;
 }
 
 struct mmv_epilogue_inputs {
@@ -697,6 +699,14 @@ static __device__ __forceinline__ void mmv_fusion_epilogue_load(
         in.m = epi.out_mul[row];
     } else if constexpr (kind == MMV_EPILOGUE_BIAS) {
         in.m = epi.bias[row];
+    } else if constexpr (kind == MMV_EPILOGUE_SUM) {
+        // as the fused add kernel folds its operands
+        float sum = epi.sum_src[row];
+#pragma unroll
+        for (int k = 1; k < 8; k++) {
+            sum = sum + epi.sum_src[k * epi.sum_stride + row];
+        }
+        in.m = sum;
     } else if constexpr (kind == MMV_EPILOGUE_CONV) {
         const float * w = epi.conv_w + 4 * row;
         const float * s = epi.conv_state + (epi.conv_ids != nullptr ? (int64_t) epi.conv_ids[0] * epi.conv_row_stride : 0) + 3 * row;
@@ -718,7 +728,7 @@ static __device__ __forceinline__ float mmv_fusion_epilogue(
         result = result * in.m;
     } else if constexpr (kind == MMV_EPILOGUE_GATE) {
         result = (1.0f / (1.0f + expf(-result))) * in.m;
-    } else if constexpr (kind == MMV_EPILOGUE_BIAS) {
+    } else if constexpr (kind == MMV_EPILOGUE_BIAS || kind == MMV_EPILOGUE_SUM) {
         result += in.m;
     } else if constexpr (kind == MMV_EPILOGUE_CONV) {
         const float x3 = result;
@@ -1155,6 +1165,7 @@ static void mul_mat_vec_q_switch_fusion(
                 case MMV_EPILOGUE_WEIGHT: launch(std::integral_constant<int, MMV_EPILOGUE_WEIGHT>{}); break;
                 case MMV_EPILOGUE_GATE:   launch(std::integral_constant<int, MMV_EPILOGUE_GATE>{});   break;
                 case MMV_EPILOGUE_BIAS:   launch(std::integral_constant<int, MMV_EPILOGUE_BIAS>{});   break;
+                case MMV_EPILOGUE_SUM:    launch(std::integral_constant<int, MMV_EPILOGUE_SUM>{});    break;
                 default:                  launch(std::integral_constant<int, MMV_EPILOGUE_CONV>{});   break;
             }
             return;
@@ -1862,6 +1873,15 @@ void ggml_cuda_mul_mat_vec_q(
                 dst->ne[2] == 1 && dst->ne[3] == 1) {
             fusion_local.epi.bias = (const float *) fusion_local.x_bias;
             fusion_local.x_bias   = nullptr;
+            // the bias is a planned sum: read its terms instead (the add chain did not run)
+            if (ctx.graph_fusion != nullptr && !ctx.graph_fusion->bias_sum.empty()) {
+                const auto it = ctx.graph_fusion->bias_sum.find(fusion->x_bias);
+                if (it != ctx.graph_fusion->bias_sum.end()) {
+                    fusion_local.epi.bias       = nullptr;
+                    fusion_local.epi.sum_src    = it->second.first;
+                    fusion_local.epi.sum_stride = it->second.second;
+                }
+            }
         }
     }
 

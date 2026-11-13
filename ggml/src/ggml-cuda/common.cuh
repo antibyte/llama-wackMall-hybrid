@@ -1267,6 +1267,8 @@ struct ggml_cuda_graph {
     bool disable_due_to_oom = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    uint64_t compat_uid = 0; // graph uid of the cached ggml_cuda_graph_check_compability verdict
+    bool     compat     = false;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1513,6 +1515,14 @@ struct ggml_backend_cuda_context {
     // non-adjacent fusions and q8_1 reuse of one graph evaluation, see graph-fusion.cuh
     struct ggml_cuda_graph_fusion * graph_fusion = nullptr;
 
+    // small host inputs of one graph run, packed in pinned memory and brought to their tensors with one copy and one
+    // kernel on the compute stream (ggml_backend_cuda_set_tensor_staged / ggml_backend_cuda_flush_staged)
+    char * input_staging      = nullptr; // pinned: segment table, then the data
+    char * input_scratch      = nullptr; // device copy of the staging block
+    size_t input_staging_used = 0;
+    int    input_n_segments   = 0;
+    bool   input_in_flight    = false;   // the stream may still read the staging block
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
@@ -1566,6 +1576,10 @@ struct ggml_cuda_mm_epilogue {
     const float *   chan_weight = nullptr; // result *= chan_weight[dst channel]             (mul by MoE expert weights)
     const float *   out_mul     = nullptr; // result = sigmoid(result) * out_mul[row]        (sigmoid + mul)
     const float *   bias        = nullptr; // result += bias[row]                            (add, GGML_CUDA_MMVQ_EPI_BIAS)
+    // result += sum_src[row] + sum_src[sum_stride + row] + ... (8 terms, left to right): the bias is the sum of the
+    // weighted MoE expert outputs, whose add kernel is folded in
+    const float *   sum_src     = nullptr;
+    int64_t         sum_stride  = 0;
     // causal conv with kernel size 4 over [state row | result], optional silu, new state row(s) written back
     const float *   conv_w      = nullptr; // [4] per row
     const float *   conv_state  = nullptr; // [3] per row; with conv_ids the row conv_ids[0] of a cache
@@ -1576,7 +1590,7 @@ struct ggml_cuda_mm_epilogue {
     int32_t         conv_silu       = 0;
 
     bool any() const {
-        return chan_weight != nullptr || out_mul != nullptr || bias != nullptr || conv_w != nullptr;
+        return chan_weight != nullptr || out_mul != nullptr || bias != nullptr || sum_src != nullptr || conv_w != nullptr;
     }
 };
 

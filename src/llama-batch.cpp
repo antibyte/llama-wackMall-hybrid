@@ -320,7 +320,14 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (memory) {
+    // with a unified KV cache n_seq_max is LLAMA_MAX_SEQ: without a coupled pair in the batch the scan below
+    // finds nothing in 65536 probes (~0.1 ms per decode call). LLAMA_BATCH_SEQ_CPL_FAST=0 scans always.
+    static const bool seq_cpl_fast = [] {
+        const char * env = getenv("LLAMA_BATCH_SEQ_CPL_FAST");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    if (memory && (has_cpl || !seq_cpl_fast)) {
         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
                 if (seq_cpl[s0][s1]) {
