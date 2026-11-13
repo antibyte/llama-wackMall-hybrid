@@ -1,3 +1,49 @@
+# MNN-Ideen fuer den CUDA-Pfad: Linear-Attention-Fusion und q8_1-Wiederverwendung vom 2026-11-13
+
+**Ergebnis: Vier neue Fusionen aus der Analyse von alibaba/MNN (dort rechnet ein GDN-Layer im Decode mit zwei Kerneln). Ling-3.0-tiny gegen die deployten Libs aus `workers/llama`, A/B/A/B: Decode greedy 152,1 -> 165,0 t/s (+8,5 %), Tool-Anfragen mit agollm-Sampling 139,2 -> 150,2 t/s (+7,9 %), Decode nach 8,2k Prompt 136,2 -> 145,9 t/s (+7,1 %), Prefill unveraendert. Alle Greedy-Ausgaben bitgleich (SHA). FrogNano-4B und LFM2.5-1.2B +1,1 %, MiMo-9B +0,8 %, Sage und Qwen3.6-35B-A3B im Rauschen. Alle Knoepfe Default 0; eingebaut in Ling-tiny, FrogNano, LFM2.5 und MiMo (siehe Einbau).**
+
+Ausgangslage (nsys `benchmark-results/gpu-kernels-20261109/runs/lt-nsys`): ein KDA-Layer von Ling-tiny kostet im Decode 138,8 us Kernelzeit, davon 78 us Matvecs und ~19 Kleinkernel um den eigentlichen `gated_delta_net`: drei Concats (Conv-State + neue Spalte), drei Conv-State-Kopien, drei `ssm_conv`, zwei `l2_norm`, Gate-Kette, `get_rows` des 1-MiB-States aus `build_rs` und fuenf `quantize_q8_1` auf demselben `cur`. MNN (`source/backend/cuda/execution/LinearAttentionExecution.cu`) faltet Conv, SiLU und State-Update in einen Kernel und L2-Norm sowie Gate in den Rekurrenzkernel. Die MNN-Kernel selbst sind schwaecher als unsere (State im globalen Speicher, keine CUDA-Graphs); uebernommen sind nur die Fusionsgrenzen.
+
+**Knoepfe** (alle `ggml/src/ggml-cuda/`, Default 0):
+- `GGML_CUDA_CONV_CONCAT_FUSION`: `concat(conv_state, x)` -> `ssm_conv` (+ Bias/SiLU) plus die Kopie(n) des neuen Conv-State-Fensters in den Cache laufen als ein Kernel (`ssm-conv.cu` `ssm_conv_concat_f32`, bis 32 Tokens, bis 8 Rollback-Kopien). Dazu zieht `ggml_backend_cuda_graph_optimize` jede `ssm_conv` direkt hinter Concat und Kopien (vor der Speicherplanung), sonst vergibt der Allokator den Speicher der Concat-Quellen neu, bevor die Conv sie liest. Ling: 54 von 54 Concats. Bei qwen35 greift es nicht (der gesammelte Conv-State hat dort nur einen Verbraucher, die SiLU-Ausgabe landet in seinem Speicher; das waere ein echter Race), LFM2: 9 Layer.
+- `GGML_CUDA_GDN_STATE_INPLACE`: `get_rows(states, s_copy)` einer Sequenz -> `gated_delta_net` liest die Cache-Zeile direkt (`state_ids` im Kernel), die 1-MiB-Kopie pro Layer entfaellt.
+- `GGML_CUDA_GDN_L2_FUSION`: `l2_norm(q)`, `l2_norm(k)` im GDN-Kernel, gleiche Reduktionsreihenfolge wie `l2_norm_f32` (deshalb bitgleich); nur bis 32 Tokens, im sequenziellen Prefill-Loop waeren die Reduktionen teurer als die separaten Kernel.
+- `GGML_CUDA_Q8_1_REUSE`: `ggml_cuda_mul_mat_vec_q` quantisiert in einen festen 1-MiB-Puffer des Kontexts und nutzt ihn fuer folgende Matvecs auf denselben Daten, bis ein Knoten den Quellbereich beschreibt. Ling: 36 % der Matvec-Aufrufe ohne eigene Quantisierung.
+- `GGML_CUDA_GRAPH_FUSION_TRACE=1`: Planstatistik und q8_1-Trefferquote auf stderr. `GGML_CUDA_GRAPH_OPT_MAX_FANOUT` (Default 3): Fan-out-Grenze des Upstream-Concurrency-Passes.
+
+Mechanik: `graph-fusion.cuh` + `ggml_cuda_graph_fusion_plan` (ggml-cuda.cu) planen vor jeder Graph-Auswertung, welche frueheren Knoten uebersprungen werden. Bedingungen: alle Verwendungen im selben Split (globale Use-Counts), kein Knoten zwischen Quelle und uebernehmendem Kernel beschreibt die Quellen, und auch die Ausgabe des uebernehmenden Kernels selbst ueberlappt keine Quelle (Conv-Ausgabe darf `x` nur elementgleich ueberdecken; der Kernel liest dafuer erst alle Eingaben seiner Zeile). Planzeit 0,11 ms; mit CUDA-Graphen faellt sie nur beim Capture an, bei MiMo (Graphen wegen veraenderlicher Expertengewichte aus) jeden Token.
+
+Grenzbeitraege im Paket (Ling greedy, "ohne X" gegen Mittel der beiden benachbarten Laeufe mit allen vier):
+
+| ohne | t/s | Beitrag |
+|---|---|---|
+| Conv-Concat-Fusion | 157,96 | 3,7 % |
+| q8_1-Reuse | 160,74 | 2,6 % |
+| State in place | 159,80 | 2,4 % |
+| L2-Fusion | 161,96 | 0,9 % |
+
+Andere Modelle (A/B/A/B, Greedy-SHA gleich, Fehler 0):
+
+| Modell | Basis | alle vier |
+|---|---|---|
+| FrogNano-4B (qwen35, MTP) | 68,7 | 69,5 (+1,1 %) |
+| LFM2.5-1.2B (lfm2) | 245,5 | 248,1 (+1,1 %) |
+| MiMo-V2.6-9B (qwen35, ohne CUDA-Graphen) | 41,3 | 41,7 (+0,8 %) |
+| Qwen3.6-35B-A3B hybrid (DFlash, Drafts gleich) | 48,9 | 48,7 (Rauschen) |
+| Sage-A1.5 (qwen35moe) | 37,1 | 38,1 (Rauschen, +-5 %) |
+
+Fallstricke unterwegs: (1) Der erste Stand stuerzte im letzten KDA-Layer mit einem illegalen Speicherzugriff ab: die `ids` des uebersprungenen `get_rows` sind fuer den Allokator danach tot, ihr Speicher war vor dem GDN schon neu vergeben (`id=1081396167`). Jetzt wird auch der Bereich der Indizes bis einschliesslich des GDN geprueft. (2) Ohne die Umordnung griff die Concat-Fusion nur 16 von 54 Mal, aus demselben Grund. (3) Die erste Planversion (Verbraucher-Map ueber alle Knoten, 0,5 ms) kostete MiMo ohne CUDA-Graphen 4 %; jetzt Vorwaertssuche ab dem Kandidaten bis zur Use-Count-Zahl.
+
+Nicht umgesetzt / ohne Gewinn: `GGML_CUDA_GRAPH_OPT=1` startet auf Ling keine Streams (der Pass sucht nur `attn_norm` mit Q/K/V-Join; KDA hat 6 Zweige, MLA 2), auf FrogNano 68,5 gegen 68,7 t/s. Stream-K pro Quant-Typ: Q8_0 ist bei Ling 2 %, MiMo 1 %, FrogNano 36 % der Gewichte, hoechstens ~1 % Prefill. Generische Elementketten-Fusion (Gate-Kette): ~1 %, konkurriert mit der Top-k-MoE-Fusion, die am Sigmoid beginnt. Int4-GEMV mit Gleitkomma-Aktivierungen (MNN `GEMV_FpAInt4B_V14`): neuer Pfad fuer alle K-Quants, der Reuse holt den Grossteil billiger.
+
+Tests: `test-backend-ops -b CUDA0` neu `SSM_CONV_CONCAT_STATE` (14, inkl. 2 Sequenzen, 3 Rollback-Kopien, n_t 1/4/32/33) und `GATED_DELTA_NET_STATE_ROWS` (16, inkl. Lesen und Schreiben derselben Cache-Zeile), beide als ganzer Graph; dazu SSM_CONV, SSM_CONV_BIAS_SILU, GATED_DELTA_NET, L2_NORM, CONCAT, GET_ROWS, CPY, MUL_MAT, MUL_MAT_ID, MUL_MAT_VEC_FUSION mit allen Knoepfen an und aus: alle OK.
+
+Laeufe: `benchmark-results/mnn-ideas-20261113/runs/` (`ab-*`, `loo-*`: Ling greedy; `tools-*`, `pp-*`: Tools und 8,2k-Prefill; `dep-*`/`new-*`: deployte Libs gegen neuen Build; `mm-*`: andere Modelle; `go-*`: GRAPH_OPT). Build `build-mnn-sm75` (gleiche CMake-Optionen wie `build-main-sm75`). Werkzeuge: `tools/arm.sh`, `tools/mbench.py`.
+
+## Einbau (2026-11-13)
+
+Die vier Knoepfe stehen auf 1 in den agollm-Rezepten `ling-tiny`, `frognano-4b-2609`, `lfm2.5-1.2b` und `mimo-v2.6-9b` (`config_test.go` prueft sie fuer ling-tiny) sowie in `start-ling-tiny.sh`, `start-frognano-4b.sh` und `start-lfm25-1.2b.sh`. Sage, Qwen3.6, Clover und Holo4 bleiben ohne (kein messbarer Effekt). Deployt nach agollm `workers/llama`: nur `libggml-cuda.so.0` aus `build-main-sm75` (ORIGIN `mnn-fusion=20261113T102111Z`, Backup `runtime/llama-build-before-mnn-fusion-20261113T102111Z`); die uncommitteten Aenderungen anderer Sessions in der Lib sind aelter als das Deploy vom 2026-11-10 und damit unveraendert, `libggml-base` ist seit 774bf9654 unveraendert. Nachkontrolle mit dem Worker-Verzeichnis: Ling-tiny 166,2 t/s greedy, gleiche SHAs; FrogNano 70,3, LFM2.5 247,6, MiMo 39,8 t/s, jeweils gleiche SHA wie in den Messlaeufen. Live-Worker (agollm-Sampling, Chat): 161,7 / 162,8 t/s Decode.
+
 # GPU-Auslastung Ling-3.0-tiny: MLA-Prefill entpackt, Reasoning-Budget, top-k und get_rows vom 2026-11-10
 
 **Ergebnis: Vier Aenderungen, A/B/A/B gegen die deployten Binaries (Rezept `ling-tiny`, Sampling wie agollm: temp 1,0 / top_k 20 / top_p 0,95, Anfragen mit Tools): Prefill +21 % bei ~4k Tokens (1420 -> 1724 t/s) und +46 % bei ~9,5k (1191 -> 1742 t/s), Decode +11 % (130,6 -> 145,2 t/s). Groesster Hebel fuer pps ist die MLA-Attention im Prefill, fuer tps im Betrieb ein CPU-Durchlauf ueber das ganze Vokabular je Token im Reasoning-Budget-Sampler.**

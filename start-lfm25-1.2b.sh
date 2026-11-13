@@ -44,6 +44,10 @@ DECISION_SEQS="0"  # POST /v1/decision side context; agollm serves decisions on 
 
 GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS="2"  # 2026-10-02: tg128 240.0 -> 275.2 t/s together with Q6_K rows=2
 GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS="2"  # tied Q6_K output projection
+GGML_CUDA_CONV_CONCAT_FUSION="1"  # conv-state concat, conv and state copy of recurrent layers in one kernel; the four together +1.1 % decode (2026-11-13), identical output
+GGML_CUDA_GDN_STATE_INPLACE="1"  # gated_delta_net reads the recurrent state from the cache row instead of a get_rows copy
+GGML_CUDA_GDN_L2_FUSION="1"  # l2_norm of q/k inside gated_delta_net (up to 32 tokens)
+GGML_CUDA_Q8_1_REUSE="1"  # matvecs on the same input share one q8_1 quantization
 CORS_ORIGINS="*"
 API_KEY=""
 API_KEY_FILE=""
@@ -163,6 +167,10 @@ env_args=(
     "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES_VALUE"
     "GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS=$GGML_CUDA_MMVQ_Q4_K_NCOLS1_ROWS"
     "GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS=$GGML_CUDA_MMVQ_Q6_K_NCOLS1_ROWS"
+    "GGML_CUDA_CONV_CONCAT_FUSION=$GGML_CUDA_CONV_CONCAT_FUSION"
+    "GGML_CUDA_GDN_STATE_INPLACE=$GGML_CUDA_GDN_STATE_INPLACE"
+    "GGML_CUDA_GDN_L2_FUSION=$GGML_CUDA_GDN_L2_FUSION"
+    "GGML_CUDA_Q8_1_REUSE=$GGML_CUDA_Q8_1_REUSE"
     "LLAMA_ARG_HOST=$HOST"
     "LLAMA_ARG_PORT=$PORT"
     "LLAMA_ARG_CORS_ORIGINS=$CORS_ORIGINS"

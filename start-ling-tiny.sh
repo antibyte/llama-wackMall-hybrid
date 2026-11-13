@@ -262,6 +262,10 @@ LLAMA_MLA_MHA_MIN_TOKENS="128"  # ubatch size from which MLA prefill decompresse
 LLAMA_REASONING_EOG_MASK_FAST="1"  # think-block EOG mask without a full-vocabulary scan per token; +10 % decode on tool requests (CPU sampling)
 GGML_CUDA_TOP_K_LARGE="4096"  # rows from this width use the two-pass top-k instead of a radix sort (0 = off); +1-2 % decode with backend sampling
 GGML_CUDA_GET_ROWS_NARROW="8"  # get_rows rows up to this width use one thread per element (0 = off); backend top-p without top-k +27 %
+GGML_CUDA_CONV_CONCAT_FUSION="1"  # conv-state concat, conv and state copy of recurrent layers in one kernel; the four together +8.5 % decode greedy, +7.9 % with tools (2026-11-13), identical output
+GGML_CUDA_GDN_STATE_INPLACE="1"  # gated_delta_net reads the recurrent state from the cache row instead of a get_rows copy
+GGML_CUDA_GDN_L2_FUSION="1"  # l2_norm of q/k inside gated_delta_net (up to 32 tokens)
+GGML_CUDA_Q8_1_REUSE="1"  # matvecs on the same input share one q8_1 quantization
 GGML_CUDA_ASYNC_HOST_COPY="1"  # pinned split H2D
 GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate
 GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner
@@ -392,6 +396,10 @@ case "$GGML_CUDA_FA_MLA_DEC" in 0|1) ;; *) die "GGML_CUDA_FA_MLA_DEC muss 0 oder
 case "$LLAMA_REASONING_EOG_MASK_FAST" in 0|1) ;; *) die "LLAMA_REASONING_EOG_MASK_FAST muss 0 oder 1 sein." ;; esac
 [[ "$GGML_CUDA_TOP_K_LARGE" =~ ^[0-9]+$ ]] || die "GGML_CUDA_TOP_K_LARGE muss eine Zahl >= 0 sein."
 [[ "$GGML_CUDA_GET_ROWS_NARROW" =~ ^[0-9]+$ ]] || die "GGML_CUDA_GET_ROWS_NARROW muss eine Zahl >= 0 sein."
+case "$GGML_CUDA_CONV_CONCAT_FUSION" in 0|1) ;; *) die "GGML_CUDA_CONV_CONCAT_FUSION muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_GDN_STATE_INPLACE" in 0|1) ;; *) die "GGML_CUDA_GDN_STATE_INPLACE muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_GDN_L2_FUSION" in 0|1) ;; *) die "GGML_CUDA_GDN_L2_FUSION muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_Q8_1_REUSE" in 0|1) ;; *) die "GGML_CUDA_Q8_1_REUSE muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_ASYNC_HOST_COPY" in 0|1) ;; *) die "GGML_CUDA_ASYNC_HOST_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_ASYNC_D2H_COPY" in 0|1) ;; *) die "GGML_SCHED_ASYNC_D2H_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_DEDUP_DST_SYNC" in 0|1) ;; *) die "GGML_SCHED_DEDUP_DST_SYNC muss 0 oder 1 sein." ;; esac
@@ -639,6 +647,10 @@ env_args=(
     "LLAMA_REASONING_EOG_MASK_FAST=$LLAMA_REASONING_EOG_MASK_FAST"
     "GGML_CUDA_TOP_K_LARGE=$GGML_CUDA_TOP_K_LARGE"
     "GGML_CUDA_GET_ROWS_NARROW=$GGML_CUDA_GET_ROWS_NARROW"
+    "GGML_CUDA_CONV_CONCAT_FUSION=$GGML_CUDA_CONV_CONCAT_FUSION"
+    "GGML_CUDA_GDN_STATE_INPLACE=$GGML_CUDA_GDN_STATE_INPLACE"
+    "GGML_CUDA_GDN_L2_FUSION=$GGML_CUDA_GDN_L2_FUSION"
+    "GGML_CUDA_Q8_1_REUSE=$GGML_CUDA_Q8_1_REUSE"
     "GGML_CUDA_ASYNC_HOST_COPY=$GGML_CUDA_ASYNC_HOST_COPY"
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
     "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"
