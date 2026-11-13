@@ -266,6 +266,17 @@ GGML_CUDA_CONV_CONCAT_FUSION="1"  # conv-state concat, conv and state copy of re
 GGML_CUDA_GDN_STATE_INPLACE="1"  # gated_delta_net reads the recurrent state from the cache row instead of a get_rows copy
 GGML_CUDA_GDN_L2_FUSION="1"  # l2_norm of q/k inside gated_delta_net (up to 32 tokens)
 GGML_CUDA_Q8_1_REUSE="1"  # matvecs on the same input share one q8_1 quantization
+GGML_CUDA_GDN_GATE_FUSION="1"  # gated_delta_net applies the gate chain (mul, sigmoid, scale) and the beta sigmoid; its input chains move in front of it; the eleven together +9.8 % decode greedy, +8.6 % with tools (2026-11-13 round 2), identical output
+GGML_CUDA_MMVQ_EPI_CONV="1"  # q/k/v projection matvec applies the causal conv + silu per row and writes the conv state (needs GGML_CUDA_CONV_CONCAT_FUSION)
+GGML_CUDA_CONV_STATE_INPLACE="1"  # that conv reads its state from the cache row instead of a get_rows copy
+GGML_CUDA_MMVQ_EPI_GATE="1"  # mul_mat -> sigmoid -> mul inside the matvec
+GGML_CUDA_MMVQ_EPI_WEIGHT="1"  # MoE down projection scales each expert by its weight inside the matvec
+GGML_CUDA_MMVQ_EPI_BIAS="1"  # matvec + bias takes the plain kernel with an add epilogue
+GGML_CUDA_MMVQ_INPUT_ALIAS="1"  # fused gate/up/glu matvec may overwrite its input (shared expert)
+GGML_CUDA_Q8_1_REUSE_SLOTS="4"  # q8_1 copies kept at once (1..8, needs GGML_CUDA_Q8_1_REUSE)
+GGML_CUDA_NORM_Q8_1="1"  # rms_norm * weight of one row also writes the q8_1 copy for the matvecs behind it
+GGML_CUDA_NORM_ADD_FUSION="1"  # that norm kernel also does the residual add in front of it
+GGML_CUDA_CONT_FUSION="1"  # cont of an already contiguous result is dropped
 GGML_CUDA_ASYNC_HOST_COPY="1"  # pinned split H2D
 GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate
 GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner
@@ -400,6 +411,17 @@ case "$GGML_CUDA_CONV_CONCAT_FUSION" in 0|1) ;; *) die "GGML_CUDA_CONV_CONCAT_FU
 case "$GGML_CUDA_GDN_STATE_INPLACE" in 0|1) ;; *) die "GGML_CUDA_GDN_STATE_INPLACE muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_GDN_L2_FUSION" in 0|1) ;; *) die "GGML_CUDA_GDN_L2_FUSION muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_Q8_1_REUSE" in 0|1) ;; *) die "GGML_CUDA_Q8_1_REUSE muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_GDN_GATE_FUSION" in 0|1) ;; *) die "GGML_CUDA_GDN_GATE_FUSION muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_MMVQ_EPI_CONV" in 0|1) ;; *) die "GGML_CUDA_MMVQ_EPI_CONV muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_CONV_STATE_INPLACE" in 0|1) ;; *) die "GGML_CUDA_CONV_STATE_INPLACE muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_MMVQ_EPI_GATE" in 0|1) ;; *) die "GGML_CUDA_MMVQ_EPI_GATE muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_MMVQ_EPI_WEIGHT" in 0|1) ;; *) die "GGML_CUDA_MMVQ_EPI_WEIGHT muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_MMVQ_EPI_BIAS" in 0|1) ;; *) die "GGML_CUDA_MMVQ_EPI_BIAS muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_MMVQ_INPUT_ALIAS" in 0|1) ;; *) die "GGML_CUDA_MMVQ_INPUT_ALIAS muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_Q8_1_REUSE_SLOTS" in [1-8]) ;; *) die "GGML_CUDA_Q8_1_REUSE_SLOTS muss zwischen 1 und 8 liegen." ;; esac
+case "$GGML_CUDA_NORM_Q8_1" in 0|1) ;; *) die "GGML_CUDA_NORM_Q8_1 muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_NORM_ADD_FUSION" in 0|1) ;; *) die "GGML_CUDA_NORM_ADD_FUSION muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_CONT_FUSION" in 0|1) ;; *) die "GGML_CUDA_CONT_FUSION muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_ASYNC_HOST_COPY" in 0|1) ;; *) die "GGML_CUDA_ASYNC_HOST_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_ASYNC_D2H_COPY" in 0|1) ;; *) die "GGML_SCHED_ASYNC_D2H_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_DEDUP_DST_SYNC" in 0|1) ;; *) die "GGML_SCHED_DEDUP_DST_SYNC muss 0 oder 1 sein." ;; esac
@@ -651,6 +673,17 @@ env_args=(
     "GGML_CUDA_GDN_STATE_INPLACE=$GGML_CUDA_GDN_STATE_INPLACE"
     "GGML_CUDA_GDN_L2_FUSION=$GGML_CUDA_GDN_L2_FUSION"
     "GGML_CUDA_Q8_1_REUSE=$GGML_CUDA_Q8_1_REUSE"
+    "GGML_CUDA_GDN_GATE_FUSION=$GGML_CUDA_GDN_GATE_FUSION"
+    "GGML_CUDA_MMVQ_EPI_CONV=$GGML_CUDA_MMVQ_EPI_CONV"
+    "GGML_CUDA_CONV_STATE_INPLACE=$GGML_CUDA_CONV_STATE_INPLACE"
+    "GGML_CUDA_MMVQ_EPI_GATE=$GGML_CUDA_MMVQ_EPI_GATE"
+    "GGML_CUDA_MMVQ_EPI_WEIGHT=$GGML_CUDA_MMVQ_EPI_WEIGHT"
+    "GGML_CUDA_MMVQ_EPI_BIAS=$GGML_CUDA_MMVQ_EPI_BIAS"
+    "GGML_CUDA_MMVQ_INPUT_ALIAS=$GGML_CUDA_MMVQ_INPUT_ALIAS"
+    "GGML_CUDA_Q8_1_REUSE_SLOTS=$GGML_CUDA_Q8_1_REUSE_SLOTS"
+    "GGML_CUDA_NORM_Q8_1=$GGML_CUDA_NORM_Q8_1"
+    "GGML_CUDA_NORM_ADD_FUSION=$GGML_CUDA_NORM_ADD_FUSION"
+    "GGML_CUDA_CONT_FUSION=$GGML_CUDA_CONT_FUSION"
     "GGML_CUDA_ASYNC_HOST_COPY=$GGML_CUDA_ASYNC_HOST_COPY"
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
     "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"

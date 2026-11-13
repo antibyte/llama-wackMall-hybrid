@@ -1,3 +1,67 @@
+# CUDA-Kernel Runde 2: Matvec-Epilogues, Norm-Zeile, GDN-Gates vom 2026-11-13
+
+**Ergebnis: Elf weitere Knoepfe, die Kleinkernel in die Kernel davor oder dahinter falten. Ling-3.0-tiny gegen den deployten Stand (`build-main-sm75`), A/B/A/B: Decode greedy 164,2 -> 180,3 t/s (+9,8 %), Tool-Anfragen mit agollm-Sampling 142,7 -> 154,9 t/s (+8,6 %), Decode nach 8,2k Prompt 154,0 -> 167,1 t/s (+8,5 %), Prefill unveraendert. Alle Greedy-Ausgaben bitgleich (SHA), auch ueber 2 x 1500 Tokens. Kernelstarts je Token 934 -> 593, dazu 36 Kopierknoten weniger. LFM2.5-1.2B +1,1 %, FrogNano, MiMo, Sage und Qwen3.6 unveraendert (gleiche SHA). Alle Knoepfe Default 0; eingebaut in Ling-tiny und LFM2.5 (siehe Einbau).**
+
+Ausgangslage (nsys mit den Knoepfen der MNN-Runde, `runs/p-ling-dec`): 934 Kernel je Token, 5,54 ms Kernelzeit, dazu 0,39 ms Luecken zwischen den Kerneln und 0,63 ms Host zwischen den Tokens. 70 % der Starts laufen kuerzer als 5 us (27 % der Kernelzeit). Die grossen Matvecs sind bandbreitengebunden: Experten Gate/Up 226 GB/s, Q8_0 k/v 235 GB/s, `output.weight` (198 MB je Token, 12 % der Kernelzeit) am Limit. Bei FrogNano (27 % der Kernelzeit im Output-Matvec, 521 MB) und MiMo (834 MB) gilt das fuer fast alles; dort hilft kein Kernel mehr, nur weniger Bytes. Ein Kernelstart kostet auf der 1660 Ti 1,4-3,3 us plus 0,2-0,45 us Luecke, ein Matvec traegt 2-3 us Fixkosten. Der Hebel bei Ling ist also weiter die Zahl der Starts.
+
+**Knoepfe** (alle `ggml/src/ggml-cuda/`, Default 0, geplant in `ggml_cuda_graph_fusion_plan`):
+- `GGML_CUDA_GDN_GATE_FUSION`: `gated_delta_net` rechnet die Gate-Kette `scale(sigmoid(mul(x, a)))` und das Sigmoid von beta selbst. Dazu zieht `graph_optimize` die Einzelnutzer-Ketten vor ihren GDN-Knoten, damit ihre Eingaben bis dahin belegt bleiben; State- und L2-Faltung treffen damit 18 von 18 Layern (vorher 17 und 16).
+- `GGML_CUDA_MMVQ_EPI_CONV` (braucht `GGML_CUDA_CONV_CONCAT_FUSION`): der Matvec der q/k/v-Projektion wendet die kausale Conv samt SiLU auf jede fertige Zeile an und schreibt den neuen Conv-State; Concat, Conv, SiLU und Kopie entfallen (54 je Token). `GGML_CUDA_CONV_STATE_INPLACE` liest den Conv-State dabei direkt aus der Cache-Zeile (`get_rows` entfaellt).
+- `GGML_CUDA_MMVQ_EPI_GATE`: `mul_mat -> sigmoid -> mul(., other)` (Ausgangs-Gate der KDA-Layer) im Matvec.
+- `GGML_CUDA_MMVQ_EPI_WEIGHT`: `mul_mat_id -> mul(., Gewicht je Experte)` (MoE-Down) im Matvec.
+- `GGML_CUDA_MMVQ_EPI_BIAS`: Matvec mit Bias allein nimmt den einfachen Kernel mit Add-Epilogue statt des Gate/Bias-Kernels (0,45-0,77 us schneller je Aufruf).
+- `GGML_CUDA_MMVQ_INPUT_ALIAS` (gab es schon, Default 0): Gate/Up/SiLU des Shared Expert darf seinen Eingang ueberschreiben, damit greift die GLU-Fusion in allen 23 MoE-Layern.
+- `GGML_CUDA_Q8_1_REUSE_SLOTS` (1..8, Default 1): mehrere q8_1-Kopien statt einer; mit 4 brauchen noch 48 % der Matvecs eine eigene Quantisierung (vorher 64 %).
+- `GGML_CUDA_NORM_Q8_1` (braucht `GGML_CUDA_Q8_1_REUSE`): `rms_norm * weight` einer Zeile schreibt die q8_1-Kopie gleich mit (`rms_norm_row_f32`).
+- `GGML_CUDA_NORM_ADD_FUSION`: derselbe Kernel uebernimmt das Residual-Add vor der Norm.
+- `GGML_CUDA_CONT_FUSION`: `cont` eines schon zusammenhaengenden Ergebnisses entfaellt (Matvec schreibt direkt in die Kopie, die Norm hinter `gated_delta_net` liest dessen Ausgabe).
+
+Ein KDA-Layer braucht damit 11 statt 21-23 Kernel und keinen Kopierknoten mehr, ein MoE-Layer 10 statt 17.
+
+Grenzbeitraege im Paket (Ling greedy ohne Spekulation, "ohne X" gegen das Mittel der beiden Nachbarlaeufe mit allen):
+
+| ohne | t/s | Beitrag |
+|---|---|---|
+| GDN-Gates | 176,8 | 1,5 % |
+| Conv-Epilogue | 176,4 | 1,5 % |
+| Input-Alias | 176,8 | 1,3 % |
+| q8_1-Slots | 177,0 | 1,2 % |
+| Norm-q8_1 | 177,4 | 1,1 % |
+| Norm-Add | 177,7 | 0,8 % |
+| Gate-Epilogue | 177,7 | 0,8 % |
+| Bias-Epilogue | 177,9 | 0,7 % |
+| Gewichts-Epilogue | 178,1 | 0,65 % |
+| Cont | 178,3 | 0,5 % |
+| Conv-State in place | 178,3 | 0,4 % |
+
+Andere Modelle mit allen Knoepfen (gleiche SHA, Fehler 0): LFM2.5-1.2B 248,2 -> 251,0 t/s (+1,1 %), MiMo-9B 40,99 -> 41,13 (A/B/A/B, +0,3 %), FrogNano-4B 72,4 -> 72,2 (Rauschen), Sage und Qwen3.6-hybrid gleiche SHA bei verrauschter Zeit.
+
+Fallstricke unterwegs:
+- Die Lib baut mit `-use_fast_math`. Schon das Vorziehen von `expf(g)` in ein lokales Array aenderte die FMA-Kontraktion im GDN-Update und damit die Ausgabe. Gefaltete Schritte stehen deshalb in derselben Ausdrucksform wie der Kernel, den sie ersetzen; geprueft wird per SHA gegen den alten Build mit Knopf aus und an.
+- Der Gate/Bias-Kernel (`has_fusion`) ist als reiner Matvec 50-100 % langsamer (Q6_K-Experten 21,9 -> 39 us). Epilogues haengen deshalb am einfachen Kernel, und zwar als eigene Variante je Art: Code einer anderen Art im selben Kernel bremst das Skalarprodukt, auch wenn er nie laeuft (21,9 -> 26,2 us). Ein indiziertes lokales Array im Epilogue machte alle Fusionskernel 3-5-mal langsamer (Stack fuer jeden Thread).
+- Epilogue-Eingaben nach der Reduktion zu laden kostet 2-6 us; sie werden vor dem Skalarprodukt geladen.
+- Speicherplan: uebersprungene Knoten zaehlen in den Bereichspruefungen nicht als Schreiber. Die Kopie hinter `gated_delta_net` legt der Allokator auf dessen eben frei gewordene Eingaben; dort liest stattdessen die Norm die GDN-Ausgabe. Das Add vor der Norm wird nur gefaltet, wenn es nicht schon mit dem Matvec davor lief (`ran_idx`).
+- Die Umordnung der GDN-Eingaben riss zuerst Conv und SiLU von v auseinander (18 Kernel mehr); v bleibt jetzt stehen.
+
+Geprueft und verworfen: unabhaengige Kernel im CUDA-Graph parallel legen (`tools/graphpar.cu`, `tools/graphdag.cu`). Kleinstkernel kosten parallel 0,6 statt 1,0 us, ein Zweier-Diamant wird langsamer, ein KDA-artiger Layer gewinnt 8,4 von 96,6 us. Das waeren bei Ling etwa 4 % bei hohem Risiko (jede Speicherwiederverwendung wird zur Abhaengigkeit).
+
+**Offen** (aus `runs/p-ling-final`: 593 Kernel, 5,11 ms Kernelzeit, 52 % der Starts unter 5 us):
+- 90 `quantize_q8_1` hinter Matvecs (Experten- und Shared-Aktivierungen, GDN-Ausgang): ~2,5 %; die Zeilen eines Matvecs entstehen in verschiedenen Bloecken, also nur mit eigenem Kernel fuer Gate/Up + Quantisierung.
+- MLA-Layer (6 x ~25 Kernel): Norm-Zeile fuer 256 Spalten, Gate-Kette, zwei Concats; ~1,5 %.
+- Host zwischen den Tokens 0,65 ms (10 %).
+- `gated_delta_net` rechnet die Gates in jedem Warp (+0,7 us je Layer); einmal je Block ueber Shared Memory.
+- `rms_norm_row_f32` braucht 3,7 us (ein Block mit 1024 Threads); ein schlankerer Block aendert die Summenreihenfolge und damit die Ausgabe.
+- Planzeit 0,38 ms mit allen Knoepfen; faellt mit CUDA-Graphen nur beim Capture an.
+- Output-Matvec: bandbreitengebunden; nur mit kleinerem Quant fuer `output.weight` (Q4_K: -31 % Bytes, ~3 % bei Ling, ~8 % bei FrogNano) oder einer Vorauswahl der Kandidaten, beides aendert die Ausgabe.
+
+Tests: `test-backend-ops -b CUDA0` neu `KDA_DECODE_LAYER` (8: ein Decode-Token durch einen KDA-Layer wie im Modellgraph, vier Quant-Typen, Cache-Inhalt im Ergebnis; mit Knoepfen greifen alle Faltungen) und `MUL_MAT_ID_WEIGHTED` (8). Mit allen Knoepfen an und aus: MUL_MAT 1177, MUL_MAT_ID 863, MUL_MAT_VEC_FUSION 446, RMS_NORM, RMS_NORM_MUL_ADD, SSM_CONV*, GATED_DELTA_NET*, L2_NORM, CONCAT, GET_ROWS, CPY, CONT, ADD, MUL, SCALE: alle OK.
+
+Laeufe: `benchmark-results/cuda-kernels-20261113/runs/` (`p-*`: nsys-Profile, `ab-*`: A/B/A/B gegen `build-main-sm75`, `loo-*`: Grenzbeitraege, `om-*`/`om2-*`/`lf-*`/`mi-*`: andere Modelle, `dep-*`: Nachkontrolle des Deploys). Werkzeuge: `tools/ab.sh`, `tools/profile.sh`, `tools/knobs.sh`, `tools/decode_shapes.py`, `tools/decode_seq.py`, `tools/diff_counts.py`. Build `build-mnn-sm75`.
+
+## Einbau (2026-11-13, Runde 2)
+
+Die elf Knoepfe (`GGML_CUDA_Q8_1_REUSE_SLOTS` auf 4, die uebrigen auf 1) stehen in den agollm-Rezepten `ling-tiny` und `lfm2.5-1.2b` (`config_test.go` prueft sie fuer ling-tiny) sowie in `start-ling-tiny.sh` und `start-lfm25-1.2b.sh`. FrogNano, MiMo, Sage, Qwen3.6, Clover und Holo4 bleiben ohne (kein messbarer Effekt). Deployt nach agollm `workers/llama`: nur `libggml-cuda.so.0` aus `build-main-sm75` (ORIGIN `cuda-kernels2=20261113T143420Z`, Backup `runtime/llama-build-before-cuda-kernels2-20261113T143420Z`); die uncommitteten Aenderungen anderer Sessions in der Lib (`fattn*`, vom 2026-11-06/10) sind aelter als die letzten Deploys und damit unveraendert, die Quellen von `libggml-base` ebenso. Nachkontrolle mit dem Worker-Verzeichnis und den Rezepten, jeweils gleiche SHA wie mit der alten Lib und ohne Fehler: Ling-tiny 180,3 t/s, LFM2.5 254,0, FrogNano 71,7, MiMo 41,4, Sage 35,3 t/s. Live-Worker (agollm-Sampling, Chat): 178,2 / 178,4 t/s Decode (vorher 161,7 / 162,8).
+
 # MNN-Ideen fuer den CUDA-Pfad: Linear-Attention-Fusion und q8_1-Wiederverwendung vom 2026-11-13
 
 **Ergebnis: Vier neue Fusionen aus der Analyse von alibaba/MNN (dort rechnet ein GDN-Layer im Decode mit zwei Kerneln). Ling-3.0-tiny gegen die deployten Libs aus `workers/llama`, A/B/A/B: Decode greedy 152,1 -> 165,0 t/s (+8,5 %), Tool-Anfragen mit agollm-Sampling 139,2 -> 150,2 t/s (+7,9 %), Decode nach 8,2k Prompt 136,2 -> 145,9 t/s (+7,1 %), Prefill unveraendert. Alle Greedy-Ausgaben bitgleich (SHA). FrogNano-4B und LFM2.5-1.2B +1,1 %, MiMo-9B +0,8 %, Sage und Qwen3.6-35B-A3B im Rauschen. Alle Knoepfe Default 0; eingebaut in Ling-tiny, FrogNano, LFM2.5 und MiMo (siehe Einbau).**
