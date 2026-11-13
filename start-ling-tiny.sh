@@ -22,7 +22,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"  # directo
 
 # Paths
 SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"  # current Turbo4-enabled native sm_75 Release executable
-MODEL="$HOME/models/ling-3.0-tiny/Ling-3.0-tiny-Q4_K_M.gguf"  # target GGUF
+MODEL="$HOME/models/ling-3.0-tiny/Ling-3.0-tiny-Q4_K_M-outq4k.gguf"  # target GGUF; output.weight Q4_K instead of Q6_K: +4.8 % decode, KLD 0.0036 against Q4_K_M (2026-11-13)
 SPEC_MODE="ngram"  # none | mtp | dflash | ngram; Ling winner is ngram-simple
 SPEC_DRAFT_MODEL=""  # unused for ngram; set a sidecar only after switching SPEC_MODE to dflash
 DFLASH_TARGET_TENSOR_OVERRIDE=""  # Qwen NextN override; empty for Ling
@@ -277,6 +277,10 @@ GGML_CUDA_Q8_1_REUSE_SLOTS="4"  # q8_1 copies kept at once (1..8, needs GGML_CUD
 GGML_CUDA_NORM_Q8_1="1"  # rms_norm * weight of one row also writes the q8_1 copy for the matvecs behind it
 GGML_CUDA_NORM_ADD_FUSION="1"  # that norm kernel also does the residual add in front of it
 GGML_CUDA_CONT_FUSION="1"  # cont of an already contiguous result is dropped
+GGML_CUDA_MMVQ_EPI_BIAS_SUM="1"  # shared-expert matvec adds up the weighted expert rows itself (needs GGML_CUDA_MMVQ_EPI_BIAS); the four together +1.9 % decode (2026-11-13 round 3), identical output
+GGML_SCHED_ASYNC_USER_INPUTS="16384"  # user inputs up to this size reach the GPU with one copy and one kernel in front of the graph (bytes, 0 = one blocking copy each)
+GGML_CUDA_GRAPH_COMPAT_CACHE="1"  # an unchanged CUDA graph keeps its compatibility verdict (default 1)
+LLAMA_BATCH_SEQ_CPL_FAST="1"  # skip the coupled-sequence scan of a batch without coupled sequences (default 1)
 GGML_CUDA_ASYNC_HOST_COPY="1"  # pinned split H2D
 GGML_SCHED_ASYNC_D2H_COPY="0"  # exact but below promotion gate
 GGML_SCHED_DEDUP_DST_SYNC="1"  # exact 3x2K winner
@@ -422,6 +426,10 @@ case "$GGML_CUDA_Q8_1_REUSE_SLOTS" in [1-8]) ;; *) die "GGML_CUDA_Q8_1_REUSE_SLO
 case "$GGML_CUDA_NORM_Q8_1" in 0|1) ;; *) die "GGML_CUDA_NORM_Q8_1 muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_NORM_ADD_FUSION" in 0|1) ;; *) die "GGML_CUDA_NORM_ADD_FUSION muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_CONT_FUSION" in 0|1) ;; *) die "GGML_CUDA_CONT_FUSION muss 0 oder 1 sein." ;; esac
+case "$GGML_CUDA_MMVQ_EPI_BIAS_SUM" in 0|1) ;; *) die "GGML_CUDA_MMVQ_EPI_BIAS_SUM muss 0 oder 1 sein." ;; esac
+case "$GGML_SCHED_ASYNC_USER_INPUTS" in ''|*[!0-9]*) die "GGML_SCHED_ASYNC_USER_INPUTS muss eine nichtnegative ganze Zahl sein." ;; esac
+case "$GGML_CUDA_GRAPH_COMPAT_CACHE" in 0|1) ;; *) die "GGML_CUDA_GRAPH_COMPAT_CACHE muss 0 oder 1 sein." ;; esac
+case "$LLAMA_BATCH_SEQ_CPL_FAST" in 0|1) ;; *) die "LLAMA_BATCH_SEQ_CPL_FAST muss 0 oder 1 sein." ;; esac
 case "$GGML_CUDA_ASYNC_HOST_COPY" in 0|1) ;; *) die "GGML_CUDA_ASYNC_HOST_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_ASYNC_D2H_COPY" in 0|1) ;; *) die "GGML_SCHED_ASYNC_D2H_COPY muss 0 oder 1 sein." ;; esac
 case "$GGML_SCHED_DEDUP_DST_SYNC" in 0|1) ;; *) die "GGML_SCHED_DEDUP_DST_SYNC muss 0 oder 1 sein." ;; esac
@@ -684,6 +692,10 @@ env_args=(
     "GGML_CUDA_NORM_Q8_1=$GGML_CUDA_NORM_Q8_1"
     "GGML_CUDA_NORM_ADD_FUSION=$GGML_CUDA_NORM_ADD_FUSION"
     "GGML_CUDA_CONT_FUSION=$GGML_CUDA_CONT_FUSION"
+    "GGML_CUDA_MMVQ_EPI_BIAS_SUM=$GGML_CUDA_MMVQ_EPI_BIAS_SUM"
+    "GGML_SCHED_ASYNC_USER_INPUTS=$GGML_SCHED_ASYNC_USER_INPUTS"
+    "GGML_CUDA_GRAPH_COMPAT_CACHE=$GGML_CUDA_GRAPH_COMPAT_CACHE"
+    "LLAMA_BATCH_SEQ_CPL_FAST=$LLAMA_BATCH_SEQ_CPL_FAST"
     "GGML_CUDA_ASYNC_HOST_COPY=$GGML_CUDA_ASYNC_HOST_COPY"
     "GGML_SCHED_ASYNC_D2H_COPY=$GGML_SCHED_ASYNC_D2H_COPY"
     "GGML_SCHED_DEDUP_DST_SYNC=$GGML_SCHED_DEDUP_DST_SYNC"
