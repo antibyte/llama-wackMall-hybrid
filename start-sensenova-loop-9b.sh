@@ -80,7 +80,7 @@ FIT_TARGET="80"
 FIT_CTX="2048"
 
 # Context, KV, Flash Attention
-CONTEXT="16384"  # f16 KV + MTP: 18432 peaked at 5590, 20480 at 5712 of 5748 MiB
+CONTEXT="65536"  # needs KVFlash; without it 16384 (18432 peaked at 5590, 20480 at 5712 of 5748 MiB)
 N_PREDICT="16384"
 TARGET_TYPE_K="f16"
 TARGET_TYPE_V="f16"
@@ -88,12 +88,14 @@ FLASH_ATTN="on"
 KV_OFFLOAD="1"
 LOAD_MODE="mmap"
 OFFLINE="1"
-# Resident KV tokens; 0 disables paging. The whole 20k context fits, and LRU
-# paging drops evicted chunks from attention.
-LLAMA_KVFLASH="0"
-LLAMA_KVFLASH_MAX_POOL="8192"
-LLAMA_KVFLASH_TAU="64"
-LLAMA_KVFLASH_POLICY="lru"
+# Resident KV tokens; 0 disables paging (then CONTEXT 16384).
+# 2026-11-15, 49k prompt with three passwords: qk pool 12288 tau 512 found all
+# at 182 t/s prefill, 21.5 t/s decode, peak 5474 MiB; lru pool 8192 only the last
+# (233 / 28.2 t/s); qk pool 8192 tau 64 all at 150 / 11.5 t/s.
+LLAMA_KVFLASH="12288"
+LLAMA_KVFLASH_MAX_POOL="12288"
+LLAMA_KVFLASH_TAU="512"  # reselect interval of the qk policy
+LLAMA_KVFLASH_POLICY="qk"  # lru | qk (keep chunks by query-key score)
 LLAMA_KVFLASH_STATS="0"
 
 # Speculative decoding: none | ngram | mtp | ngram-mtp
@@ -203,7 +205,7 @@ if [[ "$LLAMA_KVFLASH" =~ ^[1-9][0-9]*$ ]] && (( LLAMA_KVFLASH < 512 )); then
     die "LLAMA_KVFLASH ist eine Tokenanzahl (mindestens 512), kein Boolean."
 fi
 [[ "$LLAMA_KVFLASH_MAX_POOL" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_KVFLASH_MAX_POOL muss eine positive Ganzzahl sein."
-case "$LLAMA_KVFLASH_POLICY" in lru) ;; *) die "LLAMA_KVFLASH_POLICY muss lru sein." ;; esac
+case "$LLAMA_KVFLASH_POLICY" in lru|qk) ;; *) die "LLAMA_KVFLASH_POLICY muss lru oder qk sein." ;; esac
 if [[ "$LLAMA_KVFLASH" != 0 && "$FLASH_ATTN" != on ]]; then
     die "KVFlash benoetigt FLASH_ATTN=on."
 fi

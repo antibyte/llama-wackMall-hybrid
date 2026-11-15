@@ -7,8 +7,8 @@
 # Änderung einfach erneut ./start1660.sh ausführen.
 #
 # GTX 1660 Ti (sm_75, 6 GiB) live reference, 2026-08-27:
-#   DFlash n_max=4 p_min=0.75, S=20 W=8 frequency/200 replace_ratio=2.5,
-#   Turbo4 KV, ctx 65536, KVFlash 4096/8192, prefill 1856, decode 64,
+#   DFlash n_max=4 p_min=0.75, S=16 W=4 frequency/200 replace_ratio=2.5,
+#   f16 KV, ctx 65536, KVFlash 16384/16384, prefill 1856, decode 64,
 #   froggeric chat template, reasoning budget 6000.
 # Observed first prompt: 45.04 tok/s / 3781 tok, accept 0.806, peak 3s 57.48.
 # Prefetch slots (210 MiB Down-expert) are allocated once and reused; gallocr
@@ -77,15 +77,15 @@ N_PREDICT="32768"  # CLI/server generation limit; API requests may impose a lowe
 #   turbo4_k/turbo4_k = aktuell aktiv; experimenteller DFlash-Kapazitaetspfad
 #   q8_0/q8_0       = Qualitaetskandidat mit hoeherem VRAM-Bedarf und etwas weniger TPS
 # Nur die beiden folgenden Zeilen aendern; die passenden Turbo4-Guards duerfen auf 1 bleiben.
-TARGET_TYPE_K="q4_0"  # 2026-10-02 6x3x1024: q4_0/q4_0 44.98 vs turbo4 42.76 t/s (+5.2%), same S/W fit
-TARGET_TYPE_V="q4_0"  # q4/q4 PPL +0.96% KLD 0.015 vs turbo4/turbo4 +1.58% KLD 0.028 (TURBOQUANT_EXPERIMENTS)
+TARGET_TYPE_K="f16"  # KVFlash qk scores K: q4_0 found 0-1 of 3 passwords in a long prompt; only the pool sits in VRAM
+TARGET_TYPE_V="f16"
 DRAFT_TYPE_K="turbo4_k"  # speculative draft K cache for MTP or DFlash
 DRAFT_TYPE_V="turbo4_k"  # speculative draft V cache for MTP or DFlash; requires Flash Attention
 LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy used by the measured DFlash winner
-LLAMA_KVFLASH="4096"  # resident target-KV tokens; this is a token count, not a boolean switch
-LLAMA_KVFLASH_MAX_POOL="8192"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
-LLAMA_KVFLASH_TAU="64"  # scorer reselection interval; inert while the current LRU policy has no scorer
-LLAMA_KVFLASH_POLICY="lru"  # only supported KVFlash replacement policy
+LLAMA_KVFLASH="16384"  # resident target-KV tokens (not a boolean); 2026-11-15: pool 4096 never recalled three passwords from 20k-54k, 8192 in 5 of 8 runs, 16384 in 13 of 13
+LLAMA_KVFLASH_MAX_POOL="16384"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
+LLAMA_KVFLASH_TAU="512"  # reselect interval of the qk policy
+LLAMA_KVFLASH_POLICY="qk"  # lru | qk; 2026-11-15 54k prompt: lru pool 4096 found 0 of 3 passwords, qk pool 8192 f16 3 of 3
 LLAMA_KVFLASH_STATS="0"  # production default; set to 1 to report paging and host-memory counters
 LLAMA_TURBO4_V_EXPERIMENTAL="1"  # required guard for Turbo4 target V; 0 rejects this configuration
 LLAMA_TURBO4_MTP_EXPERIMENTAL="1"  # required guard for target Turbo4 with draft-mtp
@@ -137,8 +137,8 @@ CMOE_UBATCH="64"  # physical base ubatch; keep equal to CMOE_BATCH
 # Phase batching: large prefill for PP; small decode so graph peak can shrink
 # after set_runtime_ubatch (P0 gallocr shrink, 2026-08-16).
 # DFlash draft context is sized to decode geometry, not prefill.
-CMOE_PREFILL_BATCH="3072"  # 2.4k agollm prompt in one expert pass: 6.0 vs 8.6 s; 4096 fails to reserve
-CMOE_PREFILL_UBATCH="3072"  # physical target prompt ubatch
+CMOE_PREFILL_BATCH="2752"  # 3072 with the f16 KVFlash pool drops the second expert prefetch slot after the first request (29k: 445 vs 496 t/s); 4096 fails to reserve
+CMOE_PREFILL_UBATCH="2752"  # physical target prompt ubatch
 CMOE_PREFILL_STEPDOWN="1"  # prefill ubatch that does not fit: halve it before decode takes over
 CMOE_DECODE_BATCH="64"  # logical batch during generation / DFlash verify
 CMOE_DECODE_UBATCH="64"  # physical decode ubatch; phase switch frees prefill peak
@@ -153,7 +153,7 @@ CACHE_IDLE_SLOTS="1"  # retain idle slots through the full-state RAM prompt cach
 
 # Expert tier. These names are the actual LLAMA_EXPERT_* runtime variables.
 LLAMA_EXPERT_HOT="$PROFILE"  # ranking/usage CSV used to select fixed hot experts
-LLAMA_EXPERT_S="20"  # S20 + W8 + sentinel; slot budget 36, reserve 250
+LLAMA_EXPERT_S="16"  # 20 until 2026-11-15; four hot experts pay for the 16384-token KVFlash pool
 LLAMA_EXPERT_PLACEMENT="$PLACEMENT"  # validated per-layer slot manifest; mutually exclusive with S
 LLAMA_EXPERT_TMAX="32"  # maximum token count for the tiered single-row path
 LLAMA_EXPERT_STATS="0"  # 0 disables stats, 1 prints to stderr, a path writes a file
@@ -334,7 +334,7 @@ if [[ "$LLAMA_KVFLASH" =~ ^[1-9][0-9]*$ ]] && (( LLAMA_KVFLASH < 512 )); then
 fi
 [[ "$LLAMA_KVFLASH_MAX_POOL" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_KVFLASH_MAX_POOL muss eine positive Ganzzahl sein."
 [[ "$LLAMA_KVFLASH_TAU" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_KVFLASH_TAU muss eine positive Ganzzahl sein."
-case "$LLAMA_KVFLASH_POLICY" in lru) ;; *) die "LLAMA_KVFLASH_POLICY muss lru sein." ;; esac
+case "$LLAMA_KVFLASH_POLICY" in lru|qk) ;; *) die "LLAMA_KVFLASH_POLICY muss lru oder qk sein." ;; esac
 case "$LLAMA_KVFLASH_STATS" in 0|1) ;; *) die "LLAMA_KVFLASH_STATS muss 0 oder 1 sein." ;; esac
 [[ "$CTX_CHECKPOINTS" =~ ^[0-9]+$ ]] || die "CTX_CHECKPOINTS muss eine nichtnegative Ganzzahl sein."
 [[ "$CACHE_RAM" =~ ^(-1|[0-9]+)$ ]] || die "CACHE_RAM muss -1 oder eine nichtnegative Ganzzahl sein."

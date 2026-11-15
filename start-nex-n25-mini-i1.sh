@@ -73,15 +73,15 @@ N_PREDICT="32768"  # CLI/server generation limit; API requests may impose a lowe
 #   turbo4_k/turbo4_k = aktuell aktiv; experimenteller DFlash-Kapazitaetspfad
 #   q8_0/q8_0       = Qualitaetskandidat mit hoeherem VRAM-Bedarf und etwas weniger TPS
 # Nur die beiden folgenden Zeilen aendern; die passenden Turbo4-Guards duerfen auf 1 bleiben.
-TARGET_TYPE_K="turbo4_k"  # same speed as q8 on Nex; more 64k headroom
-TARGET_TYPE_V="turbo4_k"
+TARGET_TYPE_K="f16"  # KVFlash qk scores K: q4_0 found 0-1 of 3 passwords in a long prompt; only the pool sits in VRAM
+TARGET_TYPE_V="f16"
 DRAFT_TYPE_K="q8_0"
 DRAFT_TYPE_V="q8_0"
 LLAMA_KV_Q4_SCALE="legacy"  # Q4 scale policy used by the measured DFlash winner
-LLAMA_KVFLASH="4096"  # resident target-KV tokens; this is a token count, not a boolean switch
+LLAMA_KVFLASH="8192"  # resident target-KV tokens; this is a token count, not a boolean switch
 LLAMA_KVFLASH_MAX_POOL="8192"  # cap future VRAM-aware auto sizing for the 6-GiB GTX 1660 Ti
-LLAMA_KVFLASH_TAU="64"  # scorer reselection interval; inert while the current LRU policy has no scorer
-LLAMA_KVFLASH_POLICY="lru"  # only supported KVFlash replacement policy
+LLAMA_KVFLASH_TAU="512"  # reselect interval of the qk policy
+LLAMA_KVFLASH_POLICY="qk"  # lru | qk; 2026-11-15 54k prompt: lru pool 4096 found 0 of 3 passwords, qk pool 8192 f16 3 of 3
 LLAMA_KVFLASH_STATS="0"  # production default; set to 1 to report paging and host-memory counters
 LLAMA_TURBO4_V_EXPERIMENTAL="1"
 LLAMA_TURBO4_MTP_EXPERIMENTAL="0"
@@ -323,7 +323,7 @@ if [[ "$LLAMA_KVFLASH" =~ ^[1-9][0-9]*$ ]] && (( LLAMA_KVFLASH < 512 )); then
 fi
 [[ "$LLAMA_KVFLASH_MAX_POOL" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_KVFLASH_MAX_POOL muss eine positive Ganzzahl sein."
 [[ "$LLAMA_KVFLASH_TAU" =~ ^[1-9][0-9]*$ ]] || die "LLAMA_KVFLASH_TAU muss eine positive Ganzzahl sein."
-case "$LLAMA_KVFLASH_POLICY" in lru) ;; *) die "LLAMA_KVFLASH_POLICY muss lru sein." ;; esac
+case "$LLAMA_KVFLASH_POLICY" in lru|qk) ;; *) die "LLAMA_KVFLASH_POLICY muss lru oder qk sein." ;; esac
 case "$LLAMA_KVFLASH_STATS" in 0|1) ;; *) die "LLAMA_KVFLASH_STATS muss 0 oder 1 sein." ;; esac
 [[ "$CTX_CHECKPOINTS" =~ ^[0-9]+$ ]] || die "CTX_CHECKPOINTS muss eine nichtnegative Ganzzahl sein."
 [[ "$CACHE_RAM" =~ ^(-1|[0-9]+)$ ]] || die "CACHE_RAM muss -1 oder eine nichtnegative Ganzzahl sein."
