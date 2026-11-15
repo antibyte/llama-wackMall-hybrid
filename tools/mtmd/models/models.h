@@ -35,11 +35,6 @@ struct clip_graph_qwen2vl : clip_graph {
     ggml_tensor * build_inp_with_temporal_merge();
 };
 
-struct clip_graph_magevl : clip_graph {
-    clip_graph_magevl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
-    ggml_cgraph * build() override;
-};
-
 struct clip_graph_qwen3vl : clip_graph_qwen2vl {
     clip_graph_qwen3vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph_qwen2vl(ctx, img) {}
     ggml_cgraph * build() override;
