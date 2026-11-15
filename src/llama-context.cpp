@@ -1117,6 +1117,11 @@ llama_context::~llama_context() {
     }
 #endif
 
+    // the pager dies with memory, after the backends it would synchronize
+    if (kvflash_pager != nullptr) {
+        (void) kvflash_pager->synchronize_paging();
+    }
+
     if (dflash_target != nullptr) {
         dflash_target->detach_dflash(this);
     }
