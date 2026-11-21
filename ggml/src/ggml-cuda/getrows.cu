@@ -390,12 +390,15 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
+    // rows up to GGML_CUDA_GET_ROWS_NARROW elements: one thread per element (the vector kernel runs a block per row)
+    const bool narrow = ne00 <= ggml_cuda_get_rows_narrow() && ne10*ne00 <= INT32_MAX;
+
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
         const int64_t ne00v = ne00 / VEC;
         const int64_t vec_block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
         const bool enough_blocks = vec_block_num_y * ne10 * ne11 * ne12 >= 128;
-        const bool can_vec = VEC > 1 && enough_blocks &&
+        const bool can_vec = VEC > 1 && enough_blocks && !narrow &&
             (ne00 % VEC == 0) &&
             (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
             (nb1  % 16 == 0) && (nb2  % 16 == 0) && (nb3  % 16 == 0) &&
@@ -415,7 +418,7 @@ static void get_rows_cuda_float(
         }
     }
 
-    if (ne00 <= ggml_cuda_get_rows_narrow() && ne10*ne00 <= INT32_MAX) {
+    if (narrow) {
         const dim3 block_nums((ne10*ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, 1, MIN(ne11*ne12, UINT16_MAX));
         k_get_rows_float_narrow<src0_t, dst_t><<<block_nums, block_dims, 0, stream>>>(
             src0_d, src1_d, dst_d, ne00, ne10, ne11, ne12_fdv, s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
