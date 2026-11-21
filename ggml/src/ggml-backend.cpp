@@ -1936,10 +1936,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     };
 
+    // GGML_SCHED_SPLIT_TIMING=1: host time per backend for the input phase (copies, waits for the producers) and the
+    // compute call of each split (synchronous for the CPU, a launch for devices), printed every 256 graphs
+    static const bool split_timing = getenv("GGML_SCHED_SPLIT_TIMING") != NULL && atoi(getenv("GGML_SCHED_SPLIT_TIMING")) != 0;
+    static int64_t st_in[GGML_SCHED_MAX_BACKENDS] = {}, st_cmp[GGML_SCHED_MAX_BACKENDS] = {}, st_n[GGML_SCHED_MAX_BACKENDS] = {};
+    static int64_t st_graphs = 0, st_total = 0;
+    const int64_t st_graph_start = split_timing ? ggml_time_us() : 0;
+    int64_t st_t0 = 0, st_t1 = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (split_timing) {
+            st_t0 = ggml_time_us();
+        }
         int split_prefetch_slot = -1;
         ggml_tensor * prefetch_input_cpy = NULL;
         ggml_backend_buffer_t prefetch_saved_buffer = NULL;
@@ -2134,6 +2145,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         flush_user_inputs(split_backend_id, split_backend);
+        if (split_timing) {
+            st_t1 = ggml_time_us();
+            st_in[split_backend_id] += st_t1 - st_t0;
+            st_n[split_backend_id]++;
+        }
 
         if (!sched->callback_eval) {
             if (dedup_dst_sync) {
@@ -2232,6 +2248,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
+        }
+        if (split_timing) {
+            st_cmp[split_backend_id] += ggml_time_us() - st_t1;
+        }
+    }
+
+    if (split_timing) {
+        st_total += ggml_time_us() - st_graph_start;
+        if (++st_graphs == 256) {
+            for (int b = 0; b < sched->n_backends; ++b) {
+                if (st_n[b] > 0) {
+                    // stderr: the server filters the library log
+                    fprintf(stderr, "%s: %-8s splits/graph %5.1f  inputs %8.1f us  compute %8.1f us (per graph)\n", __func__,
+                        ggml_backend_name(sched->backends[b]), st_n[b]/256.0, st_in[b]/256.0, st_cmp[b]/256.0);
+                }
+                st_in[b] = st_cmp[b] = st_n[b] = 0;
+            }
+            fprintf(stderr, "%s: total %.1f us per graph\n", __func__, st_total/256.0);
+            st_graphs = 0;
+            st_total  = 0;
         }
     }
 
