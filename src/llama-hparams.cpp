@@ -196,6 +196,11 @@ uint32_t llama_hparams::n_embd_r() const {
         return token_shift_count * n_embd;
     }
 
+    if (n_sconv_channels != 0) {
+        // for Inkling2 models, before LFM2 as they set n_shortconv_l_cache too
+        return n_sconv_channels * (n_shortconv_l_cache - 1);
+    }
+
     if (n_shortconv_l_cache != 0) {
         // for LFM2 models
         return n_embd * (n_shortconv_l_cache - 1);
@@ -297,6 +302,29 @@ bool llama_hparams::has_kv(uint32_t il) const {
 
 uint32_t llama_hparams::n_layer() const {
     return n_layer_all - n_layer_nextn;
+}
+
+uint32_t llama_hparams::loop_n_extra() const {
+    return loop_n_pass > 1 ? (loop_n_pass - 1)*(loop_core_end - loop_core_start) : 0;
+}
+
+uint32_t llama_hparams::loop_layer(uint32_t il) const {
+    if (loop_n_pass < 2 || il < loop_core_start) {
+        return il;
+    }
+    const uint32_t n_core = loop_core_end - loop_core_start;
+    if (il < loop_core_start + loop_n_pass*n_core) {
+        return loop_core_start + (il - loop_core_start) % n_core;
+    }
+    return il - loop_n_extra();
+}
+
+uint32_t llama_hparams::loop_visit(uint32_t ip) const {
+    return ip < loop_core_end ? ip : ip + loop_n_extra();
+}
+
+uint32_t llama_hparams::n_layer_weights() const {
+    return n_layer_all - loop_n_extra();
 }
 
 bool llama_hparams::use_mrope() const {

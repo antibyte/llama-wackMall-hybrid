@@ -79,6 +79,7 @@ struct llama_hparams {
     struct llama_hparams_convnext convnext;
 
     uint32_t n_shortconv_l_cache  = 0;
+    uint32_t n_sconv_channels     = 0; // inkling2: conv state channels per layer (K, V, attn and FFN outputs)
 
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
@@ -110,6 +111,27 @@ struct llama_hparams {
     float f_attn_logit_softcapping   = 50.0f;
     float f_router_logit_softcapping = 30.0f;
     float f_final_logit_softcapping  = 30.0f;
+
+    // inkling2
+    float    expert_weights_norm_eps = 0.0f;  // > 0: weights / (sum + eps), else the sum is clamped
+    bool     expert_router_f32       = false; // router logits accumulated in F32
+    uint32_t attn_res_block_size     = 0;     // 0 = no cross-layer attention residuals
+    float    situ_beta               = 1.0f;
+    float    situ_linear_beta        = 0.0f;  // 0 = no linear-beta transform on the up branch
+    uint32_t n_relative              = 0;
+    uint32_t n_relative_extent       = 0;
+    uint32_t n_vocab_unpadded        = 0;
+    uint32_t n_vocab_padded          = 0;
+    uint32_t n_log_scale_floor       = 0;
+    float    f_log_scale_alpha       = 0.0f;
+    float    f_qk_clip               = 0.0f;
+    float    f_relative_clip         = 0.0f;
+
+    // looped layers: [loop_core_start, loop_core_end) run loop_n_pass times, each visit has its own layer index
+    uint32_t loop_core_start = 0;
+    uint32_t loop_core_end   = 0;
+    uint32_t loop_n_pass     = 0; // < 2: no loop
+    uint32_t loop_gate_rank  = 0;
 
     // for RWKV
     uint32_t rescale_every_n_layers = 0;
@@ -394,6 +416,12 @@ struct llama_hparams {
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
+
+    // looped layers: extra visits, physical layer of a visit, first visit of a physical layer, layers with weights
+    uint32_t loop_n_extra() const;
+    uint32_t loop_layer(uint32_t il) const;
+    uint32_t loop_visit(uint32_t ip) const;
+    uint32_t n_layer_weights() const;
 
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons

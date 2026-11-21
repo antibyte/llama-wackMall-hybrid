@@ -1743,6 +1743,139 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
     return data;
 }
 
+static bool is_inkling_template(const std::string & src) {
+    return src.find("<|message_user|>") != std::string::npos &&
+           src.find("<|content_image|>") != std::string::npos;
+}
+
+// Inkling 1 and 2 (ported from the Unsloth llama.cpp b12588-mix) - the assistant turn is a list of blocks, all closed by <|end_message|>:
+//   <|message_model|><|content_thinking|>...<|end_message|>
+//   <|message_model|><|content_text|>...<|end_message|>
+//   <|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>
+static common_chat_params common_chat_params_init_inkling(const common_chat_template &          tmpl,
+                                                          const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+
+    const std::string HEADER    = "<|message_model|>";
+    const std::string THINK     = "<|content_thinking|>";
+    const std::string TEXT      = "<|content_text|>";
+    const std::string TOOL_JSON = "<|content_invoke_tool_json|>";
+    const std::string END       = "<|end_message|>";
+
+    data.preserved_tokens = { HEADER, THINK, TEXT, TOOL_JSON, END };
+
+    data.thinking_start_tag = THINK;
+    data.thinking_end_tags  = { END };
+
+    data.message_delimiters = {
+        { COMMON_CHAT_ROLE_ASSISTANT, HEADER               },
+        { COMMON_CHAT_ROLE_USER,      "<|message_user|>"   },
+        { COMMON_CHAT_ROLE_SYSTEM,    "<|message_system|>" },
+        { COMMON_CHAT_ROLE_TOOL,      "<|message_tool|>"   },
+    };
+
+    if (inputs.has_continuation()) {
+        const auto & msg = inputs.continue_msg;
+
+        data.generation_prompt.clear();
+        if (!msg.reasoning_content.empty()) {
+            data.generation_prompt = HEADER + THINK + msg.reasoning_content;
+        }
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            if (!data.generation_prompt.empty()) {
+                data.generation_prompt += END;
+            }
+            data.generation_prompt += HEADER + TEXT + msg.render_content();
+        }
+
+        data.prompt += data.generation_prompt;
+    }
+
+    const bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    const bool has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+    const bool use_tools           = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+    const bool extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto header = p.literal(HEADER);
+        auto end    = p.literal(END);
+
+        auto think    = p.literal(THINK);
+        auto thinking = p.rule("thinking", extract_reasoning ? think + p.reasoning(p.until(END)) + end :
+                                                               p.atomic(p.content(think)) + p.content(p.until(END) + end));
+        auto text     = p.rule("text", p.literal(TEXT) + p.content(p.until(END)) + end);
+
+        if (has_response_format) {
+            auto response_format = p.rule("response-format", p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)));
+            return p.zero_or_more(header + thinking) + header + p.literal(TEXT) + response_format + end;
+        }
+
+        auto blocks = p.zero_or_more(header + (thinking | text));
+
+        if (!use_tools) {
+            return blocks;
+        }
+
+        auto tool_choice = p.choice();
+        size_t tool_index = 0;
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & function = tool.at("function");
+            std::string  name     = function.at("name");
+
+            auto open = p.tool_name(p.literal(name)) + p.literal(TOOL_JSON) + p.literal("{\"name\":" + json(name).dump() + ",\"args\":");
+            auto args = p.tool_args(p.json());
+
+            tool_choice |= p.rule("tool-" + std::to_string(tool_index++), p.tool(p.tool_open(open) + args + p.tool_close(p.literal("}")) + end));
+        });
+
+        // tool calls are the last blocks of the turn
+        auto calls      = inputs.parallel_tool_calls ? tool_choice + p.zero_or_more(header + tool_choice) : tool_choice;
+        auto tool_calls = header + p.trigger_rule("tool-calls", calls);
+
+        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+            return blocks + tool_calls;
+        }
+
+        return blocks + p.optional(tool_calls);
+    });
+
+    data.parser = parser.save();
+
+    if (has_response_format || use_tools) {
+        data.grammar_lazy = !has_response_format && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                auto schema = tool.at("function").at("parameters");
+                builder.resolve_refs(schema);
+            });
+            if (has_response_format) {
+                auto schema = inputs.json_schema;
+                builder.resolve_refs(schema);
+            }
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        if (data.grammar_lazy) {
+            // a header followed by text and not by a content token is a tool call, the grammar starts at the name
+            data.grammar_triggers = {
+                { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "<\\|message_model\\|>([^<])" },
+            };
+            // the first header is in the generation prompt and a lazy grammar does not get the prompt:
+            // an output that starts with no content token is a tool call (not for a continuation, it starts with text)
+            if (!inputs.has_continuation()) {
+                data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL, "[^<]+" });
+            }
+        }
+    }
+
+    return data;
+}
+
 // LFM2/LFM2.5 parser. Tool calls are almost Python-style and parallel-capable
 // (except dotted names and JSON literals true/false/null).
 // Always wrapped in <|tool_call_start|>[name(args)]<|tool_call_end|> with optional <think> reasoning.
@@ -2759,6 +2892,12 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         src.find("<|START_ACTION|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Cohere2 MoE\n");
         return common_chat_params_init_cohere2moe(tmpl, params);
+    }
+
+    // Inkling 1 and 2: message blocks with content tokens, JSON tool calls
+    if (is_inkling_template(src)) {
+        LOG_DBG("Using specialized template: Inkling\n");
+        return common_chat_params_init_inkling(tmpl, params);
     }
 
     if (is_lfm2_template(src)) {

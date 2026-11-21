@@ -64,6 +64,7 @@ enum llm_ffn_op_type : int {
     LLM_FFN_GEGLU,
     LLM_FFN_REGLU,
     LLM_FFN_SWIGLU_OAI_MOE,
+    LLM_FFN_SITU,               // inkling2: beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
 };
 
 enum llm_ffn_gate_type {
@@ -701,6 +702,35 @@ public:
     const llama_cparams cparams;
 
     const llama_memory_hybrid_iswa_context * mctx;
+};
+
+// inkling2: hybrid iSWA memory plus the distance of each token to each cell, which gathers the relative-position bias
+class llm_graph_input_mem_hybrid_iswa_rel : public llm_graph_input_mem_hybrid_iswa {
+public:
+    llm_graph_input_mem_hybrid_iswa_rel(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn,
+            std::unique_ptr<llm_graph_input_rs>          inp_rs,
+            const llama_memory_hybrid_iswa_context *     mctx,
+            uint32_t extent,
+            uint32_t extent_swa) :
+        llm_graph_input_mem_hybrid_iswa(cparams, std::move(inp_attn), std::move(inp_rs), mctx),
+        extent(extent),
+        extent_swa(extent_swa) { }
+    virtual ~llm_graph_input_mem_hybrid_iswa_rel() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    const uint32_t extent;
+    const uint32_t extent_swa;
+
+    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_tokens]
+    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_tokens]
+
+    // per-graph device copies of the distances, shared by the chunked gathers of all layers
+    ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
 };
 
 class llm_graph_input_sampling : public llm_graph_input_i {
@@ -1379,6 +1409,22 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    // inkling2: relative positions clipped to extent (full attention) and extent_swa (SWA layers)
+    llm_graph_input_mem_hybrid_iswa_rel * build_inp_mem_hybrid_iswa_rel(uint32_t extent, uint32_t extent_swa) const;
+
+    // inkling2: attention with a per-head bias kq_b [n_kv, n_rows, n_head, n_stream] added after the scale;
+    // q holds the query rows [i_row, i_row + n_rows) of the ubatch, k_cur/v_cur are stored when not null
+    ggml_tensor * build_attn_rel(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il,
+                int64_t   i_row) const;
 
     //
     // pooling
