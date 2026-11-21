@@ -476,7 +476,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                     (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
             if (n_rows_max < n_seq_tokens) {
                 const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
-                n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
+                n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 16));
             }
             auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
                 int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
