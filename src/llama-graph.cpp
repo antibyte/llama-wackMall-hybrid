@@ -2330,12 +2330,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    // per-expert weight scales (NVFP4 scale2): build_lora_mm_id ignores w_s, apply the scale of each selected expert
+    auto scale_by_expert = [&](ggml_tensor * t, ggml_tensor * w_s) {
+        ggml_tensor * sr = ggml_reshape_3d(ctx0, w_s, 1, w_s->ne[0], 1);
+        sr = ggml_repeat_4d(ctx0, sr, 1, w_s->ne[0], t->ne[2], 1);
+        sr = ggml_get_rows(ctx0, sr, selected_experts); // [1, n_expert_used, n_tokens]
+        return ggml_mul(ctx0, t, sr);
+    };
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, hot_ids); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
+            gate_up = scale_by_expert(gate_up, up_exps_s);
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
         }
 
@@ -2355,6 +2364,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
+            up = scale_by_expert(up, up_exps_s);
             cb(up, "ffn_moe_up_scaled", il);
         }
 
@@ -2370,7 +2380,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = up;
         }
 
-        if (gate_exps_s) {
+        if (gate_exps_s && gate_exps) {
+            cur = scale_by_expert(cur, gate_exps_s);
             cb(cur, "ffn_moe_gate_scaled", il);
         }
 
@@ -2457,6 +2468,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
+        experts = scale_by_expert(experts, down_exps_s);
         cb(experts, "ffn_moe_down_scaled", il);
     }
     if (moe_cold) {
