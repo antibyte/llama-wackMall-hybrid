@@ -2783,10 +2783,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
-                            // inkling2 attends without flash attention (per-head relative bias): keep V transposed,
-                            // or every decode step copies the whole V cache of every layer (LLAMA_INKLING2_V_TRANS=0: off)
+                            // inkling2 decodes with flash attention and V untransposed (LLAMA_INKLING2_FA_ROWS);
+                            // LLAMA_INKLING2_V_TRANS=1 keeps V transposed for the attention without it
                             /* attn_v_trans      */ !cparams.flash_attn || (arch == LLM_ARCH_INKLING2 &&
-                                                        !(getenv("LLAMA_INKLING2_V_TRANS") && atoi(getenv("LLAMA_INKLING2_V_TRANS")) == 0)),
+                                                        getenv("LLAMA_INKLING2_V_TRANS") && atoi(getenv("LLAMA_INKLING2_V_TRANS")) != 0),
                             /* attn_swa_full     */ params.swa_full,
                             /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_ubatch     */ cparams.n_ubatch,

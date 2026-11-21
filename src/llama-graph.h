@@ -1413,7 +1413,8 @@ struct llm_graph_context {
     // inkling2: relative positions clipped to extent (full attention) and extent_swa (SWA layers)
     llm_graph_input_mem_hybrid_iswa_rel * build_inp_mem_hybrid_iswa_rel(uint32_t extent, uint32_t extent_swa) const;
 
-    // inkling2: attention with a per-head bias kq_b [n_kv, n_rows, n_head, n_stream] added after the scale;
+    // inkling2: attention with a per-head bias kq_b [n_head, n_kv, n_rows, n_stream] added after the scale;
+    // sinks: the sink logits of the query rows [n_head, n_rows, n_stream]
     // q holds the query rows [i_row, i_row + n_rows) of the ubatch, k_cur/v_cur are stored when not null
     ggml_tensor * build_attn_rel(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
