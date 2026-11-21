@@ -579,10 +579,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             const llama_token forced = common_reasoning_budget_get_forced_token(rbudget);
             if (forced != LLAMA_TOKEN_NULL) {
                 id = forced;
-            } else if (common_reasoning_budget_blocks_eog(rbudget, id)) {
-                // Backend sampled EOS inside an open think block. Fall through
-                // so the CPU chain can mask it and continue the thought.
-            } else {
+            }
+            // A backend-sampled EOS inside an open think block falls through so the CPU chain can mask it and
+            // continue the thought. A forced token must not: the CPU chain would sample from the backend's
+            // candidates, which need not hold it, and lose the closing sequence.
+            if (forced != LLAMA_TOKEN_NULL || !common_reasoning_budget_blocks_eog(rbudget, id)) {
                 for (size_t i = 0; i < cur_p.size; ++i) {
                     if (cur_p.data[i].id == id) {
                         cur_p.selected = i;
