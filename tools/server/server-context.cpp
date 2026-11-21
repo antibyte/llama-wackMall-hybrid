@@ -2486,6 +2486,22 @@ private:
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
+        // LLAMA_REASONING_CTX_RESERVE=N: the reasoning budget leaves N tokens of the slot context after the prompt for
+        // the answer, so a long reasoning cannot fill the context in the middle of an answer or a tool call (0 = off)
+        static const int32_t reasoning_ctx_reserve = [] {
+            const char * e = getenv("LLAMA_REASONING_CTX_RESERVE");
+            return e ? std::max(0, atoi(e)) : 0;
+        }();
+        if (reasoning_ctx_reserve > 0 && task.need_sampling() && !task.params.sampling.reasoning_budget_start.empty()) {
+            const int32_t room   = std::max<int32_t>(0, slot.n_ctx - (int32_t) task.tokens.size() - reasoning_ctx_reserve);
+            int32_t &     budget = task.params.sampling.reasoning_budget_tokens;
+            if (budget < 0 || budget > room) {
+                SLT_INF(slot, "reasoning budget %d -> %d (prompt %zu, context %d, reserve %d)\n",
+                        budget, room, task.tokens.size(), slot.n_ctx, reasoning_ctx_reserve);
+                budget = room;
+            }
+        }
+
         // initialize samplers
         if (task.need_sampling()) {
             try {
