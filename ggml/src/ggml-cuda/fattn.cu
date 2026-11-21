@@ -493,13 +493,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
-    }
-
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // an F32 mask: only the vector kernel for one query with F16 K/V and no softcap
+    if (mask && mask->type == GGML_TYPE_F32) {
+        float logit_softcap;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        const bool ok = can_use_vector_kernel && Q->ne[1] == 1 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            logit_softcap == 0.0f && (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) && Q->ne[2] % mask->ne[2] == 0;
+        return ok ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+    }
+
+    // a mask per head (ne32 > 1): only the vector kernel indexes the mask by head, it runs one head per block
+    if (mask && mask->ne[2] != 1) {
+        return can_use_vector_kernel && Q->ne[1] <= 2 && Q->ne[2] % mask->ne[2] == 0 ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+    }
 
     if (K->type == GGML_TYPE_TURBO4_K || V->type == GGML_TYPE_TURBO4_K) {
 #ifndef GGML_CUDA_TURBO4_F16_PREFILL

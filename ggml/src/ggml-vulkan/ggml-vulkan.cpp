@@ -17658,6 +17658,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[4] && op->src[4]->type != GGML_TYPE_F32) {
                     return false;
                 }
+                if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
+                    return false;
+                }
                 if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
                 }

@@ -20,7 +20,8 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+// mask_f32: the mask is F32 (only for one query with F16 K/V, see ggml_cuda_flash_attn_ext_vec_case)
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool mask_f32 = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -126,7 +127,9 @@ static __global__ void flash_attn_ext_vec(
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
-    const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
+    // a mask with ne32 > 1 holds one slice per head (per-head bias, e.g. relative positions)
+    using mask_t = typename std::conditional<mask_f32, float, half>::type;
+    const mask_t * maskh = (const mask_t *) (mask + nb33*(sequence % ne33) + nb32*(head % ne32) + nb31*ic0);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -271,6 +274,14 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        // F32 masks (relative-position bias with a sliding window): skip tiles the mask hides completely,
+        // they add exp(-inf) = 0 and leave the running maximum unchanged
+        if constexpr (mask_f32 && ncols == 1) {
+            if (mask && !__syncthreads_or(maskh[tid] != -INFINITY)) {
+                continue;
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 
@@ -294,7 +305,7 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    sum += slope*float(maskh[j*ne11 + i_KQ]);
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -582,13 +593,13 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
-template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool mask_f32 = false>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, mask_f32>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
@@ -602,6 +613,18 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
+    const ggml_tensor * mask = dst->src[3];
+    if (mask && mask->type == GGML_TYPE_F32) {
+        // instantiated for F16 K/V only, one query, no softcap (ggml_cuda_get_best_fattn_kernel checks this)
+        if constexpr (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {
+            GGML_ASSERT(Q->ne[1] == 1 && logit_softcap == 0.0f);
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, type_K, type_V, false, true>(ctx, dst);
+        } else {
+            GGML_ABORT("fatal error");
+        }
+        return;
+    }
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
