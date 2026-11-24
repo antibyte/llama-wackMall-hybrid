@@ -864,6 +864,13 @@ struct ggml_backend_sched {
     ggml_backend_t prefetch_backend;
     int prefetch_n_slots;
     ggml_backend_buffer_t prefetch_slots[GGML_SCHED_MAX_PREFETCH_SLOTS];
+    void * prefetch_base[GGML_SCHED_MAX_PREFETCH_SLOTS];
+    size_t prefetch_size[GGML_SCHED_MAX_PREFETCH_SLOTS];
+    bool   prefetch_borrowed[GGML_SCHED_MAX_PREFETCH_SLOTS]; // region of a provider buffer, see set_prefetch_provider
+    bool   prefetch_written[GGML_SCHED_MAX_PREFETCH_SLOTS];  // a copy landed in the borrowed region
+    ggml_backend_sched_prefetch_get_t prefetch_get;
+    ggml_backend_sched_prefetch_put_t prefetch_put;
+    void * prefetch_provider_user;
     ggml_backend_event_t prefetch_ready[GGML_SCHED_MAX_PREFETCH_SLOTS];
     ggml_backend_event_t prefetch_free[GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool prefetch_used[GGML_SCHED_MAX_PREFETCH_SLOTS];
@@ -1614,6 +1621,23 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// the backends must be idle: a borrowed region goes back to its owner, an own buffer is freed
+static void ggml_backend_sched_prefetch_slot_free(ggml_backend_sched_t sched, int i) {
+    if (sched->prefetch_slots[i] != NULL) {
+        if (sched->prefetch_borrowed[i]) {
+            sched->prefetch_put(sched->prefetch_provider_user, i, sched->prefetch_written[i]);
+        } else {
+            ggml_backend_buffer_free(sched->prefetch_slots[i]);
+        }
+    }
+    sched->prefetch_slots[i]    = NULL;
+    sched->prefetch_base[i]     = NULL;
+    sched->prefetch_size[i]     = 0;
+    sched->prefetch_borrowed[i] = false;
+    sched->prefetch_written[i]  = false;
+    sched->prefetch_used[i]     = false;
+}
+
 static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml_backend_t split_backend) {
     sched->prefetch_experts = false;
     if (sched->prefetch_backend) {
@@ -1621,9 +1645,7 @@ static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml
         ggml_backend_synchronize(sched->prefetch_backend);
     }
     for (int i = 0; i < sched->prefetch_n_slots; i++) {
-        ggml_backend_buffer_free(sched->prefetch_slots[i]);
-        sched->prefetch_slots[i] = NULL;
-        sched->prefetch_used[i] = false;
+        ggml_backend_sched_prefetch_slot_free(sched, i);
     }
 }
 
@@ -1639,8 +1661,15 @@ static bool ggml_backend_sched_prefetch_eligible(const ggml_tensor * input, cons
         return false;
     }
 
+    // GGML_SCHED_PREFETCH_MIN_IDS: routed selections per expert from which a weight is prefetched (default 4:
+    // ~128 tokens at top-k 8 of 256; Inkling sets 32 so batches up to 511 tokens keep the expert tier's stores)
+    static const int64_t min_ids = [] {
+        const char * env = getenv("GGML_SCHED_PREFETCH_MIN_IDS");
+        const long v = env ? atol(env) : 4;
+        return (int64_t) (v > 0 ? v : 4);
+    }();
     const ggml_tensor * ids = node->src[2];
-    return ids && ids->ne[0]*ids->ne[1] >= 4*input->ne[2];
+    return ids && ids->ne[0]*ids->ne[1] >= min_ids*input->ne[2];
 }
 
 static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched) {
@@ -1691,13 +1720,31 @@ static bool ggml_backend_sched_prefetch_init(
 
     int n_ready = 0;
     for (int i = 0; i < n_slots; i++) {
-        if (sched->prefetch_slots[i] != NULL &&
-                ggml_backend_buffer_get_size(sched->prefetch_slots[i]) >= size) {
+        if (sched->prefetch_slots[i] != NULL && sched->prefetch_size[i] >= size) {
+            n_ready++;
+            continue;
+        }
+        // borrowed memory first: it costs no free VRAM
+        ggml_backend_buffer_t buf = NULL;
+        void * base = NULL;
+        if (sched->prefetch_get != NULL && sched->prefetch_slots[i] == NULL &&
+                sched->prefetch_get(sched->prefetch_provider_user, i, size, &buf, &base)) {
+            sched->prefetch_slots[i]    = buf;
+            sched->prefetch_base[i]     = base;
+            sched->prefetch_size[i]     = size;
+            sched->prefetch_borrowed[i] = true;
+            sched->prefetch_used[i]     = false;
             n_ready++;
         }
     }
     if (n_ready == n_slots) {
         return true;
+    }
+    n_ready = 0;
+    for (int i = 0; i < n_slots; i++) {
+        if (sched->prefetch_slots[i] != NULL && sched->prefetch_size[i] >= size) {
+            n_ready++;
+        }
     }
 
     size_t free_mem = 0, total_mem = 0;
@@ -1714,8 +1761,7 @@ static bool ggml_backend_sched_prefetch_init(
         return (size_t) (mib > 0 ? mib : 0) * 1024 * 1024;
     }();
     for (int i = 0; i < n_slots; i++) {
-        if (sched->prefetch_slots[i] != NULL &&
-                ggml_backend_buffer_get_size(sched->prefetch_slots[i]) >= size) {
+        if (sched->prefetch_slots[i] != NULL && sched->prefetch_size[i] >= size) {
             continue;
         }
         if (size + mmq_headroom > free_mem) {
@@ -1730,10 +1776,12 @@ static bool ggml_backend_sched_prefetch_init(
         if (sched->prefetch_slots[i] != NULL) {
             ggml_backend_synchronize(split_backend);
             ggml_backend_synchronize(sched->prefetch_backend);
-            ggml_backend_buffer_free(sched->prefetch_slots[i]);
+            ggml_backend_sched_prefetch_slot_free(sched, i);
         }
         sched->prefetch_slots[i] = new_buf;
-        sched->prefetch_used[i] = false;
+        sched->prefetch_base[i]  = ggml_backend_buffer_get_base(new_buf);
+        sched->prefetch_size[i]  = ggml_backend_buffer_get_size(new_buf);
+        sched->prefetch_used[i]  = false;
         n_ready++;
         free_mem = (free_mem > size) ? free_mem - size : 0;
     }
@@ -1785,7 +1833,7 @@ static void ggml_backend_sched_prefetch_bind_copies(ggml_backend_sched_t sched) 
     }
 
     ggml_backend_buffer_t slot0 = sched->prefetch_slots[0];
-    void * base = ggml_backend_buffer_get_base(slot0);
+    void * base = sched->prefetch_base[0];
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &sched->splits[split_id];
         if (split->graph.n_nodes == 0) {
@@ -1938,7 +1986,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     // GGML_SCHED_SPLIT_TIMING=1: host time per backend for the input phase (copies, waits for the producers) and the
     // compute call of each split (synchronous for the CPU, a launch for devices), printed every 256 graphs
-    static const bool split_timing = getenv("GGML_SCHED_SPLIT_TIMING") != NULL && atoi(getenv("GGML_SCHED_SPLIT_TIMING")) != 0;
+    // (a value N > 1 prints every N graphs, e.g. 1 graph per prefill ubatch with N = 2 and one ubatch)
+    static const int  split_timing_env = getenv("GGML_SCHED_SPLIT_TIMING") != NULL ? atoi(getenv("GGML_SCHED_SPLIT_TIMING")) : 0;
+    static const bool split_timing = split_timing_env != 0;
+    static const int64_t st_period = split_timing_env > 1 ? split_timing_env : 256;
     static int64_t st_in[GGML_SCHED_MAX_BACKENDS] = {}, st_cmp[GGML_SCHED_MAX_BACKENDS] = {}, st_n[GGML_SCHED_MAX_BACKENDS] = {};
     static int64_t st_graphs = 0, st_total = 0;
     const int64_t st_graph_start = split_timing ? ggml_time_us() : 0;
@@ -2010,13 +2061,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             prefetch_saved_buffer = input_cpy->buffer;
                             prefetch_saved_data   = input_cpy->data;
                             input_cpy->buffer = sched->prefetch_slots[slot];
-                            input_cpy->data   = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
+                            input_cpy->data   = sched->prefetch_base[slot];
+                            sched->prefetch_written[slot] = true;
                             ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                             ggml_backend_event_record(sched->prefetch_ready[slot], sched->prefetch_backend);
                             ggml_backend_event_wait(split_backend, sched->prefetch_ready[slot]);
                             split_prefetch_slot = slot;
                             continue;
                         }
+                    }
+                }
+                // a copy bound to a borrowed slot (slot 0 replaces the gallocr copy) overwrites the owner's data
+                for (int i = 0; i < GGML_SCHED_MAX_PREFETCH_SLOTS; i++) {
+                    if (sched->prefetch_borrowed[i] && (char *) input_cpy->data >= (char *) sched->prefetch_base[i] &&
+                            (char *) input_cpy->data < (char *) sched->prefetch_base[i] + sched->prefetch_size[i]) {
+                        sched->prefetch_written[i] = true;
                     }
                 }
                 // wait for the split backend to finish using the input before overwriting it
@@ -2256,16 +2315,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     if (split_timing) {
         st_total += ggml_time_us() - st_graph_start;
-        if (++st_graphs == 256) {
+        if (++st_graphs == st_period) {
             for (int b = 0; b < sched->n_backends; ++b) {
                 if (st_n[b] > 0) {
                     // stderr: the server filters the library log
                     fprintf(stderr, "%s: %-8s splits/graph %5.1f  inputs %8.1f us  compute %8.1f us (per graph)\n", __func__,
-                        ggml_backend_name(sched->backends[b]), st_n[b]/256.0, st_in[b]/256.0, st_cmp[b]/256.0);
+                        ggml_backend_name(sched->backends[b]), st_n[b]/(double)st_period, st_in[b]/(double)st_period, st_cmp[b]/(double)st_period);
                 }
                 st_in[b] = st_cmp[b] = st_n[b] = 0;
             }
-            fprintf(stderr, "%s: total %.1f us per graph\n", __func__, st_total/256.0);
+            fprintf(stderr, "%s: total %.1f us per graph\n", __func__, st_total/(double)st_period);
             st_graphs = 0;
             st_total  = 0;
         }
@@ -2363,7 +2422,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int i = 0; i < GGML_SCHED_MAX_PREFETCH_SLOTS; i++) {
             ggml_backend_event_free(sched->prefetch_ready[i]);
             ggml_backend_event_free(sched->prefetch_free[i]);
-            ggml_backend_buffer_free(sched->prefetch_slots[i]);
+            ggml_backend_sched_prefetch_slot_free(sched, i);
         }
         ggml_backend_free(sched->prefetch_backend);
     }
@@ -2651,12 +2710,20 @@ void ggml_backend_sched_prefetch_release(ggml_backend_sched_t sched) {
     }
 
     ggml_backend_sched_synchronize(sched);
+    ggml_backend_synchronize(sched->prefetch_backend);
     for (int i = 0; i < GGML_SCHED_MAX_PREFETCH_SLOTS; i++) {
-        ggml_backend_buffer_free(sched->prefetch_slots[i]);
-        sched->prefetch_slots[i] = NULL;
-        sched->prefetch_used[i] = false;
+        ggml_backend_sched_prefetch_slot_free(sched, i);
     }
     sched->prefetch_cur = 0;
+}
+
+void ggml_backend_sched_set_prefetch_provider(ggml_backend_sched_t sched,
+        ggml_backend_sched_prefetch_get_t get, ggml_backend_sched_prefetch_put_t put, void * user) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT((get == NULL) == (put == NULL));
+    sched->prefetch_get           = get;
+    sched->prefetch_put           = put;
+    sched->prefetch_provider_user = user;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

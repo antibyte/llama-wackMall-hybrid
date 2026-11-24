@@ -3480,6 +3480,27 @@ struct ggml_tensor * ggml_moe_cold(
     return result;
 }
 
+void ggml_moe_cold_set_act(
+        struct ggml_tensor  * cold,
+        enum ggml_moe_cold_act act,
+        float                 beta,
+        float                 linear_beta,
+        struct ggml_tensor  * gate_up_scale) {
+    GGML_ASSERT(cold->op == GGML_OP_MOE_COLD);
+    GGML_ASSERT(act >= GGML_MOE_COLD_ACT_DEFAULT && act <= GGML_MOE_COLD_ACT_SITU);
+    GGML_ASSERT(act != GGML_MOE_COLD_ACT_SITU || beta > 0.0f);
+    // op_params[0] belongs to the caller (the expert tier stores the layer there)
+    cold->op_params[1] = (int32_t) act;
+    memcpy(&cold->op_params[2], &beta,        sizeof(float));
+    memcpy(&cold->op_params[3], &linear_beta, sizeof(float));
+    if (gate_up_scale) {
+        GGML_ASSERT(cold->src[7] == NULL);
+        GGML_ASSERT(gate_up_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(gate_up_scale));
+        GGML_ASSERT(ggml_nelements(gate_up_scale) == cold->src[0]->ne[2]);
+        cold->src[7] = gate_up_scale;
+    }
+}
+
 // ggml_moe_count
 
 struct ggml_tensor * ggml_moe_count(

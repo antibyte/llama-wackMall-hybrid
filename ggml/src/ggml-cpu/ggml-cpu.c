@@ -2477,6 +2477,45 @@ static void ggml_moe_activate_range(
     }
 }
 
+// act: enum ggml_moe_cold_act with DEFAULT resolved; scale (1.0f: none) multiplies gate and up first
+static void ggml_moe_activate_range_act(
+        float * gate, float * up, int64_t begin, int64_t end, int act, float beta, float lb, float scale) {
+    if (scale != 1.0f) {
+        for (int64_t i = begin; i < end; i++) {
+            gate[i] *= scale;
+            up[i]   *= scale;
+        }
+    }
+    if (act == GGML_MOE_COLD_ACT_SITU) {
+        const float inv_beta = 1.0f/beta;
+        const float inv_lb   = lb > 0.0f ? 1.0f/lb : 0.0f;
+        for (int64_t i = begin; i < end; i++) {
+            const float g = gate[i];
+            const float u = lb > 0.0f ? lb*tanhf(up[i]*inv_lb) : up[i];
+            gate[i] = beta*tanhf(g*inv_beta)/(1.0f + expf(-g))*u;
+        }
+        return;
+    }
+    ggml_moe_activate_range(gate, up, begin, end, act == GGML_MOE_COLD_ACT_GELU);
+}
+
+// expert of a global cold column: col0 is ascending, empty experts share the next one's start
+static int ggml_moe_column_expert(const int64_t * col0, const int64_t * counts, int n_as, int64_t c) {
+    int lo = 0, hi = n_as - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1)/2;
+        if (col0[mid] <= c) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    while (lo > 0 && counts[lo] == 0) {
+        lo--;
+    }
+    return lo;
+}
+
 static void ggml_compute_forward_moe_cold(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -2861,9 +2900,17 @@ static void ggml_compute_forward_moe_cold(
         ggml_barrier(params->threadpool);
     }
 
-    // phase B (multi-threaded): activation (SwiGLU/GELU) + quantize the intermediate
+    // phase B (multi-threaded): activation (SwiGLU/GELU/SITU) + quantize the intermediate
     const int64_t total_cols = n_as > 0 ? (col0[n_as - 1] + matrix_row_counts[n_as - 1]) : 0;
-    const bool is_gelu = (w_gate == w_up);
+    int act = dst->op_params[1];
+    if (act == GGML_MOE_COLD_ACT_DEFAULT) {
+        act = (w_gate == w_up) ? GGML_MOE_COLD_ACT_GELU : GGML_MOE_COLD_ACT_SILU;
+    }
+    float act_beta, act_lb;
+    memcpy(&act_beta, &dst->op_params[2], sizeof(float));
+    memcpy(&act_lb,   &dst->op_params[3], sizeof(float));
+    // src[7] is either the i64 gate weight pointers (unused here) or the f32 gate/up scale
+    const float * gu_scale = (dst->src[7] && dst->src[7]->type == GGML_TYPE_F32) ? (const float *) dst->src[7]->data : NULL;
 
     if (ggml_cpu_moe_get_parallel_activation()) {
         // A decode graph often has fewer cold columns than CPU workers. Split
@@ -2882,16 +2929,18 @@ static void ggml_compute_forward_moe_cold(
             const int64_t i0 = (current % blocks_per_col)*block;
             const int64_t i1 = i0 + (column_end - current)*block;
             float * go = gate_out + c*n_ff;
-            const float * uo = up_out + c*n_ff;
-            ggml_moe_activate_range(go, uo, i0, i1, is_gelu);
+            float * uo = up_out + c*n_ff;
+            const float sc = gu_scale ? gu_scale[ggml_moe_column_expert(col0, matrix_row_counts, n_as, c)] : 1.0f;
+            ggml_moe_activate_range_act(go, uo, i0, i1, act, act_beta, act_lb, sc);
             from_fa(go + i0, act_q + c*q_ff + ggml_row_size(vdt_d, i0), i1 - i0);
             current = column_end;
         }
     } else {
         for (int64_t c = ith; c < total_cols; c += nth) {
             float * go = gate_out + c*n_ff;
-            const float * uo = up_out + c*n_ff;
-            ggml_moe_activate_range(go, uo, 0, n_ff, is_gelu);
+            float * uo = up_out + c*n_ff;
+            const float sc = gu_scale ? gu_scale[ggml_moe_column_expert(col0, matrix_row_counts, n_as, c)] : 1.0f;
+            ggml_moe_activate_range_act(go, uo, 0, n_ff, act, act_beta, act_lb, sc);
             from_fa(go, act_q + c*q_ff, n_ff);
         }
     }

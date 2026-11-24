@@ -347,6 +347,14 @@ extern "C" {
     // on the next wide MUL_MAT_ID if enough VRAM remains.
     GGML_API void                 ggml_backend_sched_prefetch_release(ggml_backend_sched_t sched);
 
+    // Device memory for the expert prefetch slots from the caller, e.g. weights that no op reads during a prefill.
+    // get: a region of at least size bytes for slot `slot` inside `buffer` (false: the scheduler allocates the slot).
+    // put: the scheduler is done with the slot and has synchronized its backends; written: it copied data into it.
+    typedef bool (*ggml_backend_sched_prefetch_get_t)(void * user, int slot, size_t size, ggml_backend_buffer_t * buffer, void ** base);
+    typedef void (*ggml_backend_sched_prefetch_put_t)(void * user, int slot, bool written);
+    GGML_API void                 ggml_backend_sched_set_prefetch_provider(ggml_backend_sched_t sched,
+            ggml_backend_sched_prefetch_get_t get, ggml_backend_sched_prefetch_put_t put, void * user);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.

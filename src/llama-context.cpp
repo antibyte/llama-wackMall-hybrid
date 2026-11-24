@@ -1379,6 +1379,7 @@ void llama_context::sched_reserve() {
     gf_res_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    llama_expert_tier::attach_prefetch_provider(sched.get());
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1422,6 +1423,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                llama_expert_tier::attach_prefetch_provider(sched.get());
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -5060,6 +5062,12 @@ llama_context * llama_init_from_model(
     }
 
     try {
+        // an explicit hot set pins its stores before the compute buffers are reserved: it is sized by the
+        // user, and the reserve then accounts for the tier's graph and may borrow full layers for prefetch
+        const char * hot_set = getenv("LLAMA_EXPERT_HOT_SET");
+        if (hot_set && hot_set[0] && !model->hparams.no_alloc) {
+            llama_expert_tier::init(*model);
+        }
         auto * ctx = new llama_context(*model, params);
         if (!model->hparams.no_alloc) {
             llama_expert_tier::init(*model);

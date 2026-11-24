@@ -1517,6 +1517,25 @@ extern "C" {
             struct ggml_tensor  * ptrs_up,
             struct ggml_tensor  * ptrs_down);
 
+    // activation of a ggml_moe_cold node; without this call a merged gate/up
+    // tensor (gate == up) means GELU and separate ones SiLU.
+    // SITU: beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb) (lb <= 0: plain u).
+    // gate_up_scale (f32 [n_expert], may be NULL): per-expert scale of the
+    // gate and up outputs, applied before the activation (needs ptrs_gate NULL)
+    enum ggml_moe_cold_act {
+        GGML_MOE_COLD_ACT_DEFAULT = 0,
+        GGML_MOE_COLD_ACT_SILU    = 1,
+        GGML_MOE_COLD_ACT_GELU    = 2,
+        GGML_MOE_COLD_ACT_SITU    = 3,
+    };
+
+    GGML_API void ggml_moe_cold_set_act(
+            struct ggml_tensor  * cold,
+            enum ggml_moe_cold_act act,
+            float                 beta,
+            float                 linear_beta,
+            struct ggml_tensor  * gate_up_scale);
+
     // count-only sibling of ggml_moe_cold for large batches (prompt
     // harvesting): increments counts per selection and returns a scalar
     // f32 tensor holding 0.0f (reference it to keep the op in the graph)

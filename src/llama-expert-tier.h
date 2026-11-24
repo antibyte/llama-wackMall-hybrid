@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "llama.h"
 
 #include <cstdint>
@@ -105,6 +106,10 @@ void configure_request_scoped(bool enabled);
 // common.cpp or an explicit LLAMA_EXPERT_* environment control is present
 void init(const llama_model & model);
 
+// lends the memory of fully pinned hot-set layers to the scheduler's prefill expert prefetch
+// (no-op unless LLAMA_EXPERT_HOT_SET pins whole layers)
+void attach_prefetch_provider(ggml_backend_sched_t sched);
+
 // drop-in replacement for ggml_mul_mat_id on MoE expert weights:
 // hot part on the GPU via the pinned store, cold part on the CPU via
 // ggml_mul_mat_id_cold; falls back to plain ggml_mul_mat_id when the weight
@@ -168,9 +173,13 @@ bool cpu_async_enabled();
 // build the cold op right after the router so the hot branch can overlap it
 bool cold_first_enabled();
 
+// act/beta/linear_beta/gate_up_scale: see ggml_moe_cold_set_act (0: the
+// op's default, SiLU for separate gate/up and GELU for a merged tensor)
 ggml_tensor * end_moe_cold(ggml_context * ctx,
         ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,
-        ggml_tensor * x, ggml_tensor * ids);
+        ggml_tensor * x, ggml_tensor * ids,
+        int act = 0, float beta = 0.0f, float linear_beta = 0.0f,
+        ggml_tensor * gate_up_scale = nullptr);
 
 // Number of predicted next-layer experts to read ahead, 0 when disabled, the
 // tier is inactive, or n_tokens is above LLAMA_EXPERT_TMAX.

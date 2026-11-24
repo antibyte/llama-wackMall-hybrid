@@ -2326,11 +2326,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // matmul so the CPU split overlaps GPU hot work) covers the cold ones
     ggml_tensor * gw = gate_exps ? gate_exps : gate_up_exps;
     ggml_tensor * uw = up_exps   ? up_exps   : gate_up_exps;
+    // the cold op applies SITU and a merged gate_up tensor's per-expert scale itself
+    const bool gate_up_scaled = gate_up_exps && up_exps_s && !gate_exps_s;
     const bool cold_ok = !weight_before_ffn && gw && uw && down_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
-        !up_exps_s && !gate_exps_s &&
-        (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) &&
+        (!up_exps_s || gate_up_scaled) && !gate_exps_s &&
+        (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || (type_op == LLM_FFN_SITU && gate_up_exps)) &&
         arch != LLM_ARCH_STEP35;
+    const int     cold_act      = type_op == LLM_FFN_SITU ? (int) GGML_MOE_COLD_ACT_SITU : 0;
+    ggml_tensor * cold_gu_scale = gate_up_scaled ? up_exps_s : nullptr;
     const bool moe_cold = llama_expert_tier::begin_moe_cold(cold_ok,
             gw, uw, down_exps, selected_experts);
     ggml_tensor * hot_ids = llama_expert_tier::build_hot_ids(ctx0, gw, selected_experts);
@@ -2344,7 +2348,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // computes (async job, or scheduler head launch), and the later combine
     // copy is the first point that joins the CPU result.
     if (moe_cold && llama_expert_tier::cold_first_enabled()) {
-        cold = llama_expert_tier::end_moe_cold(ctx0, gw, uw, down_exps, x_in, selected_experts);
+        cold = llama_expert_tier::end_moe_cold(ctx0, gw, uw, down_exps, x_in, selected_experts,
+                cold_act, hparams.situ_beta, hparams.situ_linear_beta, cold_gu_scale);
         if (cold) {
             if (page_prefetch) {
                 ggml_build_forward_expand(gf, page_prefetch);
@@ -2526,7 +2531,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     if (moe_cold) {
         if (!cold) {
-            cold = llama_expert_tier::end_moe_cold(ctx0, gw, uw, down_exps, x_in, selected_experts);
+            cold = llama_expert_tier::end_moe_cold(ctx0, gw, uw, down_exps, x_in, selected_experts,
+                    cold_act, hparams.situ_beta, hparams.situ_linear_beta, cold_gu_scale);
             if (cold && page_prefetch) {
                 // hot branch, then the read-ahead: the cold op follows directly,
                 // so both CPU ops land in one split
