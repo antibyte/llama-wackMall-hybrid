@@ -50,6 +50,7 @@
 #include "ggml-cuda/graph-fusion.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/mhc.cuh"
+#include "ggml-cuda/attn-res.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
@@ -4892,6 +4893,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // depth attention residuals and loop gates (Inkling 2), see attn-res.cuh
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_skip = ggml_cuda_try_attn_res_fusion(*cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    } else if (node->op == GGML_OP_CONCAT) {
+        const int n_skip = ggml_cuda_try_loop_gate_fusion(*cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
 
     ggml_cuda_moe_combine_args moe_combine;
     const int moe_combine_skip = ggml_cuda_moe_combine_fusion(cgraph, i, moe_combine);

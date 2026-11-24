@@ -18,6 +18,17 @@ static int64_t inkling2_kq_bias_max() {
 }
 static constexpr int64_t n_kq_chunk_max = 64;
 
+// row j of a mix() result [n_embd, n_rows, n_tokens] as [n_embd, n_tokens]; for one token the view is already
+// contiguous and needs no copy (LLAMA_INKLING2_DECODE_VIEWS, default 1)
+static ggml_tensor * inkling2_row(ggml_context * ctx, ggml_tensor * t, int64_t j) {
+    static const bool views = [] {
+        const char * e = getenv("LLAMA_INKLING2_DECODE_VIEWS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    ggml_tensor * v = ggml_view_2d(ctx, t, t->ne[0], t->ne[2], t->nb[2], j*t->nb[1]);
+    return views && ggml_is_contiguous(v) ? v : ggml_cont(ctx, v);
+}
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -381,8 +392,8 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 ggml_tensor * m_kv   = mix(bank_norm, bank_last, q_kv);
 
                 for (int j = 0; j < 2; ++j) {
-                    messages[j == 0 ? 0 : 3] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_attn, n_embd, n_tokens, m_attn->nb[2], j*m_attn->nb[1]));
-                    messages[j == 0 ? 1 : 2] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_kv,   n_embd, n_tokens, m_kv->nb[2],   j*m_kv->nb[1]));
+                    messages[j == 0 ? 0 : 3] = inkling2_row(ctx0, m_attn, j);
+                    messages[j == 0 ? 1 : 2] = inkling2_row(ctx0, m_kv,   j);
                 }
             }
         }
@@ -406,7 +417,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         if (layer.attn_res_query) {
             ggml_tensor * mixed = mix(blocks_norm, cur, layer.attn_res_query);
             for (int j = 0; j < 3; ++j) {
-                inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+                inputs[j] = inkling2_row(ctx0, mixed, is_swa ? 0 : j);
             }
         }
 

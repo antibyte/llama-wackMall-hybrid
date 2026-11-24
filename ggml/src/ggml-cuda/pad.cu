@@ -13,11 +13,10 @@ static __global__ void pad_f32(const float * src, size_t s00, size_t s01, size_t
                                const int ne0, const int ne1, const int ne2, const int ne3,
                                const bool circular) {
     // blockIdx.z: i3*ne2+i2
-    // blockIdx.y: i1
-    // blockIDx.x: i0 / CUDA_PAD_BLOCK_SIZE
-    // gridDim.y:  ne1
+    // blockIdx.y: i1 / blockDim.y (narrow rows: several per block)
+    // blockIDx.x: i0 / blockDim.x
     int i0 = threadIdx.x + blockIdx.x * blockDim.x;
-    int i1 = blockIdx.y;
+    int i1 = threadIdx.y + blockIdx.y * blockDim.y;
     int i2 = blockIdx.z % ne2;
     int i3 = blockIdx.z / ne2;
 
@@ -66,9 +65,21 @@ static void pad_f32_cuda(const float * src, size_t s00, size_t s01, size_t s02, 
     const int lp2, const int rp2, const int lp3, const int rp3,
     const int ne0, const int ne1, const int ne2, const int ne3,
     const bool circular, cudaStream_t stream) {
-    int  num_blocks = (ne0 + CUDA_PAD_BLOCK_SIZE - 1) / CUDA_PAD_BLOCK_SIZE;
-    dim3 gridDim(num_blocks, ne1, ne2 * ne3);
-    pad_f32<<<gridDim, CUDA_PAD_BLOCK_SIZE, 0, stream>>>(src, s00, s01, s02, s03, dst,
+    // GGML_CUDA_PAD_PACK_ROWS (default 1): rows narrower than half a block share one block, e.g. a 16-wide
+    // [16, 1025] pad ran 1025 blocks with 16 of 256 threads busy
+    static const bool pack = [] {
+        const char * e = getenv("GGML_CUDA_PAD_PACK_ROWS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    int rows = 1;
+    int width = CUDA_PAD_BLOCK_SIZE;
+    if (pack && ne0 <= CUDA_PAD_BLOCK_SIZE / 2) {
+        width = (ne0 + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
+        rows  = CUDA_PAD_BLOCK_SIZE / width;
+    }
+    const int num_blocks = (ne0 + width - 1) / width;
+    dim3 gridDim(num_blocks, (ne1 + rows - 1) / rows, ne2 * ne3);
+    pad_f32<<<gridDim, dim3(width, rows, 1), 0, stream>>>(src, s00, s01, s02, s03, dst,
                                                          lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3,
                                                          ne0, ne1, ne2, ne3, circular);
 }
