@@ -3233,7 +3233,13 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         }
 
         if (loader.has_audio && !skip_audio) {
-            ctx_audio = new clip_ctx(ctx_params);
+            // MTMD_AUDIO_GPU=0 (default 1): the audio encoder runs on the CPU while vision keeps the GPU
+            // (gemma4a on a 1660 Ti: 37 s of speech 0.7 s on the GPU, 1.9 s on the CPU; vision 0.4 vs 3-5 s)
+            clip_context_params audio_params = ctx_params;
+            if (const char * e = std::getenv("MTMD_AUDIO_GPU"); e != nullptr && std::atoi(e) == 0) {
+                audio_params.use_gpu = false;
+            }
+            ctx_audio = new clip_ctx(audio_params);
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
             loader.load_tensors(*ctx_audio);
             loader.init_ctx(*ctx_audio);
