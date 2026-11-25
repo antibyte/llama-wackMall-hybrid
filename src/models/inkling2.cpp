@@ -476,8 +476,16 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_tensor * sinks = ggml_reshape_3d(ctx0, build_lora_mm(layer.attn_sink_proj, inputs[0]), n_head, n_tokens/n_stream, n_stream);
 
             // project before gathering: only the gathered bias is n_kv x n_tokens x n_head
-            ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
-            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+            ggml_tensor * rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+            auto project = [&](ggml_tensor * r) {
+                return ggml_cont(ctx0, ggml_permute(ctx0, ggml_mul_mat(ctx0, rel_bias, r), 1, 0, 2, 3));
+            };
+            // LLAMA_INKLING2_TABLE_PER_CHUNK=1 (default 0): chunked prefill projects each chunk's rows instead of
+            // keeping the table of the whole ubatch ([extent + 1, n_head, n_tokens] F32, ~100 MiB) alive
+            static const bool table_per_chunk = [] {
+                const char * e = getenv("LLAMA_INKLING2_TABLE_PER_CHUNK");
+                return e != nullptr && atoi(e) != 0;
+            }();
 
             // the dense bias (and kq) is n_kv x n_tokens x n_head: chunk query rows past the budget,
             // sized for a full cache so the chunking does not change while it fills
@@ -486,14 +494,25 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
             int64_t n_rows_max = std::max({ int64_t(1), inkling2_kq_bias_max()/(n_kv_max*n_head*n_stream),
                     (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
             if (n_rows_max < n_seq_tokens) {
+                // multiples of 16 rows; LLAMA_INKLING2_ATTN_CHUNK_ROUND_DOWN=1 (default 0) stays within the budget,
+                // at least 16 rows and the chunk count limit. Rounding up took 32 rows at 32k context (50 % above
+                // the budget) but runs fewer chunks: 16k prefill 187 vs 174 t/s.
+                static const bool round_down = [] {
+                    const char * e = getenv("LLAMA_INKLING2_ATTN_CHUNK_ROUND_DOWN");
+                    return e != nullptr && atoi(e) != 0;
+                }();
                 const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
-                n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 16));
+                const int64_t even     = (n_seq_tokens + n_chunks - 1)/n_chunks;
+                n_rows_max = round_down ? std::max<int64_t>({ 16, even/16*16, GGML_PAD((n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max, 16) })
+                                        : GGML_PAD(even, 16);
+                n_rows_max = std::min(n_seq_tokens, n_rows_max);
             }
             auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
                 int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
                 ne[d] = nr;
                 return ggml_cont(ctx0, ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], r0*t->nb[d]));
             };
+            ggml_tensor * table = table_per_chunk && n_rows_max < n_seq_tokens ? nullptr : project(Rcur);
             std::vector<ggml_tensor *> outs;
             for (int64_t r0 = 0; r0 < n_seq_tokens; r0 += n_rows_max) {
                 const int64_t nr  = std::min(n_rows_max, n_seq_tokens - r0);
@@ -507,12 +526,19 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 } else {
                     q_c = ggml_reshape_3d(ctx0, rows(ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_seq_tokens, n_stream), 2, r0, nr),
                             n_embd_head, n_head, nr*n_stream);
-                    ggml_tensor * table_c = ggml_reshape_4d(ctx0, table, table->ne[0], table->ne[1], n_seq_tokens, n_stream);
-                    table_c = ggml_view_4d(ctx0, table_c, table_c->ne[0], table_c->ne[1], nr, n_stream,
-                            table_c->nb[1], table_c->nb[2], table_c->nb[3], r0*table_c->nb[2]);
+                    ggml_tensor * table_c = nullptr;
+                    if (table) {
+                        table_c = ggml_reshape_4d(ctx0, table, table->ne[0], table->ne[1], n_seq_tokens, n_stream);
+                        table_c = ggml_view_4d(ctx0, table_c, table_c->ne[0], table_c->ne[1], nr, n_stream,
+                                table_c->nb[1], table_c->nb[2], table_c->nb[3], r0*table_c->nb[2]);
+                    } else {
+                        ggml_tensor * r4 = ggml_reshape_4d(ctx0, Rcur, Rcur->ne[0], Rcur->ne[1], n_seq_tokens, n_stream);
+                        table_c = project(ggml_view_4d(ctx0, r4, r4->ne[0], r4->ne[1], nr, n_stream,
+                                r4->nb[1], r4->nb[2], r4->nb[3], r0*r4->nb[2]));
+                    }
                     ggml_tensor *& rel_pos_dev = inp->self_rel_pos_dev[is_swa];
                     if (!rel_pos_dev) {
-                        rel_pos_dev = ggml_cont(ctx0, rel_pos);
+                        rel_pos_dev = inp->on_device ? rel_pos : ggml_cont(ctx0, rel_pos);
                     }
                     ggml_tensor * rel_pos_c = ggml_view_3d(ctx0, rel_pos_dev, n_kv, nr, n_stream,
                             rel_pos_dev->nb[1], n_seq_tokens*rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);

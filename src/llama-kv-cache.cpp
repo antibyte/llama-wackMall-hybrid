@@ -2875,7 +2875,10 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    // a mask in device memory (LLAMA_ATTN_INPUTS_ON_DEVICE) is built in a host copy and uploaded once
+    const bool host = ggml_backend_buffer_is_host(dst->buffer);
+    std::vector<uint8_t> staging(host ? 0 : ggml_nbytes(dst));
+    void * out = host ? dst->data : (void *) staging.data();
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
@@ -2900,9 +2903,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     };
 
     if (dst->type == GGML_TYPE_F16) {
-        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) out, causal_attn);
     } else {
-        set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+        set_input_kq_mask_impl<float>(args, (float *) out, causal_attn);
+    }
+    if (!host) {
+        ggml_backend_tensor_set(dst, out, 0, ggml_nbytes(dst));
     }
 
     //const int64_t t_end = ggml_time_us();

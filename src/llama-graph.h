@@ -731,6 +731,9 @@ public:
 
     // per-graph device copies of the distances, shared by the chunked gathers of all layers
     ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
+
+    // masks and distances live in GPU memory (LLAMA_ATTN_INPUTS_ON_DEVICE): no device copies needed
+    bool on_device = false;
 };
 
 class llm_graph_input_sampling : public llm_graph_input_i {

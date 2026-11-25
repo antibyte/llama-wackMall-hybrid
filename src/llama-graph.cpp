@@ -3909,6 +3909,31 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    // LLAMA_ATTN_INPUTS_ON_DEVICE=1 (default 0): the masks and distances are allocated on the first GPU backend and
+    // written there once per ubatch. A host input is copied again by every split that reads it (each attention layer
+    // between CPU expert splits), and the chunked gathers kept a second device copy of the distances.
+    static const bool on_device = [] {
+        const char * e = getenv("LLAMA_ATTN_INPUTS_ON_DEVICE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (on_device && sched != nullptr) {
+        ggml_backend_t gpu = nullptr;
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched) && gpu == nullptr; ++i) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            const auto type = ggml_backend_dev_type(ggml_backend_get_device(b));
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                gpu = b;
+            }
+        }
+        if (gpu != nullptr) {
+            const auto * ia = inp->get_attn();
+            for (ggml_tensor * t : { ia->self_kq_mask, ia->self_kq_mask_swa, inp->self_rel_pos, inp->self_rel_pos_swa }) {
+                ggml_backend_sched_set_tensor_backend(sched, t, gpu);
+            }
+            inp->on_device = true;
+        }
+    }
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
