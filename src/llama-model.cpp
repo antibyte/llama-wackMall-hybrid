@@ -2869,6 +2869,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    // Mellum MTP is one extra SWA block. The trunk cache skips it;
+                    // the draft cache keeps only that block.
+                    if (arch == LLM_ARCH_MELLUM && hparams.n_layer_nextn > 0) {
+                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        } else {
+                            filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
+                        }
+                    }
+
                     if (arch == LLM_ARCH_DEEPSEEK4) {
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
