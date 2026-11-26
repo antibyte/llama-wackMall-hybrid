@@ -299,6 +299,8 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
     };
 
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         const auto & layer = model.layers[il];
         ggml_tensor * inpSA = inpL;
         ggml_tensor * cur = build_norm(inpL, layer.attn_norm, nullptr, LLM_NORM_RMS, il);

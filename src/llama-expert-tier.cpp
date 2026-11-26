@@ -142,6 +142,7 @@ static bool g_shared_hot_ids = false;
 // loading and computing against zero weights. Default off until measured.
 static bool g_skip_sentinel = false;
 static int  g_page_prefetch_top_m = 0;
+static int  g_page_prefetch_max_tokens = -1; // -1 = LLAMA_EXPERT_TMAX
 static bool g_static_no_sync_requested = false;
 static bool g_static_no_sync_active = false;
 static int  g_prefetch_streams = 1;
@@ -2203,6 +2204,12 @@ void init(const llama_model & model) {
             g_page_prefetch_top_m = 0;
         }
     }
+    if (const char * max_tokens = getenv("LLAMA_EXPERT_PAGE_PREFETCH_MAX_TOKENS")) {
+        if (!parse_nonnegative_int(max_tokens, g_page_prefetch_max_tokens)) {
+            TIER_LOG("%s: invalid LLAMA_EXPERT_PAGE_PREFETCH_MAX_TOKENS='%s'; expected >= 0\n", __func__, max_tokens);
+            g_page_prefetch_max_tokens = -1;
+        }
+    }
     ggml_cpu_moe_set_single_row_chunk(g_cpu_single_row_chunk);
     ggml_cpu_moe_set_parallel_activation(g_cpu_parallel_activation);
     ggml_cpu_moe_set_down_prefetch(g_cpu_down_prefetch);
@@ -3249,14 +3256,18 @@ static void page_prefetch_op(ggml_tensor * dst, int ith, int nth, void * userdat
 #endif
 }
 
+static int64_t page_prefetch_max_tokens() {
+    return g_page_prefetch_max_tokens < 0 ? (int64_t) g_tmax : std::min<int64_t>(g_page_prefetch_max_tokens, g_tmax);
+}
+
 int page_prefetch_top_m(int64_t n_tokens) {
-    return g_stores.empty() || n_tokens > (int64_t) g_tmax ? 0 : g_page_prefetch_top_m;
+    return g_stores.empty() || n_tokens > page_prefetch_max_tokens() ? 0 : g_page_prefetch_top_m;
 }
 
 ggml_tensor * build_page_prefetch(ggml_context * ctx,
         ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * down_w,
         ggml_tensor * predicted_ids) {
-    if (g_page_prefetch_top_m <= 0 || !predicted_ids || predicted_ids->ne[1] > (int64_t) g_tmax) {
+    if (g_page_prefetch_top_m <= 0 || !predicted_ids || predicted_ids->ne[1] > page_prefetch_max_tokens()) {
         return nullptr;
     }
     auto ig = g_stores.find(tier_canon(gate_w));

@@ -7,15 +7,31 @@
 # Bench 2026-10-30 (benchmark-results/ling-3-flash-20261030): decode ~7.5 t/s,
 # prefill ~37 t/s for a 3.9k-token prompt, 7-11 t/s for short prompts; the SSD
 # runs at its 0.9-1.2 GB/s limit while decoding.
+# Default LING3_QUANT=expq3k loads the file from ./download-ling-3-flash-q3.sh (routed experts
+# Q3_K, rest Q4_K_M, 52.7 GiB); q4km loads the plain splits the lines above describe. Bench 2026-11-14 (benchmark-results/ling-dspark-20261114, cold page
+# and drive cache, A/B/A/B): decode 14.3 vs 7.5-8.4 t/s, after a 5.2k-token prompt 12.4 vs 7.6,
+# its prefill 38.7 vs 29.1 t/s, auto-fit S=19. KLD 0.095 against Q4_K_M, same top token 91.3 %.
 set -Eeuo pipefail
 
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 SERVER="${LING3_SERVER:-$PROJECT_ROOT/build-main-sm75/bin/llama-server}"
-MODEL="${LING3_MODEL:-$HOME/models/ling-3-flash/Ling-3.0-flash-Q4_K_M-00001-of-00002.gguf}"
+QUANT="${LING3_QUANT:-expq3k}"
+case "$QUANT" in
+    q4km)   MODEL_DEFAULT="$HOME/models/ling-3-flash/Ling-3.0-flash-Q4_K_M-00001-of-00002.gguf" ;;
+    expq3k) MODEL_DEFAULT="$HOME/models/ling-3-flash/Ling-3.0-flash-Q4_K_M-expq3k.gguf" ;;
+    *) printf 'start-ling-3-flash.sh: LING3_QUANT must be q4km or expq3k\n' >&2; exit 1 ;;
+esac
+MODEL="${LING3_MODEL:-$MODEL_DEFAULT}"
 HOST="${LING3_HOST:-127.0.0.1}"
 PORT="${LING3_PORT:-8094}"
-CONTEXT="${LING3_CONTEXT:-32768}"
+DSPARK="${LING3_DSPARK:-0}"
+# The draft keeps f16 K/V for 5 layers of 32 heads: 2.56 GiB at 32768 cells, 640 MiB at 8192.
+if [[ "$DSPARK" == 1 ]]; then
+    CONTEXT="${LING3_CONTEXT:-8192}"
+else
+    CONTEXT="${LING3_CONTEXT:-32768}"
+fi
 THREADS="${LING3_THREADS:-8}"
 ALIAS="${LING3_ALIAS:-ling-3-flash}"
 
@@ -26,7 +42,30 @@ die() {
 
 [[ $# -eq 0 ]] || die "use LING3_* environment variables instead of arguments"
 [[ -x "$SERVER" ]] || die "llama-server is not executable: $SERVER"
-[[ -f "$MODEL" ]] || die "model not found: $MODEL (run ./download-ling-3-flash.sh)"
+[[ -f "$MODEL" ]] || die "model not found: $MODEL (run ./download-ling-3-flash.sh or ./download-ling-3-flash-q3.sh)"
+
+# DSpark draft (inclusionAI/Ling-3.0-flash-dspark, ./download-ling-3-flash-dspark.sh). Off by default:
+# 2026-11-14, cold cache, A/B/A/B, 192 greedy tokens: 6.8-7.4 vs 7.6 t/s on Q4_K_M and 12.7-13.0
+# vs 13.8 t/s on expq3k with n_max 3 (80-90 % of the drafts accepted). A k-token verify computes
+# and reads k tokens' cold experts; only the GPU part is shared. With every expert in RAM
+# (same prompt repeated) n_max 3 gives 19 vs 15.7 t/s, n_max 8 only 13.5.
+# A Q4_K_M draft and q8_0 draft K/V (S 7-10 instead of 5) stay at 12.5-13.3 vs 14.2-14.4 t/s.
+# Draft length 2 (acceptance 90-95 %) stays at 13.1-13.6 vs 13.7-14.3 t/s.
+DRAFT="${LING3_DRAFT:-$HOME/models/ling-3-flash/Ling-3.0-flash-DSpark-Q8_0.gguf}"
+case "$DSPARK" in 0|1) ;; *) die "LING3_DSPARK must be 0 or 1" ;; esac
+if [[ "$DSPARK" == 1 ]]; then
+    [[ -f "$DRAFT" ]] || die "draft not found: $DRAFT (run ./download-ling-3-flash-dspark.sh)"
+    export LLAMA_ARG_SPEC_TYPE=draft-dspark
+    export LLAMA_ARG_SPEC_DRAFT_MODEL="$DRAFT"
+    export LLAMA_ARG_N_GPU_LAYERS_DRAFT=99
+    export LLAMA_ARG_SPEC_DRAFT_N_MAX="${LLAMA_ARG_SPEC_DRAFT_N_MAX:-3}"
+    export LLAMA_ARG_SPEC_DRAFT_N_MIN="${LLAMA_ARG_SPEC_DRAFT_N_MIN:-1}"
+    # The confidence head predicts 1 - TV (rejection sampling), so it is conservative for greedy.
+    export LLAMA_ARG_SPEC_DRAFT_P_MIN="${LLAMA_ARG_SPEC_DRAFT_P_MIN:-0.25}"
+    export LLAMA_DFLASH_COMBINED="${LLAMA_DFLASH_COMBINED:-1}"
+    # The expert auto-fit runs before the draft loads; leave room for its weights, K/V and buffers.
+    export LLAMA_EXPERT_VRAM_RESERVE_MIB="${LLAMA_EXPERT_VRAM_RESERVE_MIB:-1900}"
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export LLAMA_ARG_POWER_BUSY_CMD="${LLAMA_ARG_POWER_BUSY_CMD-busctl call com.system76.PowerDaemon /com/system76/PowerDaemon com.system76.PowerDaemon Performance}"
@@ -61,7 +100,11 @@ export LLAMA_EXPERT_CPU_CHUNK="${LLAMA_EXPERT_CPU_CHUNK:-64}"
 export LLAMA_EXPERT_CPU_FUSED_GATE_UP="${LLAMA_EXPERT_CPU_FUSED_GATE_UP:-1}"
 export LLAMA_EXPERT_SHARED_HOT_IDS="${LLAMA_EXPERT_SHARED_HOT_IDS:-1}"
 export LLAMA_EXPERT_SKIP_SENTINEL="${LLAMA_EXPERT_SKIP_SENTINEL:-1}"
+# Read the next layer's predicted cold experts ahead. 2026-11-14 with 8 predictions, decode only
+# (MAX_TOKENS 1): expq3k 13.0-13.2 vs 13.8 t/s. On Q4_K_M 8.3 vs 7.6-7.8 t/s with 8 predictions
+# and 5.3 t/s with 16 (both without the token limit). Off.
 export LLAMA_EXPERT_PAGE_PREFETCH="${LLAMA_EXPERT_PAGE_PREFETCH:-0}"
+export LLAMA_EXPERT_PAGE_PREFETCH_MAX_TOKENS="${LLAMA_EXPERT_PAGE_PREFETCH_MAX_TOKENS:-1}"
 # Copy the CPU splits' inputs from the GPU asynchronously, one sync per split:
 # decode 7.50 -> 7.58 t/s, same tokens (SSD-bound; Kolibri +2.5 %).
 export GGML_SCHED_ASYNC_D2H_COPY="${GGML_SCHED_ASYNC_D2H_COPY:-1}"

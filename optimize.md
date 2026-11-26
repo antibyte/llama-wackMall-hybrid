@@ -1,3 +1,37 @@
+# Ling-3.0-flash: Experten in Q3_K, DSpark-Draft und Layer-voraus-Prefetch vom 2026-11-14
+
+**Ergebnis: Eine Mischdatei mit den gerouteten Experten aus Q3_K_S und allem anderen aus Q4_K_M (52,7 statt 72,5 GiB) laeuft mit 14,3 t/s Decode gegen 7,5-8,4 t/s (A/B/A/B, Page- und SSD-Cache vor jedem Arm geleert), nach einem 5,2k-Prompt mit 12,4 gegen 7,6 t/s, dessen Prefill mit 38,7 gegen 29,1 t/s. Preis: KLD 0,095 gegen Q4_K_M, gleicher Top-Token 91,3 %. Der DSpark-Draft von inclusionAI laeuft (80-90 % Akzeptanz bei 3 Tokens), verliert aber auf beiden Dateien 5-10 %, ebenso der Layer-voraus-Prefetch auf der Mischdatei. Eingebaut: das agollm-Rezept `ling-3-flash` und `start-ling-3-flash.sh` laden die Mischdatei (Entscheidung des Nutzers).**
+
+| Decode, 3 Prompts x 192 Greedy-Tokens, ctx 8192, kalter Cache | Runde 1 | Runde 2 | fehlende Slabs |
+|---|---|---|---|
+| Q4_K_M (Rezept) | 8,36 | 7,49 | 21,4 / 22,4 % |
+| Mischdatei `expq3k` | **14,28** | **14,31** | 13,2 / 13,4 % |
+| reines Q3_K_S (ohne SSD-Cache-Leerung, Basis dort 8,75) | 13,64 | 14,43 | 14,2 / 13,4 % |
+
+| Auf der Mischdatei, verschachtelt, nur Page-Cache geleert | Runde 1 | Runde 2 |
+|---|---|---|
+| ohne Zusatz | 13,81 | 13,76 |
+| DSpark n_max 3, p_min 0,25 (S=5 statt 19) | 13,02 | 12,71 |
+| `LLAMA_EXPERT_PAGE_PREFETCH=8`, nur Decode | 13,01 | 13,24 |
+
+| Qualitaet gegen Q4_K_M (`llama-perplexity`, 5 x 2048 Tokens Deutsch, Englisch, Code) | KLD Mittel | Median | gleicher Top-Token | PPL-Verhaeltnis |
+|---|---|---|---|---|
+| Mischdatei (Experten Q3_K, Rest Q4_K_M) | 0,095 | 0,010 | 91,3 % | 1,032 +- 0,010 |
+| reines Q3_K_S | 0,129 | 0,014 | 89,9 % | 1,009 +- 0,011 |
+
+- **Wohin die Tokenzeit geht.** Liegen alle Experten im RAM (derselbe Prompt wiederholt, Prompt-Cache an), schafft Q4_K_M 15,7-19 t/s statt ~8. gdb-Stichproben des Rechen-Threads in diesem Zustand: 49 % Warten auf die GPU, 49 % im kalten MoE-Knoten. Im Betrieb kommen also 60-75 ms SSD-Warten je Token dazu, mehr als die Haelfte. Die GPU-Fusionsknoepfe von Ling-tiny bringen bei flash nichts (18,0-20,9 gegen 17,2-20,0 t/s, andere Ausgabe-SHA) und bleiben draussen.
+- **Mischdatei.** `tools/gguf_mix_experts.py` schreibt Metadaten und Tensoren der Basis in eine Datei und nimmt die 123 Tensoren `blk.*.ffn_{gate,up,down}_exps.weight` aus dem Spender. `download-ling-3-flash-q3.sh` laedt Q3_K_S (sha256 geprueft) und baut `~/models/ling-3-flash/Ling-3.0-flash-Q4_K_M-expq3k.gguf`. Ein Experten-Slice hat 2,4 statt 3,2-3,6 MiB, das Auto-Fit setzt S=19 statt 12. Die Mischdatei ist bei gleicher Groesse naeher am Original als reines Q3_K_S.
+- **DSpark.** `inclusionAI/Ling-3.0-flash-dspark` (5 Layer, Block 8, Markov-Kopf) wird von `download-ling-3-flash-dspark.sh` ohne die eigenen Embeddings und den LM-Head konvertiert (600 MB Q8_0, beides kommt zur Laufzeit vom Zielmodell). `bailingmoe3.cpp` setzt dafuer `t_layer_inp`. Akzeptanz: n_max 8 63-70 % (mittlere Draft-Laenge 5,3-6), n_max 3 80-91 %. Ein Verify ueber k Tokens rechnet und liest aber die kalten Experten von k Tokens, geteilt wird nur der GPU-Teil: Q4_K_M kalt 6,84 / 7,36 gegen 7,62 / 7,57 t/s, Mischdatei siehe Tabelle. Nur wenn alles im RAM liegt, gewinnt er (n_max 3: 19 gegen 15,7 t/s, n_max 8: 13,5). Der Draft-KV braucht f16 2,56 GiB bei 32k Zellen, deshalb setzt der Launcher mit Draft ctx 8192. Offen: die Greedy-Ausgabe mit n_max 3 weicht von der ohne Draft ab (mit n_max 8 ueber 64 Tokens gleich); nicht untersucht, weil der Draft aus bleibt.
+- **Kleinerer Drafter, kleinerer Draft-KV.** Nachmessung auf der Mischdatei, zwei verschachtelte Runden, n_max 3: ohne Draft 14,16 / 14,42 t/s; Q8_0-Drafter mit f16-KV (S=5) 12,47 / 13,01; Q4_K_M-Drafter (313 MiB, S=7) 13,20 / 13,12; Q8_0 mit q8_0-KV (S=8) 13,08 / 12,90; Q4_K_M mit q8_0-KV (S=10) 12,49 / 13,33. Akzeptanz ueberall 80-90 %. Der Drafter ist nicht der Engpass (5 ms je Schritt), das groessere Hot-Set schliesst die Luecke nicht. Die Q4_K_M-Datei ist wieder geloescht.
+- **Draft-Laenge 2.** Gleiche Methode, Q8_0-Drafter: ohne Draft 13,72 / 14,32 t/s; n_max 2 mit f16-KV (S=5) 13,14 / 13,61; n_max 2 mit q8_0-KV (S=8) 13,42 / 13,28. Akzeptanz 90-95 %. Die Luecke schrumpft auf 4-7 %, bleibt aber ein Verlust.
+- **Prefetch.** Neu `LLAMA_EXPERT_PAGE_PREFETCH_MAX_TOKENS` (Default und Obergrenze `LLAMA_EXPERT_TMAX`): der Prefetch laeuft nur bis zu dieser Batchgroesse. Auf Q4_K_M ohne Grenze 8,34 / 8,26 gegen 7,6-7,8 t/s bei 8 Vorhersagen (fehlende Slabs 7,2-7,6 statt 19,7 %), 5,34 t/s bei 16. Auf der Mischdatei mit Grenze 1 ein Verlust (Tabelle). Bleibt aus.
+
+Einbau: `start-ling-3-flash.sh` mit `LING3_QUANT=expq3k|q4km` (Default expq3k), `LING3_DSPARK=0|1` und den beiden Prefetch-Knoepfen ausdruecklich. agollm: `config/llama/ling-3-flash.yaml` zeigt auf die Mischdatei (Routing 13 t/s, Prefill 30 t/s), README-Zeile und `config_test.go` angepasst; keine neuen Worker-Libs noetig. Die Q4_K_M-Splits bleiben als Rueckweg und Quelle der Mischdatei liegen, die Q3_K_S-Splits und die BF16-Zwischendatei des Drafts sind geloescht. Kontrolle ueber den Router: 220 Tokens mit 12,5 t/s bei agollm-Sampling.
+
+Nicht gemessen: laengere Antworten als 192 Tokens je Prompt, Q3_K_M- oder Q2_K-Experten (Q2_K waere ~43 GiB), ein Paar-Kernel fuer Q3_K wie `ggml_vec_dot_q4_K_q8_K_pair` (die Mischdatei rechnet Gate und Up einzeln).
+
+Messprogramme (gitignored): `benchmark-results/ling-dspark-20261114/` (`tools/arm.sh` kalter Decode-Arm, `tools/kld.sh`, `tools/cpusplit.py`, `tools/stacks.sh`, `runs/`, `kld/`).
+
 # Offene Punkte der Kernel-Runde 2: Host zwischen den Tokens, Summen-Epilogue, Output-Quant vom 2026-11-13
 
 **Ergebnis: Vier Aenderungen gegen den deployten Stand vom Vormittag, A/B/A/B: Ling-3.0-tiny Decode greedy 178,3 -> 181,7 t/s (+1,9 %), Tool-Anfragen 155,0 -> 158,1 t/s (+2,0 %), LFM2.5-1.2B 254,5 -> 258,4 (+1,55 %), FrogNano-4B 71,8 -> 72,3 (+0,75 %), MiMo unveraendert; alle Greedy-Ausgaben bitgleich. Dazu als Messung, nicht eingebaut: `output.weight` in Q4_K statt Q6_K bringt Ling-tiny weitere +4,8 % (184,8 -> 193,7 t/s) bei KLD 0,0036 gegen das bisherige Modell. Beides eingebaut (siehe Einbau).**

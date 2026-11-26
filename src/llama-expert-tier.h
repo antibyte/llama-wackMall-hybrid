@@ -182,7 +182,8 @@ ggml_tensor * end_moe_cold(ggml_context * ctx,
         ggml_tensor * gate_up_scale = nullptr);
 
 // Number of predicted next-layer experts to read ahead, 0 when disabled, the
-// tier is inactive, or n_tokens is above LLAMA_EXPERT_TMAX.
+// tier is inactive, or n_tokens is above LLAMA_EXPERT_PAGE_PREFETCH_MAX_TOKENS
+// (default and upper bound: LLAMA_EXPERT_TMAX).
 int page_prefetch_top_m(int64_t n_tokens);
 
 // CPU op that madvise(WILLNEED)s the cold slabs of the predicted experts
