@@ -27,6 +27,31 @@ static int ggml_cuda_turbo4_f16_prefill_min_batch() {
 }
 #endif
 
+// Number of query heads that share one KV head in the attention tile kernel. The
+// tile reads the K/V data gqa_ratio/ncols2 times, so a wider tile means less K/V
+// traffic but fewer blocks. 0 = auto (wide tile only above the KV threshold and
+// only when the model has more heads than the generic dispatch uses), 8 = off,
+// 16/32 = force the width.
+static int ggml_cuda_fa_ncols2() {
+    static const int value = []() {
+        const char * env = std::getenv("GGML_CUDA_FA_NCOLS2");
+        return env == nullptr ? 0 : std::atoi(env);
+    }();
+    return value;
+}
+
+// KV length from which the attention tile kernel prefers the wide query tile.
+// A long KV makes the kernel bandwidth-bound on the K/V reads, a short one prefers
+// more blocks over a saturated card. The Deepseek branch in
+// ggml_cuda_flash_attn_ext_mma_f16 uses the same threshold.
+static int ggml_cuda_fa_kv_wide_threshold() {
+    static const int value = []() {
+        const char * env = std::getenv("GGML_CUDA_FA_KV_WIDE_THRESHOLD");
+        return env == nullptr ? 16384 : std::atoi(env);
+    }();
+    return value;
+}
+
 // Without tensor cores the vec kernel reads quantized K/V once per Q head. From this
 // many KV cells on, GQA decode converts K/V to F16 for the tile kernel instead. 0 = off.
 static int ggml_cuda_fa_quant_tile_min_kv() {
@@ -94,6 +119,34 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    // A long KV cache makes the tile kernel bandwidth-bound on the K/V reads. The
+    // ncols2 tile holds ncols2 query heads that share one KV head, so the K/V data
+    // is read gqa_ratio/ncols2 times. The generic dispatch below caps the tile at
+    // 8 heads, so a model with more heads than that reads the K/V needlessly often.
+    // The Deepseek branch in ggml_cuda_flash_attn_ext_mma_f16 uses the same idea.
+    if constexpr (DKQ == 128) {
+        const int forced = ggml_cuda_fa_ncols2();
+        // A tile wider than the GQA ratio would only compute masked-out heads.
+        const int max_useful = std::min(gqa_ratio, 32);
+        int ncols2 = 0;
+        if (forced != 0) {
+            ncols2 = forced <= max_useful ? forced : 0;
+        } else if (use_gqa_opt && gqa_ratio > 8 && cc >= GGML_CUDA_CC_TURING &&
+                   K->ne[1] > ggml_cuda_fa_kv_wide_threshold()) {
+            // Only above the threshold: with a short KV there is not enough work to
+            // keep the card busy when all heads share one tile.
+            ncols2 = max_useful;
+        }
+        if (ncols2 == 32 && Q->ne[1] <= 4) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 32>(ctx, dst);
+            return;
+        }
+        if (ncols2 == 16 && Q->ne[1] <= 4) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 16>(ctx, dst);
+            return;
+        }
+    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
@@ -262,7 +315,20 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 // Volta:
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 4>(ctx, dst);
             } else if (gqa_ratio % 16 == 0) {
-                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
+                // The tile holds 16 query heads, so the K/V data is read gqa_ratio/16
+                // times. A model with more heads per KV head reads the K/V needlessly
+                // often, and with a long KV that traffic dominates. The tile is
+                // widened when the KV is long and there are enough heads to fill it.
+                const int forced = ggml_cuda_fa_ncols2();
+                const int wide = std::min(gqa_ratio, 32);
+                const bool want_wide = wide > 16 && Q->ne[1] <= 4 &&
+                        (forced == wide || (forced == 0 && cc >= GGML_CUDA_CC_TURING &&
+                                            K->ne[1] > ggml_cuda_fa_kv_wide_threshold()));
+                if (want_wide) {
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 32>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
+                }
             } else {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512,  4>(ctx, dst);
             }
