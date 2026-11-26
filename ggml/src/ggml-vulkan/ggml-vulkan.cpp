@@ -3573,6 +3573,21 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
     }
 
+    // GGML_VK_FA_SCALAR_{BR,BC,WG,ROW_SPLIT,OCC}: overrides for large batches (n_rows >= 64),
+    // e.g. long non-causal vision-encoder attention. Unset keeps the defaults above.
+    if (n_rows >= 64) {
+        auto env_u32 = [](const char * name, uint32_t & v) {
+            if (const char * e = getenv(name); e && *e) {
+                v = (uint32_t) atoi(e);
+            }
+        };
+        env_u32("GGML_VK_FA_SCALAR_BR", result.block_rows);
+        env_u32("GGML_VK_FA_SCALAR_BC", result.block_cols);
+        env_u32("GGML_VK_FA_SCALAR_WG", result.workgroup_size);
+        env_u32("GGML_VK_FA_SCALAR_ROW_SPLIT", result.row_split);
+        env_u32("GGML_VK_FA_SCALAR_OCC", result.limit_occupancy_shmem);
+    }
+
     return result;
 }
 

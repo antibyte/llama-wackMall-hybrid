@@ -64,18 +64,16 @@ ggml_cgraph * clip_graph_magevl::build() {
     // ---- layernorm_pre ----
     inpL = build_norm(inpL, model.pre_ln_w, model.pre_ln_b, NORM_TYPE_NORMAL, eps, -1);
 
-    // rope application helper: x is [d_head, n_head, n_pos]
+    // rope application helper: x is [d_head, n_head, n_pos] and contiguous.
+    // cos/sin are [d_head, 1, n_pos] and broadcast over the heads, so no permute is needed;
+    // R @ x runs on the 2D view [d_head, n_head*n_pos].
+    ggml_tensor * cos3 = ggml_reshape_3d(ctx0, rope_cos, d_head, 1, n_pos);
+    ggml_tensor * sin3 = ggml_reshape_3d(ctx0, rope_sin, d_head, 1, n_pos);
     auto apply_rope = [&](ggml_tensor * x) -> ggml_tensor * {
-        ggml_tensor * xp = ggml_permute(ctx0, x, 0, 2, 1, 3);       // [d_head, n_pos, n_head]
-        xp = ggml_cont_3d(ctx0, xp, d_head, n_pos, n_head);
-        ggml_tensor * cos3 = ggml_reshape_3d(ctx0, rope_cos, d_head, n_pos, 1);
-        ggml_tensor * sin3 = ggml_reshape_3d(ctx0, rope_sin, d_head, n_pos, 1);
-        ggml_tensor * xrot = ggml_mul_mat(ctx0, model.rope_rotmat, xp); // R @ x
-        ggml_tensor * out  = ggml_add(ctx0,
-                              ggml_mul(ctx0, xp,   cos3),
-                              ggml_mul(ctx0, xrot, sin3));
-        out = ggml_permute(ctx0, out, 0, 2, 1, 3);                  // back to [d_head, n_head, n_pos]
-        return ggml_cont_3d(ctx0, out, d_head, n_head, n_pos);
+        ggml_tensor * x2   = ggml_reshape_2d(ctx0, x, d_head, n_head * n_pos);
+        ggml_tensor * xrot = ggml_mul_mat(ctx0, model.rope_rotmat, x2); // R @ x
+        xrot = ggml_reshape_3d(ctx0, xrot, d_head, n_head, n_pos);
+        return ggml_add(ctx0, ggml_mul(ctx0, x, cos3), ggml_mul(ctx0, xrot, sin3));
     };
 
     // ---- encoder layers ----

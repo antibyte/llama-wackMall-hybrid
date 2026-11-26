@@ -697,7 +697,15 @@ ggml_tensor * clip_graph::build_attn(
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        // LLAMA_MTMD_FA_PREC=f16 leaves the vision attention at default precision, so backends may
+        // accumulate KQ in FP16 (CUDA tile kernel without tensor cores: hfma2 sums). Default f32.
+        static const bool fa_prec_f16 = [] {
+            const char * e = getenv("LLAMA_MTMD_FA_PREC");
+            return e != nullptr && (strcmp(e, "f16") == 0 || strcmp(e, "fp16") == 0);
+        }();
+        if (!fa_prec_f16) {
+            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        }
         if (sinks != nullptr) {
             ggml_flash_attn_ext_add_sinks(cur, sinks);
         }
@@ -1490,6 +1498,17 @@ struct clip_model_loader {
                         get_f32("clip.vision.rope_theta", hparams.rope_theta, false);
                         // warmup on the config image_size (448x448), avoids OOM on load
                         hparams.warmup_image_size = hparams.image_size;
+                        // --image-min-tokens / --image-max-tokens win over the GGUF pixel limits
+                        if (hparams.custom_image_min_tokens > 0 || hparams.custom_image_max_tokens > 0) {
+                            const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
+                            if (hparams.custom_image_min_tokens > 0) {
+                                hparams.image_min_pixels = hparams.custom_image_min_tokens * patch_area;
+                            }
+                            if (hparams.custom_image_max_tokens > 0) {
+                                hparams.image_max_pixels = hparams.custom_image_max_tokens * patch_area;
+                            }
+                            hparams.warmup_image_size = hparams.image_size;
+                        }
                     } break;
                 case PROJECTOR_TYPE_MINIMAX_M3:
                     {

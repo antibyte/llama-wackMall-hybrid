@@ -1071,11 +1071,14 @@ struct server_slot {
         // TODO @ngxson : move this log line to debug when it become more stable
         SLT_TRC(*this, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+        const int64_t t_encode_start = ggml_time_us();
         res = mtmd_batch_encode(mbatch.get());
         if (res != 0) {
             SLT_ERR(*this, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
             return -1;
         }
+        SLT_INF(*this, "media encode: %d chunk(s), first chunk %d tokens, %.1f ms\n", n_added,
+                (int) mtmd_input_chunk_get_n_tokens(chunk.get()), (ggml_time_us() - t_encode_start) / 1000.0);
 
         return try_decode();
     }
