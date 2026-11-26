@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 #
-# llama-wackMall-hybrid GTX 1660 Ti launcher for SenseNova-Loop-9B-Preview Q3_K_M.
+# llama-wackMall-hybrid GTX 1660 Ti launcher for SenseNova-Loop-9B Q3_K_M.
 #
 # Alle Einstellungen stehen in diesem Block. Keine Kommandozeilenparameter,
 # keine stillen Shell-Overrides. Nach einer Aenderung: ./start-sensenova-loop-9b.sh
 #
-# SenseNova-Loop-9B-Preview Q3_K_M (4.32 GiB), guideboardlabs GGUF of
-# sensenova/SenseNova-Loop-9B-Preview. Arch sensenova_loop: Qwen3.5 9B hybrid
-# trunk (linear attention, full attention every 4th layer), layers 4..27 run
-# twice (56 passes from 32 stored layers), two mHC residual streams with a
-# sinkhorn router around every sublayer. Text only. The guideboardlabs GGUF has
-# no MTP head; download-sensenova-loop-9b.sh appends the trained head from the
-# HF repo (mtp.safetensors) as block 56 (Q4_0, +131 MiB).
-# Thinking is the template default.
+# SenseNova-Loop-9B Q3_K_M (4.32 GiB), guideboardlabs GGUF of
+# sensenova/SenseNova-Loop-9B (the release, not the Preview). Arch
+# sensenova_loop: Qwen3.5 9B hybrid trunk (linear attention, full attention
+# every 4th layer), layers 4..27 run twice (56 passes from 32 stored layers),
+# two mHC residual streams with a sinkhorn router around every sublayer.
+# Text only. Trained context is 524288 with YaRN factor 2 over 262144; the
+# fork reads rope.scaling from the GGUF. The release export has no MTP head
+# (the Preview launcher grafted mtp.safetensors as block 56). Thinking is
+# the template default.
+# The numbers below are the Preview Q3_K_M on this card (2026-11-01), same
+# quant and shape. This checkpoint has not been remeasured. Those VRAM peaks
+# include the Preview MTP head (131 MiB) and its rollback state.
 # Bench 2026-11-01 GTX 1660 Ti, build-main-sm75 (agollm stopped):
 #   tg128 23.2 t/s, pp512 257 t/s. Before the Q3_K matvec changes (SWAR byte
 #   subtract, VDR 2) and Q3_K rows=2 it was 20.4 t/s.
@@ -49,7 +53,7 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # ============================================================================
 
 SERVER="$PROJECT_ROOT/build-main-sm75/bin/llama-server"
-MODEL="$HOME/models/sensenova-loop-9b/SenseNova-Loop-9B-Preview-Q3_K_M-mtp-q4_0.gguf"  # trunk + MTP head
+MODEL="$HOME/models/sensenova-loop-9b/SenseNova-Loop-9B-Q3_K_M.gguf"
 CHAT_TEMPLATE_FILE=""  # GGUF Jinja; generation prompt opens <think>
 
 # Network / OpenWebUI
@@ -99,9 +103,9 @@ LLAMA_KVFLASH_POLICY="qk"  # lru | qk (keep chunks by query-key score)
 LLAMA_KVFLASH_STATS="0"
 
 # Speculative decoding: none | ngram | mtp | ngram-mtp
-# ngram-mtp: ngram-simple drafts first (edits), the MTP head when no n-gram matches.
-SPEC_MODE="ngram-mtp"
-SPEC_DRAFT_N_MAX="1"  # MTP draft tokens; ngram-simple drafts up to its size_m (48)
+# The release GGUF has no MTP head, so mtp and ngram-mtp will not load.
+SPEC_MODE="ngram"
+SPEC_DRAFT_N_MAX="1"  # only the MTP draft length; ngram-simple uses size_m (48)
 SPEC_DRAFT_P_MIN=""   # MTP stops drafting below this top-1 probability; empty = server default 0
 MTP_PROCESS_CHUNK="0" # tokens per MTP catch-up decode, 0 = draft ubatch (fork default 8)
 NGRAM_SIMPLE_SIZE_N=""
