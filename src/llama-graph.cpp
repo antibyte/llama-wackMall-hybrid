@@ -3205,14 +3205,16 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_tensor * k_dep = ggml_sum(ctx0, ggml_cast(ctx0, ggml_view_1d(ctx0, stored_k, 1, 0), GGML_TYPE_F32));
             ggml_tensor * v_dep = ggml_sum(ctx0, ggml_cast(ctx0, ggml_view_1d(ctx0, stored_v, 1, 0), GGML_TYPE_F32));
             KvFlashStreamUser * user = mctx_cur->kvflash_stream_prepare(
-                    il, n_head, n_head_kv, head_dim, kq_scale);
-            // Keep the causal mask allocated. Nothing else reads it on this path,
-            // and set_input asserts if an input tensor has no buffer.
-            ggml_tensor * stream_args[] = { q_stream, k_dep, v_dep, kq_mask };
-            cur = ggml_custom_4d(ctx0, GGML_TYPE_F32,
-                    (int64_t) head_dim * n_head, q_cur->ne[2], 1, 1,
-                    stream_args, 4, llama_kvflash_stream_op, 1, user);
-            ggml_build_forward_expand(gf, cur);
+                    il, n_head, n_head_kv, head_dim, kq_scale, (int) q_cur->ne[2]);
+            if (user) {
+                // Keep the causal mask allocated. Nothing else reads it on this path,
+                // and set_input asserts if an input tensor has no buffer.
+                ggml_tensor * stream_args[] = { q_stream, k_dep, v_dep, kq_mask };
+                cur = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+                        (int64_t) head_dim * n_head, q_cur->ne[2], 1, 1,
+                        stream_args, 4, llama_kvflash_stream_op, 1, user);
+                ggml_build_forward_expand(gf, cur);
+            }
         }
     }
 #endif

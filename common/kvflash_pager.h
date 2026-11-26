@@ -77,7 +77,8 @@ struct KvFlashStateSpan {
 
 // One logical chunk of one layer, in position order.
 // host == 0: k/v are device pointers into the resident pool.
-// host == 1: k/v are host snapshots. n_tok may be short on the tail chunk.
+// host == 1: k/v are host snapshots in pageable memory, 2: in pinned memory
+// (device-readable at the same address). n_tok may be short on the tail chunk.
 struct KvFlashChunkRef {
     const void * k = nullptr;
     const void * v = nullptr;
@@ -1022,7 +1023,7 @@ public:
                 ref.v = (const uint8_t *) v->data + (size_t) state.block * v_seg;
             } else if (state.on_host && state.snapshot_valid && state.host_ptr != nullptr &&
                     !state.host_inflight) {
-                ref.host = 1;
+                ref.host = state.host_pinned ? 2 : 1;
                 ref.k = state.host_ptr + k_off;
                 ref.v = state.host_ptr + v_off;
             } else {
@@ -1053,6 +1054,7 @@ private:
         bool device_inflight = false;
         uint64_t last_use = 0;
         uint8_t * host_ptr = nullptr;
+        bool host_pinned = false;
     };
 
     struct HostSlab {
@@ -1406,6 +1408,9 @@ private:
             return false;
         }
         state.host_ptr = base + slab.used;
+        // The CUDA host type falls back to a CPU buffer when pinning fails.
+        state.host_pinned = slab.buffer != nullptr && host_buft_ != nullptr &&
+            ggml_backend_buffer_get_type(slab.buffer) == host_buft_;
         slab.used += chunk_bytes_;
         stats_.host_bytes += (int64_t) chunk_bytes_;
         return true;

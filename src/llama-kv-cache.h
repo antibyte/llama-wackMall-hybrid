@@ -21,6 +21,8 @@ struct KvFlashStreamUser {
     int n_head_kv = 0;
     int head_dim = 0;
     float scale = 0.f;
+    size_t k_row = 0;
+    size_t v_row = 0;
 };
 
 void llama_kvflash_stream_op(struct ggml_tensor * dst, int ith, int nth, void * userdata);
@@ -187,7 +189,11 @@ public:
     common_kvflash::KvFlashPager * get_kvflash() const;
     bool has_kvflash() const;
     // Stable across later prepare() calls for other layers. Used as ggml custom userdata.
-    KvFlashStreamUser * kvflash_stream_prepare(int il, int n_head, int n_head_kv, int head_dim, float scale);
+    // Also sizes the device arena of the stream op for graphs of up to n_tokens queries.
+    // nullptr: no arena (the graph then attends the resident pool only).
+    KvFlashStreamUser * kvflash_stream_prepare(int il, int n_head, int n_head_kv, int head_dim, float scale, int n_tokens);
+    void * kvflash_stream_arena(size_t & bytes, int & n_q_max, int & n_ctx) const;
+    int kvflash_stream_ctx() const;
     bool kvflash_export_chunks(int il, int64_t n_tokens, std::vector<common_kvflash::KvFlashChunkRef> & out);
 
     bool can_commit_tree(
@@ -339,6 +345,13 @@ private:
     // physical pool slots and may page cold chunks to host.
     std::unique_ptr<common_kvflash::KvFlashPager> kvflash; // complete type via kvflash_pager.h
     std::deque<KvFlashStreamUser> kvflash_stream_users;
+    uint32_t kvflash_max_ctx = 0;
+    // Device arena of the stream op, sized at graph build (max over layers and query batches).
+    ggml_backend_buffer_ptr kvflash_stream_buf;
+    size_t kvflash_stream_need = 0;
+    ggml_backend_buffer_type_t kvflash_stream_buft = nullptr;
+    int kvflash_stream_n_q_max = 0;
+    bool kvflash_stream_alloc_failed = false;
 
     struct kvflash_cell_page {
         std::vector<llama_pos> pos;
@@ -448,7 +461,7 @@ public:
     uint32_t get_n_kv() const;
     const llama_kv_cache::slot_info & get_slot_info() const;
     bool has_kvflash() const;
-    KvFlashStreamUser * kvflash_stream_prepare(int il, int n_head, int n_head_kv, int head_dim, float scale) const;
+    KvFlashStreamUser * kvflash_stream_prepare(int il, int n_head, int n_head_kv, int head_dim, float scale, int n_tokens) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

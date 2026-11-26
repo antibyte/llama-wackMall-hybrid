@@ -723,6 +723,33 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 }
 
+ggml_cuda_fattn_parts *& ggml_cuda_fattn_parts_current() {
+    static thread_local ggml_cuda_fattn_parts * cur = nullptr;
+    return cur;
+}
+
+bool ggml_cuda_flash_attn_ext_parts(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_fattn_parts * parts) {
+    ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_flash_attn_ext_mla_dec_applies(dst)) {
+        return false;
+    }
+    best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (kernel == BEST_FATTN_KERNEL_NONE) {
+        return false;
+    }
+    if (kernel == BEST_FATTN_KERNEL_MMA_F16) {
+        kernel = BEST_FATTN_KERNEL_TILE; // stream-K fixup has no exportable partials
+    }
+    ggml_cuda_fattn_parts_current() = parts;
+    if (kernel == BEST_FATTN_KERNEL_VEC) {
+        ggml_cuda_flash_attn_ext_vec(ctx, dst);
+    } else {
+        ggml_cuda_flash_attn_ext_tile(ctx, dst);
+    }
+    ggml_cuda_fattn_parts_current() = nullptr;
+    return parts->blocks > 0;
+}
+
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

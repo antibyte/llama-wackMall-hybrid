@@ -950,6 +950,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
             ret[buft] += ggml_backend_buffer_get_size(buf.get());
         }
     }
+    if (kvflash_stream_buf) {
+        ret[ggml_backend_buffer_get_type(kvflash_stream_buf.get())] += ggml_backend_buffer_get_size(kvflash_stream_buf.get());
+    } else if (hparams.no_alloc && kvflash_stream_buft && kvflash_stream_need > 0) {
+        ret[kvflash_stream_buft] += kvflash_stream_need;
+    }
 
     return ret;
 }
@@ -1769,6 +1774,7 @@ bool llama_kv_cache::init_kvflash(uint32_t pool_tokens, uint32_t max_context_tok
     cfg.chunk_tokens       = chunk_tokens;
     cfg.pool_tokens        = (int) pool_tokens;
     cfg.max_context_tokens = max_context_tokens;
+    kvflash_max_ctx        = max_context_tokens;
     cfg.sink_chunks        = 1;
     // ~128-token protected tail (2 chunks @ 64). Smaller tail leaves more
     // pool for pageable history (important on 6 GiB with pool 512–1024).
@@ -1839,7 +1845,7 @@ bool llama_kv_cache::has_kvflash() const {
 }
 
 KvFlashStreamUser * llama_kv_cache::kvflash_stream_prepare(
-        int il, int n_head, int n_head_kv, int head_dim, float scale) {
+        int il, int n_head, int n_head_kv, int head_dim, float scale, int n_tokens) {
     while ((int) kvflash_stream_users.size() <= il) {
         kvflash_stream_users.emplace_back();
     }
@@ -1850,7 +1856,69 @@ KvFlashStreamUser * llama_kv_cache::kvflash_stream_prepare(
     user.n_head_kv = n_head_kv;
     user.head_dim = head_dim;
     user.scale = scale;
+#ifdef GGML_USE_CUDA
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
+    try {
+        k = get_k_storage(il);
+        v = get_v_storage(il);
+    } catch (const std::out_of_range &) {
+        return nullptr;
+    }
+    if (!k || !v || !k->buffer || (!hparams.no_alloc && ggml_backend_buffer_is_host(k->buffer))) {
+        return nullptr;
+    }
+    user.k_row = k->nb[1];
+    user.v_row = v->nb[1];
+    kvflash_stream_n_q_max = std::max(kvflash_stream_n_q_max, std::max(n_tokens, 1));
+    const kvflash_stream_shape shape = {
+        n_head, n_head_kv, head_dim, user.k_row, user.v_row, kvflash_stream_n_q_max, kvflash_stream_ctx(),
+    };
+    const size_t need = kvflash_stream_arena_bytes(&shape);
+    if (need == 0) {
+        return nullptr;
+    }
+    kvflash_stream_need = std::max(kvflash_stream_need, need);
+    kvflash_stream_buft = ggml_backend_buffer_get_type(k->buffer);
+    if (hparams.no_alloc) {
+        return &user;
+    }
+    if (!kvflash_stream_buf || ggml_backend_buffer_get_size(kvflash_stream_buf.get()) < kvflash_stream_need) {
+        if (kvflash_stream_alloc_failed) {
+            return nullptr;
+        }
+        // Allocated here, at graph build, so the compute buffers reserved next see it.
+        kvflash_stream_buf.reset();
+        kvflash_stream_buf.reset(ggml_backend_buft_alloc_buffer(kvflash_stream_buft, kvflash_stream_need));
+        if (!kvflash_stream_buf) {
+            kvflash_stream_alloc_failed = true;
+            LLAMA_LOG_ERROR("%s: KVFlash stream arena of %.1f MiB does not fit, attention reads the resident pool only\n",
+                    __func__, kvflash_stream_need / (1024.0 * 1024.0));
+            return nullptr;
+        }
+        LLAMA_LOG_INFO("%s: KVFlash stream arena %.1f MiB on %s (window %d tokens, %d queries per graph)\n",
+                __func__, kvflash_stream_need / (1024.0 * 1024.0), ggml_backend_buft_name(kvflash_stream_buft),
+                kvflash_stream_window(&shape), kvflash_stream_n_q_max);
+    }
+#else
+    GGML_UNUSED(n_tokens);
+#endif
     return &user;
+}
+
+int llama_kv_cache::kvflash_stream_ctx() const {
+    return kvflash_max_ctx > 0 ? (int) kvflash_max_ctx : (1 << 30);
+}
+
+void * llama_kv_cache::kvflash_stream_arena(size_t & bytes, int & n_q_max, int & n_ctx) const {
+    n_q_max = kvflash_stream_n_q_max;
+    n_ctx = kvflash_stream_ctx();
+    if (!kvflash_stream_buf) {
+        bytes = 0;
+        return nullptr;
+    }
+    bytes = ggml_backend_buffer_get_size(kvflash_stream_buf.get());
+    return ggml_backend_buffer_get_base(kvflash_stream_buf.get());
 }
 
 bool llama_kv_cache::kvflash_export_chunks(
@@ -1878,8 +1946,8 @@ bool llama_kv_cache_context::has_kvflash() const {
 }
 
 KvFlashStreamUser * llama_kv_cache_context::kvflash_stream_prepare(
-        int il, int n_head, int n_head_kv, int head_dim, float scale) const {
-    return kv->kvflash_stream_prepare(il, n_head, n_head_kv, head_dim, scale);
+        int il, int n_head, int n_head_kv, int head_dim, float scale, int n_tokens) const {
+    return kv->kvflash_stream_prepare(il, n_head, n_head_kv, head_dim, scale, n_tokens);
 }
 
 void llama_kvflash_stream_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
@@ -1921,6 +1989,10 @@ void llama_kvflash_stream_op(ggml_tensor * dst, int ith, int nth, void * userdat
         std::memset(dst->data, 0, n_bytes);
         return;
     }
+    size_t arena_bytes = 0;
+    int n_q_max = 0;
+    int n_ctx = 0;
+    void * arena = user->kv->kvflash_stream_arena(arena_bytes, n_q_max, n_ctx);
     std::vector<kvflash_stream_chunk> raw(chunks.size());
     for (size_t i = 0; i < chunks.size(); ++i) {
         raw[i].k = chunks[i].k;
@@ -1931,15 +2003,17 @@ void llama_kvflash_stream_op(ggml_tensor * dst, int ith, int nth, void * userdat
         raw[i].k_stride = chunks[i].k_stride;
         raw[i].v_stride = chunks[i].v_stride;
     }
-    kvflash_stream_args args;
+    kvflash_stream_args args = {};
     args.q = (const float *) q->data;
     args.dst = (float *) dst->data;
     args.n_q = n_q;
-    args.n_head = user->n_head;
-    args.n_head_kv = user->n_head_kv;
-    args.head_dim = user->head_dim;
-    args.scale = user->scale;
     args.q_pos0 = (int) (n_pos - n_q);
+    args.scale = user->scale;
+    args.shape = {
+        user->n_head, user->n_head_kv, user->head_dim, user->k_row, user->v_row, n_q_max, n_ctx,
+    };
+    args.arena = arena;
+    args.arena_bytes = arena_bytes;
     args.chunks = raw.data();
     args.n_chunks = (int) raw.size();
     if (!kvflash_stream_attn(&args)) {

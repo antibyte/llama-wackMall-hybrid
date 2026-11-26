@@ -1087,6 +1087,21 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Optional export of the parallel-block partials instead of combining them, for callers
+// that merge several FA calls over disjoint KV ranges (KVFlash stream).
+// parts: [rows][blocks][DV] unnormalized, meta: [rows][blocks] (KQ max, KQ sum).
+struct ggml_cuda_fattn_parts {
+    float  * parts = nullptr;
+    float2 * meta = nullptr;
+    size_t   cap_parts = 0;      // floats
+    size_t   cap_meta = 0;       // float2
+    bool     allow_single = false; // one block may write the normalized result to dst
+    int      blocks = 0;         // out: blocks used, 0 = nothing launched
+};
+
+// Set only around one launch on the calling thread.
+ggml_cuda_fattn_parts *& ggml_cuda_fattn_parts_current();
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1113,6 +1128,14 @@ void launch_fattn(
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+
+    ggml_cuda_fattn_parts * ext = ggml_cuda_fattn_parts_current();
+    if (ext) {
+        ext->blocks = 0;
+        if (stream_k || (need_f16_K && K->type != GGML_TYPE_F16) || (need_f16_V && V->type != GGML_TYPE_F16)) {
+            return; // export needs the plain parallel-block layout and no temp buffers
+        }
+    }
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1209,7 +1232,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && mask->type == GGML_TYPE_F16 && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (!ext && mask && mask->type == GGML_TYPE_F16 && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1268,14 +1291,21 @@ void launch_fattn(
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        int parallel_blocks_max = ntiles_KV;
+        if (ext) {
+            const size_t cap_rows  = ext->cap_meta  / (size_t) ggml_nrows(KQV);
+            const size_t cap_elems = ext->cap_parts / (size_t) ggml_nelements(KQV);
+            parallel_blocks_max = (int) std::min<size_t>((size_t) parallel_blocks_max, std::min(cap_rows, cap_elems));
+            parallel_blocks_max = std::max(parallel_blocks_max, 1); // one block writes dst, not the parts
+        }
+        parallel_blocks = std::min(parallel_blocks, parallel_blocks_max);
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= parallel_blocks_max; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
@@ -1292,11 +1322,18 @@ void launch_fattn(
             }
         }
 
+        if (ext && parallel_blocks < 2 && !ext->allow_single) {
+            if (parallel_blocks_max < 2) {
+                return; // a merged call needs the (max, sum) meta, which one block does not write
+            }
+            parallel_blocks = 2;
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
 
-        if (parallel_blocks > 1) {
+        if (parallel_blocks > 1 && !ext) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
         }
@@ -1333,7 +1370,8 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        !stream_k && parallel_blocks > 1 ? (ext ? ext->parts : dst_tmp.ptr) : (float *) KQV->data,
+        ext && parallel_blocks > 1 ? ext->meta : dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
@@ -1379,6 +1417,8 @@ void launch_fattn(
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
+    } else if (ext) {
+        ext->blocks = parallel_blocks;
     } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
