@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -3146,12 +3147,16 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
 
     // store to KV cache
+    ggml_tensor * stored_k = nullptr;
+    ggml_tensor * stored_v = nullptr;
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        stored_k = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        stored_v = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        ggml_build_forward_expand(gf, stored_k);
+        ggml_build_forward_expand(gf, stored_v);
     }
 
     ggml_tensor * kq_mask = kq_mask_override ? kq_mask_override : inp->get_kq_mask();
@@ -3160,7 +3165,60 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = nullptr;
+#ifdef GGML_USE_CUDA
+    {
+        static int decided = 0;
+        const char * block = nullptr;
+        const char * env = std::getenv("LLAMA_KVFLASH_STREAM");
+        const bool requested = env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+        const int head_dim = (int) q_cur->ne[0];
+        const int n_head = (int) q_cur->ne[1];
+        const int n_head_kv = (int) k_cur->ne[1];
+        if (!requested) {
+            block = nullptr;
+        } else if (!mctx_cur->has_kvflash()) {
+            block = "KVFlash is off";
+        } else if (kq_b || sinks || v_mla) {
+            block = "bias, sinks, or MLA";
+        } else if (hparams.f_max_alibi_bias != 0.0f || hparams.attn_soft_cap) {
+            block = "alibi or logit softcap";
+        } else if (mctx_cur->type_k() != GGML_TYPE_F16 || mctx_cur->type_v() != GGML_TYPE_F16) {
+            block = "KV type is not f16";
+        } else if (head_dim != (int) k_cur->ne[0] || head_dim != (int) v_cur->ne[0] ||
+                n_head_kv <= 0 || n_head % n_head_kv != 0 ||
+                head_dim < 32 || head_dim > 256 || head_dim % 32 != 0) {
+            block = "unsupported head shape";
+        }
+        if (requested && block && !decided) {
+            decided = 1;
+            LLAMA_LOG_WARN("%s: KVFlash stream disabled (%s)\n", __func__, block);
+        } else if (requested && !block) {
+            if (!decided) {
+                decided = 1;
+                LLAMA_LOG_INFO("%s: KVFlash stream attention (every KV chunk, host tiles included)\n", __func__);
+            }
+            ggml_tensor * q_stream = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+            q_stream = ggml_cast(ctx0, ggml_cont(ctx0, q_stream), GGML_TYPE_F32);
+            // A one-element reduction keeps the custom op after the KV store.
+            // Passing the view itself has no buffer and the scheduler aborts.
+            ggml_tensor * k_dep = ggml_sum(ctx0, ggml_cast(ctx0, ggml_view_1d(ctx0, stored_k, 1, 0), GGML_TYPE_F32));
+            ggml_tensor * v_dep = ggml_sum(ctx0, ggml_cast(ctx0, ggml_view_1d(ctx0, stored_v, 1, 0), GGML_TYPE_F32));
+            KvFlashStreamUser * user = mctx_cur->kvflash_stream_prepare(
+                    il, n_head, n_head_kv, head_dim, kq_scale);
+            // Keep the causal mask allocated. Nothing else reads it on this path,
+            // and set_input asserts if an input tensor has no buffer.
+            ggml_tensor * stream_args[] = { q_stream, k_dep, v_dep, kq_mask };
+            cur = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+                    (int64_t) head_dim * n_head, q_cur->ne[2], 1, 1,
+                    stream_args, 4, llama_kvflash_stream_op, 1, user);
+            ggml_build_forward_expand(gf, cur);
+        }
+    }
+#endif
+    if (!cur) {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

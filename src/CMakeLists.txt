@@ -62,6 +62,17 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    enable_language(CUDA)
+    target_sources(llama PRIVATE kvflash-stream.cu)
+    set_source_files_properties(kvflash-stream.cu PROPERTIES LANGUAGE CUDA)
+    target_link_libraries(llama PRIVATE CUDA::cudart)
+    if (TARGET ggml-cuda)
+        target_link_libraries(llama PRIVATE ggml-cuda)
+    endif()
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

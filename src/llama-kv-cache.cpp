@@ -7,10 +7,12 @@
 #include "llama-context.h"
 
 #include "kvflash_pager.h"
+#include "kvflash-stream.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -1834,6 +1836,118 @@ common_kvflash::KvFlashPager * llama_kv_cache::get_kvflash() const {
 
 bool llama_kv_cache::has_kvflash() const {
     return kvflash != nullptr;
+}
+
+KvFlashStreamUser * llama_kv_cache::kvflash_stream_prepare(
+        int il, int n_head, int n_head_kv, int head_dim, float scale) {
+    while ((int) kvflash_stream_users.size() <= il) {
+        kvflash_stream_users.emplace_back();
+    }
+    KvFlashStreamUser & user = kvflash_stream_users[(size_t) il];
+    user.kv = this;
+    user.il = il;
+    user.n_head = n_head;
+    user.n_head_kv = n_head_kv;
+    user.head_dim = head_dim;
+    user.scale = scale;
+    return &user;
+}
+
+bool llama_kv_cache::kvflash_export_chunks(
+        int il, int64_t n_tokens, std::vector<common_kvflash::KvFlashChunkRef> & out) {
+    out.clear();
+    if (!kvflash || il < 0 || !kvflash->synchronize_paging()) {
+        return false;
+    }
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
+    try {
+        k = get_k_storage(il);
+        v = get_v_storage(il);
+    } catch (const std::out_of_range &) {
+        return false;
+    }
+    if (!k || !v || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) {
+        return false;
+    }
+    return kvflash->export_chunks(k, v, n_tokens, out);
+}
+
+bool llama_kv_cache_context::has_kvflash() const {
+    return kv && kv->has_kvflash();
+}
+
+KvFlashStreamUser * llama_kv_cache_context::kvflash_stream_prepare(
+        int il, int n_head, int n_head_kv, int head_dim, float scale) const {
+    return kv->kvflash_stream_prepare(il, n_head, n_head_kv, head_dim, scale);
+}
+
+void llama_kvflash_stream_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0 || !dst || !userdata) {
+        return;
+    }
+    const KvFlashStreamUser * user = (const KvFlashStreamUser *) userdata;
+    const ggml_tensor * q = dst->src[0];
+    const int64_t n_bytes = ggml_nbytes(dst);
+    if (!q || q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        user->head_dim <= 0 || q->ne[0] != user->head_dim || q->ne[2] != user->n_head ||
+        dst->ne[0] != (int64_t) user->head_dim * user->n_head || dst->ne[1] != q->ne[1]) {
+        std::fprintf(stderr, "kvflash stream: unexpected Q/dst shape\n");
+        if (dst->data && n_bytes > 0) {
+            std::memset(dst->data, 0, n_bytes);
+        }
+        return;
+    }
+#ifndef GGML_USE_CUDA
+    GGML_UNUSED(user);
+    std::fprintf(stderr, "kvflash stream: built without CUDA\n");
+    std::memset(dst->data, 0, n_bytes);
+    return;
+#else
+    const llama_pos pmax = user->kv->seq_pos_max(0);
+    const int n_q = (int) q->ne[1];
+    if (pmax < 0 || (int64_t) pmax + 1 < n_q) {
+        std::fprintf(stderr, "kvflash stream: position range pmax=%lld n_q=%d\n",
+                (long long) pmax, n_q);
+        std::memset(dst->data, 0, n_bytes);
+        return;
+    }
+    const int64_t n_pos = (int64_t) pmax + 1;
+    std::vector<common_kvflash::KvFlashChunkRef> chunks;
+    if (!user->kv->kvflash_export_chunks(user->il, n_pos, chunks) || chunks.empty()) {
+        std::fprintf(stderr, "kvflash stream: no chunks for layer %d n_pos=%lld\n",
+                user->il, (long long) n_pos);
+        std::memset(dst->data, 0, n_bytes);
+        return;
+    }
+    std::vector<kvflash_stream_chunk> raw(chunks.size());
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        raw[i].k = chunks[i].k;
+        raw[i].v = chunks[i].v;
+        raw[i].host = chunks[i].host;
+        raw[i].n_tok = chunks[i].n_tok;
+        raw[i].pos0 = chunks[i].pos0;
+        raw[i].k_stride = chunks[i].k_stride;
+        raw[i].v_stride = chunks[i].v_stride;
+    }
+    kvflash_stream_args args;
+    args.q = (const float *) q->data;
+    args.dst = (float *) dst->data;
+    args.n_q = n_q;
+    args.n_head = user->n_head;
+    args.n_head_kv = user->n_head_kv;
+    args.head_dim = user->head_dim;
+    args.scale = user->scale;
+    args.q_pos0 = (int) (n_pos - n_q);
+    args.chunks = raw.data();
+    args.n_chunks = (int) raw.size();
+    if (!kvflash_stream_attn(&args)) {
+        std::fprintf(stderr, "kvflash stream: attention failed layer %d n_q=%d n_pos=%lld\n",
+                user->il, n_q, (long long) n_pos);
+        std::memset(dst->data, 0, n_bytes);
+    }
+#endif
 }
 
 void llama_kv_cache::kvflash_clear_block(int block, int chunk_tokens) {

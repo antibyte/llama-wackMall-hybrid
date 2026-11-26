@@ -6,10 +6,24 @@
 #include "llama-memory.h"
 #include "kvflash_pager.h"
 
+#include <deque>
 #include <memory>
 #include <set>
 #include <unordered_map>
 #include <vector>
+
+class llama_kv_cache;
+
+struct KvFlashStreamUser {
+    llama_kv_cache * kv = nullptr;
+    int il = 0;
+    int n_head = 0;
+    int n_head_kv = 0;
+    int head_dim = 0;
+    float scale = 0.f;
+};
+
+void llama_kvflash_stream_op(struct ggml_tensor * dst, int ith, int nth, void * userdata);
 
 struct llama_cparams;
 struct llama_hparams;
@@ -172,6 +186,9 @@ public:
     bool init_kvflash(uint32_t pool_tokens, uint32_t max_context_tokens, int chunk_tokens = 64);
     common_kvflash::KvFlashPager * get_kvflash() const;
     bool has_kvflash() const;
+    // Stable across later prepare() calls for other layers. Used as ggml custom userdata.
+    KvFlashStreamUser * kvflash_stream_prepare(int il, int n_head, int n_head_kv, int head_dim, float scale);
+    bool kvflash_export_chunks(int il, int64_t n_tokens, std::vector<common_kvflash::KvFlashChunkRef> & out);
 
     bool can_commit_tree(
             llama_seq_id seq_id,
@@ -321,6 +338,7 @@ private:
     // Optional KVFlash pager (owned). When set, find_slot maps logical pos →
     // physical pool slots and may page cold chunks to host.
     std::unique_ptr<common_kvflash::KvFlashPager> kvflash; // complete type via kvflash_pager.h
+    std::deque<KvFlashStreamUser> kvflash_stream_users;
 
     struct kvflash_cell_page {
         std::vector<llama_pos> pos;
@@ -429,6 +447,8 @@ public:
 
     uint32_t get_n_kv() const;
     const llama_kv_cache::slot_info & get_slot_info() const;
+    bool has_kvflash() const;
+    KvFlashStreamUser * kvflash_stream_prepare(int il, int n_head, int n_head_kv, int head_dim, float scale) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

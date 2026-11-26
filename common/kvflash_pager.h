@@ -75,6 +75,19 @@ struct KvFlashStateSpan {
     size_t size = 0;
 };
 
+// One logical chunk of one layer, in position order.
+// host == 0: k/v are device pointers into the resident pool.
+// host == 1: k/v are host snapshots. n_tok may be short on the tail chunk.
+struct KvFlashChunkRef {
+    const void * k = nullptr;
+    const void * v = nullptr;
+    int host = 0;
+    int n_tok = 0;
+    int64_t pos0 = 0;
+    size_t k_stride = 0;
+    size_t v_stride = 0;
+};
+
 class KvFlashPager {
 public:
     KvFlashPager() = default;
@@ -943,6 +956,82 @@ public:
             }
         }
         return (int) (outgoing.size() + incoming.size());
+    }
+
+    // Logical chunks [0, n_tokens) for one K/V pair. Resident chunks point at
+    // the device pool; cold chunks point at the host snapshot. Fails if any
+    // chunk in that range has neither.
+    bool export_chunks(const ggml_tensor * k, const ggml_tensor * v, int64_t n_tokens,
+            std::vector<KvFlashChunkRef> & out) const {
+        out.clear();
+        if (!k || !v || !k->data || !v->data || n_tokens <= 0 || cfg_.chunk_tokens <= 0) {
+            return false;
+        }
+        size_t k_off = (size_t) -1;
+        size_t v_off = (size_t) -1;
+        size_t k_seg = 0;
+        size_t v_seg = 0;
+        size_t cursor = 0;
+        for (const TensorBinding & binding : bindings_) {
+            if (binding.tensor == k) {
+                k_off = cursor;
+                k_seg = binding.segment_bytes;
+            }
+            if (binding.tensor == v) {
+                v_off = cursor;
+                v_seg = binding.segment_bytes;
+            }
+            if (cursor > (size_t) -1 - binding.segment_bytes) {
+                return false;
+            }
+            cursor += binding.segment_bytes;
+        }
+        if (k_off == (size_t) -1 || v_off == (size_t) -1) {
+            return false;
+        }
+        const int chunk = cfg_.chunk_tokens;
+        const size_t k_row = k->nb[1];
+        const size_t v_row = v->nb[1];
+        if (k_row == 0 || v_row == 0 ||
+            k_seg != (size_t) chunk * k_row || v_seg != (size_t) chunk * v_row) {
+            return false;
+        }
+        const int64_t n_chunks64 = (n_tokens + chunk - 1) / chunk;
+        if (n_chunks64 <= 0 || n_chunks64 > (int64_t) chunks_.size() ||
+            n_chunks64 > (int64_t) std::numeric_limits<int>::max()) {
+            return false;
+        }
+        const int n_chunks = (int) n_chunks64;
+        out.reserve((size_t) n_chunks);
+        for (int c = 0; c < n_chunks; ++c) {
+            const ChunkState & state = chunks_[(size_t) c];
+            const int64_t pos0 = (int64_t) c * chunk;
+            const int n_tok = (int) std::min<int64_t>(chunk, n_tokens - pos0);
+            if (n_tok <= 0) {
+                out.clear();
+                return false;
+            }
+            KvFlashChunkRef ref;
+            ref.n_tok = n_tok;
+            ref.pos0 = pos0;
+            ref.k_stride = k_row;
+            ref.v_stride = v_row;
+            if (state.block >= 0) {
+                ref.host = 0;
+                ref.k = (const uint8_t *) k->data + (size_t) state.block * k_seg;
+                ref.v = (const uint8_t *) v->data + (size_t) state.block * v_seg;
+            } else if (state.on_host && state.snapshot_valid && state.host_ptr != nullptr &&
+                    !state.host_inflight) {
+                ref.host = 1;
+                ref.k = state.host_ptr + k_off;
+                ref.v = state.host_ptr + v_off;
+            } else {
+                out.clear();
+                return false;
+            }
+            out.push_back(ref);
+        }
+        return true;
     }
 
 private:
