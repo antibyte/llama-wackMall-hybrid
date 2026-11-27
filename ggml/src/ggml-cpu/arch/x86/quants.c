@@ -11,6 +11,40 @@
 #include <math.h>
 #include <string.h>
 #include <assert.h>
+#include <stdlib.h>
+#if defined(__BMI2__) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#endif
+
+#if defined(__BMI2__)
+// PDEP is microcoded on AMD before Zen 3 (family 19h), ~250 cycles instead of 3:
+// IQ1_S matvec ran at 14 vs 135 GFLOPS (NVFP4) on a Ryzen 7 4800H. The shift
+// path is used there. GGML_CPU_PDEP=0/1 overrides the detection.
+static int ggml_x86_fast_pdep(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    int fast = 1;
+    const char * env = getenv("GGML_CPU_PDEP");
+    if (env && *env) {
+        fast = atoi(env) != 0;
+    } else {
+#if defined(__GNUC__) || defined(__clang__)
+        unsigned a, b, c, d;
+        if (__get_cpuid(0, &a, &b, &c, &d) && b == 0x68747541 && __get_cpuid(1, &a, &b, &c, &d)) { // "AuthenticAMD"
+            unsigned family = (a >> 8) & 0xf;
+            if (family == 0xf) {
+                family += (a >> 20) & 0xff;
+            }
+            fast = family >= 0x19;
+        }
+#endif
+    }
+    cached = fast;
+    return fast;
+}
+#endif
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
@@ -695,6 +729,53 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     UNUSED(x);
     UNUSED(y);
     ggml_vec_dot_q1_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+// One Q2_0 block (64 weights, 2 bits, {0..3} -> {-1..2}) pairs with two Q8_0 blocks.
+// The generic loop ran at 32 GFLOPS on a Ryzen 7 4800H (NVFP4 135).
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    const int nb = n / QK2_0;
+
+    assert(n % QK2_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const __m128i m3 = _mm_set1_epi8(3);
+    const __m256i one = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        // byte b of a half holds elements 4b..4b+3 in bit pairs 0, 2, 4, 6
+        const __m128i raw = _mm_loadu_si128((const __m128i *) x[i].qs);
+        const __m128i q0 = _mm_and_si128(raw, m3);
+        const __m128i q1 = _mm_and_si128(_mm_srli_epi16(raw, 2), m3);
+        const __m128i q2 = _mm_and_si128(_mm_srli_epi16(raw, 4), m3);
+        const __m128i q3 = _mm_and_si128(_mm_srli_epi16(raw, 6), m3);
+        const __m128i a_lo = _mm_unpacklo_epi8(q0, q1);
+        const __m128i a_hi = _mm_unpackhi_epi8(q0, q1);
+        const __m128i c_lo = _mm_unpacklo_epi8(q2, q3);
+        const __m128i c_hi = _mm_unpackhi_epi8(q2, q3);
+        const __m256i h0 = _mm256_sub_epi8(MM256_SET_M128I(_mm_unpackhi_epi16(a_lo, c_lo), _mm_unpacklo_epi16(a_lo, c_lo)), one);
+        const __m256i h1 = _mm256_sub_epi8(MM256_SET_M128I(_mm_unpackhi_epi16(a_hi, c_hi), _mm_unpacklo_epi16(a_hi, c_hi)), one);
+
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const __m256 p0 = mul_sum_i8_pairs_float(h0, _mm256_loadu_si256((const __m256i *) y[2*i + 0].qs));
+        const __m256 p1 = mul_sum_i8_pairs_float(h1, _mm256_loadu_si256((const __m256i *) y[2*i + 1].qs));
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*i + 0].d)), p0, acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*i + 1].d)), p1, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
 
@@ -4109,6 +4190,9 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #if defined __AVX2__
 
+#ifdef __BMI2__
+    const int fast_pdep = ggml_x86_fast_pdep();
+#endif
     __m256 accum = _mm256_setzero_ps();
     float accum1 = 0;
     for (int i = 0; i < nb; ++i) {
@@ -4120,19 +4204,23 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
         __m256i sumi = _mm256_setzero_si256();
         int sumi1 = 0;
         for (int ib = 0; ib < QK_K/32; ib += 2) {
+            __m256i q1b_1, q1b_2;
 #ifdef __BMI2__
-            const uint64_t packed_idx1 = _pdep_u64(*(const uint32_t *)qs, 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib], 0x700070007000700ULL);
-            const uint64_t packed_idx2 = _pdep_u64(*(const uint32_t *)(qs + 4), 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib + 1], 0x700070007000700ULL);
-            const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
-            const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
-            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
-            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
-#else
-            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[qs[3] | ((qh[ib+0] >> 1) & 0x700)], iq1s_grid[qs[2] | ((qh[ib+0] << 2) & 0x700)],
-                                                    iq1s_grid[qs[1] | ((qh[ib+0] << 5) & 0x700)], iq1s_grid[qs[0] | ((qh[ib+0] << 8) & 0x700)]);
-            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[qs[7] | ((qh[ib+1] >> 1) & 0x700)], iq1s_grid[qs[6] | ((qh[ib+1] << 2) & 0x700)],
-                                                    iq1s_grid[qs[5] | ((qh[ib+1] << 5) & 0x700)], iq1s_grid[qs[4] | ((qh[ib+1] << 8) & 0x700)]);
+            if (fast_pdep) {
+                const uint64_t packed_idx1 = _pdep_u64(*(const uint32_t *)qs, 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib], 0x700070007000700ULL);
+                const uint64_t packed_idx2 = _pdep_u64(*(const uint32_t *)(qs + 4), 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib + 1], 0x700070007000700ULL);
+                const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
+                const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
+                q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
+                q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
+            } else
 #endif
+            {
+                q1b_1 = _mm256_set_epi64x(iq1s_grid[qs[3] | ((qh[ib+0] >> 1) & 0x700)], iq1s_grid[qs[2] | ((qh[ib+0] << 2) & 0x700)],
+                                          iq1s_grid[qs[1] | ((qh[ib+0] << 5) & 0x700)], iq1s_grid[qs[0] | ((qh[ib+0] << 8) & 0x700)]);
+                q1b_2 = _mm256_set_epi64x(iq1s_grid[qs[7] | ((qh[ib+1] >> 1) & 0x700)], iq1s_grid[qs[6] | ((qh[ib+1] << 2) & 0x700)],
+                                          iq1s_grid[qs[5] | ((qh[ib+1] << 5) & 0x700)], iq1s_grid[qs[4] | ((qh[ib+1] << 8) & 0x700)]);
+            }
             qs += 8;
             const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
             const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
@@ -4230,6 +4318,10 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #if defined __AVX2__
 
+#ifdef __BMI2__
+    const int fast_pdep = ggml_x86_fast_pdep();
+#endif
+
     const __m256i mask = _mm256_set1_epi16(0x7);
     const __m256i mone = _mm256_set1_epi16(1);
     const __m256i mone8 = _mm256_set1_epi8(1);
@@ -4259,39 +4351,43 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
         __m256i sumi1 = _mm256_setzero_si256();
         __m256i sumi2 = _mm256_setzero_si256();
         for (int ib = 0; ib < QK_K/32; ib += 2) {
+            __m256i q1b_1, q1b_2, delta1, delta2;
 #ifdef __BMI2__
-            const uint64_t packed_idx1 = _pdep_u64(*(const uint32_t *)qs, 0x00ff00ff00ff00ffULL)
-                                       | _pdep_u64(*(const uint16_t*)(qh) & 0x7777, 0xf000f000f000f00ULL);
-            const uint64_t packed_idx2 = _pdep_u64(*(const uint32_t *)(qs + 4), 0x00ff00ff00ff00ffULL)
-                                       | _pdep_u64(*(const uint16_t*)(qh + 2) & 0x7777, 0xf000f000f000f00ULL);
-            const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
-            const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
-            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
-            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
+            if (fast_pdep) {
+                const uint64_t packed_idx1 = _pdep_u64(*(const uint32_t *)qs, 0x00ff00ff00ff00ffULL)
+                                           | _pdep_u64(*(const uint16_t*)(qh) & 0x7777, 0xf000f000f000f00ULL);
+                const uint64_t packed_idx2 = _pdep_u64(*(const uint32_t *)(qs + 4), 0x00ff00ff00ff00ffULL)
+                                           | _pdep_u64(*(const uint16_t*)(qh + 2) & 0x7777, 0xf000f000f000f00ULL);
+                const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
+                const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
+                q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
+                q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
 
-            // Convert signs to bytes 0x81 (negative) or 0x01 (positive)
-            const uint64_t delta_sign = _pdep_u64(*(const uint32_t*)(qh) & 0x88888888, 0xf0f0f0f0f0f0f0f0ULL);
-            const __m256i delta1 = _mm256_or_si256(mone8, _mm256_cvtepi8_epi64(_mm_set1_epi32(delta_sign)));
-            const __m256i delta2 = _mm256_or_si256(mone8, _mm256_cvtepi8_epi64(_mm_set1_epi32(delta_sign >> 32)));
-#else
-            const __m256i q1b_1 = _mm256_set_epi64x(
-                    iq1s_grid[qs[3] | (((uint16_t)qh[1] << 4) & 0x700)], iq1s_grid[qs[2] | (((uint16_t)qh[1] << 8) & 0x700)],
-                    iq1s_grid[qs[1] | (((uint16_t)qh[0] << 4) & 0x700)], iq1s_grid[qs[0] | (((uint16_t)qh[0] << 8) & 0x700)]
-            );
-            const __m256i q1b_2 = _mm256_set_epi64x(
-                    iq1s_grid[qs[7] | (((uint16_t)qh[3] << 4) & 0x700)], iq1s_grid[qs[6] | (((uint16_t)qh[3] << 8) & 0x700)],
-                    iq1s_grid[qs[5] | (((uint16_t)qh[2] << 4) & 0x700)], iq1s_grid[qs[4] | (((uint16_t)qh[2] << 8) & 0x700)]
-            );
-
-            const __m256i delta1 = _mm256_set_epi64x(qh[1] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[1] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[0] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[0] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101);
-            const __m256i delta2 = _mm256_set_epi64x(qh[3] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[3] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[2] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[2] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101);
+                // Convert signs to bytes 0x81 (negative) or 0x01 (positive)
+                const uint64_t delta_sign = _pdep_u64(*(const uint32_t*)(qh) & 0x88888888, 0xf0f0f0f0f0f0f0f0ULL);
+                delta1 = _mm256_or_si256(mone8, _mm256_cvtepi8_epi64(_mm_set1_epi32(delta_sign)));
+                delta2 = _mm256_or_si256(mone8, _mm256_cvtepi8_epi64(_mm_set1_epi32(delta_sign >> 32)));
+            } else
 #endif
+            {
+                q1b_1 = _mm256_set_epi64x(
+                        iq1s_grid[qs[3] | (((uint16_t)qh[1] << 4) & 0x700)], iq1s_grid[qs[2] | (((uint16_t)qh[1] << 8) & 0x700)],
+                        iq1s_grid[qs[1] | (((uint16_t)qh[0] << 4) & 0x700)], iq1s_grid[qs[0] | (((uint16_t)qh[0] << 8) & 0x700)]
+                );
+                q1b_2 = _mm256_set_epi64x(
+                        iq1s_grid[qs[7] | (((uint16_t)qh[3] << 4) & 0x700)], iq1s_grid[qs[6] | (((uint16_t)qh[3] << 8) & 0x700)],
+                        iq1s_grid[qs[5] | (((uint16_t)qh[2] << 4) & 0x700)], iq1s_grid[qs[4] | (((uint16_t)qh[2] << 8) & 0x700)]
+                );
+
+                delta1 = _mm256_set_epi64x(qh[1] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
+                                           qh[1] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101,
+                                           qh[0] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
+                                           qh[0] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101);
+                delta2 = _mm256_set_epi64x(qh[3] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
+                                           qh[3] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101,
+                                           qh[2] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
+                                           qh[2] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101);
+            }
             const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
             const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
 
