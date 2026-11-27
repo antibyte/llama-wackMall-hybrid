@@ -1428,7 +1428,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,
                   float   kq_scale,
                     int   il,
-                int64_t   i_row) const;
+                int64_t   i_row,
+                   bool   bias_ready = false) const;
 
     //
     // pooling

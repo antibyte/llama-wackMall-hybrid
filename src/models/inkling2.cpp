@@ -513,6 +513,22 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 return ggml_cont(ctx0, ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], r0*t->nb[d]));
             };
             ggml_tensor * table = table_per_chunk && n_rows_max < n_seq_tokens ? nullptr : project(Rcur);
+            // LLAMA_INKLING2_BIAS_TRANSPOSE=1 (default; 0 = off): a prefill chunk subtracts its sink logits from the
+            // small bias table before the gather and brings the gathered bias into the softmax layout with the tiled
+            // transpose copy. Before, the sink subtraction read the gathered bias head-major through a permuted view:
+            // 2.0 of 17.3 s GPU time in a 3.8k prefill. Same values, so the output is unchanged.
+            static const bool bias_transpose = [] {
+                const char * e = getenv("LLAMA_INKLING2_BIAS_TRANSPOSE");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            // the gathered bias [n_head, n_kv, nr, 1] of a table with the sinks of its rows subtracted, transposed
+            // to [n_kv, nr, n_head, 1]
+            auto ready_bias = [&](ggml_tensor * tbl, ggml_tensor * pos, int64_t r0, int64_t nr) {
+                ggml_tensor * t4 = ggml_view_4d(ctx0, sinks, n_head, 1, nr, 1, sinks->nb[1], sinks->nb[1], sinks->nb[2], r0*sinks->nb[1]);
+                ggml_tensor * g  = ggml_get_rows(ctx0, ggml_sub(ctx0, tbl, t4), pos);
+                g = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, g, n_head, n_kv*nr)));
+                return ggml_reshape_4d(ctx0, g, n_kv, nr, n_head, 1);
+            };
             std::vector<ggml_tensor *> outs;
             for (int64_t r0 = 0; r0 < n_seq_tokens; r0 += n_rows_max) {
                 const int64_t nr  = std::min(n_rows_max, n_seq_tokens - r0);
@@ -520,9 +536,16 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 ggml_tensor * q_c  = Qcur;
                 ggml_tensor * kq_b = nullptr;
                 ggml_tensor * t_c  = all ? sinks : ggml_view_3d(ctx0, sinks, n_head, nr, n_stream, sinks->nb[1], sinks->nb[2], r0*sinks->nb[1]);
+                const bool ready = bias_transpose && nr > 1 && n_stream == 1;
                 if (all) {
-                    kq_b = ggml_get_rows(ctx0, table, rel_pos);
-                    kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, nr, n_stream);
+                    if (ready) {
+                        ggml_tensor * tbl = ggml_reshape_4d(ctx0, table, table->ne[0], table->ne[1], nr, 1);
+                        ggml_tensor * pos = ggml_is_contiguous(rel_pos) ? rel_pos : ggml_cont(ctx0, rel_pos);
+                        kq_b = ready_bias(tbl, ggml_reshape_3d(ctx0, pos, n_kv, nr, 1), 0, nr);
+                    } else {
+                        kq_b = ggml_get_rows(ctx0, table, rel_pos);
+                        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, nr, n_stream);
+                    }
                 } else {
                     q_c = ggml_reshape_3d(ctx0, rows(ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_seq_tokens, n_stream), 2, r0, nr),
                             n_embd_head, n_head, nr*n_stream);
@@ -542,13 +565,14 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                     }
                     ggml_tensor * rel_pos_c = ggml_view_3d(ctx0, rel_pos_dev, n_kv, nr, n_stream,
                             rel_pos_dev->nb[1], n_seq_tokens*rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);
-                    kq_b = ggml_get_rows(ctx0, table_c, rel_pos_c);
+                    kq_b = ready ? ready_bias(table_c, rel_pos_c, r0, nr) : ggml_get_rows(ctx0, table_c, rel_pos_c);
                 }
                 cb(kq_b, "kq_b", il);
 
-                // kq_b: the gathered bias [n_head, n_kv, nr, n_stream]; only the first chunk stores K and V
+                // kq_b: the gathered bias [n_head, n_kv, nr, n_stream] (ready: [n_kv, nr, n_head, 1], sinks subtracted);
+                // only the first chunk stores K and V
                 ggml_tensor * out = build_attn_rel(inp, q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr,
-                        kq_b, t_c, 1.0f/sqrtf(n_embd_head), il, r0);
+                        kq_b, t_c, 1.0f/sqrtf(n_embd_head), il, r0, ready);
                 outs.push_back(all ? out : ggml_reshape_3d(ctx0, out, out->ne[0], nr, n_stream));
             }
             while (outs.size() > 1) {

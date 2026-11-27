@@ -4006,7 +4006,8 @@ ggml_tensor * llm_graph_context::build_attn_rel(
         ggml_tensor * sinks,
               float   kq_scale,
                 int   il,
-            int64_t   i_row) const {
+            int64_t   i_row,
+               bool   bias_ready) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4031,7 +4032,8 @@ ggml_tensor * llm_graph_context::build_attn_rel(
 
     // the mask rows of this chunk of queries
     ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
-    const int64_t n_rows = kq_b->ne[2];
+    // bias_ready: kq_b is already [n_kv, n_rows, n_head, 1] with the sink logits subtracted
+    const int64_t n_rows = bias_ready ? kq_b->ne[1] : kq_b->ne[2];
     if (n_rows != kq_mask->ne[1] || i_row != 0) {
         GGML_ASSERT(i_row + n_rows <= kq_mask->ne[1]);
         kq_mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], n_rows, kq_mask->ne[2], kq_mask->ne[3],
@@ -4045,7 +4047,7 @@ ggml_tensor * llm_graph_context::build_attn_rel(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // [n_head, n_kv, n_rows, n_stream] -> [n_kv, n_rows, n_head, n_stream]
-    ggml_tensor * bias = ggml_permute(ctx0, kq_b, 2, 0, 1, 3);
+    ggml_tensor * bias = bias_ready ? kq_b : ggml_permute(ctx0, kq_b, 2, 0, 1, 3);
 
     // LLAMA_INKLING2_FA_ROWS=1 (default; 0 = off): a single query attends with flash attention, the bias and the
     // mask as one F32 mask per head (F16 would round biases up to 16 in steps of 1/64) and its sink logits as the
@@ -4057,14 +4059,16 @@ ggml_tensor * llm_graph_context::build_attn_rel(
     const bool v_trans = v->nb[1] > v->nb[2];
 
     ggml_tensor * cur = nullptr;
-    if (fa_single && cparams.flash_attn && !v_trans && n_rows*bias->ne[3] == 1) {
+    if (!bias_ready && fa_single && cparams.flash_attn && !v_trans && n_rows*bias->ne[3] == 1) {
         ggml_tensor * mask = ggml_add(ctx0, bias, kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32));
         ggml_tensor * t    = ggml_reshape_1d(ctx0, ggml_is_contiguous(sinks) ? sinks : ggml_cont(ctx0, sinks), sinks->ne[0]);
         cur = build_attn_mha(q_cur, k, v, nullptr, mask, t, nullptr, kq_scale, il);
     } else {
         // per-query sink t: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s)))
-        ggml_tensor * t = ggml_permute(ctx0, ggml_reshape_4d(ctx0, sinks, 1, sinks->ne[0], sinks->ne[1], sinks->ne[2]), 0, 2, 1, 3);
-        bias = ggml_sub(ctx0, bias, t);
+        if (!bias_ready) {
+            ggml_tensor * t = ggml_permute(ctx0, ggml_reshape_4d(ctx0, sinks, 1, sinks->ne[0], sinks->ne[1], sinks->ne[2]), 0, 2, 1, 3);
+            bias = ggml_sub(ctx0, bias, t);
+        }
         ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, sinks->ne[0]), 0.0f);
 
         // build_attn_mha adds kq_b before the scale: scale q instead, so the bias stays unscaled
