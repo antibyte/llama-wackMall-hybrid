@@ -354,6 +354,9 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph, int i0, int i1);
 // ggml-alloc.c: true if the operation can reuse memory from its sources
 GGML_API bool ggml_op_can_inplace(enum ggml_op op);
 
+// false when the indexed bias of a GGML_OP_FLASH_ATTN_EXT does not match its operands
+GGML_API bool ggml_validate_flash_attn_ext_indexed_bias(const struct ggml_tensor * a);
+
 
 // Memory allocation
 

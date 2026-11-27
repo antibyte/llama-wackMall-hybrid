@@ -4007,7 +4007,8 @@ ggml_tensor * llm_graph_context::build_attn_rel(
               float   kq_scale,
                 int   il,
             int64_t   i_row,
-               bool   bias_ready) const {
+               bool   bias_ready,
+        ggml_tensor * bias_idx) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4033,6 +4034,7 @@ ggml_tensor * llm_graph_context::build_attn_rel(
     // the mask rows of this chunk of queries
     ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
     // bias_ready: kq_b is already [n_kv, n_rows, n_head, 1] with the sink logits subtracted
+    // bias_idx: kq_b is the bias table [n_bins, n_head, n_rows] with the sink logits subtracted, bias_idx the bins [n_kv, n_rows]
     const int64_t n_rows = bias_ready ? kq_b->ne[1] : kq_b->ne[2];
     if (n_rows != kq_mask->ne[1] || i_row != 0) {
         GGML_ASSERT(i_row + n_rows <= kq_mask->ne[1]);
@@ -4046,6 +4048,27 @@ ggml_tensor * llm_graph_context::build_attn_rel(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    const bool v_trans = v->nb[1] > v->nb[2];
+
+    if (bias_idx) {
+        // flash attention with the indexed bias (LLAMA_INKLING2_FA_BIAS): no dense bias or kq. The sink logits are
+        // already in the table, so the softmax gets a zero sink per head: exp(s - t)/(1 + sum(exp(s - t))).
+        GGML_ASSERT(cparams.flash_attn && !v_trans && k->ne[3] == 1);
+        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F16 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, q_cur->ne[1]), 0.0f);
+        ggml_tensor * kf = k->type == GGML_TYPE_F32 ? ggml_cast(ctx0, k, GGML_TYPE_F16) : k;
+        ggml_tensor * vf = v->type == GGML_TYPE_F32 ? ggml_cast(ctx0, v, GGML_TYPE_F16) : v;
+        ggml_tensor * cur = ggml_flash_attn_ext(ctx0, ggml_permute(ctx0, q_cur, 0, 2, 1, 3), ggml_permute(ctx0, kf, 0, 2, 1, 3),
+                ggml_permute(ctx0, vf, 0, 2, 1, 3), mask, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(cur, zero);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        ggml_flash_attn_ext_add_indexed_bias(cur, kq_b, bias_idx);
+        // [n_embd_v, n_head, n_rows, 1] -> [n_embd_v*n_head, n_rows]
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        cb(cur, "kqv_out", il);
+        return cur;
+    }
+
     // [n_head, n_kv, n_rows, n_stream] -> [n_kv, n_rows, n_head, n_stream]
     ggml_tensor * bias = bias_ready ? kq_b : ggml_permute(ctx0, kq_b, 2, 0, 1, 3);
 
@@ -4056,7 +4079,6 @@ ggml_tensor * llm_graph_context::build_attn_rel(
         const char * e = getenv("LLAMA_INKLING2_FA_ROWS");
         return e == nullptr || atoi(e) != 0;
     }();
-    const bool v_trans = v->nb[1] > v->nb[2];
 
     ggml_tensor * cur = nullptr;
     if (!bias_ready && fa_single && cparams.flash_attn && !v_trans && n_rows*bias->ne[3] == 1) {

@@ -473,6 +473,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
 
+    if (!ggml_validate_flash_attn_ext_indexed_bias(dst)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
 
@@ -557,6 +561,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // an indexed bias: the tile kernel, one head per column, K/V converted to F16
+    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        float logit_softcap;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        const bool ok = (Q->ne[0] == 64 || Q->ne[0] == 128) && V->ne[0] == Q->ne[0] && logit_softcap == 0.0f &&
+            K->type != GGML_TYPE_TURBO4_K && V->type != GGML_TYPE_TURBO4_K;
+        return ok ? BEST_FATTN_KERNEL_TILE : BEST_FATTN_KERNEL_NONE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:

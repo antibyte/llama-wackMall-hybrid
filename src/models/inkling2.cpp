@@ -507,12 +507,28 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                                         : GGML_PAD(even, 16);
                 n_rows_max = std::min(n_seq_tokens, n_rows_max);
             }
+            // LLAMA_INKLING2_FA_BIAS=1 (default 0): batches of more than one token attend through flash attention with
+            // the indexed relative bias (ggml_flash_attn_ext_add_indexed_bias, the CUDA tile kernel): no dense
+            // n_kv x rows x n_head bias or kq, so no row budget. Query chunks of LLAMA_INKLING2_FA_BIAS_ROWS
+            // (default 256) bound the bias table [n_bins, n_head, rows] F32 (~96 KiB per row).
+            static const bool fa_bias = [] {
+                const char * e = getenv("LLAMA_INKLING2_FA_BIAS");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            static const int64_t fa_bias_rows = [] {
+                const char * e = getenv("LLAMA_INKLING2_FA_BIAS_ROWS");
+                return e == nullptr ? int64_t(256) : std::max<int64_t>(1, atoll(e));
+            }();
+            const bool use_fa_bias = fa_bias && cparams.flash_attn && n_stream == 1 && n_seq_tokens > 1;
+            if (use_fa_bias) {
+                n_rows_max = std::min(n_seq_tokens, fa_bias_rows);
+            }
             auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
                 int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
                 ne[d] = nr;
                 return ggml_cont(ctx0, ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], r0*t->nb[d]));
             };
-            ggml_tensor * table = table_per_chunk && n_rows_max < n_seq_tokens ? nullptr : project(Rcur);
+            ggml_tensor * table = use_fa_bias || (table_per_chunk && n_rows_max < n_seq_tokens) ? nullptr : project(Rcur);
             // LLAMA_INKLING2_BIAS_TRANSPOSE=1 (default; 0 = off): a prefill chunk subtracts its sink logits from the
             // small bias table before the gather and brings the gathered bias into the softmax layout with the tiled
             // transpose copy. Before, the sink subtraction read the gathered bias head-major through a permuted view:
@@ -537,6 +553,23 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 ggml_tensor * kq_b = nullptr;
                 ggml_tensor * t_c  = all ? sinks : ggml_view_3d(ctx0, sinks, n_head, nr, n_stream, sinks->nb[1], sinks->nb[2], r0*sinks->nb[1]);
                 const bool ready = bias_transpose && nr > 1 && n_stream == 1;
+                if (use_fa_bias) {
+                    // the chunk's bias table [n_bins, n_head, nr] with its sink logits [1, n_head, nr] subtracted
+                    ggml_tensor * r_v = ggml_view_3d(ctx0, Rcur, Rcur->ne[0], n_head, nr, Rcur->nb[1], Rcur->nb[2], r0*Rcur->nb[2]);
+                    ggml_tensor * t_v = ggml_view_3d(ctx0, sinks, 1, n_head, nr, sinks->nb[0], sinks->nb[1], r0*sinks->nb[1]);
+                    ggml_tensor * tbl = ggml_sub(ctx0, ggml_mul_mat(ctx0, rel_bias, r_v), t_v);
+                    cb(tbl, "kq_b_table", il);
+                    ggml_tensor *& rel_pos_dev = inp->self_rel_pos_dev[is_swa];
+                    if (!rel_pos_dev) {
+                        rel_pos_dev = inp->on_device ? rel_pos : ggml_cont(ctx0, rel_pos);
+                    }
+                    ggml_tensor * idx = ggml_view_2d(ctx0, rel_pos_dev, n_kv, nr, rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);
+                    ggml_tensor * q_v = ggml_view_3d(ctx0, Qcur, n_embd_head, n_head, nr, Qcur->nb[1], Qcur->nb[2], r0*Qcur->nb[2]);
+                    ggml_tensor * out = build_attn_rel(inp, q_v, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr,
+                            tbl, t_c, 1.0f/sqrtf(n_embd_head), il, r0, false, idx);
+                    outs.push_back(all ? out : ggml_reshape_3d(ctx0, out, out->ne[0], nr, n_stream));
+                    continue;
+                }
                 if (all) {
                     if (ready) {
                         ggml_tensor * tbl = ggml_reshape_4d(ctx0, table, table->ne[0], table->ne[1], nr, 1);

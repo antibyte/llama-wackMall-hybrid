@@ -24797,7 +24797,7 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
             func = ggml_cl_cumsum;
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            if (!any_on_device) {
+            if (!any_on_device || ggml_flash_attn_ext_has_indexed_bias(op)) {
                 return false;
             }
             ggml_cl_flash_attn(backend, tensor->src[0], tensor->src[1], tensor);

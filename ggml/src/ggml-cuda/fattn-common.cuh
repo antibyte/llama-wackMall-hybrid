@@ -19,6 +19,26 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// ggml_flash_attn_ext_add_indexed_bias: table [n_bins, n_head, n_query] F32, indices [n_keys, n_query] I32.
+// Only the tile kernel reads it (template indexed_bias); the others get an empty one.
+struct fattn_indexed_bias {
+    const float   * table;
+    const int32_t * indices;
+    int32_t n_bins;
+    int32_t n_keys;
+    int64_t query_stride; // n_bins*n_head
+
+    // the bias of head `head` from query `first_query` on
+    __device__ fattn_indexed_bias for_head(int64_t first_query, int head) const {
+        return {table + first_query*query_stride + int64_t(head)*n_bins, indices + first_query*n_keys, n_bins, n_keys, query_stride};
+    }
+
+    __device__ float add(float mask, int query, int key) const {
+        const int bin = indices[int64_t(query)*n_keys + key];
+        return bin >= 0 && bin < n_bins ? mask + table[int64_t(query)*query_stride + bin] : mask;
+    }
+};
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -40,7 +60,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const fattn_indexed_bias bias);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1229,10 +1250,16 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    const bool has_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
+    const ggml_tensor * bias_table   = has_bias ? dst->src[6] : nullptr;
+    const ggml_tensor * bias_indices = has_bias ? dst->src[7] : nullptr;
+
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
-    //     multiple sequences of possibly different lengths.
-    if (!ext && mask && mask->type == GGML_TYPE_F16 && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    //     multiple sequences of possibly different lengths. An indexed bias costs per key, so its causal
+    //     prefill chunks (fewer than 1024 queries) scan too, if the mask has the ncols1 rows of every tile.
+    if (!ext && mask && mask->type == GGML_TYPE_F16 && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+            (Q->ne[1] >= 1024 || Q->ne[3] > 1 || (has_bias && mask->ne[1] >= int64_t(ntiles_x)*ncols1))) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1377,7 +1404,12 @@ void launch_fattn(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        fattn_indexed_bias{has_bias ? (const float   *) bias_table->data   : nullptr,
+                           has_bias ? (const int32_t *) bias_indices->data : nullptr,
+                           has_bias ? int32_t(bias_table->ne[0])   : 0,
+                           has_bias ? int32_t(bias_indices->ne[0]) : 0,
+                           has_bias ? bias_table->ne[0]*bias_table->ne[1] : 0}
     );
     CUDA_CHECK(cudaGetLastError());
 

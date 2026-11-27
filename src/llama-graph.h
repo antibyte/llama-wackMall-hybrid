@@ -1429,7 +1429,8 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
                 int64_t   i_row,
-                   bool   bias_ready = false) const;
+                   bool   bias_ready = false,
+            ggml_tensor * bias_idx   = nullptr) const;
 
     //
     // pooling
