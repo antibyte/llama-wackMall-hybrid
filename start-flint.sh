@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Flint Preview UD-Q4_K_XL (unsloth/flint-GGUF) on the GTX 1660 Ti.
+# Flint UD-Q4_K_XL (unsloth/flint-GGUF, release; the GGUF still names itself "Flint Preview") on the GTX 1660 Ti.
 # 49 layers, n_embd 2048, 256 experts / 6 used, 2 packed shared experts,
 # 2 dense lead layers. Routed experts are mixed IQ/QK, so they stay CPU mmap.
 #
