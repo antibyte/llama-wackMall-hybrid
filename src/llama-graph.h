@@ -729,6 +729,11 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_tokens]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_tokens]
 
+    // positions the distances are computed from on the device (LLAMA_INKLING2_FA_BIAS_POS)
+    ggml_tensor * self_cell_pos     = nullptr; // F32 [n_kv],     -1 for empty cells
+    ggml_tensor * self_cell_pos_swa = nullptr; // F32 [n_kv_swa]
+    ggml_tensor * self_tok_pos      = nullptr; // F32 [n_tokens]
+
     // per-graph device copies of the distances, shared by the chunked gathers of all layers
     ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
 

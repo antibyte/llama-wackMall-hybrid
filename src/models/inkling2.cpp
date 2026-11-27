@@ -519,6 +519,14 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 const char * e = getenv("LLAMA_INKLING2_FA_BIAS_ROWS");
                 return e == nullptr ? int64_t(256) : std::max<int64_t>(1, atoll(e));
             }();
+            // LLAMA_INKLING2_FA_BIAS_POS=1 (default; 0 = off): with FA_BIAS each chunk computes its bins on the device from
+            // the cell and token positions, clamp(pos_q - pos_k, 0, extent), instead of reading the rows of the
+            // [n_kv, n_ubatch] I32 distances (235 MB at 56k, built and uploaded per ubatch). Where the host gives
+            // extent to an empty, future or foreign cell the causal mask is -inf, so the bias there does not count.
+            static const bool fa_bias_pos = [] {
+                const char * e = getenv("LLAMA_INKLING2_FA_BIAS_POS");
+                return e == nullptr || atoi(e) != 0;
+            }();
             const bool use_fa_bias = fa_bias && cparams.flash_attn && n_stream == 1 && n_seq_tokens > 1;
             if (use_fa_bias) {
                 n_rows_max = std::min(n_seq_tokens, fa_bias_rows);
@@ -559,11 +567,22 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                     ggml_tensor * t_v = ggml_view_3d(ctx0, sinks, 1, n_head, nr, sinks->nb[0], sinks->nb[1], r0*sinks->nb[1]);
                     ggml_tensor * tbl = ggml_sub(ctx0, ggml_mul_mat(ctx0, rel_bias, r_v), t_v);
                     cb(tbl, "kq_b_table", il);
-                    ggml_tensor *& rel_pos_dev = inp->self_rel_pos_dev[is_swa];
-                    if (!rel_pos_dev) {
-                        rel_pos_dev = inp->on_device ? rel_pos : ggml_cont(ctx0, rel_pos);
+                    ggml_tensor * idx = nullptr;
+                    if (fa_bias_pos && cparams.causal_attn) {
+                        // [n_kv, nr]: pos_q of the column minus pos_k of the row, clamped to the bins
+                        ggml_tensor * pos_k = is_swa ? inp->self_cell_pos_swa : inp->self_cell_pos;
+                        ggml_tensor * pos_q = ggml_view_2d(ctx0, inp->self_tok_pos, 1, nr, sizeof(float), r0*sizeof(float));
+                        ggml_tensor * d = ggml_sub(ctx0, ggml_repeat_4d(ctx0, pos_q, n_kv, nr, 1, 1), pos_k);
+                        d   = ggml_clamp(ctx0, d, 0.0f, float(is_swa ? inp->extent_swa : inp->extent));
+                        idx = ggml_cast(ctx0, d, GGML_TYPE_I32);
+                    } else {
+                        ggml_tensor *& rel_pos_dev = inp->self_rel_pos_dev[is_swa];
+                        if (!rel_pos_dev) {
+                            rel_pos_dev = inp->on_device ? rel_pos : ggml_cont(ctx0, rel_pos);
+                        }
+                        idx = ggml_view_2d(ctx0, rel_pos_dev, n_kv, nr, rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);
                     }
-                    ggml_tensor * idx = ggml_view_2d(ctx0, rel_pos_dev, n_kv, nr, rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);
+                    cb(idx, "kq_b_bins", il);
                     ggml_tensor * q_v = ggml_view_3d(ctx0, Qcur, n_embd_head, n_head, nr, Qcur->nb[1], Qcur->nb[2], r0*Qcur->nb[2]);
                     ggml_tensor * out = build_attn_rel(inp, q_v, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr,
                             tbl, t_c, 1.0f/sqrtf(n_embd_head), il, r0, false, idx);

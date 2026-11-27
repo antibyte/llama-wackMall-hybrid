@@ -3060,6 +3060,17 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+void llama_kv_cache::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    const int64_t n_kv = dst->ne[0];
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    std::vector<float> data(n_kv);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        data[j] = cells.is_empty(j) ? -1.0f : float(cells.pos_get(j));
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -4458,6 +4469,10 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_cell_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

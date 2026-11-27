@@ -1294,6 +1294,19 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     if (self_rel_pos_swa && self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
+    if (self_cell_pos && self_cell_pos->buffer) {
+        attn_ctx->get_base()->set_input_cell_pos(self_cell_pos, ubatch);
+    }
+    if (self_cell_pos_swa && self_cell_pos_swa->buffer) {
+        attn_ctx->get_swa()->set_input_cell_pos(self_cell_pos_swa, ubatch);
+    }
+    if (self_tok_pos && self_tok_pos->buffer) {
+        std::vector<float> pos(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            pos[i] = float(ubatch->pos[i]);
+        }
+        ggml_backend_tensor_set(self_tok_pos, pos.data(), 0, ggml_nbytes(self_tok_pos));
+    }
 }
 
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
@@ -1305,6 +1318,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos->ne[1]     == params.ubatch.n_tokens;
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+    res &= self_cell_pos->ne[0]     == attn_ctx->get_base()->get_n_kv();
+    res &= self_cell_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    res &= self_tok_pos->ne[0]      == params.ubatch.n_tokens;
 
     return res;
 }
@@ -3969,6 +3985,19 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    // only allocated when a graph reads them instead of the distances
+    inp->self_cell_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, attn_ctx->get_base()->get_n_kv());
+    ggml_set_input(inp->self_cell_pos);
+    ggml_set_name(inp->self_cell_pos, "attn_inp_cell_pos");
+
+    inp->self_cell_pos_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, attn_ctx->get_swa()->get_n_kv());
+    ggml_set_input(inp->self_cell_pos_swa);
+    ggml_set_name(inp->self_cell_pos_swa, "attn_inp_cell_pos_swa");
+
+    inp->self_tok_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, ubatch.n_tokens);
+    ggml_set_input(inp->self_tok_pos);
+    ggml_set_name(inp->self_tok_pos, "attn_inp_tok_pos");
+
     // LLAMA_ATTN_INPUTS_ON_DEVICE=1 (default 0): the masks and distances are allocated on the first GPU backend and
     // written there once per ubatch. A host input is copied again by every split that reads it (each attention layer
     // between CPU expert splits), and the chunked gathers kept a second device copy of the distances.
@@ -3987,7 +4016,8 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
         }
         if (gpu != nullptr) {
             const auto * ia = inp->get_attn();
-            for (ggml_tensor * t : { ia->self_kq_mask, ia->self_kq_mask_swa, inp->self_rel_pos, inp->self_rel_pos_swa }) {
+            for (ggml_tensor * t : { ia->self_kq_mask, ia->self_kq_mask_swa, inp->self_rel_pos, inp->self_rel_pos_swa,
+                                     inp->self_cell_pos, inp->self_cell_pos_swa, inp->self_tok_pos }) {
                 ggml_backend_sched_set_tensor_backend(sched, t, gpu);
             }
             inp->on_device = true;

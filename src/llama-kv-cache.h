@@ -258,6 +258,8 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     // inkling2: distance from each token to each cell of the view, extent for empty, future or far cells
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // F32 position of each cell of the view in the stream of the ubatch, -1 for empty cells
+    void set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -498,6 +500,8 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     // inkling2: distance from each token to each cell of the view, extent for empty, future or far cells
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // F32 position of each cell of the view in the stream of the ubatch, -1 for empty cells
+    void set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
